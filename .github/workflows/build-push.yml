@@ -12,6 +12,7 @@ env:
 jobs:
   build-kex:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -33,6 +34,7 @@ jobs:
 
   build-fuse:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -136,7 +138,7 @@ jobs:
             ghcr.io/gctrl-tech/app:${{ github.sha }}
 
   deploy-vps:
-    needs: [build-kex, build-fuse, build-api, build-agent, build-web, build-app]
+    needs: [build-api, build-web, build-app]
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to VPS
