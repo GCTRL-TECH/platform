@@ -1,4 +1,4 @@
-﻿// n8n-nodes-GCTRL - Community node package for GCTRL
+// n8n-nodes-GCTRL - Community node package for GCTRL
 // Exports all nodes and credentials
 
 export { GCTRLApi } from './credentials/GCTRLApi.credentials';

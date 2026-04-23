@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "gctrl-mcp",
   "version": "0.1.0",
   "description": "GCTRL MCP Server — exposes KEX, FUSE, KG, and RAG as tools for AI agents",

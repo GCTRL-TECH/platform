@@ -1,4 +1,4 @@
-﻿# GCTRL SaaS Platform — Design Spec
+# GCTRL SaaS Platform — Design Spec
 **Date:** 2026-04-23  
 **Status:** Approved  
 **Project:** Ground Control (GCTRL) — formerly GCTRL

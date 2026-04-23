@@ -1,4 +1,4 @@
-﻿# n8n-nodes-GCTRL
+# n8n-nodes-GCTRL
 
 n8n community node for [GCTRL](https://GCTRL.ai) - structured knowledge graphs for AI.
 

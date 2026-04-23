@@ -1,4 +1,4 @@
-﻿import { useState, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { Link, useSearchParams, useNavigate } from 'react-router-dom'
 import { Hexagon, Eye, EyeOff, AlertCircle, CheckCircle2 } from 'lucide-react'
 import { apiPost } from '@/lib/api'

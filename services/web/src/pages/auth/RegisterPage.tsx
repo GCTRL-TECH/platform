@@ -1,4 +1,4 @@
-﻿import { useState, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Hexagon, Eye, EyeOff, AlertCircle, CheckCircle2, Check, X } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'

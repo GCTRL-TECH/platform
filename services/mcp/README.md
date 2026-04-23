@@ -1,4 +1,4 @@
-﻿# GCTRL MCP Server
+# GCTRL MCP Server
 
 Exposes GCTRL's knowledge management as MCP tools for Claude and other AI agents.
 

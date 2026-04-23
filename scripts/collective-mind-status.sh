@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # GCTRL Collective Mind - Status Check
 # Shows the current state of all knowledge graphs and their refresh schedules
 
