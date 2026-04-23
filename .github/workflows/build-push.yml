@@ -177,7 +177,7 @@ jobs:
             done
 
             # ── Run full schema migration (all 13 migrations, idempotent) ────
-            docker exec gctrl-app-db psql -U borghive -d borghive << 'SQLEOF'
+            docker exec -i gctrl-app-db psql -U borghive -d borghive << 'SQLEOF'
             -- Extensions
             CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
             CREATE EXTENSION IF NOT EXISTS "pgcrypto";
