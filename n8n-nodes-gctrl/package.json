@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "n8n-nodes-gctrl",
   "version": "0.1.0",
   "description": "n8n community node for GCTRL - structured knowledge graphs for AI. Extract, query, fuse, and manage knowledge graphs. Use as memory for AI agents.",

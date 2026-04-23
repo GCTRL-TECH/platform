@@ -1,4 +1,4 @@
-﻿import {
+import {
 	IHttpRequestMethods,
 	IHttpRequestOptions,
 	IDataObject,
