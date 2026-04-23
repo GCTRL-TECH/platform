@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <rect width="64" height="64" rx="12" fill="#1a1a2e"/>
+  <path d="M32 12L48 22v20L32 52L16 42V22L32 12z" stroke="#e94560" stroke-width="2" fill="none"/>
+  <path d="M32 12v40M16 22l32 20M48 22L16 42" stroke="#e94560" stroke-width="1" opacity="0.4"/>
+  <circle cx="32" cy="12" r="3" fill="#e94560"/>
+  <circle cx="48" cy="22" r="3" fill="#e94560"/>
+  <circle cx="48" cy="42" r="3" fill="#e94560"/>
+  <circle cx="32" cy="52" r="3" fill="#e94560"/>
+  <circle cx="16" cy="42" r="3" fill="#e94560"/>
+  <circle cx="16" cy="22" r="3" fill="#e94560"/>
+  <circle cx="32" cy="32" r="5" fill="#e94560"/>
+  <text x="32" y="36" text-anchor="middle" fill="white" font-size="6" font-family="sans-serif" font-weight="bold">BH</text>
+</svg>

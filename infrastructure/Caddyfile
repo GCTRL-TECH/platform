@@ -1,0 +1,45 @@
+# BorgHive Production Caddyfile
+# Automatic HTTPS via Let's Encrypt
+# Replace {$DOMAIN} with your actual domain or set DOMAIN env var
+
+{$DOMAIN:localhost} {
+    # API routes
+    handle /api/* {
+        reverse_proxy api:4000
+    }
+
+    # OAuth callbacks (need to go to API)
+    handle /connectors/* {
+        reverse_proxy api:4000
+    }
+
+    # Grafana dashboards (admin only)
+    handle /grafana/* {
+        reverse_proxy grafana:3000
+    }
+
+    # Everything else -> frontend
+    handle {
+        reverse_proxy web:80
+    }
+
+    # Security headers
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    # Compression
+    encode gzip zstd
+
+    # Logging
+    log {
+        output file /data/access.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}

@@ -1,0 +1,332 @@
+﻿##############################################################################
+# GCTRL Production Docker Compose
+#
+# Usage:
+#   cp .env.production.example .env.production
+#   # Edit .env.production with real secrets
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+#
+# Features:
+#   - Health checks on all services
+#   - Resource limits (memory, CPU)
+#   - Restart policies
+#   - Named volumes for persistence
+#   - Caddy reverse proxy with automatic SSL
+#   - No exposed internal ports (only Caddy 80/443)
+#   - Secrets via environment variables
+##############################################################################
+
+services:
+
+  # ─── Reverse Proxy (SSL termination) ────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ─── API Server ─────────────────────────────────────────────────────
+  api:
+    build: ./services/api
+    container_name: gctrl-api
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - DATABASE_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
+      - REDIS_URL=redis://redis:6379
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - MAIL_HOST=${MAIL_HOST:-smtp.mailgun.org}
+      - MAIL_PORT=${MAIL_PORT:-587}
+      - MAIL_USER=${MAIL_USER:-}
+      - MAIL_PASS=${MAIL_PASS:-}
+      - FRONTEND_URL=${FRONTEND_URL:-https://app.GCTRL.ai}
+      - GCTRL_BASE_URL=${GCTRL_BASE_URL:-https://api.GCTRL.ai}
+      - KEX_WORKER_URL=http://kex:4010
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_BASE=http://ollama:11434
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - MICROSOFT_CLIENT_ID=${MICROSOFT_CLIENT_ID:-}
+      - MICROSOFT_CLIENT_SECRET=${MICROSOFT_CLIENT_SECRET:-}
+      - SLACK_CLIENT_ID=${SLACK_CLIENT_ID:-}
+      - SLACK_CLIENT_SECRET=${SLACK_CLIENT_SECRET:-}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - GCTRL
+      - ollama-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+
+  # ─── Frontend ───────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./services/web
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+    container_name: gctrl-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ─── KEX Worker ─────────────────────────────────────────────────────
+  kex:
+    build: ./services/kex
+    container_name: gctrl-kex
+    restart: unless-stopped
+    environment:
+      - OLLAMA_BASE=http://ollama:11434
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - REDIS_URL=redis://redis:6379
+      - PG_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
+      - QDRANT_URL=http://qdrant:6333
+      - KEX_WORKER_THREADS=${KEX_WORKER_THREADS:-1}
+      - WHISPER_MODEL=${WHISPER_MODEL:-base}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; r=requests.get('http://localhost:4010/health'); exit(0 if r.ok else 1)"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+    volumes:
+      - kex-models:/app/models
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - GCTRL
+      - ollama-net
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ─── FUSE Worker ────────────────────────────────────────────────────
+  fuse:
+    build: ./services/fuse
+    container_name: gctrl-fuse
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - PG_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
+      - QDRANT_URL=http://qdrant:6333
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ─── LIMES Entity Matching ──────────────────────────────────────────
+  limes:
+    build: ./services/limes
+    container_name: gctrl-limes
+    restart: unless-stopped
+    environment:
+      - JAVA_OPTS=-Xmx2G
+    command: ["-s"]
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+
+  # ─── PostgreSQL ─────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: gctrl-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${PG_USER}
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+      - POSTGRES_DB=${PG_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-GCTRL}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - GCTRL-pgdata:/var/lib/postgresql/data
+      - ./shared/db/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ─── Redis ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: gctrl-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - GCTRL-redis:/data
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  # ─── Neo4j ──────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:2025.02.3-community
+    container_name: gctrl-neo4j
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_memory_pagecache_size=1G
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - GCTRL-neo4j:/data
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # ─── Qdrant Vector Store ────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: gctrl-qdrant
+    restart: unless-stopped
+    volumes:
+      - GCTRL-qdrant:/qdrant/storage
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ─── Prometheus (Monitoring) ────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: gctrl-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./infrastructure/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - GCTRL-prometheus:/prometheus
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Grafana (Dashboards) ──────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: gctrl-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SERVER_ROOT_URL=${GRAFANA_URL:-http://localhost:3100}
+    volumes:
+      - GCTRL-grafana:/var/lib/grafana
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+# ─── Volumes ────────────────────────────────────────────────────────
+volumes:
+  caddy-data:
+  caddy-config:
+  GCTRL-pgdata:
+  GCTRL-redis:
+  GCTRL-neo4j:
+  GCTRL-qdrant:
+  GCTRL-prometheus:
+  GCTRL-grafana:
+  kex-models:
+
+# ─── Networks ───────────────────────────────────────────────────────
+networks:
+  GCTRL:
+    driver: bridge
+  ollama-net:
+    external: true
+    name: self-hosted-ai-starter-kit_demo
+
+

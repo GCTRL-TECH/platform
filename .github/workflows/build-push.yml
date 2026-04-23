@@ -1,0 +1,135 @@
+name: Build, Obfuscate, Push, Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  ORG: gctrl-tech
+
+jobs:
+  build-kex:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/kex
+          file: services/kex/build/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/kex:latest
+            ghcr.io/gctrl-tech/kex:${{ github.sha }}
+
+  build-fuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/fuse
+          file: services/fuse/build/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/fuse:latest
+            ghcr.io/gctrl-tech/fuse:${{ github.sha }}
+
+  build-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/license-api
+          file: services/license-api/build/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/license-api:latest
+            ghcr.io/gctrl-tech/license-api:${{ github.sha }}
+
+  build-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/agent
+          file: services/agent/build/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/agent:latest
+            ghcr.io/gctrl-tech/agent:${{ github.sha }}
+
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/web
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/web:latest
+            ghcr.io/gctrl-tech/web:${{ github.sha }}
+
+  deploy-vps:
+    needs: [build-kex, build-fuse, build-api, build-agent, build-web]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /opt/gctrl
+            echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u gctrl --password-stdin
+            docker compose pull gctrl-api gctrl-web
+            docker compose up -d gctrl-api gctrl-web
+            docker compose ps
+
+  update-deploy-repo:
+    needs: deploy-vps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: gctrl-tech/deploy
+          token: ${{ secrets.GHCR_TOKEN }}
+          path: deploy-repo
+      - name: Update version tag in installer
+        run: |
+          cd deploy-repo
+          sed -i "s/GCTRL_VERSION=.*/GCTRL_VERSION=${{ github.sha }}/" install.sh
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git commit -am "chore: update to ${{ github.sha }}" || echo "No changes"
+          git push

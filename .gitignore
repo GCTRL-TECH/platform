@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+dist/
+__pycache__/
+*.pyc
+.venv/
+*.log
+*.pem
+*.key
+config/license.jwt
+.previous-images
+coverage/
+.pytest_cache/
