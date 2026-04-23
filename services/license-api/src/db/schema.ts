@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, integer, timestamp, boolean, jsonb } from 'drizzle-orm/pg-core';
+import { relations } from 'drizzle-orm';
 
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -63,6 +64,21 @@ export const auditLog = pgTable('audit_log', {
   payload: jsonb('payload'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
+
+export const usersRelations = relations(users, ({ many }) => ({
+  licenses: many(licenses),
+  tokenUsage: many(tokenUsage),
+  subscriptions: many(subscriptions),
+}));
+
+export const licensesRelations = relations(licenses, ({ one }) => ({
+  user: one(users, { fields: [licenses.userId], references: [users.id] }),
+}));
+
+export const tokenUsageRelations = relations(tokenUsage, ({ one }) => ({
+  user: one(users, { fields: [tokenUsage.userId], references: [users.id] }),
+  license: one(licenses, { fields: [tokenUsage.licenseId], references: [licenses.id] }),
+}));
 
 export const appVersions = pgTable('app_versions', {
   id: uuid('id').primaryKey().defaultRandom(),
