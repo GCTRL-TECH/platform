@@ -176,10 +176,13 @@ jobs:
               docker exec gctrl-app-db pg_isready -U borghive -q && break || sleep 2
             done
 
-            # ── Run users schema migration (idempotent) ─────────────────────
+            # ── Run full schema migration (all 13 migrations, idempotent) ────
             docker exec gctrl-app-db psql -U borghive -d borghive << 'SQLEOF'
+            -- Extensions
             CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
             CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+            -- Enums
             DO $$ BEGIN
               IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='user_role') THEN
                 CREATE TYPE user_role AS ENUM ('viewer','analyst','editor','admin');
@@ -187,7 +190,33 @@ jobs:
               IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='user_clearance') THEN
                 CREATE TYPE user_clearance AS ENUM ('PUBLIC','INTERNAL','CONFIDENTIAL','RESTRICTED');
               END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='job_type') THEN
+                CREATE TYPE job_type AS ENUM ('kex_extract','kex_upload','fuse_merge');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='job_status') THEN
+                CREATE TYPE job_status AS ENUM ('pending','processing','completed','failed');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='ontology_scope') THEN
+                CREATE TYPE ontology_scope AS ENUM ('private','shared','public');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='connector_provider') THEN
+                CREATE TYPE connector_provider AS ENUM ('google','microsoft','slack','github');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='trigger_type') THEN
+                CREATE TYPE trigger_type AS ENUM ('cron','change_detection');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='trigger_module') THEN
+                CREATE TYPE trigger_module AS ENUM ('kex','fuse','compilation');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='trigger_status') THEN
+                CREATE TYPE trigger_status AS ENUM ('active','paused','error');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='rag_mode') THEN
+                CREATE TYPE rag_mode AS ENUM ('standard','incognito');
+              END IF;
             END $$;
+
+            -- 001 users
             CREATE TABLE IF NOT EXISTS users (
               id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
               email VARCHAR(255) UNIQUE NOT NULL,
@@ -205,6 +234,327 @@ jobs:
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS default_ontology_id UUID;
+
+            -- 002 api_keys
+            CREATE TABLE IF NOT EXISTS api_keys (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              key_hash VARCHAR(255) NOT NULL,
+              name VARCHAR(255) NOT NULL DEFAULT 'Default',
+              scopes TEXT[] DEFAULT '{}',
+              last_used_at TIMESTAMPTZ,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+            CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+            -- 003 jobs
+            CREATE TABLE IF NOT EXISTS jobs (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              type job_type NOT NULL,
+              status job_status NOT NULL DEFAULT 'pending',
+              input JSONB NOT NULL DEFAULT '{}',
+              result JSONB,
+              error TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              completed_at TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+            -- 004 token_usage
+            CREATE TABLE IF NOT EXISTS token_usage (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              action VARCHAR(100) NOT NULL,
+              tokens_spent INTEGER NOT NULL,
+              job_id UUID REFERENCES jobs(id),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_usage_user ON token_usage(user_id);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at);
+
+            -- 005 audit_log
+            CREATE TABLE IF NOT EXISTS audit_log (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID REFERENCES users(id),
+              action VARCHAR(100) NOT NULL,
+              resource_type VARCHAR(100),
+              resource_id VARCHAR(255),
+              details JSONB DEFAULT '{}',
+              ip_address INET,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_log(resource_type, resource_id);
+
+            -- 006 compilations
+            CREATE TABLE IF NOT EXISTS compilations (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name VARCHAR(255) NOT NULL,
+              description TEXT,
+              source_job_ids UUID[] DEFAULT '{}',
+              classification user_clearance NOT NULL DEFAULT 'PUBLIC',
+              version INTEGER NOT NULL DEFAULT 1,
+              cron_schedule VARCHAR(100),
+              cron_mode VARCHAR(20) DEFAULT 'incremental',
+              last_refresh_at TIMESTAMPTZ,
+              node_count INTEGER NOT NULL DEFAULT 0,
+              edge_count INTEGER NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_compilations_user ON compilations(user_id);
+            CREATE INDEX IF NOT EXISTS idx_compilations_classification ON compilations(classification);
+            ALTER TABLE compilations ADD COLUMN IF NOT EXISTS entity_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE compilations ADD COLUMN IF NOT EXISTS duplicate_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE compilations ADD COLUMN IF NOT EXISTS link_count INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE IF NOT EXISTS compilation_acl (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              compilation_id UUID NOT NULL REFERENCES compilations(id) ON DELETE CASCADE,
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              permission VARCHAR(20) NOT NULL DEFAULT 'read',
+              granted_by UUID REFERENCES users(id),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              UNIQUE(compilation_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_compilation_acl_compilation ON compilation_acl(compilation_id);
+            CREATE INDEX IF NOT EXISTS idx_compilation_acl_user ON compilation_acl(user_id);
+
+            -- 007 ontologies
+            CREATE TABLE IF NOT EXISTS ontologies (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name VARCHAR(255) NOT NULL,
+              description TEXT,
+              version INTEGER NOT NULL DEFAULT 1,
+              parent_ontology_id UUID REFERENCES ontologies(id) ON DELETE SET NULL,
+              scope ontology_scope NOT NULL DEFAULT 'private',
+              source VARCHAR(100) DEFAULT 'custom',
+              entity_type_count INTEGER NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              UNIQUE(user_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ontologies_user ON ontologies(user_id);
+            CREATE INDEX IF NOT EXISTS idx_ontologies_scope ON ontologies(scope);
+            CREATE TABLE IF NOT EXISTS ontology_entity_types (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              ontology_id UUID NOT NULL REFERENCES ontologies(id) ON DELETE CASCADE,
+              qid VARCHAR(50),
+              name VARCHAR(255) NOT NULL,
+              aliases TEXT[] DEFAULT '{}',
+              description TEXT,
+              parent_qid VARCHAR(50),
+              confidence_threshold FLOAT DEFAULT 0.3,
+              color VARCHAR(20),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              UNIQUE(ontology_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ontology_entity_types_ontology ON ontology_entity_types(ontology_id);
+            CREATE INDEX IF NOT EXISTS idx_ontology_entity_types_qid ON ontology_entity_types(qid);
+            CREATE TABLE IF NOT EXISTS ontology_properties (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              entity_type_id UUID NOT NULL REFERENCES ontology_entity_types(id) ON DELETE CASCADE,
+              name VARCHAR(100) NOT NULL,
+              data_type VARCHAR(50) DEFAULT 'text',
+              required BOOLEAN DEFAULT FALSE,
+              searchable BOOLEAN DEFAULT TRUE,
+              weight_in_matching FLOAT DEFAULT 1.0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_ontology_properties_type ON ontology_properties(entity_type_id);
+            CREATE TABLE IF NOT EXISTS ontology_match_rules (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              ontology_id UUID NOT NULL REFERENCES ontologies(id) ON DELETE CASCADE,
+              entity_type_a VARCHAR(255) NOT NULL,
+              entity_type_b VARCHAR(255) NOT NULL,
+              can_match BOOLEAN DEFAULT TRUE,
+              similarity_metric VARCHAR(100) DEFAULT 'trigrams',
+              threshold FLOAT DEFAULT 0.85,
+              blocking_strategy VARCHAR(50) DEFAULT 'type_based',
+              properties_to_match TEXT[] DEFAULT '{"name"}',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_ontology_match_rules_ontology ON ontology_match_rules(ontology_id);
+            ALTER TABLE compilations ADD COLUMN IF NOT EXISTS ontology_id UUID REFERENCES ontologies(id);
+            ALTER TABLE compilations ADD COLUMN IF NOT EXISTS ontology_version INTEGER;
+
+            -- 008 active_learning
+            CREATE TABLE IF NOT EXISTS review_queue (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              ontology_id UUID REFERENCES ontologies(id) ON DELETE SET NULL,
+              compilation_id UUID REFERENCES compilations(id) ON DELETE SET NULL,
+              entity_a_uri VARCHAR(500) NOT NULL,
+              entity_a_name VARCHAR(500),
+              entity_a_type VARCHAR(100),
+              entity_b_uri VARCHAR(500) NOT NULL,
+              entity_b_name VARCHAR(500),
+              entity_b_type VARCHAR(100),
+              confidence FLOAT NOT NULL,
+              discovery_method VARCHAR(50),
+              status VARCHAR(20) NOT NULL DEFAULT 'pending',
+              decision VARCHAR(20),
+              decision_reason TEXT,
+              decided_at TIMESTAMPTZ,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_queue_user ON review_queue(user_id);
+            CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
+            CREATE INDEX IF NOT EXISTS idx_review_queue_ontology ON review_queue(ontology_id);
+            CREATE INDEX IF NOT EXISTS idx_review_queue_compilation ON review_queue(compilation_id);
+            CREATE TABLE IF NOT EXISTS learned_weights (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              ontology_id UUID NOT NULL REFERENCES ontologies(id) ON DELETE CASCADE,
+              property_name VARCHAR(100) NOT NULL,
+              weight FLOAT NOT NULL DEFAULT 1.0,
+              feedback_count INTEGER NOT NULL DEFAULT 0,
+              last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              UNIQUE(ontology_id, property_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_learned_weights_ontology ON learned_weights(ontology_id);
+
+            -- 009 kg_folders
+            CREATE TABLE IF NOT EXISTS kg_folders (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name VARCHAR(255) NOT NULL,
+              parent_folder_id UUID REFERENCES kg_folders(id) ON DELETE SET NULL,
+              position INTEGER NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_folders_user ON kg_folders(user_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_folders_parent ON kg_folders(parent_folder_id);
+            ALTER TABLE compilations ADD COLUMN IF NOT EXISTS folder_id UUID REFERENCES kg_folders(id) ON DELETE SET NULL;
+            CREATE INDEX IF NOT EXISTS idx_compilations_folder ON compilations(folder_id);
+
+            -- 010 connectors
+            CREATE TABLE IF NOT EXISTS oauth_connectors (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              provider connector_provider NOT NULL,
+              label VARCHAR(255) NOT NULL,
+              access_token TEXT NOT NULL,
+              refresh_token TEXT,
+              token_expires_at TIMESTAMPTZ,
+              scopes JSONB DEFAULT '[]',
+              provider_account_id VARCHAR(255),
+              provider_email VARCHAR(255),
+              metadata JSONB DEFAULT '{}',
+              is_active BOOLEAN DEFAULT true,
+              last_sync_at TIMESTAMPTZ,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_connectors_user ON oauth_connectors(user_id);
+            CREATE INDEX IF NOT EXISTS idx_oauth_connectors_provider ON oauth_connectors(provider);
+            CREATE TABLE IF NOT EXISTS connector_sync_jobs (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              connector_id UUID NOT NULL REFERENCES oauth_connectors(id) ON DELETE CASCADE,
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              source_type VARCHAR(50) NOT NULL,
+              source_id VARCHAR(500) NOT NULL,
+              source_name VARCHAR(1000),
+              kex_job_id UUID REFERENCES jobs(id),
+              status VARCHAR(20) NOT NULL DEFAULT 'pending',
+              error TEXT,
+              metadata JSONB DEFAULT '{}',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_connector ON connector_sync_jobs(connector_id);
+            CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_user ON connector_sync_jobs(user_id);
+            CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_status ON connector_sync_jobs(status);
+
+            -- 011 connector_configs
+            CREATE TABLE IF NOT EXISTS connector_configs (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              provider VARCHAR(50) NOT NULL UNIQUE,
+              client_id TEXT NOT NULL,
+              client_secret TEXT NOT NULL,
+              extra JSONB DEFAULT '{}',
+              is_active BOOLEAN DEFAULT true,
+              updated_by UUID REFERENCES users(id),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_configs_provider ON connector_configs(provider);
+
+            -- 012 job_batches
+            CREATE TABLE IF NOT EXISTS job_batches (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name VARCHAR(500) NOT NULL,
+              source VARCHAR(100),
+              source_metadata JSONB DEFAULT '{}',
+              total_jobs INTEGER NOT NULL DEFAULT 0,
+              completed_jobs INTEGER NOT NULL DEFAULT 0,
+              failed_jobs INTEGER NOT NULL DEFAULT 0,
+              status VARCHAR(20) NOT NULL DEFAULT 'pending',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_batches_user ON job_batches(user_id);
+            CREATE INDEX IF NOT EXISTS idx_job_batches_status ON job_batches(status);
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_id UUID REFERENCES job_batches(id) ON DELETE SET NULL;
+            CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;
+
+            -- 013 triggers
+            CREATE TABLE IF NOT EXISTS triggers (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name VARCHAR(255) NOT NULL,
+              module trigger_module NOT NULL,
+              type trigger_type NOT NULL,
+              status trigger_status NOT NULL DEFAULT 'active',
+              cron_schedule VARCHAR(100),
+              config JSONB NOT NULL DEFAULT '{}',
+              last_run_at TIMESTAMPTZ,
+              next_run_at TIMESTAMPTZ,
+              last_error TEXT,
+              run_count INTEGER NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_triggers_user ON triggers(user_id);
+            CREATE INDEX IF NOT EXISTS idx_triggers_status ON triggers(status);
+            CREATE INDEX IF NOT EXISTS idx_triggers_next_run ON triggers(next_run_at) WHERE status = 'active';
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trigger_id UUID REFERENCES triggers(id) ON DELETE SET NULL;
+
+            -- RAG conversations + messages
+            CREATE TABLE IF NOT EXISTS conversations (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              compilation_id UUID REFERENCES compilations(id) ON DELETE SET NULL,
+              title VARCHAR(500) NOT NULL DEFAULT 'New conversation',
+              model VARCHAR(255) NOT NULL DEFAULT 'ollama:llama3.2',
+              mode rag_mode NOT NULL DEFAULT 'standard',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+            CREATE TABLE IF NOT EXISTS messages (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+              role VARCHAR(20) NOT NULL,
+              content TEXT NOT NULL,
+              cypher_query TEXT,
+              sources JSONB DEFAULT '[]',
+              confidence REAL,
+              graph_trace JSONB,
+              tokens_used INTEGER,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
+
+            SELECT 'Schema migration complete' AS status;
             SQLEOF
 
             # ── Start / update borghive app container ──────────────────────
