@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Ground Control Rollback
 # Usage: curl -fsSL https://gctrl.tech/rollback | bash
 set -euo pipefail

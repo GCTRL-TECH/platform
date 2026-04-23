@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Ground Control Updater
 # Usage: curl -fsSL https://gctrl.tech/update | bash
 set -euo pipefail
