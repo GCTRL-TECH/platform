@@ -114,8 +114,29 @@ jobs:
             ghcr.io/gctrl-tech/web:latest
             ghcr.io/gctrl-tech/web:${{ github.sha }}
 
+  build-app:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: TortillaJackson
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/api
+          file: services/api/build/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/app:latest
+            ghcr.io/gctrl-tech/app:${{ github.sha }}
+
   deploy-vps:
-    needs: [build-kex, build-fuse, build-api, build-agent, build-web]
+    needs: [build-kex, build-fuse, build-api, build-agent, build-web, build-app]
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to VPS
@@ -124,12 +145,17 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: GHCR_TOKEN
           script: |
             cd /docker/gctrl
-            echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u TortillaJackson --password-stdin
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
+            # Inject GHCR_READ_TOKEN for installer registry distribution
+            grep -q GHCR_READ_TOKEN .env || echo "GHCR_READ_TOKEN=$GHCR_TOKEN" >> .env
             docker compose pull gctrl-api gctrl-web
             docker compose up -d gctrl-api gctrl-web
             docker compose ps
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
   update-deploy-repo:
     needs: deploy-vps
