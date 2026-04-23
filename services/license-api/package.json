@@ -28,6 +28,7 @@
   },
   "jest": {
     "extensionsToTreatAsEsm": [".ts"],
+    "testPathIgnorePatterns": ["/node_modules/", "/dist/"],
     "transform": {
       "^.+\\.tsx?$": ["ts-jest", { "useESM": true }]
     },
