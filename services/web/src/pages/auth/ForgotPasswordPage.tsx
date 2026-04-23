@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import { Hexagon, AlertCircle, CheckCircle2, ArrowLeft } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ArrowLeft } from 'lucide-react'
 import { apiPost } from '@/lib/api'
 
 export function ForgotPasswordPage() {
@@ -41,12 +41,7 @@ export function ForgotPasswordPage() {
 
       <div className="relative w-full max-w-sm animate-slide-up">
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-blue-500 shadow-lg shadow-blue-500/25">
-            <Hexagon size={24} className="text-white" fill="white" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-slate-100">GCTRL</h1>
-          </div>
+          <img src="/logo.png" alt="GCTRL" className="h-16 w-auto" />
         </div>
 
         <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-8 shadow-2xl backdrop-blur-sm">

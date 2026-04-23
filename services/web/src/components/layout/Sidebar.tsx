@@ -12,7 +12,6 @@ import {
   Timer,
   LogOut,
   ChevronRight,
-  Hexagon,
   type LucideIcon,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
@@ -152,14 +151,9 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
       <div
         className={`flex h-16 items-center border-b border-slate-800 ${collapsed ? 'justify-center px-2' : 'gap-2.5 px-5'}`}
       >
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500">
-          <Hexagon size={16} className="text-white" fill="white" />
-        </div>
+        <img src="/logo.png" alt="GCTRL" className={`shrink-0 w-auto ${collapsed ? 'h-8' : 'h-7'}`} />
         {!collapsed && (
-          <div>
-            <span className="text-sm font-semibold text-slate-100">GCTRL</span>
-            <p className="text-[10px] text-slate-500 leading-tight">Knowledge Platform</p>
-          </div>
+          <p className="text-[10px] text-slate-500 leading-tight">Knowledge Platform</p>
         )}
       </div>
 

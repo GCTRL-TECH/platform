@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate, useLocation } from 'react-router-dom'
-import { Hexagon, Eye, EyeOff, AlertCircle } from 'lucide-react'
+import { Eye, EyeOff, AlertCircle } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
 
@@ -51,11 +51,8 @@ export function LoginPage() {
       <div className="relative w-full max-w-sm animate-slide-up">
         {/* Logo */}
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-blue-500 shadow-lg shadow-blue-500/25">
-            <Hexagon size={24} className="text-white" fill="white" />
-          </div>
+          <img src="/logo.png" alt="GCTRL" className="h-16 w-auto" />
           <div>
-            <h1 className="text-2xl font-bold text-slate-100">GCTRL</h1>
             <p className="mt-1 text-sm text-slate-500">Drop any data. Get structured knowledge.</p>
           </div>
         </div>
