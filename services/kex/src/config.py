@@ -1,4 +1,4 @@
-﻿"""
+"""
 KEX Service Configuration
 """
 

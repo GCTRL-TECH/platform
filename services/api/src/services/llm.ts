@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Multi-model LLM service
  * Supports: Ollama (local), OpenAI, Anthropic, OpenRouter
  * Config is per-request — no global API key storage

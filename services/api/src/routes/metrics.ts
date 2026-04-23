@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Prometheus-compatible metrics endpoint.
  * Exposes basic application metrics for monitoring.
  */

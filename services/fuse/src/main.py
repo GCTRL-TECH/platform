@@ -1,4 +1,4 @@
-﻿"""
+"""
 FUSE Service - Knowledge Graph Fusion Worker
 Merges multiple source knowledge graphs into unified compilations.
 Listens on Redis queue 'fuse:jobs' for merge requests.

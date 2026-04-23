@@ -1,4 +1,4 @@
-﻿"""
+"""
 Three-Stage Entity Merger for GCTRL FUSE
 
 Stage 1: Neo4j APOC — exact/near-exact pre-filter (fast, high confidence)

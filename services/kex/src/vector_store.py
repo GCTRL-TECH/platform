@@ -1,4 +1,4 @@
-﻿"""
+"""
 Vector store for KEX pipeline.
 
 Persists text chunks in two places:
