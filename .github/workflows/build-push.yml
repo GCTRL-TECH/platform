@@ -147,13 +147,89 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           envs: GHCR_TOKEN
           script: |
+            set -e
             cd /docker/gctrl
             echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
-            # Inject GHCR_READ_TOKEN for installer registry distribution
             grep -q GHCR_READ_TOKEN .env || echo "GHCR_READ_TOKEN=$GHCR_TOKEN" >> .env
+
+            # Discover the Docker network used by the existing gctrl stack
+            GCTRL_NET=$(docker inspect gctrl-db --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
+            GCTRL_NET=${GCTRL_NET:-gctrl_gctrl}
+            echo "Using network: $GCTRL_NET"
+
+            # ── Start borghive app DB (idempotent) ─────────────────────────
+            if ! docker ps --format '{{.Names}}' | grep -q '^gctrl-app-db$'; then
+              docker run -d \
+                --name gctrl-app-db \
+                --network "$GCTRL_NET" \
+                --restart unless-stopped \
+                -v gctrl-app-pgdata:/var/lib/postgresql/data \
+                -e POSTGRES_USER=borghive \
+                -e POSTGRES_PASSWORD=borghive \
+                -e POSTGRES_DB=borghive \
+                postgres:16-alpine
+            fi
+            # Wait for postgres to be ready
+            for i in $(seq 1 30); do
+              docker exec gctrl-app-db pg_isready -U borghive -q && break || sleep 2
+            done
+
+            # ── Run users schema migration (idempotent) ─────────────────────
+            docker exec gctrl-app-db psql -U borghive -d borghive << 'SQLEOF'
+            CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+            CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+            DO $$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='user_role') THEN
+                CREATE TYPE user_role AS ENUM ('viewer','analyst','editor','admin');
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='user_clearance') THEN
+                CREATE TYPE user_clearance AS ENUM ('PUBLIC','INTERNAL','CONFIDENTIAL','RESTRICTED');
+              END IF;
+            END $$;
+            CREATE TABLE IF NOT EXISTS users (
+              id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+              email VARCHAR(255) UNIQUE NOT NULL,
+              password_hash VARCHAR(255) NOT NULL,
+              name VARCHAR(255) NOT NULL,
+              role user_role NOT NULL DEFAULT 'viewer',
+              clearance user_clearance NOT NULL DEFAULT 'PUBLIC',
+              email_verified BOOLEAN NOT NULL DEFAULT true,
+              verification_token VARCHAR(255),
+              reset_token VARCHAR(255),
+              reset_token_expires TIMESTAMPTZ,
+              tokens_balance INTEGER NOT NULL DEFAULT 50,
+              tier VARCHAR(50) NOT NULL DEFAULT 'free',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            SQLEOF
+
+            # ── Start / update borghive app container ──────────────────────
+            docker pull ghcr.io/gctrl-tech/app:latest
+            docker rm -f gctrl-app 2>/dev/null || true
+            docker run -d \
+              --name gctrl-app \
+              --network "$GCTRL_NET" \
+              --restart unless-stopped \
+              -e NODE_ENV=production \
+              -e PORT=4000 \
+              -e DATABASE_URL="postgresql://borghive:borghive@gctrl-app-db:5432/borghive" \
+              -e REDIS_URL="redis://gctrl-redis:6379" \
+              -e NEO4J_URI="bolt://localhost:7687" \
+              -e NEO4J_USER=neo4j \
+              -e NEO4J_PASSWORD=none \
+              -e JWT_SECRET="${JWT_SECRET:-gctrl-jwt-secret-change-me}" \
+              -e JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET:-gctrl-jwt-refresh-change-me}" \
+              -e FRONTEND_URL="https://gctrl.tech" \
+              ghcr.io/gctrl-tech/app:latest
+
+            # ── Refresh license-api + web ──────────────────────────────────
             docker compose pull gctrl-api gctrl-web
             docker compose up -d gctrl-api gctrl-web
-            docker compose ps
+
+            echo "=== Running containers ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
