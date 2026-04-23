@@ -110,8 +110,8 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            cd /opt/gctrl
-            echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u gctrl --password-stdin
+            cd /docker/gctrl
+            echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u TortillaJackson --password-stdin
             docker compose pull gctrl-api gctrl-web
             docker compose up -d gctrl-api gctrl-web
             docker compose ps
