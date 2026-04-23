@@ -1,0 +1,58 @@
+﻿{
+  "name": "n8n-nodes-gctrl",
+  "version": "0.1.0",
+  "description": "n8n community node for GCTRL - structured knowledge graphs for AI. Extract, query, fuse, and manage knowledge graphs. Use as memory for AI agents.",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "GCTRL",
+    "knowledge-graph",
+    "rag",
+    "ai-memory",
+    "entity-extraction",
+    "graph-fusion"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/GCTRL/n8n-nodes-GCTRL",
+  "author": {
+    "name": "gctrl",
+    "url": "https://GCTRL.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GCTRL/n8n-nodes-GCTRL.git"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && gulp build:icons",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/GCTRLApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/GCTRL/GCTRL.node.js",
+      "dist/nodes/GCTRLTrigger/GCTRLTrigger.node.js",
+      "dist/nodes/GCTRLMemory/GCTRLMemory.node.js",
+      "dist/nodes/GCTRLKnowledgeTool/GCTRLKnowledgeTool.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "gulp": "^4.0.2",
+    "n8n-workflow": "^1.0.0",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}
+
+

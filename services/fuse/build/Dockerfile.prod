@@ -1,0 +1,17 @@
+# Stage 1: Obfuscate
+FROM python:3.11-slim AS obfuscator
+WORKDIR /build
+RUN pip install pyarmor==8.5.11
+COPY requirements.txt ./
+COPY src/ ./src/
+RUN pyarmor gen --output dist/obfuscated --recursive --platform linux.x86_64 src/
+
+# Stage 2: Runtime
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y gcc g++ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=obfuscator /build/dist/obfuscated ./src
+EXPOSE 4020
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4020"]

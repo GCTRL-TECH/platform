@@ -1,0 +1,25 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npm run build
+RUN npm install -g javascript-obfuscator && \
+    javascript-obfuscator dist/ --output dist-obfuscated/ \
+      --compact true \
+      --control-flow-flattening true \
+      --string-array true \
+      --string-array-encoding rc4 \
+      --source-map false
+RUN npx @yao-pkg/pkg dist-obfuscated/index.js \
+      --target node20-linux-x64 \
+      --output gctrl-agent
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates wget
+WORKDIR /app
+COPY --from=builder /app/gctrl-agent ./gctrl-agent
+VOLUME /app/config
+EXPOSE 7070
+CMD ["./gctrl-agent"]
