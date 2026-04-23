@@ -1,4 +1,4 @@
-﻿/**
+/**
  * RAG API routes — Talk to Graph module
  *
  * Dual-mode:

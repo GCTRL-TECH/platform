@@ -1,4 +1,4 @@
-﻿const TOKEN_KEY = 'GCTRL_token'
+const TOKEN_KEY = 'GCTRL_token'
 const REFRESH_TOKEN_KEY = 'GCTRL_refresh_token'
 
 export interface TokenPayload {

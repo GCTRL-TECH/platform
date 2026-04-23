@@ -1,4 +1,4 @@
-﻿import nodemailer, { Transporter } from 'nodemailer';
+import nodemailer, { Transporter } from 'nodemailer';
 import { config } from '../config.js';
 
 let transporter: Transporter | null = null;

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * OAuth2 Configuration for external connectors.
  *
  * Priority: Database (connector_configs table) > Environment variables

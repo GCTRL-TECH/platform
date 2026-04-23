@@ -1,4 +1,4 @@
-﻿const requireEnv = (key: string, fallback?: string): string => {
+const requireEnv = (key: string, fallback?: string): string => {
   const value = process.env[key] ?? fallback;
   if (value === undefined) {
     throw new Error(`Required environment variable ${key} is not set`);

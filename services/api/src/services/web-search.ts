@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Web search enrichment for RAG pipeline.
  * Searches the web for additional context when graph + vector confidence is low.
  * Uses DuckDuckGo HTML search (no API key needed) + Trafilatura-style scraping.

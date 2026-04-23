@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Qdrant vector search service.
  * Searches the "GCTRL_chunks" collection for text chunks semantically
  * similar to an embedded query vector. Used by the hybrid RAG pipeline.

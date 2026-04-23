@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Web Crawler Connector
  * Recursively crawls a website and extracts text from each page.
  * Respects robots.txt, depth limits, and same-domain restriction.
