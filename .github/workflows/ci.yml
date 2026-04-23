@@ -57,4 +57,4 @@ jobs:
           cache: npm
           cache-dependency-path: services/agent/package-lock.json
       - run: cd services/agent && npm ci
-      - run: cd services/agent && node node_modules/jest/bin/jest.js --testMatch="**/src/**/*.test.ts"
+      - run: cd services/agent && npm test
