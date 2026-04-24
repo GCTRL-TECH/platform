@@ -21,6 +21,7 @@ import AdminPanel from '@/pages/admin/AdminPanel'
 import TriggersPage from '@/pages/triggers/TriggersPage'
 import OnboardingWizard from '@/pages/onboarding/OnboardingWizard'
 import GoogleDrivePage from '@/pages/connectors/GoogleDrivePage'
+import { LandingPage } from '@/pages/landing/LandingPage'
 
 function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useAuth()
@@ -65,6 +66,19 @@ function PublicRoute() {
   return <Outlet />
 }
 
+function LandingRoute() {
+  const { isAuthenticated, isLoading } = useAuth()
+  if (isLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#020617]">
+        <div className="h-6 w-6 animate-spin rounded-full border-2 border-indigo-500/30 border-t-indigo-500" />
+      </div>
+    )
+  }
+  if (isAuthenticated) return <Navigate to="/dashboard" replace />
+  return <LandingPage />
+}
+
 export function App() {
   return (
     <Routes>
@@ -97,7 +111,7 @@ export function App() {
       </Route>
 
       {/* Root redirect */}
-      <Route path="/" element={<Navigate to="/dashboard" replace />} />
+      <Route path="/" element={<LandingRoute />} />
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
   )
