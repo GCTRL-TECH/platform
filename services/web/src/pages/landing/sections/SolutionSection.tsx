@@ -1,3 +1,5 @@
+import { Link } from 'react-router-dom'
+
 const CAPABILITIES = [
   { label: 'KEX Extract', color: 'indigo' },
   { label: 'FUSE Merge',  color: 'violet' },
@@ -25,7 +27,7 @@ export function SolutionSection() {
             Connect any storage backend. Use our native Neo4j + Qdrant stack, or swap in your own. GCTRL is infrastructure-agnostic, built to integrate with whatever you already run.
           </p>
           <div className="mt-8">
-            <a href="/register" className="btn-cta-primary">Start Grounding Your Data</a>
+            <Link to="/register" className="btn-cta-primary">Start Grounding Your Data</Link>
           </div>
         </div>
 

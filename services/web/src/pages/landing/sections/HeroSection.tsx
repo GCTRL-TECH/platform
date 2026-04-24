@@ -1,3 +1,5 @@
+import { Link } from 'react-router-dom'
+
 export function HeroSection() {
   return (
     <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#020617] px-6 pt-20">
@@ -19,13 +21,17 @@ export function HeroSection() {
       {/* Mission Control icon cluster — top right */}
       <div className="pointer-events-none absolute right-8 top-28 hidden opacity-30 lg:block">
         <div className="flex flex-col gap-2">
-          {[...Array(3)].map((_, r) => (
+          {[
+            [0.55, 0.35, 0.65, 0.40],
+            [0.70, 0.50, 0.30, 0.60],
+            [0.45, 0.75, 0.55, 0.35],
+          ].map((row, r) => (
             <div key={r} className="flex gap-2">
-              {[...Array(4)].map((_, c) => (
+              {row.map((opacity, c) => (
                 <div
                   key={c}
                   className="h-8 w-12 rounded border border-indigo-500/30 bg-indigo-900/20"
-                  style={{ opacity: Math.random() * 0.5 + 0.3 }}
+                  style={{ opacity }}
                 />
               ))}
             </div>
@@ -58,15 +64,15 @@ export function HeroSection() {
 
         {/* CTAs */}
         <div className="flex flex-wrap items-center justify-center gap-4">
-          <a href="/register" className="btn-cta-primary">
+          <Link to="/register" className="btn-cta-primary">
             Get Started Free
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
             </svg>
-          </a>
-          <a href="/login" className="btn-cta-secondary">
+          </Link>
+          <Link to="/login" className="btn-cta-secondary">
             Sign In
-          </a>
+          </Link>
         </div>
 
         {/* Trust signals */}

@@ -1,3 +1,5 @@
+import { Link } from 'react-router-dom'
+
 export function CtaSection() {
   return (
     <section className="relative overflow-hidden bg-[#0a0f24] px-6 py-28">
@@ -24,12 +26,12 @@ export function CtaSection() {
         </p>
 
         <div className="flex flex-wrap items-center justify-center gap-4 reveal">
-          <a href="/register" className="btn-cta-primary px-8 py-3.5 text-base">
+          <Link to="/register" className="btn-cta-primary px-8 py-3.5 text-base">
             Get Started Free
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
             </svg>
-          </a>
+          </Link>
           <a href="mailto:hello@gctrl.tech" className="btn-cta-secondary px-8 py-3.5 text-base">
             Talk to Us
           </a>

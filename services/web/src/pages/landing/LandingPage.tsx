@@ -62,7 +62,7 @@ function LandingNav() {
         <button
           className="flex items-center justify-center rounded-lg p-2 text-slate-400 hover:text-white md:hidden"
           onClick={() => setMenuOpen((v) => !v)}
-          aria-label="Toggle menu"
+          aria-label="Toggle menu" aria-expanded={menuOpen}
         >
           {menuOpen ? (
             <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -136,9 +136,15 @@ function LandingFooter() {
               <ul className="space-y-2">
                 {col.links.map(([label, href]) => (
                   <li key={label}>
-                    <a href={href} className="text-sm text-slate-500 transition-colors hover:text-slate-300">
-                      {label}
-                    </a>
+                    {href.startsWith('/') ? (
+                      <Link to={href} className="text-sm text-slate-500 transition-colors hover:text-slate-300">
+                        {label}
+                      </Link>
+                    ) : (
+                      <a href={href} className="text-sm text-slate-500 transition-colors hover:text-slate-300">
+                        {label}
+                      </a>
+                    )}
                   </li>
                 ))}
               </ul>

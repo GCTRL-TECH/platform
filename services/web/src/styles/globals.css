@@ -266,21 +266,6 @@
     50%       { transform: translateY(-12px); }
   }
 
-  @keyframes orbit {
-    from { transform: rotate(var(--orbit-start, 0deg)) translateX(var(--orbit-r, 110px)) rotate(calc(-1 * var(--orbit-start, 0deg))); }
-    to   { transform: rotate(calc(var(--orbit-start, 0deg) + 360deg)) translateX(var(--orbit-r, 110px)) rotate(calc(-1 * (var(--orbit-start, 0deg) + 360deg))); }
-  }
-
-  @keyframes connector-draw {
-    from { stroke-dashoffset: 300; opacity: 0; }
-    to   { stroke-dashoffset: 0;   opacity: 0.6; }
-  }
-
-  @keyframes nav-bg-in {
-    from { background: transparent; backdrop-filter: none; }
-    to   { background: rgba(2,6,23,0.85); backdrop-filter: blur(12px); }
-  }
-
   .animate-ring-1 { animation: ring-pulse 4s ease-in-out infinite; }
   .animate-ring-2 { animation: ring-pulse 4s ease-in-out infinite 1.3s; }
   .animate-ring-3 { animation: ring-pulse 4s ease-in-out infinite 2.6s; }
@@ -310,6 +295,9 @@
 
     .animate-ring-1, .animate-ring-2, .animate-ring-3,
     .animate-float {
+      animation: none;
+    }
+    .animate-bounce {
       animation: none;
     }
   }
