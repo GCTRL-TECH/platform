@@ -16,6 +16,7 @@ warn()    { echo -e "${YELLOW}[GCTRL]${NC} $1"; }
 error()   { echo -e "${RED}[GCTRL]${NC} $1"; exit 1; }
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
+GCTRL_LICENSE_KEY="${GCTRL_LICENSE_KEY:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --key|-k) GCTRL_LICENSE_KEY="$2"; shift 2 ;;
@@ -51,6 +52,68 @@ compute_fingerprint() {
         ifconfig 2>/dev/null | grep "ether" | head -1 | awk '{print $2}' || \
         echo "00:00:00:00:00:00")
   printf '%s' "${cpu}::${disk}::${mac}" | sha256sum | awk '{print $1}'
+}
+
+# ── Service Detection ─────────────────────────────────────────────────────────
+# Probe a TCP port on localhost (returns 0 = open, 1 = closed/timeout)
+probe_tcp() {
+  local port=$1
+  timeout 2 bash -c ">/dev/tcp/127.0.0.1/$port" 2>/dev/null
+}
+
+# For each infrastructure dependency, detect if it's already running on the host.
+# Sets: NEO4J_URI, QDRANT_URL, OLLAMA_BASE, PROFILES (array of compose profiles to activate)
+PROFILES=()
+NEO4J_URI=""
+NEO4J_USER="neo4j"
+NEO4J_PASSWORD="gctrl-neo4j-password"
+QDRANT_URL=""
+OLLAMA_BASE=""
+
+detect_services() {
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  info "Detecting existing infrastructure..."
+  echo ""
+
+  # Neo4j (Bolt :7687)
+  if probe_tcp 7687; then
+    NEO4J_URI="bolt://host.docker.internal:7687"
+    success "Neo4j detected on :7687 — will connect to existing instance"
+  else
+    PROFILES+=("bundled-neo4j")
+    NEO4J_URI="bolt://gctrl-neo4j:7687"
+    info "Neo4j not found — will deploy bundled container"
+  fi
+
+  # Qdrant (:6333)
+  if probe_tcp 6333; then
+    QDRANT_URL="http://host.docker.internal:6333"
+    success "Qdrant detected on :6333 — will connect to existing instance"
+  else
+    PROFILES+=("bundled-qdrant")
+    QDRANT_URL="http://gctrl-qdrant:6333"
+    info "Qdrant not found — will deploy bundled container"
+  fi
+
+  # Ollama (:11434)
+  if probe_tcp 11434; then
+    OLLAMA_BASE="http://host.docker.internal:11434"
+    success "Ollama detected on :11434 — will connect to existing instance"
+  else
+    PROFILES+=("bundled-ollama")
+    OLLAMA_BASE="http://gctrl-ollama:11434"
+    info "Ollama not found — will deploy bundled container"
+  fi
+
+  echo ""
+  if [ ${#PROFILES[@]} -eq 0 ]; then
+    success "All infrastructure already present — GCTRL will connect to your existing stack"
+  else
+    info "Will deploy bundled: ${PROFILES[*]}"
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
 }
 
 # ── License Activation ────────────────────────────────────────────────────────
@@ -116,7 +179,11 @@ pull_images() {
   success "Registry login OK"
 
   info "Pulling GCTRL images (this may take a few minutes)..."
-  docker compose -f "${INSTALL_DIR}/docker-compose.yml" pull
+  local profile_flags=()
+  for p in "${PROFILES[@]}"; do
+    profile_flags+=("--profile" "$p")
+  done
+  docker compose -f "${INSTALL_DIR}/docker-compose.yml" "${profile_flags[@]}" pull
   success "Images ready"
 }
 
@@ -131,11 +198,21 @@ generate_config() {
   local public_key
   public_key=$(curl -fsSL "${API_URL}/v1/public-key")
 
+  local jwt_secret
+  jwt_secret=$(openssl rand -hex 32)
+
   cat > "${INSTALL_DIR}/.env" <<EOF
 GCTRL_LICENSE_JWT_PATH=/app/config/license.jwt
 GCTRL_LICENSE_PUBLIC_KEY=${public_key}
 GCTRL_API_URL=https://api.gctrl.tech
 GCTRL_DATA_DIR=${INSTALL_DIR}/data
+JWT_SECRET=${jwt_secret}
+NEO4J_URI=${NEO4J_URI}
+NEO4J_USER=${NEO4J_USER}
+NEO4J_PASSWORD=${NEO4J_PASSWORD}
+QDRANT_URL=${QDRANT_URL}
+OLLAMA_BASE=${OLLAMA_BASE}
+POSTGRES_PASSWORD=gctrl-postgres-password
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
   success "Config generated"
@@ -144,7 +221,17 @@ EOF
 # ── Start Stack ───────────────────────────────────────────────────────────────
 start_stack() {
   info "Starting GCTRL..."
-  docker compose -f "${INSTALL_DIR}/docker-compose.yml" --env-file "${INSTALL_DIR}/.env" up -d
+
+  local profile_flags=()
+  for p in "${PROFILES[@]}"; do
+    profile_flags+=("--profile" "$p")
+  done
+
+  docker compose \
+    -f "${INSTALL_DIR}/docker-compose.yml" \
+    --env-file "${INSTALL_DIR}/.env" \
+    "${profile_flags[@]}" \
+    up -d
 
   info "Waiting for services to be ready (up to 120s)..."
   local max_wait=120 waited=0
@@ -162,14 +249,21 @@ start_stack() {
   echo "  Installed : ${INSTALL_DIR}"
   echo "  To update : curl -fsSL https://gctrl.tech/update | bash"
   echo ""
+  if probe_tcp 11434; then
+    echo "  Ollama    : connected at ${OLLAMA_BASE}"
+  else
+    echo "  Ollama    : bundled — pull a model: docker exec gctrl-ollama ollama pull qwen2.5:7b"
+  fi
+  echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   check_prereqs
-  generate_config
+  detect_services
   activate_license
+  generate_config
   pull_images
   start_stack
 }

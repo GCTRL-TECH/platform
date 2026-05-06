@@ -29,6 +29,8 @@ import metricsRouter from './routes/metrics.js';
 import crawlerRouter from './routes/crawler.js';
 import databaseRouter from './routes/database.js';
 import sourcesRouter from './routes/sources.js';
+import setupRouter from './routes/setup.js';
+import updateRouter from './routes/update.js';
 import { initHeartbeat, stopHeartbeat } from './services/heartbeat.js';
 
 const app = express();
@@ -88,6 +90,8 @@ app.use('/api/metrics', metricsRouter);
 app.use('/api/crawler', crawlerRouter);
 app.use('/api/database', databaseRouter);
 app.use('/api/sources', sourcesRouter);
+app.use('/api/setup', setupRouter);
+app.use('/api/update', updateRouter);
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 

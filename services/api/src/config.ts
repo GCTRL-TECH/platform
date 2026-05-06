@@ -45,6 +45,8 @@ export const config = {
 
   kexWorkerUrl: requireEnv('KEX_WORKER_URL', 'http://localhost:4010'),
 
+  qdrantUrl: requireEnv('QDRANT_URL', 'http://localhost:6333'),
+
   bcryptRounds: 12,
 
   uploadDir: process.env['UPLOAD_DIR'] ?? '/tmp/GCTRL-uploads',

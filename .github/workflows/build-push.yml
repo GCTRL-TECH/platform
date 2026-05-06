@@ -75,7 +75,29 @@ jobs:
             ghcr.io/gctrl-tech/license-api:latest
             ghcr.io/gctrl-tech/license-api:${{ github.sha }}
 
-  build-agent:
+  # build-agent (Node.js) - replaced by Rust build below
+  # build-agent:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: TortillaJackson
+  #         password: ${{ secrets.GHCR_TOKEN }}
+  #     - uses: docker/build-push-action@v5
+  #       with:
+  #         context: services/agent
+  #         file: services/agent/build/Dockerfile.prod
+  #         push: true
+  #         tags: |
+  #           ghcr.io/gctrl-tech/agent:latest
+  #           ghcr.io/gctrl-tech/agent:${{ github.sha }}
+
+  build-agent-rs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -87,10 +109,10 @@ jobs:
           registry: ghcr.io
           username: TortillaJackson
           password: ${{ secrets.GHCR_TOKEN }}
-      - uses: docker/build-push-action@v5
+      - name: Build and push agent (Rust)
+        uses: docker/build-push-action@v5
         with:
-          context: services/agent
-          file: services/agent/build/Dockerfile.prod
+          context: ./services/agent-rs
           push: true
           tags: |
             ghcr.io/gctrl-tech/agent:latest
@@ -116,7 +138,29 @@ jobs:
             ghcr.io/gctrl-tech/web:latest
             ghcr.io/gctrl-tech/web:${{ github.sha }}
 
-  build-app:
+  # build-app (Node.js) - replaced by Rust build below
+  # build-app:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: TortillaJackson
+  #         password: ${{ secrets.GHCR_TOKEN }}
+  #     - uses: docker/build-push-action@v5
+  #       with:
+  #         context: services/api
+  #         file: services/api/build/Dockerfile.prod
+  #         push: true
+  #         tags: |
+  #           ghcr.io/gctrl-tech/app:latest
+  #           ghcr.io/gctrl-tech/app:${{ github.sha }}
+
+  build-api-rs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -128,14 +172,14 @@ jobs:
           registry: ghcr.io
           username: TortillaJackson
           password: ${{ secrets.GHCR_TOKEN }}
-      - uses: docker/build-push-action@v5
+      - name: Build and push api (Rust)
+        uses: docker/build-push-action@v5
         with:
-          context: services/api
-          file: services/api/build/Dockerfile.prod
+          context: ./services/api-rs
           push: true
           tags: |
-            ghcr.io/gctrl-tech/app:latest
-            ghcr.io/gctrl-tech/app:${{ github.sha }}
+            ghcr.io/gctrl-tech/api:latest
+            ghcr.io/gctrl-tech/api:${{ github.sha }}
 
   build-portal:
     runs-on: ubuntu-latest
@@ -159,7 +203,7 @@ jobs:
             ghcr.io/gctrl-tech/portal:${{ github.sha }}
 
   deploy-vps:
-    needs: [build-api, build-portal, build-app]
+    needs: [build-api, build-portal, build-api-rs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -183,8 +227,8 @@ jobs:
             docker compose -f docker-compose.yml pull gctrl-api gctrl-web
             docker compose -f docker-compose.yml up -d gctrl-api gctrl-web
 
-            # Update borghive app container
-            docker pull ghcr.io/gctrl-tech/app:latest
+            # Update borghive api container (Rust)
+            docker pull ghcr.io/gctrl-tech/api:latest
             GCTRL_NET=$(docker inspect gctrl-db --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
             GCTRL_NET=${GCTRL_NET:-gctrl}
             docker rm -f gctrl-app 2>/dev/null || true
@@ -192,7 +236,6 @@ jobs:
               --name gctrl-app \
               --network "$GCTRL_NET" \
               --restart unless-stopped \
-              -e NODE_ENV=production \
               -e PORT=4000 \
               -e DATABASE_URL="postgresql://borghive:borghive@gctrl-app-db:5432/borghive" \
               -e REDIS_URL="redis://gctrl-redis:6379" \
@@ -202,7 +245,7 @@ jobs:
               -e JWT_SECRET="${JWT_SECRET:-gctrl-jwt-secret-change-me}" \
               -e JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET:-gctrl-jwt-refresh-change-me}" \
               -e FRONTEND_URL="https://gctrl.tech" \
-              ghcr.io/gctrl-tech/app:latest
+              ghcr.io/gctrl-tech/api:latest
 
             echo "=== Running containers ==="
             docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"

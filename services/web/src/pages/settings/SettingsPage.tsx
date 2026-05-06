@@ -24,6 +24,10 @@ import {
   Code2,
   Search,
   Palette,
+  Server,
+  RefreshCw,
+  Wifi,
+  WifiOff,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
@@ -31,7 +35,7 @@ import { api } from '@/lib/api'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'models' | 'integrations' | 'skills' | 'mcp' | 'n8n' | 'account'
+type TabId = 'models' | 'integrations' | 'skills' | 'mcp' | 'n8n' | 'account' | 'infrastructure'
 
 interface Tab {
   id: TabId
@@ -79,6 +83,7 @@ const TABS: Tab[] = [
   { id: 'skills', label: 'Skills & Plugins', icon: Puzzle },
   { id: 'mcp', label: 'MCP Server', icon: Code2 },
   { id: 'n8n', label: 'n8n', icon: Plug },
+  { id: 'infrastructure', label: 'Infrastructure', icon: Server },
   { id: 'account', label: 'Account', icon: User },
 ]
 
@@ -1430,6 +1435,192 @@ function AccountTab() {
   )
 }
 
+// ─── Tab: Infrastructure ──────────────────────────────────────────────────────
+
+interface ServiceStatus {
+  connected: boolean
+  latencyMs: number | null
+  url: string
+}
+
+interface SetupStatus {
+  services: {
+    neo4j:    ServiceStatus
+    qdrant:   ServiceStatus
+    ollama:   ServiceStatus
+    postgres: ServiceStatus
+    redis:    ServiceStatus
+  }
+}
+
+const SERVICE_META: Array<{
+  key: keyof SetupStatus['services']
+  label: string
+  description: string
+  icon: string
+}> = [
+  { key: 'neo4j',    label: 'Neo4j',        description: 'Knowledge graph database',  icon: '🔵' },
+  { key: 'qdrant',   label: 'Qdrant',        description: 'Vector store for RAG',       icon: '🟣' },
+  { key: 'ollama',   label: 'Ollama',        description: 'Local LLM inference',        icon: '🦙' },
+  { key: 'postgres', label: 'PostgreSQL',    description: 'Metadata & job storage',     icon: '🐘' },
+  { key: 'redis',    label: 'Redis',         description: 'Job queue & cache',          icon: '🔴' },
+]
+
+function ServiceRow({ label, description, icon, status, loading }: {
+  label: string
+  description: string
+  icon: string
+  status: ServiceStatus | undefined
+  loading: boolean
+}) {
+  const connected = status?.connected ?? false
+  const latency = status?.latencyMs
+  const url = status?.url
+
+  return (
+    <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3">
+      <div className="flex items-center gap-3 min-w-0">
+        <span className="text-xl">{icon}</span>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-slate-200">{label}</span>
+            {!loading && (
+              connected
+                ? <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"><Wifi size={9} />connected</span>
+                : <span className="flex items-center gap-1 text-[10px] font-medium text-red-400"><WifiOff size={9} />offline</span>
+            )}
+            {loading && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-slate-500" />}
+          </div>
+          <p className="text-[11px] text-slate-500 truncate">{description}</p>
+        </div>
+      </div>
+      <div className="flex items-center gap-3 shrink-0">
+        {url && url !== '(configured)' && (
+          <span className="hidden sm:block text-[10px] font-mono text-slate-500 max-w-[160px] truncate">{url}</span>
+        )}
+        {latency !== null && latency !== undefined && (
+          <span className="text-[10px] text-slate-500">{latency}ms</span>
+        )}
+        <div className={cn(
+          'h-2 w-2 rounded-full',
+          loading ? 'animate-pulse bg-slate-600' : connected ? 'bg-emerald-500' : 'bg-red-500'
+        )} />
+      </div>
+    </div>
+  )
+}
+
+function InfrastructureTab() {
+  const [status, setStatus] = useState<SetupStatus | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const refresh = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await api.get<SetupStatus>('/api/setup/status')
+      setStatus(res.data)
+    } catch (err: any) {
+      setError(err?.message ?? 'Failed to reach API')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void refresh() }, [refresh])
+
+  const allConnected = status
+    ? Object.values(status.services).every((s) => s.connected)
+    : false
+
+  return (
+    <div className="space-y-8">
+      {/* Status Overview */}
+      <section>
+        <div className="flex items-center justify-between mb-4">
+          <SectionHeader>Service Status</SectionHeader>
+          <button
+            onClick={() => void refresh()}
+            disabled={loading}
+            className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+            Refresh
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-4 rounded-lg border border-red-900/40 bg-red-950/20 px-4 py-2 text-sm text-red-400">
+            {error}
+          </div>
+        )}
+
+        {!error && !loading && allConnected && (
+          <div className="mb-4 rounded-lg border border-emerald-900/40 bg-emerald-950/10 px-4 py-2 text-sm text-emerald-400 flex items-center gap-2">
+            <Check size={14} />
+            All services connected and healthy
+          </div>
+        )}
+
+        <div className="space-y-2">
+          {SERVICE_META.map(({ key, label, description, icon }) => (
+            <ServiceRow
+              key={key}
+              label={label}
+              description={description}
+              icon={icon}
+              status={status?.services[key]}
+              loading={loading}
+            />
+          ))}
+        </div>
+      </section>
+
+      {/* Connection Info */}
+      <section>
+        <SectionHeader>Connection Details</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-3">
+          {status && SERVICE_META.map(({ key, label }) => {
+            const svc = status.services[key]
+            if (!svc || svc.url === '(configured)') return null
+            return (
+              <div key={key} className="flex items-center justify-between text-sm">
+                <span className="text-slate-500">{label}</span>
+                <span className="font-mono text-[11px] text-slate-300">{svc.url}</span>
+              </div>
+            )
+          })}
+          {!status && !loading && (
+            <p className="text-sm text-slate-500">No data — click Refresh to check connections.</p>
+          )}
+        </div>
+      </section>
+
+      {/* Ollama Model Hint */}
+      <section>
+        <SectionHeader>Local LLM (Ollama)</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-3">
+          <p className="text-sm text-slate-400">
+            GCTRL uses Ollama for local, GDPR-compliant inference. Your data never leaves the machine.
+          </p>
+          <div className="rounded-md bg-slate-950 border border-slate-800 px-3 py-2 font-mono text-xs text-slate-300 space-y-1">
+            <p className="text-slate-500"># Pull a recommended model</p>
+            <p>docker exec gctrl-ollama ollama pull qwen2.5:7b</p>
+            <p className="text-slate-500 mt-2"># Or use your native Ollama</p>
+            <p>ollama pull qwen2.5:7b</p>
+          </div>
+          <p className="text-[11px] text-slate-500">
+            Recommended: <span className="text-slate-300">qwen2.5:7b</span> (4 GB) ·
+            Larger: <span className="text-slate-300">qwen2.5:14b</span>, <span className="text-slate-300">mistral</span> ·
+            Fast: <span className="text-slate-300">phi3.5</span>
+          </p>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export function SettingsPage() {
@@ -1481,6 +1672,7 @@ export function SettingsPage() {
         {activeTab === 'skills' && <SkillsTab />}
         {activeTab === 'mcp' && <McpTab />}
         {activeTab === 'n8n' && <N8nTab />}
+        {activeTab === 'infrastructure' && <InfrastructureTab />}
         {activeTab === 'account' && <AccountTab />}
       </main>
     </div>
