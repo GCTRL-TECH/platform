@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GCTRL_DIR="${GCTRL_DIR:-$HOME/gctrl}"
+
+echo "[GCTRL] Updating Ground Control..."
+
+if [ ! -f "$GCTRL_DIR/docker-compose.yml" ]; then
+  echo "[GCTRL] ERROR: No docker-compose.yml found in $GCTRL_DIR"
+  echo "[GCTRL] Set GCTRL_DIR to your installation directory and retry."
+  exit 1
+fi
+
+cd "$GCTRL_DIR"
+
+echo "[GCTRL] Pulling latest images..."
+docker compose pull
+
+echo "[GCTRL] Restarting containers with new images..."
+docker compose up -d
+
+echo ""
+echo "[GCTRL] Update complete."
+docker ps --filter "name=gctrl-" --format "  {{.Names}}\t{{.Status}}"
