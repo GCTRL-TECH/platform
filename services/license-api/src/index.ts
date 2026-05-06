@@ -5,13 +5,17 @@ import activateRouter from './routes/activate.js';
 import heartbeatRouter from './routes/heartbeat.js';
 import stripeRouter from './routes/stripe.js';
 import adminRouter from './routes/admin.js';
+import authRouter from './routes/auth.js';
 
 const app = express();
 
 // Stripe needs raw body for signature verification — must come before express.json()
 app.use('/v1/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use(express.json());
-app.use(cors({ origin: ['https://gctrl.tech', 'https://admin.gctrl.tech'] }));
+app.use(cors({
+  origin: ['https://gctrl.tech', 'https://www.gctrl.tech', 'https://admin.gctrl.tech'],
+  credentials: true,
+}));
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'gctrl-api' }));
 
@@ -25,6 +29,7 @@ app.get('/v1/public-key', (_req, res) => {
 app.use(activateRouter);
 app.use(heartbeatRouter);
 app.use(stripeRouter);
+app.use(authRouter);
 app.use('/admin', adminRouter);
 
 const PORT = process.env.PORT ?? 4000;

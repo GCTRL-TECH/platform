@@ -40,7 +40,7 @@ interface FuseJobData {
     relations_merged?: number
     nodes_total?: number
     stage1_apoc?: number
-    stage2_limes?: number
+    stage2_resolver?: number
     stage3_conex?: number
     total_links?: number
   }
@@ -285,7 +285,7 @@ export function FuseJobDetail() {
                   <span className="h-2.5 w-2.5 rounded-full bg-blue-500" />
                   <span className="text-sm text-slate-300">Similarity-Based Discovery</span>
                 </div>
-                <span className="font-mono text-sm font-medium text-slate-200">{r.stage2_limes ?? 0}</span>
+                <span className="font-mono text-sm font-medium text-slate-200">{r.stage2_resolver ?? 0}</span>
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -304,10 +304,10 @@ export function FuseJobDetail() {
                       style={{ width: `${((r.stage1_apoc ?? 0) / (r.total_links ?? 1)) * 100}%` }}
                     />
                   )}
-                  {(r.stage2_limes ?? 0) > 0 && (
+                  {(r.stage2_resolver ?? 0) > 0 && (
                     <div
                       className="bg-blue-500"
-                      style={{ width: `${((r.stage2_limes ?? 0) / (r.total_links ?? 1)) * 100}%` }}
+                      style={{ width: `${((r.stage2_resolver ?? 0) / (r.total_links ?? 1)) * 100}%` }}
                     />
                   )}
                   {(r.stage3_conex ?? 0) > 0 && (

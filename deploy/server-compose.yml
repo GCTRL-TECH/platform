@@ -1,0 +1,89 @@
+version: "3.8"
+
+# GCTRL Server Stack — runs on Hostinger VPS
+# Manages: license API, web frontend, app database
+# Deploy: cd /docker/gctrl && docker compose -f server-compose.yml up -d
+# Or via CI/CD: build-push.yml deploys automatically on push to main
+
+services:
+
+  # ─── License API ────────────────────────────────────────────────────
+  # Handles: license activation, heartbeat, version management, credits
+  # Routes via Traefik to: api.gctrl.tech
+  gctrl-api:
+    image: ghcr.io/gctrl-tech/license-api:latest
+    container_name: gctrl-api
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - DATABASE_URL=postgresql://gctrl:${POSTGRES_PASSWORD}@gctrl-db:5432/gctrl_license
+      - JWT_SECRET=${JWT_SECRET}
+      - LICENSE_HMAC_SECRET=${LICENSE_HMAC_SECRET}
+      - LICENSE_RSA_PRIVATE_KEY_PATH=/run/secrets/license_private
+      - LICENSE_RSA_PUBLIC_KEY_PATH=/run/secrets/license_public
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - FRONTEND_URL=https://gctrl.tech
+      - GHCR_REGISTRY=ghcr.io
+      - GHCR_ORG=gctrl-tech
+      - GHCR_TOKEN=${GHCR_TOKEN}
+    volumes:
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      gctrl-db:
+        condition: service_healthy
+    networks:
+      - gctrl-server
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gctrl-api.rule=Host(`api.gctrl.tech`)"
+      - "traefik.http.routers.gctrl-api.entrypoints=websecure"
+      - "traefik.http.routers.gctrl-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.gctrl-api.loadbalancer.server.port=4000"
+
+  # ─── Portal Frontend ─────────────────────────────────────────────────
+  # GCTRL customer portal: register, login, license management, admin
+  # Routes via Traefik to: gctrl.tech
+  gctrl-web:
+    image: ghcr.io/gctrl-tech/portal:latest
+    container_name: gctrl-web
+    restart: unless-stopped
+    depends_on:
+      - gctrl-api
+    networks:
+      - gctrl-server
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gctrl-web.rule=Host(`gctrl.tech`) || Host(`www.gctrl.tech`)"
+      - "traefik.http.routers.gctrl-web.entrypoints=websecure"
+      - "traefik.http.routers.gctrl-web.tls.certresolver=letsencrypt"
+      - "traefik.http.services.gctrl-web.loadbalancer.server.port=80"
+
+  # ─── PostgreSQL ──────────────────────────────────────────────────────
+  # License server database (users, licenses, usage, billing)
+  gctrl-db:
+    image: postgres:16-alpine
+    container_name: gctrl-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=gctrl
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=gctrl_license
+    volumes:
+      - gctrl-server-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gctrl -d gctrl_license"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gctrl-server
+
+volumes:
+  gctrl-server-pgdata:
+
+networks:
+  gctrl-server:
+    driver: bridge
+    name: gctrl_gctrl
