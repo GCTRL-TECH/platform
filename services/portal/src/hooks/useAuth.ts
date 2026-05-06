@@ -7,7 +7,7 @@ import {
   createElement,
   type ReactNode,
 } from 'react'
-import { getToken, setToken, clearToken, isTokenExpired, decodeToken } from '@/lib/auth'
+import { getToken, setToken, clearToken, isTokenExpired } from '@/lib/auth'
 import { apiGet, apiPost } from '@/lib/api'
 
 export interface PortalUser {

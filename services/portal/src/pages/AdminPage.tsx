@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Users, KeyRound, BarChart3, Tag, AlertTriangle } from 'lucide-react'
+import { Users, KeyRound, BarChart3, Tag, AlertTriangle, type LucideIcon } from 'lucide-react'
 import { apiGet, apiPost, apiPatch } from '@/lib/api'
 import { formatDistanceToNow } from 'date-fns'
 
@@ -22,7 +22,7 @@ interface AnalyticsSummary {
 
 type Tab = 'users' | 'licenses' | 'versions' | 'analytics'
 
-const TABS: { id: Tab; label: string; icon: React.FC<{ size?: number }> }[] = [
+const TABS: { id: Tab; label: string; icon: LucideIcon }[] = [
   { id: 'users', label: 'Users', icon: Users },
   { id: 'licenses', label: 'Issue License', icon: KeyRound },
   { id: 'versions', label: 'Versions', icon: Tag },
