@@ -17,7 +17,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - GCTRL_LICENSE_JWT_PATH=/app/config/license.jwt
-      - GCTRL_LICENSE_PUBLIC_KEY=${GCTRL_LICENSE_PUBLIC_KEY}
+      - GCTRL_LICENSE_PUBLIC_KEY_FILE=/app/config/license.pub
       - GCTRL_API_URL=${GCTRL_API_URL:-https://api.gctrl.tech}
       - GCTRL_COMPOSE_FILE=/app/docker-compose.yml
       - GCTRL_NETWORK=gctrl

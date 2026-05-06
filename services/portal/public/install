@@ -102,14 +102,13 @@ generate_config() {
   curl -fsSL "https://gctrl.tech/compose.yml" \
     -o "${INSTALL_DIR}/docker-compose.yml"
 
-  local public_key
-  public_key=$(curl -fsSL "${API_URL}/v1/public-key")
+  curl -fsSL "${API_URL}/v1/public-key" -o "${CONFIG_DIR}/license.pub"
+  chmod 600 "${CONFIG_DIR}/license.pub"
 
   local jwt_secret
   jwt_secret=$(openssl rand -hex 32)
 
   cat > "${INSTALL_DIR}/.env" <<EOF
-GCTRL_LICENSE_PUBLIC_KEY=${public_key}
 GCTRL_API_URL=https://api.gctrl.tech
 GCTRL_DATA_DIR=${INSTALL_DIR}/data
 JWT_SECRET=${jwt_secret}
