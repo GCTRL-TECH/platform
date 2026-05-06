@@ -29,6 +29,11 @@ check_prereqs() {
   if [ ${#missing[@]} -gt 0 ]; then
     error "Missing: ${missing[*]}\nInstall Docker: https://docs.docker.com/engine/install/"
   fi
+
+  if ! docker info &>/dev/null; then
+    error "Docker daemon is not running or not accessible.\n  Start it : sudo systemctl start docker\n  Then run : sudo usermod -aG docker \$USER && newgrp docker\n  (Log out and back in if the group change doesn't take effect immediately)"
+  fi
+
   success "Prerequisites OK"
 }
 
