@@ -5,7 +5,7 @@ COPY . .
 RUN CARGO_PROFILE_RELEASE_LTO=false cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app/target/release/gctrl-agent .
 EXPOSE 7070
