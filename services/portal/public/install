@@ -99,7 +99,7 @@ generate_config() {
   info "Creating ${INSTALL_DIR}..."
   mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${INSTALL_DIR}/data"
 
-  curl -fsSL "https://raw.githubusercontent.com/GCTRL-TECH/platform/main/deploy/compose-template.yml" \
+  curl -fsSL "https://gctrl.tech/compose.yml" \
     -o "${INSTALL_DIR}/docker-compose.yml"
 
   local public_key
