@@ -31,7 +31,23 @@ check_prereqs() {
   fi
 
   if ! docker info &>/dev/null; then
-    error "Docker daemon is not running or not accessible.\n  Start it : sudo systemctl start docker\n  Then run : sudo usermod -aG docker \$USER && newgrp docker\n  (Log out and back in if the group change doesn't take effect immediately)"
+    # Try systemd first (Linux servers — usually works silently)
+    if command -v systemctl &>/dev/null; then
+      warn "Docker daemon not running — attempting to start..."
+      sudo systemctl start docker 2>/dev/null || true
+      sleep 2
+    fi
+
+    # If still not up, wait for Docker Desktop
+    if ! docker info &>/dev/null; then
+      warn "Waiting for Docker to start — please open Docker Desktop..."
+      local waited=0
+      while ! docker info &>/dev/null; do
+        sleep 3; waited=$((waited + 3)); printf "."
+        [ $waited -ge 60 ] && echo "" && error "Docker is not running after 60s. Please start Docker Desktop and re-run the installer."
+      done
+      echo ""
+    fi
   fi
 
   success "Prerequisites OK"
