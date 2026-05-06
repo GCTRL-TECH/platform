@@ -1,4 +1,4 @@
-FROM rust:1.78 AS build
+FROM rust:1.85 AS build
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
