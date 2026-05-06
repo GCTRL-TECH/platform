@@ -50,7 +50,8 @@ async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
 
     // 2. Spawn Docker pull + start in background (non-blocking — pull takes minutes)
     let registry_token = body["registry_token"].as_str().unwrap_or("").to_string();
-    if !registry_token.is_empty() {
+    let pulling_fusion = !registry_token.is_empty();
+    if pulling_fusion {
         tokio::task::spawn_blocking(move || {
             if let Err(e) = docker_pull_fusion_engine(&registry_token) {
                 tracing::warn!("Failed to pull fusion-engine: {e}");
@@ -68,7 +69,7 @@ async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
             "ok": true,
             "tier": body["tier"],
             "credits_balance": body["credits_balance"],
-            "fusion_engine_pulling": !registry_token.is_empty(),
+            "fusion_engine_pulling": pulling_fusion,
         })),
     )
 }
