@@ -75,6 +75,25 @@ export function HeroSection() {
           </Link>
         </div>
 
+        {/* Install command */}
+        <div className="mt-10 inline-flex items-center gap-3 rounded-xl border border-slate-700/60 bg-slate-900/80 px-5 py-3 backdrop-blur-sm">
+          <span className="text-slate-500 select-none">$</span>
+          <code className="font-mono text-sm text-slate-200">curl -fsSL https://gctrl.tech/install | bash</code>
+          <button
+            onClick={() => {
+              navigator.clipboard.writeText('curl -fsSL https://gctrl.tech/install | bash')
+              const btn = document.activeElement as HTMLButtonElement
+              btn?.blur()
+            }}
+            className="ml-1 rounded-md p-1.5 text-slate-500 hover:bg-slate-700 hover:text-slate-300 transition-colors"
+            title="Copy install command"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </button>
+        </div>
+
         {/* Trust signals */}
         <div className="mt-14 flex flex-wrap items-center justify-center gap-6 text-xs text-slate-500">
           {['GDPR-Ready', 'Fully On-Prem', 'Neo4j + Qdrant Native', 'Open Connectors'].map((tag) => (

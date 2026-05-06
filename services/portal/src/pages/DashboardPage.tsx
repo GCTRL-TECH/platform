@@ -95,6 +95,15 @@ function GenerateLicenseModal({ onClose, onGenerated }: { onClose: () => void; o
 export function DashboardPage() {
   const { user } = useAuth()
   const [showGenerate, setShowGenerate] = useState(false)
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+
+  function copyKey(e: React.MouseEvent, key: string) {
+    e.preventDefault()
+    e.stopPropagation()
+    navigator.clipboard.writeText(key)
+    setCopiedKey(key)
+    setTimeout(() => setCopiedKey(null), 2000)
+  }
 
   const { data, isLoading } = useQuery({
     queryKey: ['me'],
@@ -191,6 +200,13 @@ export function DashboardPage() {
                     {statusIcon(license.status)}
                     <span className="font-mono text-sm text-slate-200 truncate">{license.key}</span>
                     {statusBadge(license.status)}
+                    <button
+                      onClick={(e) => copyKey(e, license.key)}
+                      className="ml-1 p-1 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300 transition-colors shrink-0"
+                      title="Copy license key"
+                    >
+                      {copiedKey === license.key ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+                    </button>
                   </div>
                   <div className="flex items-center gap-4 text-xs text-slate-500">
                     <span className="capitalize">{license.tier}</span>
