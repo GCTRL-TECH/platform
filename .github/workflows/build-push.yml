@@ -29,8 +29,8 @@ jobs:
           file: services/kex/build/Dockerfile.prod
           push: true
           tags: |
-            ghcr.io/gctrl-tech/kex:latest
-            ghcr.io/gctrl-tech/kex:${{ github.sha }}
+            ghcr.io/tortillajackson/kex:latest
+            ghcr.io/tortillajackson/kex:${{ github.sha }}
 
   build-fuse:
     runs-on: ubuntu-latest
@@ -51,8 +51,8 @@ jobs:
           file: services/fuse/build/Dockerfile.prod
           push: true
           tags: |
-            ghcr.io/gctrl-tech/fuse:latest
-            ghcr.io/gctrl-tech/fuse:${{ github.sha }}
+            ghcr.io/tortillajackson/fuse:latest
+            ghcr.io/tortillajackson/fuse:${{ github.sha }}
 
   build-api:
     runs-on: ubuntu-latest
@@ -72,8 +72,8 @@ jobs:
           file: services/license-api/build/Dockerfile.prod
           push: true
           tags: |
-            ghcr.io/gctrl-tech/license-api:latest
-            ghcr.io/gctrl-tech/license-api:${{ github.sha }}
+            ghcr.io/tortillajackson/license-api:latest
+            ghcr.io/tortillajackson/license-api:${{ github.sha }}
 
   # build-agent (Node.js) - replaced by Rust build below
   # build-agent:
@@ -94,8 +94,8 @@ jobs:
   #         file: services/agent/build/Dockerfile.prod
   #         push: true
   #         tags: |
-  #           ghcr.io/gctrl-tech/agent:latest
-  #           ghcr.io/gctrl-tech/agent:${{ github.sha }}
+  #           ghcr.io/tortillajackson/agent:latest
+  #           ghcr.io/tortillajackson/agent:${{ github.sha }}
 
   build-agent-rs:
     runs-on: ubuntu-latest
@@ -115,8 +115,8 @@ jobs:
           context: ./services/agent-rs
           push: true
           tags: |
-            ghcr.io/gctrl-tech/agent:latest
-            ghcr.io/gctrl-tech/agent:${{ github.sha }}
+            ghcr.io/tortillajackson/agent:latest
+            ghcr.io/tortillajackson/agent:${{ github.sha }}
 
   build-web:
     runs-on: ubuntu-latest
@@ -135,8 +135,8 @@ jobs:
           context: services/web
           push: true
           tags: |
-            ghcr.io/gctrl-tech/web:latest
-            ghcr.io/gctrl-tech/web:${{ github.sha }}
+            ghcr.io/tortillajackson/web:latest
+            ghcr.io/tortillajackson/web:${{ github.sha }}
 
   # build-app (Node.js) - replaced by Rust build below
   # build-app:
@@ -157,8 +157,8 @@ jobs:
   #         file: services/api/build/Dockerfile.prod
   #         push: true
   #         tags: |
-  #           ghcr.io/gctrl-tech/app:latest
-  #           ghcr.io/gctrl-tech/app:${{ github.sha }}
+  #           ghcr.io/tortillajackson/app:latest
+  #           ghcr.io/tortillajackson/app:${{ github.sha }}
 
   build-api-rs:
     runs-on: ubuntu-latest
@@ -178,8 +178,8 @@ jobs:
           context: ./services/api-rs
           push: true
           tags: |
-            ghcr.io/gctrl-tech/api:latest
-            ghcr.io/gctrl-tech/api:${{ github.sha }}
+            ghcr.io/tortillajackson/api:latest
+            ghcr.io/tortillajackson/api:${{ github.sha }}
 
   build-portal:
     runs-on: ubuntu-latest
@@ -199,8 +199,8 @@ jobs:
           build-args: VITE_API_URL=https://api.gctrl.tech
           push: true
           tags: |
-            ghcr.io/gctrl-tech/portal:latest
-            ghcr.io/gctrl-tech/portal:${{ github.sha }}
+            ghcr.io/tortillajackson/portal:latest
+            ghcr.io/tortillajackson/portal:${{ github.sha }}
 
   deploy-portal:
     needs: [build-api, build-portal]
@@ -219,7 +219,7 @@ jobs:
             echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
 
             # Ensure portal image is referenced (idempotent)
-            sed -i 's|image: ghcr.io/gctrl-tech/web:latest|image: ghcr.io/gctrl-tech/portal:latest|' docker-compose.yml
+            sed -i 's|image: ghcr.io/tortillajackson/web:latest|image: ghcr.io/tortillajackson/portal:latest|' docker-compose.yml
 
             docker compose -f docker-compose.yml pull gctrl-api gctrl-web
             docker compose -f docker-compose.yml up -d gctrl-api gctrl-web
@@ -244,7 +244,7 @@ jobs:
             set -e
             echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
 
-            docker pull ghcr.io/gctrl-tech/api:latest
+            docker pull ghcr.io/tortillajackson/api:latest
             GCTRL_NET=$(docker inspect gctrl-db --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
             GCTRL_NET=${GCTRL_NET:-gctrl}
             docker rm -f gctrl-app 2>/dev/null || true
@@ -261,7 +261,7 @@ jobs:
               -e JWT_SECRET="${JWT_SECRET:-gctrl-jwt-secret-change-me}" \
               -e JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET:-gctrl-jwt-refresh-change-me}" \
               -e FRONTEND_URL="https://gctrl.tech" \
-              ghcr.io/gctrl-tech/api:latest
+              ghcr.io/tortillajackson/api:latest
 
             echo "=== Running containers ==="
             docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"

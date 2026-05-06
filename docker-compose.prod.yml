@@ -180,7 +180,7 @@ services:
 
   # ─── Semantic Resolver ──────────────────────────────────────────────
   resolver:
-    image: ghcr.io/gctrl-tech/fusion-engine:latest
+    image: ghcr.io/tortillajackson/fusion-engine:latest
     container_name: gctrl-resolver
     restart: unless-stopped
     environment:
