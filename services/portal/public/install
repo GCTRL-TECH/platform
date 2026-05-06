@@ -128,7 +128,7 @@ activate_license() {
     key="$GCTRL_LICENSE_KEY"
     info "Using license key: ${key}"
   else
-    read -rp "Enter your GCTRL License Key: " key
+    read -rp "Enter your GCTRL License Key: " key </dev/tty
   fi
 
   info "Computing hardware fingerprint..."
