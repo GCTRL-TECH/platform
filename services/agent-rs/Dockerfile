@@ -8,7 +8,7 @@ RUN cargo fetch
 
 # Build binary
 COPY src ./src
-RUN cargo build --release --frozen
+RUN CARGO_PROFILE_RELEASE_LTO=false cargo build --release --frozen
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates

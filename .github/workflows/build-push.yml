@@ -99,6 +99,7 @@ jobs:
 
   build-agent-rs:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -162,6 +163,7 @@ jobs:
 
   build-api-rs:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
