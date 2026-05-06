@@ -21,8 +21,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: TortillaJackson
+          password: ${{ secrets.GHCR_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
           context: services/kex
@@ -43,8 +43,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: TortillaJackson
+          password: ${{ secrets.GHCR_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
           context: services/fuse
@@ -128,8 +128,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: TortillaJackson
+          password: ${{ secrets.GHCR_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
           context: services/web
@@ -191,8 +191,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: TortillaJackson
+          password: ${{ secrets.GHCR_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
           context: services/portal
