@@ -249,7 +249,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: GHCR_TOKEN
+          envs: GHCR_TOKEN,DATABASE_URL,JWT_SECRET,JWT_REFRESH_SECRET
           script: |
             set -e
             echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
@@ -263,13 +263,13 @@ jobs:
               --network "$GCTRL_NET" \
               --restart unless-stopped \
               -e PORT=4000 \
-              -e DATABASE_URL="postgresql://borghive:borghive@gctrl-app-db:5432/borghive" \
+              -e DATABASE_URL="$DATABASE_URL" \
               -e REDIS_URL="redis://gctrl-redis:6379" \
               -e NEO4J_URI="bolt://localhost:7687" \
               -e NEO4J_USER=neo4j \
               -e NEO4J_PASSWORD=none \
-              -e JWT_SECRET="${JWT_SECRET:-gctrl-jwt-secret-change-me}" \
-              -e JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET:-gctrl-jwt-refresh-change-me}" \
+              -e JWT_SECRET="$JWT_SECRET" \
+              -e JWT_REFRESH_SECRET="$JWT_REFRESH_SECRET" \
               -e FRONTEND_URL="https://gctrl.tech" \
               ghcr.io/gctrl-tech/api:latest
 
@@ -277,6 +277,9 @@ jobs:
             docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
 
   update-deploy-repo:
     needs: deploy-vps
