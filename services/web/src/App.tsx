@@ -1,5 +1,7 @@
+import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Navigate, Outlet } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
+import ActivationWizard from '@/pages/onboarding/ActivationWizard'
 import { AppShell } from '@/components/layout/AppShell'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
@@ -22,6 +24,36 @@ import TriggersPage from '@/pages/triggers/TriggersPage'
 import OnboardingWizard from '@/pages/onboarding/OnboardingWizard'
 import GoogleDrivePage from '@/pages/connectors/GoogleDrivePage'
 import { LandingPage } from '@/pages/landing/LandingPage'
+
+function ActivationGate({ children }: { children: React.ReactNode }) {
+  const [activated, setActivated] = useState<boolean | null>(null)
+
+  const checkActivation = useCallback(() => {
+    fetch('http://localhost:7070/status')
+      .then((r) => r.json())
+      .then((d: { activated?: boolean }) => setActivated(d.activated ?? true))
+      .catch(() => setActivated(true)) // If agent unreachable, don't block the app
+  }, [])
+
+  useEffect(() => {
+    checkActivation()
+  }, [checkActivation])
+
+  // Loading state — brief blank screen while we check
+  if (activated === null) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-950">
+        <div className="h-6 w-6 animate-spin rounded-full border-2 border-indigo-500/30 border-t-indigo-500" />
+      </div>
+    )
+  }
+
+  if (!activated) {
+    return <ActivationWizard onActivated={() => setActivated(true)} />
+  }
+
+  return <>{children}</>
+}
 
 function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useAuth()
@@ -81,39 +113,41 @@ function LandingRoute() {
 
 export function App() {
   return (
-    <Routes>
-      {/* Public routes */}
-      <Route element={<PublicRoute />}>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
-        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-        <Route path="/reset-password" element={<ResetPasswordPage />} />
-      </Route>
+    <ActivationGate>
+      <Routes>
+        {/* Public routes */}
+        <Route element={<PublicRoute />}>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+          <Route path="/reset-password" element={<ResetPasswordPage />} />
+        </Route>
 
-      {/* Protected routes */}
-      <Route element={<ProtectedRoute />}>
-        <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/kex" element={<KexPage />} />
-        <Route path="/kex/:id" element={<KexJobDetail />} />
-        <Route path="/fuse" element={<FusePage />} />
-        <Route path="/fuse/:id" element={<FuseJobDetail />} />
-        <Route path="/graphs" element={<KGListPage />} />
-        <Route path="/graphs/:id" element={<KGDetailPage />} />
-        <Route path="/ontologies" element={<OntologyListPage />} />
-        <Route path="/ontologies/:id" element={<OntologyDetailPage />} />
-        <Route path="/chat" element={<TalkToGraphPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="/billing" element={<TokenDashboard />} />
-        <Route path="/admin" element={<AdminPanel />} />
-        <Route path="/triggers" element={<TriggersPage />} />
-        <Route path="/onboarding" element={<OnboardingWizard />} />
-        <Route path="/drive" element={<GoogleDrivePage />} />
-      </Route>
+        {/* Protected routes */}
+        <Route element={<ProtectedRoute />}>
+          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/kex" element={<KexPage />} />
+          <Route path="/kex/:id" element={<KexJobDetail />} />
+          <Route path="/fuse" element={<FusePage />} />
+          <Route path="/fuse/:id" element={<FuseJobDetail />} />
+          <Route path="/graphs" element={<KGListPage />} />
+          <Route path="/graphs/:id" element={<KGDetailPage />} />
+          <Route path="/ontologies" element={<OntologyListPage />} />
+          <Route path="/ontologies/:id" element={<OntologyDetailPage />} />
+          <Route path="/chat" element={<TalkToGraphPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/billing" element={<TokenDashboard />} />
+          <Route path="/admin" element={<AdminPanel />} />
+          <Route path="/triggers" element={<TriggersPage />} />
+          <Route path="/onboarding" element={<OnboardingWizard />} />
+          <Route path="/drive" element={<GoogleDrivePage />} />
+        </Route>
 
-      {/* Root redirect */}
-      <Route path="/" element={<LandingRoute />} />
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
-    </Routes>
+        {/* Root redirect */}
+        <Route path="/" element={<LandingRoute />} />
+        <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      </Routes>
+    </ActivationGate>
   )
 }
 

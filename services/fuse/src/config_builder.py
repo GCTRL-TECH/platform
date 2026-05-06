@@ -1,6 +1,6 @@
 """
-LIMES Configuration Builder
-Generates XML configurations for LIMES link discovery from Python dicts.
+Semantic Resolver Configuration Builder
+Generates XML configurations for link discovery from Python dicts.
 Supports Neo4j/SPARQL endpoints and CSV data sources.
 """
 
@@ -10,7 +10,7 @@ from xml.dom.minidom import parseString
 
 logger = logging.getLogger(__name__)
 
-# Default LIMES metric presets per entity type
+# Default metric presets per entity type
 DEFAULT_METRICS: dict[str, str] = {
     "person": "AND(jaro(x.name, y.name)|0.85, exactmatch(x.type, y.type)|1.0)",
     "company": "AND(trigrams(x.name, y.name)|0.75, exactmatch(x.type, y.type)|1.0)",
@@ -33,24 +33,23 @@ def build_neo4j_config(
     properties: list[str] | None = None,
 ) -> str:
     """
-    Build a LIMES XML config for matching entities from Neo4j.
+    Build an XML config for matching entities from Neo4j.
 
-    Since LIMES natively supports SPARQL endpoints and CSV, we generate
-    a CSV-based config where source/target data is exported from Neo4j
-    by the FUSE service before calling LIMES.
+    Generates a CSV-based config where source/target data is exported from Neo4j
+    by the FUSE service before calling the resolver.
 
     Args:
         source_job_ids: Job IDs to use as source entities
         target_job_ids: Job IDs to use as target entities (if None, self-join source)
         neo4j_uri: Neo4j Bolt URI
-        metric: LIMES metric expression (e.g., "trigrams(x.name, y.name)|0.8")
+        metric: resolver metric expression (e.g., "trigrams(x.name, y.name)|0.8")
         acceptance_threshold: Min similarity to auto-accept as match
         review_threshold: Min similarity for human review queue
         entity_type: Filter to specific entity type (e.g., "company")
         properties: Which properties to use for matching
 
     Returns:
-        LIMES XML config string
+        XML config string
     """
     if target_job_ids is None:
         target_job_ids = source_job_ids
@@ -133,7 +132,7 @@ def build_simple_metric(
     operator: str = "AND",
 ) -> str:
     """
-    Build a LIMES metric expression from property pairs.
+    Build a resolver metric expression from property pairs.
 
     Args:
         property_pairs: List of (source_prop, target_prop, measure, threshold)
@@ -142,7 +141,7 @@ def build_simple_metric(
         operator: "AND", "OR", "MAX", "MIN"
 
     Returns:
-        LIMES metric expression string
+        resolver metric expression string
     """
     if len(property_pairs) == 1:
         sp, tp, measure, threshold = property_pairs[0]

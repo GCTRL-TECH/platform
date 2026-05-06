@@ -3,6 +3,7 @@ import { X, RefreshCw, Copy, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface AgentStatus {
+  activated: boolean
   valid: boolean
   tier: string
   balance: number
@@ -207,4 +208,30 @@ export function LicenseBanner() {
       )}
     </>
   )
+}
+
+export function useLicenseStatus() {
+  const [status, setStatus] = useState<AgentStatus | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const fetchStatus = useCallback(() => {
+    fetch('http://localhost:7070/status')
+      .then((r) => r.json())
+      .then((d) => {
+        setStatus(d as AgentStatus)
+        setLoading(false)
+      })
+      .catch(() => {
+        setStatus(null)
+        setLoading(false)
+      })
+  }, [])
+
+  useEffect(() => {
+    fetchStatus()
+    const interval = setInterval(fetchStatus, 60 * 1000) // poll every 60s
+    return () => clearInterval(interval)
+  }, [fetchStatus])
+
+  return { status, loading, refetch: fetchStatus }
 }

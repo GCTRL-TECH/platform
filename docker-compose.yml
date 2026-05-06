@@ -120,7 +120,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - PORT=4020
       - SIMILARITY_THRESHOLD=0.85
-      - LIMES_URL=http://limes:8080
+      - RESOLVER_URL=http://resolver:8080
     depends_on:
       redis:
         condition: service_started
@@ -130,11 +130,11 @@ services:
       - GCTRL
     restart: unless-stopped
 
-  limes:
+  resolver:
     build:
       context: ../DataBorg Github/LIMES-master
       dockerfile: Dockerfile
-    container_name: gctrl-limes
+    container_name: gctrl-resolver
     ports:
       - "8085:8080"
     environment:

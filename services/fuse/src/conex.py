@@ -6,7 +6,7 @@ Trains entity and relation embeddings from a knowledge graph, then
 predicts missing links between entities. Used as Stage 3 of the
 FUSE three-stage matching pipeline.
 
-This catches structural patterns that string similarity (LIMES) misses,
+This catches structural patterns that fuzzy string similarity misses,
 e.g. if entity A and entity B both supply to entity C, they might be
 the same entity even if their names are completely different.
 """

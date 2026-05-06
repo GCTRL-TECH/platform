@@ -42,8 +42,9 @@ router.post('/v1/activate', async (req: Request, res: Response): Promise<void> =
     const lastReassignment = license.lastReassignmentAt;
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    if (lastReassignment && lastReassignment > thirtyDaysAgo && reassignmentsThisMonth >= 2) {
-      res.status(403).json({ error: 'Maximum seat reassignments (2/30 days) reached. Contact support.' });
+    const limit = license.tier === 'free' ? 5 : 20;
+    if (lastReassignment && lastReassignment > thirtyDaysAgo && reassignmentsThisMonth >= limit) {
+      res.status(403).json({ error: `Maximum seat reassignments (${limit}/30 days) reached. Reset at gctrl.tech/dashboard or contact support.` });
       return;
     }
 

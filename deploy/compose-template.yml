@@ -13,11 +13,14 @@ services:
     ports:
       - "127.0.0.1:7070:7070"
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - GCTRL_LICENSE_JWT_PATH=/app/config/license.jwt
       - GCTRL_LICENSE_PUBLIC_KEY=${GCTRL_LICENSE_PUBLIC_KEY}
       - GCTRL_API_URL=${GCTRL_API_URL:-https://api.gctrl.tech}
+      - GCTRL_COMPOSE_FILE=/app/docker-compose.yml
+      - GCTRL_NETWORK=gctrl
     networks:
       - gctrl
     healthcheck:
@@ -67,6 +70,7 @@ services:
     image: ghcr.io/gctrl-tech/fusion-engine:latest
     container_name: gctrl-resolver
     restart: unless-stopped
+    profiles: [bundled-fusion]
     environment:
       - JAVA_OPTS=-Xmx2G
     command: ["-s"]
@@ -91,8 +95,6 @@ services:
       gctrl-agent:
         condition: service_healthy
       gctrl-redis:
-        condition: service_started
-      gctrl-resolver:
         condition: service_started
     networks:
       - gctrl

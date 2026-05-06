@@ -1,14 +1,14 @@
 /**
  * Multi-model LLM service
- * Supports: Ollama (local), OpenAI, Anthropic, OpenRouter
+ * Supports: Ollama (local), OpenAI, Anthropic, OpenRouter, NVIDIA NIM
  * Config is per-request — no global API key storage
  */
 
 export interface LLMConfig {
-  provider: 'ollama' | 'openai' | 'anthropic' | 'openrouter';
+  provider: 'ollama' | 'openai' | 'anthropic' | 'openrouter' | 'nim';
   model: string;
   apiKey?: string;   // required for cloud providers
-  baseUrl?: string;  // override for ollama or openrouter
+  baseUrl?: string;  // override for ollama, openrouter, or on-prem NIM
   temperature?: number;
 }
 
@@ -257,6 +257,23 @@ async function callOpenRouter(
   };
 }
 
+async function callNim(
+  config: LLMConfig,
+  systemPrompt: string,
+  userMessage: string,
+  context?: string,
+  priorMessages?: Array<{ role: string; content: string }>,
+): Promise<LLMResponse> {
+  // NVIDIA NIM is OpenAI-compatible — reuse callOpenAI with NIM base URL
+  const nimConfig = {
+    ...config,
+    provider: 'openai' as const,
+    baseUrl: config.baseUrl ?? 'https://integrate.api.nvidia.com/v1',
+  };
+  const result = await callOpenAI(nimConfig, systemPrompt, userMessage, context);
+  return { ...result, model: `nim:${config.model}` };
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function generateResponse(
@@ -275,6 +292,8 @@ export async function generateResponse(
       return callAnthropic(config, systemPrompt, userMessage, context);
     case 'openrouter':
       return callOpenRouter(config, systemPrompt, userMessage, context);
+    case 'nim':
+      return callNim(config, systemPrompt, userMessage, context, priorMessages);
     default: {
       const _exhaustive: never = config.provider;
       throw new Error(`Unknown LLM provider: ${String(_exhaustive)}`);

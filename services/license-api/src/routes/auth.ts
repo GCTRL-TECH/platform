@@ -215,6 +215,40 @@ router.get('/v1/licenses/:id/usage', requireSession, async (req: Request, res: R
   res.json({ licenseId, days });
 });
 
+// POST /v1/licenses/:id/transfer-seat — self-service machine transfer
+// Resets the seat reassignment counter so the user can activate on a new machine.
+// Cooldown: once per 30 days, enforced by lastReassignmentAt.
+router.post('/v1/licenses/:id/transfer-seat', requireSession, async (req: Request, res: Response): Promise<void> => {
+  const userId = req.sessionUser!.id;
+  const licenseId = req.params['id']!;
+
+  const [license] = await db.select()
+    .from(licenses)
+    .where(and(eq(licenses.id, licenseId), eq(licenses.userId, userId)))
+    .limit(1);
+
+  if (!license) {
+    res.status(404).json({ error: 'License not found' });
+    return;
+  }
+
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  if (license.lastReassignmentAt && license.lastReassignmentAt > thirtyDaysAgo) {
+    const nextAllowed = new Date(license.lastReassignmentAt.getTime() + 30 * 24 * 60 * 60 * 1000);
+    res.status(429).json({
+      error: 'Self-service transfer available once per 30 days.',
+      nextAllowedAt: nextAllowed.toISOString(),
+    });
+    return;
+  }
+
+  await db.update(licenses)
+    .set({ seatReassignments: 0, lastReassignmentAt: null, hardwareFingerprint: null })
+    .where(eq(licenses.id, licenseId));
+
+  res.json({ ok: true, message: 'License unbound from previous machine. Activate again on your new machine.' });
+});
+
 // POST /v1/auth/change-password
 router.post('/v1/auth/change-password', requireSession, async (req: Request, res: Response): Promise<void> => {
   const { currentPassword, newPassword } = req.body as { currentPassword?: string; newPassword?: string };
@@ -244,6 +278,37 @@ router.post('/v1/auth/change-password', requireSession, async (req: Request, res
   await db.update(users).set({ passwordHash }).where(eq(users.id, user.id));
 
   res.json({ ok: true });
+});
+
+// POST /v1/licenses — generate a new free license for the authenticated user
+router.post('/v1/licenses', requireSession, async (req: Request, res: Response): Promise<void> => {
+  const userId = req.sessionUser!.id;
+
+  const [user] = await db.select({ tier: users.tier })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  if (!user) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+
+  const licenseKey = generateLicenseKey();
+  const [license] = await db.insert(licenses).values({
+    userId,
+    licenseKey,
+    status: 'inactive',
+    tier: user.tier,
+  }).returning();
+
+  res.status(201).json({
+    id: license.id,
+    key: license.licenseKey,
+    status: license.status,
+    tier: license.tier,
+    createdAt: license.createdAt,
+  });
 });
 
 export default router;

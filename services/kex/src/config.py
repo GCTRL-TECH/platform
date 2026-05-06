@@ -23,8 +23,11 @@ PORT: int = int(os.environ.get("PORT", "4010"))
 QDRANT_URL: str = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 QDRANT_COLLECTION: str = os.environ.get("QDRANT_COLLECTION", "GCTRL_chunks")
 
-# Embedding model (Ollama)
+# Embedding provider: "ollama" | "nim" | "openai"
+EMBEDDING_PROVIDER: str = os.environ.get("EMBEDDING_PROVIDER", "ollama")
 EMBEDDING_MODEL: str = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
+EMBEDDING_BASE_URL: str = os.environ.get("EMBEDDING_BASE_URL", "")
+EMBEDDING_API_KEY: str = os.environ.get("EMBEDDING_API_KEY", "")
 
 # PostgreSQL (direct psycopg2 — for text_chunks table)
 PG_URL: str = os.environ.get("PG_URL", "postgresql://GCTRL:GCTRL@postgres:5432/GCTRL")

@@ -10,9 +10,9 @@ import { addFuseJob } from '../services/queue.js';
 
 const router = Router();
 
-// ─── In-memory LIMES config store (placeholder) ───────────────────────────────
+// ─── In-memory resolver config store (placeholder) ───────────────────────────
 
-interface LimesConfig {
+interface ResolverConfig {
   similarityThreshold: number;
   measureFunction: string;
   maxCandidates: number;
@@ -20,7 +20,7 @@ interface LimesConfig {
   reviewThreshold: number;
 }
 
-let limesConfig: LimesConfig = {
+let resolverConfig: ResolverConfig = {
   similarityThreshold: 0.85,
   measureFunction: 'trigrams',
   maxCandidates: 10,
@@ -61,7 +61,7 @@ const reviewDecisionsSchema = z.object({
   ),
 });
 
-const limesConfigUpdateSchema = z.object({
+const resolverConfigUpdateSchema = z.object({
   similarityThreshold: z.number().min(0).max(1).optional(),
   measureFunction: z
     .enum(['trigrams', 'jaccard', 'cosine', 'levenshtein'])
@@ -344,7 +344,7 @@ router.get(
         return;
       }
 
-      // Placeholder: LIMES review queue populates this when worker integration is complete
+      // Placeholder: review queue populates this when worker integration is complete
       res.json({
         jobId,
         status: job.status,
@@ -395,7 +395,7 @@ router.post(
         req.ip
       );
 
-      // Placeholder: decisions will be forwarded to LIMES worker in future integration
+      // Placeholder: decisions will be forwarded to resolver worker in future integration
       res.json({
         ok: true,
         jobId,
@@ -415,7 +415,7 @@ router.get(
   '/config',
   requireAuth,
   async (_req: Request, res: Response): Promise<void> => {
-    res.json({ config: limesConfig });
+    res.json({ config: resolverConfig });
   }
 );
 
@@ -425,12 +425,12 @@ router.put(
   '/config',
   requireAuth,
   requireRole('editor', 'admin'),
-  validate(limesConfigUpdateSchema),
+  validate(resolverConfigUpdateSchema),
   async (req: Request, res: Response): Promise<void> => {
     const userId = req.user!.sub;
-    const updates = req.body as z.infer<typeof limesConfigUpdateSchema>;
+    const updates = req.body as z.infer<typeof resolverConfigUpdateSchema>;
 
-    limesConfig = { ...limesConfig, ...updates };
+    resolverConfig = { ...resolverConfig, ...updates };
 
     writeAuditLog(
       userId,
@@ -441,7 +441,7 @@ router.put(
       req.ip
     );
 
-    res.json({ ok: true, config: limesConfig });
+    res.json({ ok: true, config: resolverConfig });
   }
 );
 

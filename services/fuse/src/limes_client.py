@@ -1,7 +1,7 @@
 """
-LIMES REST Client — uses the actual LIMES server API:
+Semantic Resolver REST Client — communicates with the GCTRL Fusion Engine:
   POST /upload          — upload CSV files → returns uploadId
-  POST /submit          — submit XML config → returns requestId
+  POST /submit          — submit config → returns requestId
   GET  /status/{id}     — poll job status (code: 0=queued, 1=running, 2=done, -1=error)
   GET  /results/{id}    — list result files
   GET  /result/{id}/{f} — download result file
@@ -19,11 +19,11 @@ from . import config as cfg
 
 logger = logging.getLogger(__name__)
 
-LIMES_TIMEOUT = 60
+RESOLVER_TIMEOUT = 60
 
 
-class LimesClient:
-    def __init__(self, base_url: str = "http://limes:8080") -> None:
+class ResolverClient:
+    def __init__(self, base_url: str = "http://resolver:8080") -> None:
         self.base_url = base_url.rstrip("/")
 
     def is_healthy(self) -> bool:
@@ -34,7 +34,7 @@ class LimesClient:
             return False
 
     def upload_csv(self, csv_content: str, filename: str = "data.csv") -> Optional[str]:
-        """Upload CSV to LIMES. Returns uploadId."""
+        """Upload CSV to resolver. Returns uploadId."""
         try:
             files = {"file": (filename, csv_content.encode("utf-8"), "text/csv")}
             resp = requests.post(f"{self.base_url}/upload", files=files, timeout=30)
@@ -43,32 +43,32 @@ class LimesClient:
                 uploads = data.get("uploads", [])
                 if uploads:
                     upload_id = uploads[0].get("uploadId", "")
-                    logger.info(f"LIMES upload: {filename} → {upload_id}")
+                    logger.info(f"resolver upload: {filename} → {upload_id}")
                     return upload_id
-            logger.warning(f"LIMES upload failed: {resp.status_code} {resp.text[:200]}")
+            logger.warning(f"resolver upload failed: {resp.status_code} {resp.text[:200]}")
             return None
         except Exception as exc:
-            logger.warning(f"LIMES upload error: {exc}")
+            logger.warning(f"resolver upload error: {exc}")
             return None
 
     def submit_config(self, config_xml: str) -> Optional[str]:
         """Submit XML config. Returns requestId."""
         try:
             files = {"config_file": ("config.xml", config_xml.encode("utf-8"), "text/xml")}
-            resp = requests.post(f"{self.base_url}/submit", files=files, timeout=LIMES_TIMEOUT)
+            resp = requests.post(f"{self.base_url}/submit", files=files, timeout=RESOLVER_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success"):
                     request_id = str(data.get("requestId", ""))
-                    logger.info(f"LIMES submit OK: requestId={request_id}")
+                    logger.info(f"resolver submit OK: requestId={request_id}")
                     return request_id
                 else:
-                    logger.warning(f"LIMES submit failed: {data}")
+                    logger.warning(f"resolver submit failed: {data}")
             else:
-                logger.warning(f"LIMES submit HTTP {resp.status_code}: {resp.text[:300]}")
+                logger.warning(f"resolver submit HTTP {resp.status_code}: {resp.text[:300]}")
             return None
         except Exception as exc:
-            logger.warning(f"LIMES submit error: {exc}")
+            logger.warning(f"resolver submit error: {exc}")
             return None
 
     def wait_for_completion(self, request_id: str, max_wait: int = 120) -> bool:
@@ -80,17 +80,17 @@ class LimesClient:
                     data = resp.json()
                     code = data.get("status", {}).get("code", -1)
                     if code == 2:  # done
-                        logger.info(f"LIMES job {request_id} completed")
+                        logger.info(f"resolver job {request_id} completed")
                         return True
                     if code == -1:  # error
                         desc = data.get("status", {}).get("description", "unknown")
-                        logger.warning(f"LIMES job {request_id} failed: {desc}")
+                        logger.warning(f"resolver job {request_id} failed: {desc}")
                         return False
                     # code 0 (queued) or 1 (running) — keep waiting
             except Exception:
                 pass
             time.sleep(2)
-        logger.warning(f"LIMES job {request_id} timed out after {max_wait}s")
+        logger.warning(f"resolver job {request_id} timed out after {max_wait}s")
         return False
 
     def get_results(self, request_id: str) -> list[dict]:
@@ -102,7 +102,7 @@ class LimesClient:
             data = resp.json()
             files = data.get("availableFiles", [])
             if not files:
-                logger.info(f"LIMES job {request_id}: no result files")
+                logger.info(f"resolver job {request_id}: no result files")
                 return []
 
             links = []
@@ -114,10 +114,10 @@ class LimesClient:
                     if file_resp.status_code == 200:
                         links.extend(self._parse_n3(file_resp.text))
                 except Exception as exc:
-                    logger.warning(f"LIMES result download failed for {filename}: {exc}")
+                    logger.warning(f"resolver result download failed for {filename}: {exc}")
             return links
         except Exception as exc:
-            logger.warning(f"LIMES results fetch error: {exc}")
+            logger.warning(f"resolver results fetch error: {exc}")
             return []
 
     def discover_links(
@@ -133,7 +133,6 @@ class LimesClient:
         """
         props = ["name", "type", "label"]
 
-        # 1. Upload source + target CSVs
         source_csv = self._entities_to_csv(source_entities, props)
         target_csv = self._entities_to_csv(target_entities, props)
 
@@ -142,22 +141,18 @@ class LimesClient:
         if not source_id or not target_id:
             return []
 
-        # 2. Build config referencing uploaded files
         config_xml = self._build_config(
             source_id, target_id, props, metric,
             acceptance_threshold, review_threshold
         )
 
-        # 3. Submit
         request_id = self.submit_config(config_xml)
         if not request_id:
             return []
 
-        # 4. Wait for completion
         if not self.wait_for_completion(request_id):
             return []
 
-        # 5. Get results
         return self.get_results(request_id)
 
     def _entities_to_csv(self, entities: list[dict], properties: list[str]) -> str:
@@ -231,16 +226,16 @@ class LimesClient:
                     "target": match.group(3),
                     "predicate": match.group(2),
                     "confidence": 1.0,
-                    "method": "limes",
+                    "method": "resolver",
                 })
-        logger.info(f"LIMES: parsed {len(links)} links from N3")
+        logger.info(f"resolver: parsed {len(links)} links from N3")
         return links
 
 
-_client: Optional[LimesClient] = None
+_client: Optional[ResolverClient] = None
 
-def get_limes_client() -> LimesClient:
+def get_limes_client() -> ResolverClient:
     global _client
     if _client is None:
-        _client = LimesClient(cfg.LIMES_URL)
+        _client = ResolverClient(cfg.RESOLVER_URL)
     return _client

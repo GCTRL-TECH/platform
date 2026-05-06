@@ -2,11 +2,11 @@
 Three-Stage Entity Merger for GCTRL FUSE
 
 Stage 1: Neo4j APOC — exact/near-exact pre-filter (fast, high confidence)
-Stage 2: LIMES — fuzzy multi-property matching with blocking (precise)
+Stage 2: Semantic Resolver — fuzzy multi-property matching with blocking (precise)
 Stage 3: ConEx — knowledge graph embedding link prediction (structural patterns)
 
 Each stage catches what the previous misses. Results are tagged with the
-discovery method (apoc/limes/conex) and confidence score.
+discovery method (apoc/resolver/conex) and confidence score.
 """
 
 import csv
@@ -87,11 +87,11 @@ class ThreeStageEntityMerger:
             f"[{compilation_id}] Stage 1 (APOC): {len(stage1_links)} exact matches"
         )
 
-        # ── Stage 2: LIMES Link Discovery ──────────────────────────────
+        # ── Stage 2: Semantic Resolver ─────────────────────────────────
         matched_uris = self._extract_matched_uris(stage1_links)
-        stage2_links = self._stage2_limes(source_job_ids, exclude_uris=matched_uris)
+        stage2_links = self._stage2_resolver(source_job_ids, exclude_uris=matched_uris)
         logger.info(
-            f"[{compilation_id}] Stage 2 (LIMES): {len(stage2_links)} fuzzy matches"
+            f"[{compilation_id}] Stage 2 (resolver): {len(stage2_links)} fuzzy matches"
         )
 
         # ── Stage 3: ConEx Link Prediction (optional) ─────────────────
@@ -123,7 +123,7 @@ class ThreeStageEntityMerger:
         stats.update({
             "relations_merged": rel_count,
             "stage1_apoc": len(stage1_links),
-            "stage2_limes": len(stage2_links),
+            "stage2_resolver": len(stage2_links),
             "stage3_conex": len(stage3_links),
             "total_links": len(all_links),
         })
@@ -168,17 +168,17 @@ class ThreeStageEntityMerger:
 
         return links
 
-    # ── Stage 2: LIMES ──────────────────────────────────────────────
+    # ── Stage 2: Semantic Resolver ──────────────────────────────────
 
-    def _stage2_limes(
+    def _stage2_resolver(
         self, source_job_ids: list[str], exclude_uris: set[str] | None = None
     ) -> list[dict]:
         """
-        Fuzzy multi-property matching via LIMES server.
-        Exports entities to CSV, uploads to LIMES, submits config, parses results.
-        Falls back to enhanced string similarity if LIMES is unavailable.
+        Fuzzy multi-property matching via semantic resolver.
+        Exports entities to CSV, uploads, submits config, parses results.
+        Falls back to enhanced string similarity if resolver is unavailable.
         """
-        limes = get_limes_client()
+        resolver = get_limes_client()
 
         entities = self._collect_entities(source_job_ids)
         if exclude_uris:
@@ -198,12 +198,12 @@ class ThreeStageEntityMerger:
             source_ents = entities[:mid_e]
             target_ents = entities[mid_e:]
 
-        if not limes.is_healthy():
-            logger.warning("LIMES server not available — falling back to string similarity")
+        if not resolver.is_healthy():
+            logger.warning("semantic resolver not available — falling back to string similarity")
             return self._stage2_fallback(source_job_ids, exclude_uris)
 
         try:
-            links = limes.discover_links(
+            links = resolver.discover_links(
                 source_entities=source_ents,
                 target_entities=target_ents,
                 metric="trigrams(x.name, y.name)|0.70",
@@ -211,20 +211,20 @@ class ThreeStageEntityMerger:
                 review_threshold=self.threshold_review,
             )
             if links:
-                logger.info(f"LIMES discovered {len(links)} links")
+                logger.info(f"resolver discovered {len(links)} links")
                 return links
             else:
-                logger.info("LIMES returned no links — using fallback")
+                logger.info("resolver returned no links — using fallback")
                 return self._stage2_fallback(source_job_ids, exclude_uris)
         except Exception as exc:
-            logger.warning(f"LIMES error: {exc} — falling back")
+            logger.warning(f"resolver error: {exc} — falling back")
             return self._stage2_fallback(source_job_ids, exclude_uris)
 
     def _stage2_fallback(
         self, source_job_ids: list[str], exclude_uris: set[str] | None = None
     ) -> list[dict]:
         """
-        Enhanced string similarity fallback when LIMES is unavailable.
+        Enhanced string similarity fallback when resolver is unavailable.
         Uses multiple metrics: JaroWinkler, trigram, and type matching.
         """
         from difflib import SequenceMatcher
@@ -277,7 +277,7 @@ class ThreeStageEntityMerger:
                         "source": e1.get("uri", ""),
                         "target": e2.get("uri", ""),
                         "confidence": round(score, 4),
-                        "method": "limes_fallback",
+                        "method": "resolver_fallback",
                         "source_name": e1.get("name", ""),
                         "target_name": e2.get("name", ""),
                     })
@@ -552,7 +552,7 @@ class ThreeStageEntityMerger:
             "relations_merged": 0,
             "nodes_total": 0,
             "stage1_apoc": 0,
-            "stage2_limes": 0,
+            "stage2_resolver": 0,
             "stage3_conex": 0,
             "total_links": 0,
         }

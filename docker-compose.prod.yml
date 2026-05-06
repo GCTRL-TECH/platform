@@ -178,10 +178,10 @@ services:
         limits:
           memory: 2G
 
-  # ─── LIMES Entity Matching ──────────────────────────────────────────
-  limes:
-    build: ./services/limes
-    container_name: gctrl-limes
+  # ─── Semantic Resolver ──────────────────────────────────────────────
+  resolver:
+    image: ghcr.io/gctrl-tech/fusion-engine:latest
+    container_name: gctrl-resolver
     restart: unless-stopped
     environment:
       - JAVA_OPTS=-Xmx2G

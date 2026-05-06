@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Ground Control (GCTRL) Installer
-# Usage: curl -fsSL https://gctrl.tech/install | bash -s -- --key GCTRL-XXXX-XXXX
+# Usage: curl -fsSL https://gctrl.tech/install | bash
+# No license key required — enter your key at http://localhost:3001 after install
 set -euo pipefail
 
 GCTRL_VERSION="${GCTRL_VERSION:-latest}"
@@ -14,15 +15,6 @@ info()    { echo -e "${BLUE}[GCTRL]${NC} $1"; }
 success() { echo -e "${GREEN}[GCTRL]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[GCTRL]${NC} $1"; }
 error()   { echo -e "${RED}[GCTRL]${NC} $1"; exit 1; }
-
-# ── Argument parsing ──────────────────────────────────────────────────────────
-GCTRL_LICENSE_KEY="${GCTRL_LICENSE_KEY:-}"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --key|-k) GCTRL_LICENSE_KEY="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 check_prereqs() {
@@ -38,20 +30,6 @@ check_prereqs() {
     error "Missing: ${missing[*]}\nInstall Docker: https://docs.docker.com/engine/install/"
   fi
   success "Prerequisites OK"
-}
-
-# ── Hardware Fingerprint ───────────────────────────────────────────────────────
-compute_fingerprint() {
-  local cpu disk mac
-  cpu=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || \
-        sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown-cpu")
-  disk=$(lsblk -d -o NAME,SERIAL 2>/dev/null | awk 'NR==2{print $2}' || \
-         diskutil info disk0 2>/dev/null | grep "Volume Serial" | awk '{print $NF}' || \
-         echo "unknown-disk")
-  mac=$(ip link show 2>/dev/null | grep -v "lo" | grep "link/ether" | head -1 | awk '{print $2}' || \
-        ifconfig 2>/dev/null | grep "ether" | head -1 | awk '{print $2}' || \
-        echo "00:00:00:00:00:00")
-  printf '%s' "${cpu}::${disk}::${mac}" | sha256sum | awk '{print $1}'
 }
 
 # ── Service Detection ─────────────────────────────────────────────────────────
@@ -116,77 +94,6 @@ detect_services() {
   echo ""
 }
 
-# ── License Activation ────────────────────────────────────────────────────────
-activate_license() {
-  echo ""
-  echo -e "${BLUE}Ground Control — Local Knowledge Graph Platform${NC}"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo ""
-
-  local key
-  if [ -n "${GCTRL_LICENSE_KEY:-}" ]; then
-    key="$GCTRL_LICENSE_KEY"
-    info "Using license key: ${key}"
-  else
-    read -rp "Enter your GCTRL License Key: " key </dev/tty
-  fi
-
-  info "Computing hardware fingerprint..."
-  local fingerprint
-  fingerprint=$(compute_fingerprint)
-
-  info "Activating license..."
-  local response
-  response=$(curl -fsSL -X POST "${API_URL}/v1/activate" \
-    -H "Content-Type: application/json" \
-    -d "{\"license_key\":\"${key}\",\"hardware_fingerprint\":\"${fingerprint}\"}" \
-    2>&1) || error "Failed to reach activation server. Check your internet connection."
-
-  local registry_token tier balance license_jwt
-  if command -v jq &>/dev/null; then
-    registry_token=$(echo "$response" | jq -r '.registry_token // empty') || true
-    license_jwt=$(echo "$response"    | jq -r '.license_jwt // empty')
-    tier=$(echo "$response"           | jq -r '.tier // empty')
-    balance=$(echo "$response"        | jq -r '.credits_balance // empty')
-  elif command -v python3 &>/dev/null; then
-    registry_token=$(echo "$response" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('registry_token',''))") || true
-    license_jwt=$(echo "$response"    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_jwt',''))")
-    tier=$(echo "$response"           | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tier',''))")
-    balance=$(echo "$response"        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('credits_balance',''))")
-  else
-    error "jq or python3 required for JSON parsing."
-  fi
-
-  if [ -z "$license_jwt" ]; then
-    error "Activation failed: $response"
-  fi
-
-  mkdir -p "${CONFIG_DIR}"
-  printf '%s' "$registry_token" > /tmp/gctrl_registry_token
-  printf '%s' "$license_jwt"    > "${CONFIG_DIR}/license.jwt"
-  chmod 600 "${CONFIG_DIR}/license.jwt"
-
-  success "License activated | Tier: ${tier} | Credits: ${balance}"
-}
-
-# ── Pull Images ───────────────────────────────────────────────────────────────
-pull_images() {
-  info "Logging into image registry..."
-  local registry_token
-  registry_token=$(cat /tmp/gctrl_registry_token)
-  echo "$registry_token" | docker login ghcr.io -u gctrl --password-stdin &>/dev/null
-  rm -f /tmp/gctrl_registry_token
-  success "Registry login OK"
-
-  info "Pulling GCTRL images (this may take a few minutes)..."
-  local profile_flags=()
-  for p in "${PROFILES[@]}"; do
-    profile_flags+=("--profile" "$p")
-  done
-  docker compose -f "${INSTALL_DIR}/docker-compose.yml" "${profile_flags[@]}" pull
-  success "Images ready"
-}
-
 # ── Generate Config ───────────────────────────────────────────────────────────
 generate_config() {
   info "Creating ${INSTALL_DIR}..."
@@ -202,7 +109,6 @@ generate_config() {
   jwt_secret=$(openssl rand -hex 32)
 
   cat > "${INSTALL_DIR}/.env" <<EOF
-GCTRL_LICENSE_JWT_PATH=/app/config/license.jwt
 GCTRL_LICENSE_PUBLIC_KEY=${public_key}
 GCTRL_API_URL=https://api.gctrl.tech
 GCTRL_DATA_DIR=${INSTALL_DIR}/data
@@ -231,11 +137,17 @@ start_stack() {
     -f "${INSTALL_DIR}/docker-compose.yml" \
     --env-file "${INSTALL_DIR}/.env" \
     "${profile_flags[@]}" \
+    pull
+
+  docker compose \
+    -f "${INSTALL_DIR}/docker-compose.yml" \
+    --env-file "${INSTALL_DIR}/.env" \
+    "${profile_flags[@]}" \
     up -d
 
   info "Waiting for services to be ready (up to 120s)..."
   local max_wait=120 waited=0
-  while ! curl -sf http://localhost:3001/api/health &>/dev/null; do
+  while ! curl -sf http://localhost:3001 &>/dev/null; do
     sleep 3
     waited=$((waited + 3))
     [ $waited -ge $max_wait ] && error "Timeout. Check: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
@@ -245,9 +157,8 @@ start_stack() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   success "GCTRL is running!"
   echo ""
-  echo "  Dashboard : http://localhost:3001"
+  echo "  Open http://localhost:3001 to activate your license and complete setup"
   echo "  Installed : ${INSTALL_DIR}"
-  echo "  To update : curl -fsSL https://gctrl.tech/update | bash"
   echo ""
   if probe_tcp 11434; then
     echo "  Ollama    : connected at ${OLLAMA_BASE}"
@@ -262,9 +173,7 @@ start_stack() {
 main() {
   check_prereqs
   detect_services
-  activate_license
   generate_config
-  pull_images
   start_stack
 }
 

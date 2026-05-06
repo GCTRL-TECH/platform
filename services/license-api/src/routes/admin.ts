@@ -53,6 +53,19 @@ router.post('/users/:id/reset-password', async (req: Request, res: Response): Pr
   res.json({ ok: true });
 });
 
+router.post('/licenses/:key/reset-seat', async (req: Request, res: Response): Promise<void> => {
+  const [lic] = await db.select().from(licenses).where(eq(licenses.licenseKey, req.params.key)).limit(1);
+  if (!lic) {
+    res.status(404).json({ error: 'License key not found' });
+    return;
+  }
+  await db.update(licenses)
+    .set({ seatReassignments: 0, lastReassignmentAt: null })
+    .where(eq(licenses.id, lic.id));
+  await audit((req as any).adminUser.id, 'reset_seat', lic.userId, { licenseKey: req.params.key });
+  res.json({ ok: true });
+});
+
 router.patch('/licenses/:id/revoke', async (req: Request, res: Response) => {
   const [lic] = await db.select().from(licenses).where(eq(licenses.id, req.params.id)).limit(1);
   await db.update(licenses).set({ status: 'revoked' }).where(eq(licenses.id, req.params.id));

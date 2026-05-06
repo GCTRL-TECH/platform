@@ -202,13 +202,11 @@ jobs:
             ghcr.io/gctrl-tech/portal:latest
             ghcr.io/gctrl-tech/portal:${{ github.sha }}
 
-  deploy-vps:
-    needs: [build-api, build-portal, build-api-rs]
+  deploy-portal:
+    needs: [build-api, build-portal]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Deploy to VPS
+      - name: Deploy portal + license-api to VPS
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -220,14 +218,32 @@ jobs:
             cd /docker/gctrl
             echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
 
-            # Update gctrl-web to use portal image
+            # Ensure portal image is referenced (idempotent)
             sed -i 's|image: ghcr.io/gctrl-tech/web:latest|image: ghcr.io/gctrl-tech/portal:latest|' docker-compose.yml
 
-            # Refresh license-api and portal
             docker compose -f docker-compose.yml pull gctrl-api gctrl-web
             docker compose -f docker-compose.yml up -d gctrl-api gctrl-web
 
-            # Update borghive api container (Rust)
+            echo "=== Portal containers ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" | grep -E "NAME|gctrl-api|gctrl-web"
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+  deploy-vps:
+    needs: [deploy-portal, build-api-rs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Rust API to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: GHCR_TOKEN
+          script: |
+            set -e
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
+
             docker pull ghcr.io/gctrl-tech/api:latest
             GCTRL_NET=$(docker inspect gctrl-db --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
             GCTRL_NET=${GCTRL_NET:-gctrl}

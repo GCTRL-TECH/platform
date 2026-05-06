@@ -25,11 +25,20 @@ pub struct LicenseClaims {
 
 #[derive(Debug, Clone)]
 pub struct LicenseCache {
-    claims:        LicenseClaims,
+    activated:     bool,
+    claims:        Option<LicenseClaims>,
     local_balance: i64,
 }
 
 impl LicenseCache {
+    pub fn unactivated() -> Self {
+        Self {
+            activated:     false,
+            claims:        None,
+            local_balance: 0,
+        }
+    }
+
     pub async fn load_from_disk(path: &str, public_key_pem: &str) -> Result<Self, crate::error::AgentError> {
         let token = fs::read_to_string(path).await
             .map_err(|_| crate::error::AgentError::LicenseNotFound(path.into()))?;
@@ -44,26 +53,36 @@ impl LicenseCache {
         let data = decode::<LicenseClaims>(token, &key, &validation)
             .map_err(|e| crate::error::AgentError::InvalidJwt(e.to_string()))?;
         let balance = data.claims.credits_balance;
-        Ok(Self { claims: data.claims, local_balance: balance })
+        Ok(Self {
+            activated:     true,
+            claims:        Some(data.claims),
+            local_balance: balance,
+        })
     }
 
     pub fn set_from_claims(&mut self, claims: LicenseClaims) {
         self.local_balance = claims.credits_balance;
-        self.claims = claims;
+        self.activated     = true;
+        self.claims        = Some(claims);
     }
 
-    pub fn is_valid(&self)             -> bool { true }
-    pub fn tier(&self)                 -> &str { &self.claims.tier }
+    pub fn is_activated(&self)         -> bool { self.activated }
+    pub fn is_valid(&self)             -> bool { self.activated }
+    pub fn tier(&self)                 -> &str { self.claims.as_ref().map_or("", |c| &c.tier) }
     pub fn balance(&self)              -> i64  { self.local_balance }
-    pub fn overdraft_limit(&self)      -> i64  { self.claims.overdraft_limit }
-    pub fn hardware_fingerprint(&self) -> &str { &self.claims.hardware_fingerprint }
-    pub fn is_update_required(&self)   -> bool { self.claims.update_required }
-    pub fn is_update_available(&self)  -> bool { self.claims.update_available }
-    pub fn latest_version(&self)       -> &str { &self.claims.latest_version }
-    pub fn license_id(&self)           -> &str { &self.claims.license_id }
+    pub fn overdraft_limit(&self)      -> i64  { self.claims.as_ref().map_or(0, |c| c.overdraft_limit) }
+    pub fn hardware_fingerprint(&self) -> &str { self.claims.as_ref().map_or("", |c| &c.hardware_fingerprint) }
+    pub fn is_update_required(&self)   -> bool { self.claims.as_ref().map_or(false, |c| c.update_required) }
+    pub fn is_update_available(&self)  -> bool { self.claims.as_ref().map_or(false, |c| c.update_available) }
+    pub fn latest_version(&self)       -> &str { self.claims.as_ref().map_or("", |c| &c.latest_version) }
+    pub fn license_id(&self)           -> &str { self.claims.as_ref().map_or("", |c| &c.license_id) }
 
     pub fn can_spend(&self, cost: i64) -> bool {
-        self.local_balance >= cost || self.local_balance + self.claims.overdraft_limit >= cost
+        if !self.activated {
+            return false;
+        }
+        let overdraft = self.claims.as_ref().map_or(0, |c| c.overdraft_limit);
+        self.local_balance >= cost || self.local_balance + overdraft >= cost
     }
 
     pub fn deduct_local(&mut self, cost: i64) {

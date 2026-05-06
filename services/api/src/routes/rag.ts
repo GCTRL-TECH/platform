@@ -64,7 +64,7 @@ const TOKEN_COST_RAG = 1;
 // ─── Validation schemas ───────────────────────────────────────────────────────
 
 const llmConfigSchema = z.object({
-  provider: z.enum(['ollama', 'openai', 'anthropic', 'openrouter']).default('ollama'),
+  provider: z.enum(['ollama', 'openai', 'anthropic', 'openrouter', 'nim']).default('ollama'),
   model: z.string().min(1).default('llama3.2'),
   apiKey: z.string().optional(),
   baseUrl: z.string().url().optional(),

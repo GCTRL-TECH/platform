@@ -73,6 +73,12 @@ pub async fn run_loop(
 ) {
     let mut last_heartbeat = std::time::Instant::now();
     loop {
+        // Skip heartbeat entirely if not yet activated
+        if !cache.read().await.is_activated() {
+            sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+
         let has_records  = queue.lock().await.size() > 0;
         let time_since   = last_heartbeat.elapsed();
 
