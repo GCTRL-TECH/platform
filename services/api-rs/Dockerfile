@@ -1,5 +1,5 @@
 FROM rust:1.78-alpine AS build
-RUN apk add --no-cache musl-dev pkgconfig
+RUN apk add --no-cache musl-dev pkgconfig perl make openssl-dev openssl-libs-static
 WORKDIR /app
 
 # Pre-fetch dependencies as a cached layer
