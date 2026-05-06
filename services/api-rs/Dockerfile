@@ -2,16 +2,13 @@ FROM rust:1.78-alpine AS build
 RUN apk add --no-cache musl-dev pkgconfig
 WORKDIR /app
 
-# Cache dependency layer
-COPY Cargo.toml Cargo.lock* ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs \
-    && cargo build --release --locked \
-    && rm -f target/release/gctrl-api target/release/deps/gctrl_api*
-RUN rm -rf src
+# Pre-fetch dependencies as a cached layer
+COPY Cargo.toml Cargo.lock ./
+RUN cargo fetch
 
-# Build actual binary
+# Build binary
 COPY src ./src
-RUN cargo build --release --locked
+RUN cargo build --release --frozen
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
