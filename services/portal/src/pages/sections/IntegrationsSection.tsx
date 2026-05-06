@@ -3,14 +3,14 @@ import { Plug2 } from 'lucide-react'
 const CDN = 'https://cdn.simpleicons.org'
 
 const INTEGRATIONS = [
-  { name: 'Neo4j',         logo: `${CDN}/neo4j/ffffff`,       desc: 'Native KG storage'     },
-  { name: 'Qdrant',        logo: `${CDN}/qdrant/ffffff`,       desc: 'Vector RAG backend'    },
-  { name: 'Google Drive',  logo: `${CDN}/googledrive/ffffff`,  desc: 'Cloud document source' },
-  { name: 'Microsoft 365', logo: `${CDN}/microsoft/ffffff`,    desc: 'Office & SharePoint'   },
-  { name: 'Confluence',    logo: `${CDN}/confluence/ffffff`,   desc: 'Wiki & documentation'  },
-  { name: 'GitHub',        logo: `${CDN}/github/ffffff`,       desc: 'Code & docs'           },
-  { name: 'Slack',         logo: `${CDN}/slack/ffffff`,        desc: 'Messages & threads'    },
-  { name: 'REST API',      logo: null,                          desc: 'Any custom source'     },
+  { name: 'Neo4j',         logo: `${CDN}/neo4j`,        desc: 'Native KG storage'     },
+  { name: 'Qdrant',        logo: `${CDN}/qdrant`,        desc: 'Vector RAG backend'    },
+  { name: 'Google Drive',  logo: `${CDN}/googledrive`,   desc: 'Cloud document source' },
+  { name: 'Microsoft 365', logo: `${CDN}/microsoft`,     desc: 'Office & SharePoint'   },
+  { name: 'Confluence',    logo: `${CDN}/confluence`,    desc: 'Wiki & documentation'  },
+  { name: 'GitHub',        logo: `${CDN}/github`,        desc: 'Code & docs'           },
+  { name: 'Slack',         logo: `${CDN}/slack`,         desc: 'Messages & threads'    },
+  { name: 'REST API',      logo: null,                    desc: 'Any custom source'     },
 ]
 
 export function IntegrationsSection() {
@@ -32,7 +32,7 @@ export function IntegrationsSection() {
               className={`reveal reveal-delay-${(i % 4) + 1} flex flex-col items-center gap-2 rounded-2xl border border-slate-800 bg-slate-900/40 p-5 text-center backdrop-blur-sm transition-all hover:border-indigo-500/30 hover:bg-slate-800/60`}
             >
               {int.logo
-                ? <img src={int.logo} alt={int.name} width={32} height={32} className="w-8 h-8" loading="lazy" />
+                ? <img src={int.logo} alt={int.name} width={32} height={32} className="w-8 h-8 brightness-0 invert" loading="lazy" />
                 : <Plug2 size={32} className="text-slate-400" />
               }
               <span className="text-sm font-semibold text-slate-200">{int.name}</span>
