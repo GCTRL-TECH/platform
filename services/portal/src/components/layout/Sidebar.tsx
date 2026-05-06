@@ -1,11 +1,12 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, KeyRound, ShieldCheck, LogOut } from 'lucide-react'
+import { LayoutDashboard, KeyRound, ShieldCheck, Settings, LogOut } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
 
 const navItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/licenses', icon: KeyRound, label: 'Licenses' },
+  { to: '/settings', icon: Settings, label: 'Settings' },
 ]
 
 const adminItems = [

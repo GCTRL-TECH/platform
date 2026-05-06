@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import bcrypt from 'bcryptjs';
 import { db } from '../db/index.js';
 import { users, licenses, tokenUsage, auditLog, appVersions } from '../db/schema.js';
 import { eq, desc, sql } from 'drizzle-orm';
@@ -37,6 +38,18 @@ router.post('/users/:id/credits', async (req: Request, res: Response) => {
     .set({ creditsBalance: sql`credits_balance + ${amount}` })
     .where(eq(users.id, req.params.id));
   await audit((req as any).adminUser.id, 'add_credits', req.params.id, { amount, reason });
+  res.json({ ok: true });
+});
+
+router.post('/users/:id/reset-password', async (req: Request, res: Response): Promise<void> => {
+  const { password } = req.body as { password?: string };
+  if (!password || password.length < 8) {
+    res.status(400).json({ error: 'Password must be at least 8 characters' });
+    return;
+  }
+  const passwordHash = await bcrypt.hash(password, 10);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, req.params['id']!));
+  await audit((req as any).adminUser.id, 'reset_password', req.params['id']!, {});
   res.json({ ok: true });
 });
 

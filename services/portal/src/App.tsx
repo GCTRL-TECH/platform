@@ -8,6 +8,7 @@ import { ForgotPasswordPage } from '@/pages/auth/ForgotPasswordPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { LicensesPage } from '@/pages/LicensesPage'
 import { LicenseDetailPage } from '@/pages/LicenseDetailPage'
+import { SettingsPage } from '@/pages/SettingsPage'
 import { AdminPage } from '@/pages/AdminPage'
 
 function Spinner() {
@@ -60,6 +61,7 @@ export function App() {
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/licenses" element={<LicensesPage />} />
         <Route path="/licenses/:id" element={<LicenseDetailPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
       </Route>
 
       <Route element={<AdminRoute />}>

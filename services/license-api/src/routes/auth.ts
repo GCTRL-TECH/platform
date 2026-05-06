@@ -215,4 +215,35 @@ router.get('/v1/licenses/:id/usage', requireSession, async (req: Request, res: R
   res.json({ licenseId, days });
 });
 
+// POST /v1/auth/change-password
+router.post('/v1/auth/change-password', requireSession, async (req: Request, res: Response): Promise<void> => {
+  const { currentPassword, newPassword } = req.body as { currentPassword?: string; newPassword?: string };
+
+  if (!currentPassword || !newPassword) {
+    res.status(400).json({ error: 'currentPassword and newPassword required' });
+    return;
+  }
+  if (newPassword.length < 8) {
+    res.status(400).json({ error: 'New password must be at least 8 characters' });
+    return;
+  }
+
+  const [user] = await db.select().from(users).where(eq(users.id, req.sessionUser!.id)).limit(1);
+  if (!user) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+
+  const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!valid) {
+    res.status(401).json({ error: 'Current password is incorrect' });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, user.id));
+
+  res.json({ ok: true });
+});
+
 export default router;

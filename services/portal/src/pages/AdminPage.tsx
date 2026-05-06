@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Users, KeyRound, BarChart3, Tag, AlertTriangle, type LucideIcon } from 'lucide-react'
+import { Users, KeyRound, BarChart3, Tag, AlertTriangle, KeySquare, type LucideIcon } from 'lucide-react'
 import { apiGet, apiPost, apiPatch } from '@/lib/api'
 import { formatDistanceToNow } from 'date-fns'
 
@@ -40,6 +40,8 @@ function UsersTab() {
   })
 
   const [creditAmounts, setCreditAmounts] = useState<Record<string, string>>({})
+  const [pwdInputs, setPwdInputs] = useState<Record<string, string>>({})
+  const [pwdOpen, setPwdOpen] = useState<Record<string, boolean>>({})
 
   const tierMutation = useMutation({
     mutationFn: ({ userId, tier }: { userId: string; tier: string }) =>
@@ -57,6 +59,15 @@ function UsersTab() {
       apiPost(`/admin/users/${userId}/credits`, { amount, reason: 'manual adjustment' }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-users'] })
+    },
+  })
+
+  const resetPwdMutation = useMutation({
+    mutationFn: ({ userId, password }: { userId: string; password: string }) =>
+      apiPost(`/admin/users/${userId}/reset-password`, { password }),
+    onSuccess: (_data, { userId }) => {
+      setPwdOpen((p) => ({ ...p, [userId]: false }))
+      setPwdInputs((p) => ({ ...p, [userId]: '' }))
     },
   })
 
@@ -125,17 +136,63 @@ function UsersTab() {
                 {formatDistanceToNow(new Date(u.createdAt), { addSuffix: true })}
               </td>
               <td className="table-cell">
-                {!u.suspended && u.role !== 'admin' && (
-                  <button
-                    className="btn-danger text-xs"
-                    onClick={() => {
-                      if (confirm(`Suspend ${u.email}?`)) suspendMutation.mutate(u.id)
-                    }}
-                  >
-                    <AlertTriangle size={12} />
-                    Suspend
-                  </button>
-                )}
+                <div className="flex flex-col gap-1.5">
+                  {/* Reset password */}
+                  {pwdOpen[u.id] ? (
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="password"
+                        placeholder="New password"
+                        className="w-28 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300"
+                        value={pwdInputs[u.id] ?? ''}
+                        onChange={(e) => setPwdInputs((p) => ({ ...p, [u.id]: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            const pw = pwdInputs[u.id] ?? ''
+                            if (pw.length >= 8) resetPwdMutation.mutate({ userId: u.id, password: pw })
+                          }
+                        }}
+                        autoFocus
+                      />
+                      <button
+                        className="text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-50"
+                        disabled={!pwdInputs[u.id] || (pwdInputs[u.id]?.length ?? 0) < 8 || resetPwdMutation.isPending}
+                        onClick={() => {
+                          const pw = pwdInputs[u.id] ?? ''
+                          if (pw.length >= 8) resetPwdMutation.mutate({ userId: u.id, password: pw })
+                        }}
+                      >
+                        Set
+                      </button>
+                      <button
+                        className="text-xs text-slate-500 hover:text-slate-300"
+                        onClick={() => setPwdOpen((p) => ({ ...p, [u.id]: false }))}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
+                      onClick={() => setPwdOpen((p) => ({ ...p, [u.id]: true }))}
+                    >
+                      <KeySquare size={12} />
+                      Reset pwd
+                    </button>
+                  )}
+                  {/* Suspend */}
+                  {!u.suspended && u.role !== 'admin' && (
+                    <button
+                      className="btn-danger text-xs"
+                      onClick={() => {
+                        if (confirm(`Suspend ${u.email}?`)) suspendMutation.mutate(u.id)
+                      }}
+                    >
+                      <AlertTriangle size={12} />
+                      Suspend
+                    </button>
+                  )}
+                </div>
               </td>
             </tr>
           ))}
