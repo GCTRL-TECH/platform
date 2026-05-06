@@ -3,13 +3,13 @@ import { Plug2 } from 'lucide-react'
 const CDN = 'https://cdn.simpleicons.org'
 
 const INTEGRATIONS = [
-  { name: 'Neo4j',         logo: `${CDN}/neo4j/4FB3FF`,       desc: 'Native KG storage'     },
-  { name: 'Qdrant',        logo: `${CDN}/qdrant/B17BFF`,       desc: 'Vector RAG backend'    },
-  { name: 'Google Drive',  logo: `${CDN}/googledrive/60A5FA`,  desc: 'Cloud document source' },
-  { name: 'Microsoft 365', logo: `${CDN}/microsoft/0EA5E9`,    desc: 'Office & SharePoint'   },
-  { name: 'Confluence',    logo: `${CDN}/confluence/2684FF`,   desc: 'Wiki & documentation'  },
-  { name: 'GitHub',        logo: `${CDN}/github/E2E8F0`,       desc: 'Code & docs'           },
-  { name: 'Slack',         logo: `${CDN}/slack/E01E5A`,        desc: 'Messages & threads'    },
+  { name: 'Neo4j',         logo: `${CDN}/neo4j/ffffff`,       desc: 'Native KG storage'     },
+  { name: 'Qdrant',        logo: `${CDN}/qdrant/ffffff`,       desc: 'Vector RAG backend'    },
+  { name: 'Google Drive',  logo: `${CDN}/googledrive/ffffff`,  desc: 'Cloud document source' },
+  { name: 'Microsoft 365', logo: `${CDN}/microsoft/ffffff`,    desc: 'Office & SharePoint'   },
+  { name: 'Confluence',    logo: `${CDN}/confluence/ffffff`,   desc: 'Wiki & documentation'  },
+  { name: 'GitHub',        logo: `${CDN}/github/ffffff`,       desc: 'Code & docs'           },
+  { name: 'Slack',         logo: `${CDN}/slack/ffffff`,        desc: 'Messages & threads'    },
   { name: 'REST API',      logo: null,                          desc: 'Any custom source'     },
 ]
 
