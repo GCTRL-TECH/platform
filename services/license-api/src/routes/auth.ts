@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { hash, compare } from 'bcryptjs';
+import bcrypt from 'bcryptjs';
 import { SignJWT } from 'jose';
 import { db } from '../db/index.js';
 import { users, licenses, tokenUsage } from '../db/schema.js';
@@ -42,7 +42,7 @@ router.post('/v1/auth/register', async (req: Request, res: Response): Promise<vo
     return;
   }
 
-  const passwordHash = await hash(password, 10);
+  const passwordHash = await bcrypt.hash(password, 10);
   const [user] = await db.insert(users).values({
     email: email.toLowerCase(),
     name: email.split('@')[0]!,
@@ -102,7 +102,7 @@ router.post('/v1/auth/login', async (req: Request, res: Response): Promise<void>
     return;
   }
 
-  const valid = await compare(password, user.passwordHash);
+  const valid = await bcrypt.compare(password, user.passwordHash);
   if (!valid) {
     res.status(401).json({ error: 'Invalid credentials' });
     return;
