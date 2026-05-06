@@ -236,7 +236,7 @@ pub async fn run(
         .route("/status",   get(handle_status))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!("Agent listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
