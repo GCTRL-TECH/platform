@@ -7,7 +7,7 @@ version: "3.8"
 
 services:
   gctrl-agent:
-    image: ghcr.io/tortillajackson/agent:latest
+    image: ghcr.io/gctrl-tech/agent:latest
     container_name: gctrl-agent
     restart: unless-stopped
     ports:
@@ -30,7 +30,7 @@ services:
       retries: 3
 
   gctrl-kex:
-    image: ghcr.io/tortillajackson/kex:latest
+    image: ghcr.io/gctrl-tech/kex:latest
     container_name: gctrl-kex
     restart: unless-stopped
     ports:
@@ -67,7 +67,7 @@ services:
               capabilities: [gpu]
 
   gctrl-resolver:
-    image: ghcr.io/tortillajackson/fusion-engine:latest
+    image: ghcr.io/gctrl-tech/fusion-engine:latest
     container_name: gctrl-resolver
     restart: unless-stopped
     profiles: [bundled-fusion]
@@ -78,7 +78,7 @@ services:
       - gctrl
 
   gctrl-fuse:
-    image: ghcr.io/tortillajackson/fuse:latest
+    image: ghcr.io/gctrl-tech/fuse:latest
     container_name: gctrl-fuse
     restart: unless-stopped
     ports:
@@ -100,7 +100,7 @@ services:
       - gctrl
 
   gctrl-api:
-    image: ghcr.io/tortillajackson/api:latest
+    image: ghcr.io/gctrl-tech/api:latest
     container_name: gctrl-api
     restart: unless-stopped
     ports:
@@ -129,7 +129,7 @@ services:
       - gctrl
 
   gctrl-web:
-    image: ghcr.io/tortillajackson/web:latest
+    image: ghcr.io/gctrl-tech/web:latest
     container_name: gctrl-web
     restart: unless-stopped
     ports:

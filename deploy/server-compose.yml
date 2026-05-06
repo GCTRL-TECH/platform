@@ -11,7 +11,7 @@ services:
   # Handles: license activation, heartbeat, version management, credits
   # Routes via Traefik to: api.gctrl.tech
   gctrl-api:
-    image: ghcr.io/tortillajackson/license-api:latest
+    image: ghcr.io/gctrl-tech/license-api:latest
     container_name: gctrl-api
     restart: unless-stopped
     environment:
@@ -46,7 +46,7 @@ services:
   # GCTRL customer portal: register, login, license management, admin
   # Routes via Traefik to: gctrl.tech
   gctrl-web:
-    image: ghcr.io/tortillajackson/portal:latest
+    image: ghcr.io/gctrl-tech/portal:latest
     container_name: gctrl-web
     restart: unless-stopped
     depends_on:
