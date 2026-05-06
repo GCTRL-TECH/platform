@@ -110,6 +110,10 @@ jobs:
           registry: ghcr.io
           username: TortillaJackson
           password: ${{ secrets.GHCR_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check agent-rs (show real errors)
+        run: cd services/agent-rs && cargo check 2>&1
       - name: Build and push agent (Rust)
         uses: docker/build-push-action@v5
         with:
@@ -174,6 +178,10 @@ jobs:
           registry: ghcr.io
           username: TortillaJackson
           password: ${{ secrets.GHCR_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check api-rs (show real errors)
+        run: cd services/api-rs && cargo check 2>&1
       - name: Build and push api (Rust)
         uses: docker/build-push-action@v5
         with:
