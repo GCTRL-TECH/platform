@@ -58,13 +58,6 @@ services:
         condition: service_started
     networks:
       - gctrl
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
   gctrl-resolver:
     image: ghcr.io/gctrl-tech/fusion-engine:latest
