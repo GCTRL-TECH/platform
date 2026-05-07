@@ -26,7 +26,7 @@ struct ResetReq { token: String, password: String }
 
 #[derive(Serialize)]
 struct AuthTokens {
-    #[serde(rename = "accessToken")]  access_token:  String,
+    #[serde(rename = "token")]  access_token:  String,
     #[serde(rename = "refreshToken")] refresh_token: String,
     user: UserOut,
 }
@@ -99,7 +99,7 @@ async fn login(
     Json(req): Json<LoginReq>,
 ) -> Result<Json<AuthTokens>> {
     let user = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>, Option<String>, Option<i32>, String)>(
-        "SELECT id, email, name, role, clearance, tier, tokens_balance, password_hash
+        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance, password_hash
          FROM users WHERE email = $1 LIMIT 1"
     )
     .bind(&req.email)
@@ -136,7 +136,7 @@ async fn refresh(
         .map_err(|_| AppError::Unauthorized)?;
 
     let user = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>, Option<String>, Option<i32>)>(
-        "SELECT id, email, name, role, clearance, tier, tokens_balance FROM users WHERE id = $1"
+        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance FROM users WHERE id = $1"
     )
     .bind(data.claims.sub)
     .fetch_optional(&state.db).await?

@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN IF NOT EXISTS default_ontology_id UUID REFERENCES ontologies(id) ON DELETE SET NULL;

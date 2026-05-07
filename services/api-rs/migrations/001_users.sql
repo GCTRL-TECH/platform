@@ -17,6 +17,7 @@ CREATE TABLE users (
   reset_token_expires TIMESTAMPTZ,
   tokens_balance INTEGER NOT NULL DEFAULT 50,
   tier VARCHAR(50) NOT NULL DEFAULT 'free',
+  default_ontology_id UUID,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

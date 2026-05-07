@@ -43,7 +43,7 @@ async fn me(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<SafeUser>> {
     let user = sqlx::query_as::<_, SafeUser>(
-        "SELECT id, email, name, role, clearance, tier, tokens_balance, default_ontology_id, created_at
+        "SELECT id, email, name, role::TEXT AS role, clearance::TEXT AS clearance, tier, tokens_balance, default_ontology_id, created_at
          FROM users WHERE id = $1"
     )
     .bind(claims.sub)

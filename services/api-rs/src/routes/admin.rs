@@ -34,7 +34,7 @@ async fn list_users(
 ) -> Result<Json<Vec<Value>>> {
     require_role(&claims, "admin")?;
     let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, String, Option<String>, Option<i32>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, email, name, role, tier, tokens_balance, created_at FROM users ORDER BY created_at DESC"
+        "SELECT id, email, name, role::TEXT AS role, tier, tokens_balance, created_at FROM users ORDER BY created_at DESC"
     )
     .fetch_all(&state.db).await?;
     let users = rows.into_iter().map(|(id, email, name, role, tier, bal, created)| {
