@@ -3,7 +3,10 @@ set -euo pipefail
 
 GCTRL_DIR="${GCTRL_DIR:-$HOME/gctrl}"
 
-echo "[GCTRL] Updating Ground Control..."
+BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()    { echo -e "${BLUE}[GCTRL]${NC} $1"; }
+success() { echo -e "${GREEN}[GCTRL]${NC} $1"; }
+skip()    { echo -e "${YELLOW}[GCTRL]${NC} $1"; }
 
 if [ ! -f "$GCTRL_DIR/docker-compose.yml" ]; then
   echo "[GCTRL] ERROR: No docker-compose.yml found in $GCTRL_DIR"
@@ -13,12 +16,84 @@ fi
 
 cd "$GCTRL_DIR"
 
-echo "[GCTRL] Pulling latest images..."
-docker compose pull
+# ── Per-service digest check ───────────────────────────────────────────────────
+# Compares local image digest to remote manifest.
+# Returns 0 (has update) or 1 (already current).
+needs_update() {
+  local image="$1"
 
-echo "[GCTRL] Restarting containers with new images..."
-docker compose up -d
+  local local_digest
+  local_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "")
+
+  if [ -z "$local_digest" ]; then
+    return 0  # not pulled yet — definitely needs pull
+  fi
+
+  local remote_digest
+  remote_digest=$(docker manifest inspect "$image" 2>/dev/null \
+    | grep -oP '"digest":\s*"\Ksha256:[a-f0-9]+' | head -1 || echo "")
+
+  if [ -z "$remote_digest" ]; then
+    return 0  # can't check — pull to be safe
+  fi
+
+  # local_digest is "image@sha256:abc", remote is "sha256:abc"
+  if echo "$local_digest" | grep -q "$remote_digest"; then
+    return 1  # already up to date
+  fi
+
+  return 0
+}
+
+# ── Collect services from compose file ────────────────────────────────────────
+# Only check the core GCTRL services — skip bundled infra (postgres, redis, etc.)
+SERVICES=(
+  "gctrl-agent:ghcr.io/gctrl-tech/agent:latest"
+  "gctrl-api:ghcr.io/gctrl-tech/api:latest"
+  "gctrl-web:ghcr.io/gctrl-tech/web:latest"
+  "gctrl-kex:ghcr.io/gctrl-tech/kex:latest"
+  "gctrl-fuse:ghcr.io/gctrl-tech/fuse:latest"
+)
 
 echo ""
-echo "[GCTRL] Update complete."
+info "Checking for updates..."
+echo ""
+
+TO_UPDATE=()
+for entry in "${SERVICES[@]}"; do
+  name="${entry%%:*}"
+  image="${entry#*:}"
+  printf "  %-20s" "$name"
+  if needs_update "$image"; then
+    echo -e "→ update available"
+    TO_UPDATE+=("$name")
+  else
+    echo -e "✓ up to date"
+  fi
+done
+
+echo ""
+
+if [ ${#TO_UPDATE[@]} -eq 0 ]; then
+  success "Everything is already up to date."
+  exit 0
+fi
+
+info "Pulling ${#TO_UPDATE[@]} updated service(s): ${TO_UPDATE[*]}"
+echo ""
+
+for svc in "${TO_UPDATE[@]}"; do
+  docker compose pull "$svc"
+done
+
+info "Restarting updated containers..."
+docker compose up -d --no-recreate "${TO_UPDATE[@]}"
+# --no-recreate skips containers whose config hasn't changed;
+# force-recreate only those we just pulled
+docker compose up -d --force-recreate "${TO_UPDATE[@]}"
+
+echo ""
+success "Update complete."
+echo ""
 docker ps --filter "name=gctrl-" --format "  {{.Names}}\t{{.Status}}"
+echo ""

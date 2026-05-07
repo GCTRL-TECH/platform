@@ -10,7 +10,44 @@ env:
   ORG: gctrl-tech
 
 jobs:
+  # ── Detect which services actually changed ──────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      kex:        ${{ steps.filter.outputs.kex }}
+      fuse:       ${{ steps.filter.outputs.fuse }}
+      agent:      ${{ steps.filter.outputs.agent }}
+      api:        ${{ steps.filter.outputs.api }}
+      web:        ${{ steps.filter.outputs.web }}
+      portal:     ${{ steps.filter.outputs.portal }}
+      license-api: ${{ steps.filter.outputs.license-api }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            kex:
+              - 'services/kex/**'
+            fuse:
+              - 'services/fuse/**'
+            agent:
+              - 'services/agent-rs/**'
+            api:
+              - 'services/api-rs/**'
+            web:
+              - 'services/web/**'
+            portal:
+              - 'services/portal/**'
+            license-api:
+              - 'services/license-api/**'
+
+  # ── Build jobs — each only runs when its source changed ────────────────────
+  # workflow_dispatch (manual trigger) always builds everything.
+
   build-kex:
+    needs: changes
+    if: needs.changes.outputs.kex == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -33,11 +70,22 @@ jobs:
             ghcr.io/gctrl-tech/kex:${{ github.sha }}
 
   build-fuse:
+    needs: changes
+    if: needs.changes.outputs.fuse == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - variant: cpu
+            torch_index: https://download.pytorch.org/whl/cpu
+            tag_suffix: ""
+          - variant: cuda
+            torch_index: https://download.pytorch.org/whl/cu121
+            tag_suffix: "-cuda"
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -49,12 +97,15 @@ jobs:
         with:
           context: services/fuse
           file: services/fuse/build/Dockerfile.prod
+          build-args: TORCH_INDEX_URL=${{ matrix.torch_index }}
           push: true
           tags: |
-            ghcr.io/gctrl-tech/fuse:latest
-            ghcr.io/gctrl-tech/fuse:${{ github.sha }}
+            ghcr.io/gctrl-tech/fuse:latest${{ matrix.tag_suffix }}
+            ghcr.io/gctrl-tech/fuse:${{ github.sha }}${{ matrix.tag_suffix }}
 
-  build-api:
+  build-license-api:
+    needs: changes
+    if: needs.changes.outputs['license-api'] == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -75,29 +126,9 @@ jobs:
             ghcr.io/gctrl-tech/license-api:latest
             ghcr.io/gctrl-tech/license-api:${{ github.sha }}
 
-  # build-agent (Node.js) - replaced by Rust build below
-  # build-agent:
-  #   runs-on: ubuntu-latest
-  #   permissions:
-  #     contents: read
-  #     packages: write
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: docker/login-action@v3
-  #       with:
-  #         registry: ghcr.io
-  #         username: TortillaJackson
-  #         password: ${{ secrets.GHCR_TOKEN }}
-  #     - uses: docker/build-push-action@v5
-  #       with:
-  #         context: services/agent
-  #         file: services/agent/build/Dockerfile.prod
-  #         push: true
-  #         tags: |
-  #           ghcr.io/gctrl-tech/agent:latest
-  #           ghcr.io/gctrl-tech/agent:${{ github.sha }}
-
   build-agent-rs:
+    needs: changes
+    if: needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -123,49 +154,9 @@ jobs:
             ghcr.io/gctrl-tech/agent:latest
             ghcr.io/gctrl-tech/agent:${{ github.sha }}
 
-  build-web:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: TortillaJackson
-          password: ${{ secrets.GHCR_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: services/web
-          push: true
-          tags: |
-            ghcr.io/gctrl-tech/web:latest
-            ghcr.io/gctrl-tech/web:${{ github.sha }}
-
-  # build-app (Node.js) - replaced by Rust build below
-  # build-app:
-  #   runs-on: ubuntu-latest
-  #   permissions:
-  #     contents: read
-  #     packages: write
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: docker/login-action@v3
-  #       with:
-  #         registry: ghcr.io
-  #         username: TortillaJackson
-  #         password: ${{ secrets.GHCR_TOKEN }}
-  #     - uses: docker/build-push-action@v5
-  #       with:
-  #         context: services/api
-  #         file: services/api/build/Dockerfile.prod
-  #         push: true
-  #         tags: |
-  #           ghcr.io/gctrl-tech/app:latest
-  #           ghcr.io/gctrl-tech/app:${{ github.sha }}
-
   build-api-rs:
+    needs: changes
+    if: needs.changes.outputs.api == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -191,7 +182,31 @@ jobs:
             ghcr.io/gctrl-tech/api:latest
             ghcr.io/gctrl-tech/api:${{ github.sha }}
 
+  build-web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: TortillaJackson
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/web
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/web:latest
+            ghcr.io/gctrl-tech/web:${{ github.sha }}
+
   build-portal:
+    needs: changes
+    if: needs.changes.outputs.portal == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -212,8 +227,14 @@ jobs:
             ghcr.io/gctrl-tech/portal:latest
             ghcr.io/gctrl-tech/portal:${{ github.sha }}
 
+  # ── Deploy jobs — only run if their upstream build ran ─────────────────────
+
   deploy-portal:
-    needs: [build-api, build-portal]
+    needs: [build-license-api, build-portal]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      (needs.build-license-api.result == 'success' || needs.build-portal.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Deploy portal + license-api to VPS
@@ -228,7 +249,6 @@ jobs:
             cd /docker/gctrl
             echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
 
-            # Ensure portal image is referenced (idempotent)
             sed -i 's|image: ghcr.io/gctrl-tech/web:latest|image: ghcr.io/gctrl-tech/portal:latest|' docker-compose.yml
 
             docker compose -f docker-compose.yml pull gctrl-api gctrl-web
@@ -241,6 +261,10 @@ jobs:
 
   deploy-vps:
     needs: [deploy-portal, build-api-rs]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      needs.build-api-rs.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy Rust API to VPS

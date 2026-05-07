@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Routes, Route, Navigate, Outlet } from 'react-router-dom'
+import { Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
 import ActivationWizard from '@/pages/onboarding/ActivationWizard'
 import { AppShell } from '@/components/layout/AppShell'
@@ -23,7 +23,6 @@ import AdminPanel from '@/pages/admin/AdminPanel'
 import TriggersPage from '@/pages/triggers/TriggersPage'
 import OnboardingWizard from '@/pages/onboarding/OnboardingWizard'
 import GoogleDrivePage from '@/pages/connectors/GoogleDrivePage'
-import { LandingPage } from '@/pages/landing/LandingPage'
 
 function ActivationGate({ children }: { children: React.ReactNode }) {
   const [activated, setActivated] = useState<boolean | null>(null)
@@ -57,6 +56,7 @@ function ActivationGate({ children }: { children: React.ReactNode }) {
 
 function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useAuth()
+  const location = useLocation()
 
   if (isLoading) {
     return (
@@ -71,6 +71,11 @@ function ProtectedRoute() {
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
+  }
+
+  // First-time users: guide through onboarding before reaching any other page
+  if (!localStorage.getItem('onboarding_complete') && location.pathname !== '/onboarding') {
+    return <Navigate to="/onboarding" replace />
   }
 
   return (
@@ -98,18 +103,6 @@ function PublicRoute() {
   return <Outlet />
 }
 
-function LandingRoute() {
-  const { isAuthenticated, isLoading } = useAuth()
-  if (isLoading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-[#020617]">
-        <div className="h-6 w-6 animate-spin rounded-full border-2 border-indigo-500/30 border-t-indigo-500" />
-      </div>
-    )
-  }
-  if (isAuthenticated) return <Navigate to="/dashboard" replace />
-  return <LandingPage />
-}
 
 export function App() {
   return (
@@ -143,8 +136,8 @@ export function App() {
           <Route path="/drive" element={<GoogleDrivePage />} />
         </Route>
 
-        {/* Root redirect */}
-        <Route path="/" element={<LandingRoute />} />
+        {/* Root and catch-all: unauthenticated → /login via ProtectedRoute, authenticated → /dashboard */}
+        <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>
     </ActivationGate>

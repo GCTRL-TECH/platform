@@ -31,14 +31,12 @@ check_prereqs() {
   fi
 
   if ! docker info &>/dev/null; then
-    # Try systemd first (Linux servers — usually works silently)
     if command -v systemctl &>/dev/null; then
       warn "Docker daemon not running — attempting to start..."
       sudo systemctl start docker 2>/dev/null || true
       sleep 2
     fi
 
-    # If still not up, wait for Docker Desktop
     if ! docker info &>/dev/null; then
       warn "Waiting for Docker to start — please open Docker Desktop..."
       local waited=0
@@ -54,20 +52,78 @@ check_prereqs() {
 }
 
 # ── Service Detection ─────────────────────────────────────────────────────────
-# Probe a TCP port on localhost (returns 0 = open, 1 = closed/timeout)
 probe_tcp() {
   local port=$1
   timeout 2 bash -c ">/dev/tcp/127.0.0.1/$port" 2>/dev/null
 }
 
-# For each infrastructure dependency, detect if it's already running on the host.
-# Sets: NEO4J_URI, QDRANT_URL, OLLAMA_BASE, PROFILES (array of compose profiles to activate)
 PROFILES=()
 NEO4J_URI=""
 NEO4J_USER="neo4j"
 NEO4J_PASSWORD="gctrl-neo4j-password"
 QDRANT_URL=""
 OLLAMA_BASE=""
+GPU_ENABLED=false
+GPU_TYPE="none"   # none | nvidia | amd
+
+# ── GPU Detection ─────────────────────────────────────────────────────────────
+# Detection strategy:
+#   NVIDIA — nvidia-smi reports only discrete NVIDIA GPUs (no Intel integrated).
+#             Requires nvidia-container-toolkit for Docker GPU passthrough.
+#   AMD    — rocm-smi or /dev/kfd presence signals an AMD GPU.
+#             Requires ROCm and /dev/kfd + /dev/dri for Docker passthrough.
+#   CPU    — fallback when no discrete GPU (or toolkit) is detected.
+detect_gpu() {
+  # ── NVIDIA ────────────────────────────────────────────────────────────────
+  if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    local gpu_name
+    gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null | head -1 || echo "NVIDIA GPU")
+
+    if command -v nvidia-ctk &>/dev/null || docker info 2>/dev/null | grep -qi "nvidia"; then
+      GPU_ENABLED=true
+      GPU_TYPE="nvidia"
+      success "GPU detected: ${gpu_name} — KEX will use NVIDIA GPU acceleration"
+      return
+    else
+      warn "NVIDIA GPU found (${gpu_name}) but nvidia-container-toolkit is not installed"
+      warn "KEX will run on CPU. To enable GPU later:"
+      info "  sudo apt-get install -y nvidia-container-toolkit"
+      info "  sudo nvidia-ctk runtime configure --runtime=docker"
+      info "  sudo systemctl restart docker"
+      info "  curl -fsSL https://gctrl.tech/install | bash"
+      return
+    fi
+  fi
+
+  # ── AMD ───────────────────────────────────────────────────────────────────
+  # rocm-smi is the AMD equivalent of nvidia-smi.
+  # /dev/kfd is the AMD GPU kernel fusion driver — present when ROCm is installed.
+  local amd_detected=false
+  local amd_name="AMD GPU"
+
+  if command -v rocm-smi &>/dev/null && rocm-smi &>/dev/null 2>&1; then
+    amd_detected=true
+    amd_name=$(rocm-smi --showproductname 2>/dev/null \
+      | grep -oP '(?i)(?<=card series:\s{0,16})\S.*' | head -1 || echo "AMD GPU")
+  elif [ -e /dev/kfd ]; then
+    # /dev/kfd present even without rocm-smi in PATH (e.g. system-level ROCm install)
+    amd_detected=true
+  fi
+
+  if [ "${amd_detected}" = "true" ]; then
+    if [ -e /dev/kfd ] && [ -e /dev/dri ]; then
+      GPU_ENABLED=true
+      GPU_TYPE="amd"
+      success "GPU detected: ${amd_name} — KEX will use AMD ROCm acceleration"
+    else
+      warn "AMD GPU found but /dev/kfd or /dev/dri not accessible — KEX will run on CPU"
+      warn "To enable AMD GPU, install ROCm: https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html"
+    fi
+    return
+  fi
+
+  info "No discrete GPU detected — KEX will run on CPU"
+}
 
 detect_services() {
   echo ""
@@ -75,7 +131,6 @@ detect_services() {
   info "Detecting existing infrastructure..."
   echo ""
 
-  # Neo4j (Bolt :7687)
   if probe_tcp 7687; then
     NEO4J_URI="bolt://host.docker.internal:7687"
     success "Neo4j detected on :7687 — will connect to existing instance"
@@ -85,7 +140,6 @@ detect_services() {
     info "Neo4j not found — will deploy bundled container"
   fi
 
-  # Qdrant (:6333)
   if probe_tcp 6333; then
     QDRANT_URL="http://host.docker.internal:6333"
     success "Qdrant detected on :6333 — will connect to existing instance"
@@ -95,7 +149,6 @@ detect_services() {
     info "Qdrant not found — will deploy bundled container"
   fi
 
-  # Ollama (:11434)
   if probe_tcp 11434; then
     OLLAMA_BASE="http://host.docker.internal:11434"
     success "Ollama detected on :11434 — will connect to existing instance"
@@ -141,7 +194,81 @@ OLLAMA_BASE=${OLLAMA_BASE}
 POSTGRES_PASSWORD=gctrl-postgres-password
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
+
+  if [ "${GPU_ENABLED}" = "true" ]; then
+    write_gpu_override
+  fi
+
   success "Config generated"
+}
+
+# Writes docker-compose.override.yml with GPU passthrough for the detected vendor.
+# Docker Compose automatically merges override.yml with docker-compose.yml on up/pull.
+# Users can delete this file to revert to CPU mode.
+write_gpu_override() {
+  if [ "${GPU_TYPE}" = "nvidia" ]; then
+    info "Writing NVIDIA GPU override (docker-compose.override.yml)..."
+    cat > "${INSTALL_DIR}/docker-compose.override.yml" <<'OVERRIDE'
+# Auto-generated by GCTRL installer — NVIDIA GPU detected.
+# Delete this file to switch back to CPU mode, then run: docker compose up -d
+services:
+  gctrl-fuse:
+    image: ghcr.io/gctrl-tech/fuse:latest-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  gctrl-kex:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  gctrl-ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+OVERRIDE
+
+  elif [ "${GPU_TYPE}" = "amd" ]; then
+    info "Writing AMD ROCm GPU override (docker-compose.override.yml)..."
+    cat > "${INSTALL_DIR}/docker-compose.override.yml" <<'OVERRIDE'
+# Auto-generated by GCTRL installer — AMD GPU detected.
+# Delete this file to switch back to CPU mode, then run: docker compose up -d
+services:
+  gctrl-fuse:
+    image: ghcr.io/gctrl-tech/fuse:latest-cuda
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+  gctrl-kex:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+  gctrl-ollama:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+OVERRIDE
+  fi
 }
 
 # ── Start Stack ───────────────────────────────────────────────────────────────
@@ -180,6 +307,12 @@ start_stack() {
   echo "  Open http://localhost:3001 to activate your license and complete setup"
   echo "  Installed : ${INSTALL_DIR}"
   echo ""
+  if [ "${GPU_ENABLED}" = "true" ]; then
+    echo "  GPU       : ${GPU_TYPE} acceleration enabled"
+  else
+    echo "  GPU       : CPU mode (no compatible GPU or toolkit found)"
+  fi
+  echo ""
   if probe_tcp 11434; then
     echo "  Ollama    : connected at ${OLLAMA_BASE}"
   else
@@ -192,6 +325,7 @@ start_stack() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   check_prereqs
+  detect_gpu
   detect_services
   generate_config
   start_stack

@@ -1125,7 +1125,7 @@ function N8nTab() {
   const credentialConfig = JSON.stringify({
     baseUrl: 'http://localhost:4000',
     authMethod: 'emailPassword',
-    email: 'admin@GCTRL.dev',
+    email: '(your email)',
     password: '(your password)',
   }, null, 2)
 

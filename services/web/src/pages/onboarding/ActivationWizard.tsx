@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Shield, KeyRound, Loader2, Check, ExternalLink, ArrowRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -9,6 +10,7 @@ interface Props {
 }
 
 export default function ActivationWizard({ onActivated }: Props) {
+  const navigate = useNavigate()
   const [step, setStep] = useState<Step>('welcome')
   const [licenseKey, setLicenseKey] = useState('')
   const [error, setError] = useState('')
@@ -50,11 +52,12 @@ export default function ActivationWizard({ onActivated }: Props) {
 
   useEffect(() => {
     if (step === 'done') {
-      // Small delay so user sees the success state
-      const t = setTimeout(onActivated, 2000)
+      onActivated() // unlock the gate immediately
+      // Navigate to register after a brief success moment
+      const t = setTimeout(() => navigate('/register'), 1800)
       return () => clearTimeout(t)
     }
-  }, [step, onActivated])
+  }, [step, onActivated, navigate])
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-950 p-6">
@@ -176,7 +179,7 @@ export default function ActivationWizard({ onActivated }: Props) {
               </div>
               <div>
                 <p className="text-sm font-medium text-emerald-300">Activation successful!</p>
-                <p className="text-xs text-slate-500 mt-1">Loading your workspace…</p>
+                <p className="text-xs text-slate-500 mt-1">Setting up your account…</p>
               </div>
             </div>
           )}

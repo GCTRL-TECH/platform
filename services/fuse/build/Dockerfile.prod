@@ -11,6 +11,11 @@ FROM python:3.11-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y gcc g++ && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
+# TORCH_INDEX_URL controls CPU vs CUDA build:
+#   CPU  (default): https://download.pytorch.org/whl/cpu        → ~700 MB
+#   CUDA:           https://download.pytorch.org/whl/cu121      → ~3 GB
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.4.0 --index-url ${TORCH_INDEX_URL}
 RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=obfuscator /build/dist/obfuscated .
 EXPOSE 4020

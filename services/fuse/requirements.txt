@@ -5,5 +5,4 @@ neo4j==5.25.0
 redis==5.0.0
 requests==2.32.0
 pydantic==2.9.0
-torch==2.4.0
 numpy==1.26.4

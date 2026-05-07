@@ -97,14 +97,13 @@ export function RegisterPage() {
               <CheckCircle2 size={32} className="text-emerald-400" />
             </div>
             <div>
-              <h2 className="text-xl font-semibold text-slate-100">Check your email</h2>
+              <h2 className="text-xl font-semibold text-slate-100">Account created!</h2>
               <p className="mt-2 text-sm text-slate-500">
-                We sent a verification link to <span className="text-slate-300">{email}</span>.
-                Click it to activate your account.
+                Sign in with <span className="text-slate-300">{email}</span> to get started.
               </p>
             </div>
             <Link to="/login" className="btn-primary mt-2">
-              Back to sign in
+              Sign in
             </Link>
           </div>
         </div>
