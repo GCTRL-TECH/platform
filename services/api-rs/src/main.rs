@@ -20,6 +20,7 @@ async fn main() {
 
     let cfg   = Arc::new(config::Config::from_env());
     let db    = db::connect(&cfg.database_url).await;
+    sqlx::migrate!("migrations").run(&db).await.expect("DB migrations failed");
     let neo   = services::neo4j::connect(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password).await;
     let redis = services::redis::connect(&cfg.redis_url).await;
 
