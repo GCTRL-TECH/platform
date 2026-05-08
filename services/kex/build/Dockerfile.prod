@@ -24,8 +24,9 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir -r requirements.txt lxml_html_clean
 
-# Copy ONLY obfuscated source (no original .py files)
-COPY --from=obfuscator /build/dist/obfuscated ./src
+# Copy obfuscated source — dist/obfuscated/ contains src/ + pyarmor_runtime_000000/
+# both must land at /app/ so uvicorn can resolve src.main from WORKDIR
+COPY --from=obfuscator /build/dist/obfuscated ./
 
 ENV TRANSFORMERS_CACHE=/app/models
 ENV NVIDIA_VISIBLE_DEVICES=all
