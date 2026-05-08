@@ -31,10 +31,12 @@ import {
   KeyRound,
   Shield,
   Loader2,
+  ArrowUpCircle,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
+import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1518,6 +1520,8 @@ function InfrastructureTab() {
   const [status, setStatus] = useState<SetupStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [showUpdateModal, setShowUpdateModal] = useState(false)
+  const { status: agentStatus } = useLicenseStatus()
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -1621,6 +1625,66 @@ function InfrastructureTab() {
           </p>
         </div>
       </section>
+
+      {/* Software Update */}
+      <section>
+        <SectionHeader>Software Update</SectionHeader>
+        <div className={cn(
+          'rounded-lg border p-4 space-y-3',
+          agentStatus?.updateRequired
+            ? 'border-red-900/50 bg-red-950/20'
+            : agentStatus?.updateAvailable
+            ? 'border-yellow-900/50 bg-yellow-950/10'
+            : 'border-slate-800 bg-slate-900/50'
+        )}>
+          {/* Status line */}
+          <div className="flex items-center justify-between">
+            <div>
+              {agentStatus?.updateRequired && (
+                <p className="text-sm font-medium text-red-400">
+                  Required update — v{agentStatus.latestVersion} available. Operations blocked until updated.
+                </p>
+              )}
+              {!agentStatus?.updateRequired && agentStatus?.updateAvailable && (
+                <p className="text-sm font-medium text-yellow-400">
+                  Update available — v{agentStatus.latestVersion}
+                </p>
+              )}
+              {!agentStatus?.updateAvailable && !agentStatus?.updateRequired && (
+                <p className="text-sm text-slate-400">
+                  {agentStatus ? 'Your installation is up to date.' : 'Agent unreachable — status unknown.'}
+                </p>
+              )}
+              <p className="mt-1 text-[11px] text-slate-500">
+                Pulls latest Docker images and recreates all containers in place. Takes ~1–2 min.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowUpdateModal(true)}
+              className={cn(
+                'ml-4 flex shrink-0 items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+                agentStatus?.updateRequired
+                  ? 'bg-red-600 hover:bg-red-500 text-white'
+                  : agentStatus?.updateAvailable
+                  ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
+                  : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
+              )}
+            >
+              <ArrowUpCircle size={15} />
+              Update now
+            </button>
+          </div>
+
+          {/* Manual fallback */}
+          <div className="rounded-md bg-slate-950 border border-slate-800 px-3 py-2 font-mono text-xs text-slate-500">
+            <span className="text-slate-600"># Or run on the server:</span>
+            <br />
+            <span className="text-slate-400">curl -fsSL https://gctrl.tech/update | bash</span>
+          </div>
+        </div>
+      </section>
+
+      {showUpdateModal && <UpdateModal onClose={() => setShowUpdateModal(false)} />}
     </div>
   )
 }

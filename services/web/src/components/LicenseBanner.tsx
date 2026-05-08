@@ -21,7 +21,7 @@ interface ProgressLine {
 
 const MANUAL_COMMAND = 'curl -fsSL https://gctrl.tech/update | bash'
 
-function UpdateModal({ onClose }: { onClose: () => void }) {
+export function UpdateModal({ onClose }: { onClose: () => void }) {
   const [lines, setLines] = useState<ProgressLine[]>([])
   const [done, setDone] = useState(false)
   const [error, setError] = useState('')
