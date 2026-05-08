@@ -27,11 +27,8 @@ function LandingNav() {
       }`}
     >
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
-        <Link to="/" className="flex items-center gap-2.5">
-          <img src="/logo.png" alt="GCTRL" className="h-7 w-auto" />
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-            Ground Control
-          </span>
+        <Link to="/" className="flex items-center">
+          <img src="/gctrl/horizontal-color-on-darkbg.svg" alt="GCTRL" className="h-7 w-auto" />
         </Link>
 
         <nav className="hidden items-center gap-6 md:flex">
@@ -109,8 +106,8 @@ function LandingFooter() {
       <div className="mx-auto max-w-6xl">
         <div className="grid gap-10 md:grid-cols-4">
           <div>
-            <div className="mb-4 flex items-center gap-2">
-              <img src="/logo.png" alt="GCTRL" className="h-6 w-auto" />
+            <div className="mb-4">
+              <img src="/gctrl/wordmark-white.svg" alt="GCTRL" className="h-5 w-auto" />
             </div>
             <p className="text-sm leading-relaxed text-slate-500">
               The knowledge infrastructure layer for enterprise AI. Ground your data. Command your AI.

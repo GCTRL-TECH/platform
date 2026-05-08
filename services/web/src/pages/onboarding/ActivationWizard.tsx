@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Shield, KeyRound, Loader2, Check, ExternalLink, ArrowRight } from 'lucide-react'
+import { KeyRound, Loader2, Check, ExternalLink, ArrowRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 type Step = 'welcome' | 'activate' | 'activating' | 'pulling' | 'done'
@@ -62,12 +62,9 @@ export default function ActivationWizard({ onActivated }: Props) {
     <div className="flex min-h-screen items-center justify-center bg-slate-950 p-6">
       <div className="w-full max-w-md">
         {/* Logo / brand */}
-        <div className="mb-8 text-center">
-          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-500/10 border border-indigo-500/20">
-            <Shield size={28} className="text-indigo-400" />
-          </div>
-          <h1 className="text-xl font-bold text-white">Ground Control</h1>
-          <p className="text-sm text-slate-500 mt-1">Activate your installation</p>
+        <div className="mb-8 flex flex-col items-center gap-3">
+          <img src="/gctrl/stacked-color-on-darkbg.svg" alt="GCTRL" className="h-20 w-auto" />
+          <p className="text-sm text-slate-500">Activate your installation</p>
         </div>
 
         <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-8 shadow-2xl backdrop-blur-xl">

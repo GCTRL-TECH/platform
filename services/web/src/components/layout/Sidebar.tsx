@@ -146,11 +146,12 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
     >
       {/* Logo */}
       <div
-        className={`flex h-16 items-center border-b border-slate-800 ${collapsed ? 'justify-center px-2' : 'gap-2.5 px-5'}`}
+        className={`flex h-16 items-center border-b border-slate-800 ${collapsed ? 'justify-center px-2' : 'px-5'}`}
       >
-        <img src="/logo.png" alt="GCTRL" className={`shrink-0 w-auto ${collapsed ? 'h-8' : 'h-7'}`} />
-        {!collapsed && (
-          <p className="text-[10px] text-slate-500 leading-tight">Knowledge Platform</p>
+        {collapsed ? (
+          <img src="/gctrl/icon-color.svg" alt="GCTRL" className="h-8 w-8 shrink-0" />
+        ) : (
+          <img src="/gctrl/horizontal-color-on-darkbg.svg" alt="GCTRL" className="h-7 w-auto shrink-0" />
         )}
       </div>
 
