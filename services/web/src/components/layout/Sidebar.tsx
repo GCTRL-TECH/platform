@@ -8,7 +8,6 @@ import {
   MessageSquare,
   Settings,
   Coins,
-  Shield,
   Timer,
   LogOut,
   ChevronRight,
@@ -48,11 +47,9 @@ const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    label: 'Integrations',
+    label: 'Account',
     items: [
       { label: 'Tokens', icon: Coins, to: '/billing' },
-      { label: 'Admin', icon: Shield, to: '/admin' },
-      { label: 'Settings', icon: Settings, to: '/settings' },
     ],
   },
 ]
@@ -185,7 +182,7 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
         ))}
       </nav>
 
-      {/* Bottom: user section */}
+      {/* Bottom: settings + user section */}
       <div className={`border-t border-slate-800 ${collapsed ? 'p-1.5' : 'p-3'}`}>
         {!collapsed && (
           <div className="mb-2 flex items-center gap-3 rounded-lg px-2 py-2">
@@ -196,6 +193,11 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
             </div>
           </div>
         )}
+
+        <div className="mb-1">
+          <NavItemLink item={{ label: 'Settings', icon: Settings, to: '/settings' }} collapsed={collapsed} />
+        </div>
+
         {collapsed ? (
           <div className="flex flex-col items-center gap-1">
             <button

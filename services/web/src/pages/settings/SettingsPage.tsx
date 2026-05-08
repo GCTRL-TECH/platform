@@ -28,6 +28,9 @@ import {
   RefreshCw,
   Wifi,
   WifiOff,
+  KeyRound,
+  Shield,
+  Loader2,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
@@ -35,7 +38,7 @@ import { api } from '@/lib/api'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'models' | 'integrations' | 'skills' | 'mcp' | 'n8n' | 'account' | 'infrastructure'
+type TabId = 'license' | 'models' | 'integrations' | 'skills' | 'mcp' | 'n8n' | 'account' | 'infrastructure'
 
 interface Tab {
   id: TabId
@@ -78,6 +81,7 @@ interface RagSkill {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TABS: Tab[] = [
+  { id: 'license', label: 'License', icon: Shield },
   { id: 'models', label: 'AI Models', icon: Brain },
   { id: 'integrations', label: 'Integrations', icon: Plug },
   { id: 'skills', label: 'Skills & Plugins', icon: Puzzle },
@@ -1621,6 +1625,117 @@ function InfrastructureTab() {
   )
 }
 
+// ─── Tab: License ─────────────────────────────────────────────────────────────
+
+function LicenseTab() {
+  const { user } = useAuth()
+  const navigate = useNavigate()
+  const [key, setKey] = useState(() => localStorage.getItem('gctrl_license_key') ?? '')
+  const [show, setShow] = useState(false)
+  const [activating, setActivating] = useState(false)
+  const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null)
+
+  async function handleActivate() {
+    if (!key.trim()) return
+    setActivating(true)
+    setResult(null)
+    try {
+      const res = await fetch('/api/setup/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ license_key: key.trim() }),
+      })
+      const data = await res.json() as { ok?: boolean; error?: string }
+      if (res.ok && data.ok) {
+        localStorage.setItem('gctrl_license_key', key.trim())
+        localStorage.setItem('gctrl_activated', 'true')
+        setResult({ ok: true, msg: 'License updated successfully' })
+      } else {
+        setResult({ ok: false, msg: data.error ?? 'Activation failed' })
+      }
+    } catch {
+      setResult({ ok: false, msg: 'Could not reach activation service' })
+    } finally {
+      setActivating(false)
+    }
+  }
+
+  const hasKey = !!localStorage.getItem('gctrl_license_key')
+
+  return (
+    <div className="space-y-6 max-w-xl">
+      <section>
+        <SectionHeader>License Key</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-4">
+          {hasKey && (
+            <div className="flex items-center gap-2">
+              <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400">
+                <Check size={10} /> Active
+              </span>
+            </div>
+          )}
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-400">License Key</label>
+            <div className="flex gap-2">
+              <input
+                type={show ? 'text' : 'password'}
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && void handleActivate()}
+                placeholder="GCTRL-XXXX-XXXX-XXXX-XXXX-XXXX"
+                className="flex-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => setShow(v => !v)}
+                className="rounded-md border border-slate-700 bg-slate-800 px-3 text-slate-500 hover:text-slate-300 transition-colors"
+              >
+                {show ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+          </div>
+          {result && (
+            <p className={cn('text-xs', result.ok ? 'text-emerald-400' : 'text-red-400')}>
+              {result.msg}
+            </p>
+          )}
+          <button
+            onClick={() => void handleActivate()}
+            disabled={!key.trim() || activating}
+            className="flex items-center gap-2 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white transition-colors"
+          >
+            {activating ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
+            {activating ? 'Activating…' : 'Activate / Update Key'}
+          </button>
+        </div>
+      </section>
+
+      <section>
+        <SectionHeader>Token Balance</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-2xl font-bold text-slate-100">
+                {(user?.tokensBalance ?? 0).toLocaleString()}
+                <span className="ml-1 text-sm font-normal text-slate-500">tokens remaining</span>
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Plan: <span className="capitalize text-slate-300">{user?.tier ?? 'free'}</span>
+              </p>
+            </div>
+            <button
+              onClick={() => navigate('/billing')}
+              className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
+            >
+              Full Usage <ChevronRight size={12} />
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export function SettingsPage() {
@@ -1667,6 +1782,7 @@ export function SettingsPage() {
           <div className="mt-1 h-px bg-slate-800" />
         </div>
 
+        {activeTab === 'license' && <LicenseTab />}
         {activeTab === 'models' && <ModelsTab />}
         {activeTab === 'integrations' && <IntegrationsTab />}
         {activeTab === 'skills' && <SkillsTab />}

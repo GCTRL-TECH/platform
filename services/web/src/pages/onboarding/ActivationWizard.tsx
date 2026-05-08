@@ -34,13 +34,12 @@ export default function ActivationWizard({ onActivated }: Props) {
         return
       }
 
+      localStorage.setItem('gctrl_license_key', licenseKey.trim())
+      localStorage.setItem('gctrl_activated', 'true')
+
       if (data.fusion_engine_pulling) {
         setStep('pulling')
-        // Give the pull a few seconds head start, then proceed
-        // The fusion engine pulls in background — we don't block on it
-        setTimeout(() => {
-          setStep('done')
-        }, 4000)
+        setTimeout(() => setStep('done'), 4000)
       } else {
         setStep('done')
       }

@@ -31,7 +31,10 @@ function ActivationGate({ children }: { children: React.ReactNode }) {
     fetch('http://localhost:7070/status')
       .then((r) => r.json())
       .then((d: { activated?: boolean }) => setActivated(d.activated ?? true))
-      .catch(() => setActivated(true)) // If agent unreachable, don't block the app
+      .catch(() => {
+        // Agent unreachable — only skip wizard if user already activated before
+        setActivated(!!localStorage.getItem('gctrl_activated'))
+      })
   }, [])
 
   useEffect(() => {
