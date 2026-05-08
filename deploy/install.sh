@@ -95,6 +95,66 @@ activate_license() {
   success "License activated | Tier: ${tier} | Credits: ${balance}"
 }
 
+# ── GPU Detection ─────────────────────────────────────────────────────────────
+check_gpu() {
+  # No nvidia-smi or GPU not responding → CPU mode, nothing to do
+  if ! command -v nvidia-smi &>/dev/null || ! nvidia-smi &>/dev/null 2>&1; then
+    info "No NVIDIA GPU detected — KEX will run in CPU mode (fully functional, slower NER)"
+    return 0
+  fi
+
+  local gpu_name
+  gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "NVIDIA GPU")
+  info "GPU detected: ${gpu_name}"
+
+  # Toolkit already installed → done
+  if command -v nvidia-ctk &>/dev/null; then
+    success "nvidia-container-toolkit already installed — GPU acceleration enabled"
+    return 0
+  fi
+
+  echo ""
+  warn "NVIDIA GPU found but nvidia-container-toolkit is not installed."
+  warn "Without it, Docker containers cannot access the GPU."
+  echo ""
+  read -rp "  Install nvidia-container-toolkit now for GPU acceleration? [y/N] " answer
+  if [[ "${answer,,}" != "y" ]]; then
+    info "Skipping GPU toolkit — GCTRL will run in CPU mode"
+    return 0
+  fi
+
+  if command -v apt-get &>/dev/null; then
+    info "Installing nvidia-container-toolkit (apt)..."
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    local distro_id
+    distro_id=$(. /etc/os-release && echo "${ID}${VERSION_ID}")
+    curl -sL "https://nvidia.github.io/libnvidia-container/stable/deb/${distro_id}/nvidia-container-toolkit.list" \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
+    sudo apt-get update -qq
+    sudo apt-get install -y nvidia-container-toolkit
+  elif command -v dnf &>/dev/null; then
+    info "Installing nvidia-container-toolkit (dnf)..."
+    curl -sL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+      | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo > /dev/null
+    sudo dnf install -y nvidia-container-toolkit
+  elif command -v yum &>/dev/null; then
+    info "Installing nvidia-container-toolkit (yum)..."
+    curl -sL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+      | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo > /dev/null
+    sudo yum install -y nvidia-container-toolkit
+  else
+    warn "Unknown package manager. Install manually and re-run:"
+    warn "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+    return 0
+  fi
+
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
+  success "nvidia-container-toolkit installed — GPU acceleration enabled"
+}
+
 # ── Pull Images ───────────────────────────────────────────────────────────────
 pull_images() {
   info "Logging into image registry..."
@@ -160,6 +220,7 @@ start_stack() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   check_prereqs
+  check_gpu
   generate_config
   activate_license
   pull_images
