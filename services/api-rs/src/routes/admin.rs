@@ -69,24 +69,48 @@ async fn list_users(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
     require_role(&claims, "admin")?;
+    // LATERAL join picks the most recent active license per user.
+    // Effective balance = credits_allocated - credits_used when a license exists,
+    // otherwise fall back to users.tokens_balance so admin always sees the same
+    // number as the client billing page.
     let rows = sqlx::query_as::<_, (
         uuid::Uuid, String, Option<String>, String, String,
-        Option<String>, Option<i32>, bool, chrono::DateTime<chrono::Utc>
+        Option<String>, i32, bool, chrono::DateTime<chrono::Utc>,
+        Option<String>, Option<i32>, Option<i32>
     )>(
-        "SELECT id, email, name, role::TEXT AS role, clearance::TEXT AS clearance,
-                tier, tokens_balance, email_verified, created_at
-         FROM users ORDER BY created_at DESC"
+        "SELECT u.id, u.email, u.name,
+                u.role::TEXT AS role,
+                u.clearance::TEXT AS clearance,
+                u.tier,
+                COALESCE(l.credits_allocated - l.credits_used, u.tokens_balance, 0) AS effective_balance,
+                u.email_verified, u.created_at,
+                l.tier AS license_tier,
+                l.credits_allocated,
+                l.credits_used
+         FROM users u
+         LEFT JOIN LATERAL (
+             SELECT tier, credits_allocated, credits_used
+             FROM licenses
+             WHERE user_id = u.id AND status = 'active'
+             ORDER BY activated_at DESC
+             LIMIT 1
+         ) l ON true
+         ORDER BY u.created_at DESC"
     ).fetch_all(&state.db).await?;
 
-    let users: Vec<Value> = rows.into_iter().map(|(id, email, name, role, clearance, tier, bal, verified, created)| {
+    let users: Vec<Value> = rows.into_iter().map(|(id, email, name, role, clearance, tier, bal, verified, created, lic_tier, lic_alloc, lic_used)| {
+        let has_license = lic_alloc.is_some();
         json!({
             "id": id,
             "email": email,
             "name": name,
             "role": role,
             "clearance": clearance,
-            "tier": tier,
-            "tokensBalance": bal.unwrap_or(0),
+            "tier": lic_tier.unwrap_or(tier),
+            "tokensBalance": bal,
+            "hasLicense": has_license,
+            "creditsAllocated": lic_alloc,
+            "creditsUsed": lic_used,
             "emailVerified": verified,
             "createdAt": created,
         })

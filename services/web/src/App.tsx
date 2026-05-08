@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
+import { api } from '@/lib/api'
 import ActivationWizard from '@/pages/onboarding/ActivationWizard'
 import { AppShell } from '@/components/layout/AppShell'
 import { LoginPage } from '@/pages/auth/LoginPage'
@@ -60,6 +61,17 @@ function ActivationGate({ children }: { children: React.ReactNode }) {
 function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useAuth()
   const location = useLocation()
+
+  // Auto-link license key to account on first authenticated session
+  useEffect(() => {
+    if (!isAuthenticated) return
+    const key = localStorage.getItem('gctrl_license_key')
+    if (!key) return
+    if (localStorage.getItem('gctrl_license_linked') === key) return
+    api.post('/billing/license', { license_key: key })
+      .then(() => localStorage.setItem('gctrl_license_linked', key))
+      .catch(() => {})
+  }, [isAuthenticated])
 
   if (isLoading) {
     return (

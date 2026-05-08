@@ -38,6 +38,9 @@ interface UserRow {
   clearance: string
   tokensBalance: number
   tier: string
+  hasLicense: boolean
+  creditsAllocated: number | null
+  creditsUsed: number | null
   emailVerified: boolean
   createdAt: string
 }
@@ -294,7 +297,7 @@ export default function AdminPanel() {
   async function loadUsers() {
     try {
       const { data } = await api.get('/admin/users')
-      setAllUsers(data.users || [])
+      setAllUsers(Array.isArray(data) ? data : (data.users || []))
     } catch { /* non-fatal */ }
   }
 
@@ -464,13 +467,20 @@ export default function AdminPanel() {
                               <button onClick={() => setEditingTokens((prev) => { const n = { ...prev }; delete n[u.id]; return n })} className="text-slate-500 hover:text-slate-300"><X size={12} /></button>
                             </div>
                           ) : (
-                            <button
-                              onClick={() => setEditingTokens((prev) => ({ ...prev, [u.id]: u.tokensBalance }))}
-                              className="group flex items-center gap-1 font-mono text-slate-300 hover:text-slate-100"
-                            >
-                              {u.tokensBalance.toLocaleString()}
-                              <Pencil size={10} className="opacity-0 group-hover:opacity-100 text-slate-500" />
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                onClick={() => setEditingTokens((prev) => ({ ...prev, [u.id]: u.tokensBalance }))}
+                                className="group flex items-center gap-1 font-mono text-slate-300 hover:text-slate-100"
+                              >
+                                {u.tokensBalance.toLocaleString()}
+                                <Pencil size={10} className="opacity-0 group-hover:opacity-100 text-slate-500" />
+                              </button>
+                              {u.hasLicense && (
+                                <span title="License-based balance" className="text-indigo-400">
+                                  <KeyRound size={10} />
+                                </span>
+                              )}
+                            </div>
                           )}
                         </td>
 
