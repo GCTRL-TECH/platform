@@ -20,7 +20,9 @@ import {
   GitMerge,
   ChevronDown,
   CheckCircle,
+  Workflow,
 } from 'lucide-react'
+import { GraphExplorer } from '@/components/GraphExplorer'
 import { format, formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
@@ -97,7 +99,7 @@ interface MergeResponse {
   status: string
 }
 
-type Tab = 'overview' | 'schedule' | 'acl' | 'audit'
+type Tab = 'overview' | 'explorer' | 'schedule' | 'acl' | 'audit'
 
 const CLASSIFICATION_STYLES: Record<
   Classification,
@@ -118,6 +120,7 @@ const CLASSIFICATION_OPTIONS: Classification[] = [
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: 'overview', label: 'Overview', icon: Network },
+  { id: 'explorer', label: 'Explorer', icon: Workflow },
   { id: 'schedule', label: 'Schedule', icon: Calendar },
   { id: 'acl', label: 'Access Control', icon: Shield },
   { id: 'audit', label: 'Audit Log', icon: ScrollText },
@@ -1096,6 +1099,9 @@ export function KGDetailPage() {
           onRefresh={() => refreshMutation.mutate({})}
           isRefreshing={refreshMutation.isPending}
         />
+      )}
+      {activeTab === 'explorer' && (
+        <GraphExplorer compilationId={compilation.id} className="w-full" />
       )}
       {activeTab === 'schedule' && <ScheduleTab compilation={compilation} />}
       {activeTab === 'acl' && <AclTab compilation={compilation} />}

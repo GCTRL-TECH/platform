@@ -22,6 +22,9 @@ import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from . import config
 from .chunking import get_chunker
@@ -61,6 +64,23 @@ def get_redis() -> Optional[redis_lib.Redis]:
             logger.warning(f"Redis not available: {exc}")
             _redis_client = None
     return _redis_client
+
+
+# ── Qdrant client (module-level, re-used by /search handler) ─────────
+
+_qdrant_client: Optional[QdrantClient] = None
+
+
+def get_qdrant_client() -> Optional[QdrantClient]:
+    global _qdrant_client
+    if _qdrant_client is None:
+        try:
+            _qdrant_client = QdrantClient(url=config.QDRANT_URL)
+            logger.info(f"Qdrant client initialized: {config.QDRANT_URL}")
+        except Exception as exc:
+            logger.warning(f"Qdrant not available: {exc}")
+            _qdrant_client = None
+    return _qdrant_client
 
 
 # ── Core extraction pipeline ─────────────────────────────────────────
@@ -404,6 +424,12 @@ class ExtractResponse(BaseModel):
     vector_stats: dict = {}
 
 
+class SearchReq(BaseModel):
+    query: str
+    limit: int = 5
+    compilation_id: Optional[str] = None
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 @app.post("/extract", response_model=ExtractResponse)
@@ -592,6 +618,98 @@ async def health_endpoint():
             "running": _worker_running,
         },
     }
+
+
+# ── Search endpoints ─────────────────────────────────────────────────
+
+@app.get("/search/health")
+async def search_health_endpoint():
+    """Diagnostics: confirm search endpoint is reachable."""
+    return {"ok": True}
+
+
+@app.post("/search")
+async def search_endpoint(req: SearchReq):
+    """
+    Semantic search over stored chunks in Qdrant.
+
+    Embeds the query, then performs an approximate nearest-neighbour search
+    against the configured Qdrant collection.  An optional compilation_id
+    filter narrows results to a specific KG compilation.
+    """
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail={"error": "query must not be empty"})
+    if len(query) > 2000:
+        raise HTTPException(status_code=400, detail={"error": "query exceeds 2000 character limit"})
+
+    # Embed the query
+    vector = get_embedding_client().embed(query)
+    if vector is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Embedding service unavailable"},
+        )
+
+    # Build optional compilation_id filter
+    qdrant_filter: Optional[Filter] = None
+    if req.compilation_id:
+        qdrant_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="compilation_id",
+                    match=MatchValue(value=req.compilation_id),
+                )
+            ]
+        )
+
+    # Query Qdrant
+    qc = get_qdrant_client()
+    if qc is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Vector search unavailable"},
+        )
+
+    try:
+        hits = qc.search(
+            collection_name=config.QDRANT_COLLECTION,
+            query_vector=vector,
+            limit=max(1, req.limit),
+            query_filter=qdrant_filter,
+            with_payload=True,
+        )
+    except UnexpectedResponse as exc:
+        if exc.status_code == 404:
+            # Collection does not exist yet — return empty results, not an error
+            logger.warning(
+                f"/search: collection '{config.QDRANT_COLLECTION}' not found in Qdrant"
+            )
+            return {"chunks": []}
+        logger.error(f"/search Qdrant error: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Vector search unavailable"},
+        )
+    except Exception as exc:
+        logger.error(f"/search Qdrant error: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Vector search unavailable"},
+        )
+
+    chunks = []
+    for hit in hits:
+        payload = hit.payload or {}
+        chunks.append({
+            "text": payload.get("text", ""),
+            "score": hit.score,
+            "entity_mentions": payload.get("entity_mentions", []),
+            "source": payload.get("source_document_id", ""),
+            "chunk_id": str(hit.id),
+        })
+
+    return {"chunks": chunks}
 
 
 # ── Local dev entry point ─────────────────────────────────────────────

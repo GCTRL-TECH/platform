@@ -40,13 +40,14 @@ fn build_router(state: Arc<models::AppState>) -> Router {
     use crate::middleware::auth::{require_auth, optional_auth};
 
     let protected = Router::new()
-        .nest("/api/users",   routes::users::router())
-        .nest("/api/kex",     routes::kex::router())
-        .nest("/api/fuse",    routes::fuse::router())
-        .nest("/api/kg",      routes::kg::router())
-        .nest("/api/billing", routes::billing::router())
-        .nest("/api/admin",   routes::admin::router())
-        .nest("/api/update",  routes::update::router())
+        .nest("/api/users",       routes::users::router())
+        .nest("/api/kex",         routes::kex::router())
+        .nest("/api/fuse",        routes::fuse::router())
+        .nest("/api/kg",          routes::kg::router())
+        .nest("/api/billing",     routes::billing::router())
+        .nest("/api/admin",       routes::admin::router())
+        .nest("/api/update",      routes::update::router())
+        .nest("/api/connectors",  routes::connectors::router())
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let optional = Router::new()
@@ -57,6 +58,7 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/health", routes::health::router())
         .nest("/api/auth",   routes::auth::router())
         .nest("/api/setup",  routes::setup::router())
+        .merge(routes::connectors::public_router())
         .merge(protected)
         .merge(optional)
         .layer(tower_http::cors::CorsLayer::permissive())

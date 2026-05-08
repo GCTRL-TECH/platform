@@ -13,6 +13,8 @@ pub struct Config {
     pub qdrant_url:         String,
     pub upload_dir:         String,
     pub bcrypt_rounds:      u32,
+    pub google_client_id:     String,
+    pub google_client_secret: String,
 }
 
 impl Config {
@@ -31,6 +33,8 @@ impl Config {
             qdrant_url:         opt_env("QDRANT_URL",         "http://localhost:6333"),
             upload_dir:         opt_env("UPLOAD_DIR",         "/tmp/gctrl-uploads"),
             bcrypt_rounds:      env_u16("BCRYPT_ROUNDS", 12) as u32,
+            google_client_id:     opt_env("GOOGLE_CLIENT_ID",     ""),
+            google_client_secret: opt_env("GOOGLE_CLIENT_SECRET", ""),
         }
     }
 }

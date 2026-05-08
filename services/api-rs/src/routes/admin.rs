@@ -106,7 +106,7 @@ async fn list_users(
             "name": name,
             "role": role,
             "clearance": clearance,
-            "tier": lic_tier.unwrap_or(tier),
+            "tier": lic_tier.or(tier),
             "tokensBalance": bal,
             "hasLicense": has_license,
             "creditsAllocated": lic_alloc,

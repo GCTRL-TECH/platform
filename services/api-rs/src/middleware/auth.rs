@@ -37,16 +37,17 @@ pub async fn optional_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if let Some(token) = req.headers()
+    // Always insert Option<JwtClaims> so handlers can extract Extension<Option<JwtClaims>>.
+    let claims: Option<JwtClaims> = req.headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        let key = DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes());
-        if let Ok(data) = decode::<JwtClaims>(token, &key, &Validation::new(Algorithm::HS256)) {
-            req.extensions_mut().insert(data.claims);
-        }
-    }
+        .and_then(|token| {
+            let key = DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes());
+            decode::<JwtClaims>(token, &key, &Validation::new(Algorithm::HS256)).ok()
+        })
+        .map(|data| data.claims);
+    req.extensions_mut().insert(claims);
     next.run(req).await
 }
 
