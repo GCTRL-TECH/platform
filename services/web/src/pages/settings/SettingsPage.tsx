@@ -1645,11 +1645,19 @@ function LicenseTab() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ license_key: key.trim() }),
       })
-      const data = await res.json() as { ok?: boolean; error?: string }
+      const data = await res.json() as { ok?: boolean; error?: string; tier?: string; credits_balance?: number }
       if (res.ok && data.ok) {
         localStorage.setItem('gctrl_license_key', key.trim())
         localStorage.setItem('gctrl_activated', 'true')
-        setResult({ ok: true, msg: 'License updated successfully' })
+        // Link the license to the logged-in user account
+        try {
+          await api.post('/billing/license', {
+            license_key: key.trim(),
+            tier: data.tier,
+            credits_allocated: data.credits_balance,
+          })
+        } catch { /* non-fatal — license stored locally, user can re-link later */ }
+        setResult({ ok: true, msg: 'License activated and linked to your account' })
       } else {
         setResult({ ok: false, msg: data.error ?? 'Activation failed' })
       }
