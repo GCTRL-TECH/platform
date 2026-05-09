@@ -198,12 +198,17 @@ async fn list(
 ) -> Result<Json<Value>> {
     let limit  = q.limit.unwrap_or(20).min(100);
     let offset = q.offset.unwrap_or(0);
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<i32>, Option<i32>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, name, description, classification, node_count, edge_count, created_at
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Vec<Uuid>, Option<i32>, Option<i32>, Option<Uuid>, chrono::DateTime<chrono::Utc>)>(
+        "SELECT id, name, description, classification, COALESCE(source_job_ids, '{}'::uuid[]),
+                node_count, edge_count, folder_id, created_at
          FROM compilations WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
     ).bind(claims.sub).bind(limit).bind(offset).fetch_all(&state.db).await?;
-    let comps: Vec<Value> = rows.into_iter().map(|(id,n,d,cls,nc,ec,c)| {
-        json!({ "id":id,"name":n,"description":d,"classification":cls,"nodeCount":nc,"edgeCount":ec,"createdAt":c })
+    let comps: Vec<Value> = rows.into_iter().map(|(id,n,d,cls,sji,nc,ec,fid,c)| {
+        json!({
+            "id": id, "name": n, "description": d, "classification": cls,
+            "sourceJobIds": sji, "nodeCount": nc, "edgeCount": ec,
+            "folderId": fid, "createdAt": c,
+        })
     }).collect();
     Ok(Json(json!({ "compilations": comps })))
 }
@@ -227,11 +232,17 @@ async fn get_one(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let row = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<i32>, Option<i32>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, name, description, classification, node_count, edge_count, created_at FROM compilations WHERE id=$1 AND user_id=$2"
+    let row = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Vec<Uuid>, Option<i32>, Option<i32>, Option<Uuid>, chrono::DateTime<chrono::Utc>)>(
+        "SELECT id, name, description, classification, COALESCE(source_job_ids, '{}'::uuid[]),
+                node_count, edge_count, folder_id, created_at
+         FROM compilations WHERE id=$1 AND user_id=$2"
     ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
-    let (id,n,d,cls,nc,ec,c) = row;
-    Ok(Json(json!({ "id":id,"name":n,"description":d,"classification":cls,"nodeCount":nc,"edgeCount":ec,"createdAt":c })))
+    let (id, n, d, cls, sji, nc, ec, fid, c) = row;
+    Ok(Json(json!({
+        "id": id, "name": n, "description": d, "classification": cls,
+        "sourceJobIds": sji, "nodeCount": nc, "edgeCount": ec,
+        "folderId": fid, "createdAt": c,
+    })))
 }
 
 async fn update(

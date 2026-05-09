@@ -155,7 +155,13 @@ function SourcePicker({
 
   function getJobPreview(job: KexJob): string {
     if (!job.input) return job.id.slice(0, 12)
-    const t = (job.input['text'] as string) || (job.input['originalFilename'] as string) || ''
+    // File uploads store the original filename under `fileName` (api-rs) or
+    // `originalFilename` (KEX worker). Text extractions store the input under `text`.
+    const t =
+      (job.input['fileName'] as string) ||
+      (job.input['originalFilename'] as string) ||
+      (job.input['text'] as string) ||
+      ''
     return t.length > 48 ? t.slice(0, 48) + '...' : t || job.id.slice(0, 12)
   }
 

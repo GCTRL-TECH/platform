@@ -31,12 +31,13 @@ async fn merge(
         .bind(claims.sub).execute(&state.db).await?;
 
     let comp_id = Uuid::new_v4();
+    // source_job_ids column is UUID[] — bind Vec<Uuid> directly (NOT jsonb).
     sqlx::query(
         "INSERT INTO compilations (id, user_id, name, description, source_job_ids, classification, version)
          VALUES ($1, $2, $3, $4, $5, 'INTERNAL', 1)"
     )
     .bind(comp_id).bind(claims.sub).bind(&req.name).bind(&req.description)
-    .bind(serde_json::to_value(&req.source_job_ids).unwrap())
+    .bind(&req.source_job_ids)
     .execute(&state.db).await?;
 
     let job_id = Uuid::new_v4();

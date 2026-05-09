@@ -347,6 +347,32 @@ else
 fi
 rm -f "$LARGE_BODY_FILE" 2>/dev/null
 
+# ─── 6c. FUSE merge create (regression: Vec<Uuid> binding to UUID[]) ─
+section "6c. FUSE merge — graph creation from source extractions"
+
+if [ -n "$JOB_ID" ]; then
+  MERGE_BODY=$(printf '{"name":"E2E Merge Test","sourceJobIds":["%s"]}' "$JOB_ID")
+  RESP=$(curl -sf --max-time 10 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -d "$MERGE_BODY" "$API_BASE/fuse/merge" 2>/dev/null || echo "")
+  MERGE_JOB_ID=$(jget "$RESP" "jobId")
+  MERGE_COMP_ID=$(jget "$RESP" "compilationId")
+  if [ -n "$MERGE_JOB_ID" ] && [ -n "$MERGE_COMP_ID" ]; then
+    pass "POST /fuse/merge accepts sourceJobIds and creates compilation"
+  else
+    fail "FUSE merge failed (Database error): response=$RESP"
+  fi
+
+  # Verify the created compilation actually has source_job_ids stored as UUID[]
+  if [ -n "$MERGE_COMP_ID" ]; then
+    RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/kg/compilations/$MERGE_COMP_ID" 2>/dev/null || echo "")
+    SRC_LEN=$(jlen "$RESP" "sourceJobIds")
+    if [ "$SRC_LEN" -ge 1 ]; then
+      pass "Merged compilation persists sourceJobIds (count=$SRC_LEN)"
+    else
+      fail "Merged compilation has empty sourceJobIds (UUID[] binding broken)"
+    fi
+  fi
+fi
+
 # ─── 7. KEX semantic search (post-extraction) ────────────────────────
 section "7. KEX semantic search"
 
