@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::{error::{AppError, Result}, middleware::auth::{require_role, JwtClaims}};
 
 #[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct SafeUser {
     id: Uuid,
     email: String,
@@ -17,7 +18,6 @@ struct SafeUser {
     clearance: Option<String>,
     tier: Option<String>,
     tokens_balance: Option<i32>,
-    #[serde(rename = "defaultOntologyId")]
     default_ontology_id: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
 }

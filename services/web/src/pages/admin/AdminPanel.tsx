@@ -68,12 +68,14 @@ interface AuditEntry {
 
 type Tab = 'overview' | 'users' | 'audit'
 
-const ROLE_COLORS: Record<string, string> = {
+// Reserved for future role-coloured badges in user list.
+const _ROLE_COLORS: Record<string, string> = {
   viewer:  'bg-slate-700 text-slate-300',
   analyst: 'bg-blue-900/50 text-blue-300',
   editor:  'bg-purple-900/50 text-purple-300',
   admin:   'bg-red-900/50 text-red-300',
 }
+void _ROLE_COLORS;
 
 const CLEARANCE_COLORS: Record<string, string> = {
   PUBLIC:       'bg-emerald-900/50 text-emerald-300',
