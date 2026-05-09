@@ -103,10 +103,34 @@ class TextChunker:
             sentence_positions.append((idx, idx + len(sent)))
             pos = idx + len(sent)
 
+        # Hard safety cap to prevent any infinite-loop pathology.
+        max_iterations = max(2048, len(sentences) * 4)
+        iterations = 0
+
         chunk_sequence = 0
         i = 0
 
         while i < len(sentences):
+            iterations += 1
+            if iterations > max_iterations:
+                logger.warning(
+                    f"TextChunker: hit safety cap ({max_iterations}) — "
+                    f"force-flushing remaining {len(sentences) - i} sentences as one chunk"
+                )
+                # Hard-stop: dump remainder and exit. Better one giant chunk than infinite loop.
+                tail = "".join(sentences[i:])
+                if tail.strip() and i < len(sentence_positions):
+                    chunks.append({
+                        "content": tail.strip(),
+                        "start_char": sentence_positions[i][0],
+                        "end_char": sentence_positions[-1][1],
+                        "chunk_sequence": chunk_sequence,
+                    })
+                    chunk_sequence += 1
+                current_sentences = []
+                current_len = 0
+                break
+
             sent = sentences[i]
             sent_len = len(sent)
 
@@ -115,14 +139,14 @@ class TextChunker:
                 current_start = sentence_positions[i][0]
 
             if current_len + sent_len <= self.chunk_size or current_len == 0:
-                # Fits in current chunk (always take at least one sentence)
+                # Fits in current chunk (always take at least one sentence even if oversize)
                 current_sentences.append(sent)
                 current_len += sent_len
                 i += 1
             else:
                 # Flush current chunk
                 chunk_text = "".join(current_sentences)
-                chunk_end = sentence_positions[i - 1][1]  # end of last included sentence
+                chunk_end = sentence_positions[i - 1][1]
                 chunks.append({
                     "content": chunk_text.strip(),
                     "start_char": current_start,
@@ -131,20 +155,23 @@ class TextChunker:
                 })
                 chunk_sequence += 1
 
-                # Build overlap: walk backwards to find sentences that fill `overlap` chars
+                # Build overlap walking backwards. CRITICAL: cap overlap to half of chunk_size.
+                # Without this cap, a long previous sentence makes overlap_len ≥ chunk_size,
+                # so when the next iteration hits the same `else` branch (sentence still
+                # doesn't fit AND current_len != 0), we loop forever without advancing `i`.
+                overlap_cap = self.chunk_size // 2
                 overlap_sentences: list[str] = []
                 overlap_len = 0
                 j = len(current_sentences) - 1
                 while j >= 0 and overlap_len < self.overlap:
-                    overlap_sentences.insert(0, current_sentences[j])
-                    overlap_len += len(current_sentences[j])
+                    next_s = current_sentences[j]
+                    if overlap_len + len(next_s) > overlap_cap:
+                        break
+                    overlap_sentences.insert(0, next_s)
+                    overlap_len += len(next_s)
                     j -= 1
 
-                # New chunk starts from overlap
                 if overlap_sentences:
-                    # Find the start position of the first overlap sentence in the original
-                    first_overlap_sent = overlap_sentences[0]
-                    # Search backwards from chunk_end for its position
                     overlap_start_idx = len(current_sentences) - len(overlap_sentences)
                     current_start = sentence_positions[i - len(current_sentences) + overlap_start_idx][0]
                 else:
@@ -152,6 +179,13 @@ class TextChunker:
 
                 current_sentences = overlap_sentences
                 current_len = overlap_len
+
+                # Defensive: if overlap is still big enough to block the upcoming sentence,
+                # drop the overlap entirely so we are guaranteed to advance.
+                if current_len > 0 and current_len + sent_len > self.chunk_size:
+                    current_sentences = []
+                    current_len = 0
+                    current_start = sentence_positions[i][0]
 
         # Flush remaining sentences
         if current_sentences:

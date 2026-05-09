@@ -306,6 +306,47 @@ else
   fail "GET /kex/jobs missing 'input' — UI will show '—' instead of filenames"
 fi
 
+# ─── 6b. KEX large-text extraction (chunker stress test) ─────────────
+section "6b. KEX large-text extraction (regression: chunker hangs on long sentences)"
+
+# Synthesize a 9k-char payload with many repeated long sentences. Pre-fix this would hang
+# the chunker forever; post-fix it must complete inside the 240s budget.
+SENT="Anthropic is an AI safety company founded by Dario Amodei and Daniela Amodei in San Francisco that develops Claude. "
+LONG_TEXT=""
+for k in $(seq 1 80); do LONG_TEXT="$LONG_TEXT$SENT"; done
+
+# Use a temp file for the JSON body to avoid bash arg-length / escaping issues.
+LARGE_BODY_FILE=$(mktemp 2>/dev/null || echo "/tmp/e2e_large_body.json")
+printf '{"text":"%s"}' "$LONG_TEXT" > "$LARGE_BODY_FILE"
+
+if [ ${#LONG_TEXT} -gt 5000 ]; then
+  RESP=$(curl -sf --max-time 10 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" --data-binary @"$LARGE_BODY_FILE" "$API_BASE/kex/extract" 2>/dev/null || echo "")
+  LARGE_JOB_ID=$(jget "$RESP" "jobId")
+  if [ -n "$LARGE_JOB_ID" ]; then
+    echo -n "  ⏳ Waiting up to 240s for large-text job to finish..."
+    WAIT=0; LSTATUS="pending"
+    while [ $WAIT -lt 240 ]; do
+      RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$LARGE_JOB_ID" 2>/dev/null || echo "")
+      LSTATUS=$(jget "$RESP" "status")
+      if [ "$LSTATUS" = "completed" ] || [ "$LSTATUS" = "failed" ]; then break; fi
+      sleep 5; WAIT=$((WAIT+5)); echo -n "."
+    done
+    echo ""
+    if [ "$LSTATUS" = "completed" ]; then
+      pass "Large-text job (${#LONG_TEXT} chars) completed without hanging"
+    elif [ "$LSTATUS" = "failed" ]; then
+      fail "Large-text job failed: $(jget "$RESP" error)"
+    else
+      fail "Large-text job stuck in '$LSTATUS' after 240s — chunker likely hung"
+    fi
+  else
+    fail "Could not submit large-text job"
+  fi
+else
+  echo "  (skipping — could not synthesize test payload)"
+fi
+rm -f "$LARGE_BODY_FILE" 2>/dev/null
+
 # ─── 7. KEX semantic search (post-extraction) ────────────────────────
 section "7. KEX semantic search"
 

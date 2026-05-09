@@ -114,8 +114,13 @@ def run_pipeline(
     logger.info(f"[{job_id}] KG: {stats}")
 
     # 4. Chunk text for vector store
+    logger.info(f"[{job_id}] Chunker: starting on {len(text)} chars")
     chunker = get_chunker()
-    chunks = chunker.chunk(text)
+    try:
+        chunks = chunker.chunk(text)
+    except Exception as exc:
+        logger.error(f"[{job_id}] Chunker FAILED: {exc}", exc_info=True)
+        chunks = [{"content": text[:8000], "start_char": 0, "end_char": min(8000, len(text)), "chunk_sequence": 0}]
     logger.info(f"[{job_id}] Chunked: {len(chunks)} chunks")
 
     # 5. Embed chunks (graceful degradation: failed embeddings become None)
