@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   api:
-    build: ./services/api
+    build: ./services/api-rs
     container_name: gctrl-api
     ports:
       - "4000:4000"
@@ -53,25 +53,9 @@ services:
       - GCTRL
     restart: unless-stopped
 
-  gctrl-agent:
-    image: ghcr.io/gctrl/agent:latest
-    container_name: gctrl-agent
-    ports:
-      - "127.0.0.1:7070:7070"
-    volumes:
-      - ./config:/app/config:ro
-    environment:
-      - GCTRL_LICENSE_JWT_PATH=/app/config/license.jwt
-      - GCTRL_LICENSE_PUBLIC_KEY=${GCTRL_LICENSE_PUBLIC_KEY}
-      - GCTRL_API_URL=https://api.gctrl.tech
-    networks:
-      - GCTRL
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7070/status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
+  # gctrl-agent: license enforcement — disabled for local dev.
+  # Re-enable for prod testing by pulling ghcr.io/gctrl-tech/agent:latest
+  # after `docker login ghcr.io`.
 
   kex:
     build: ./services/kex
@@ -94,19 +78,12 @@ services:
     depends_on:
       redis:
         condition: service_started
-      gctrl-agent:
+      postgres:
         condition: service_healthy
     networks:
       - GCTRL
       - ollama-net
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   fuse:
     build: ./services/fuse
@@ -124,7 +101,7 @@ services:
     depends_on:
       redis:
         condition: service_started
-      gctrl-agent:
+      postgres:
         condition: service_healthy
     networks:
       - GCTRL

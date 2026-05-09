@@ -10,3 +10,4 @@ pub mod admin;
 pub mod setup;
 pub mod update;
 pub mod connectors;
+pub mod ontologies;

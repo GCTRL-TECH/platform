@@ -44,6 +44,8 @@ async fn extract(
     sqlx::query("UPDATE users SET tokens_balance = tokens_balance - 5 WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
 
+    let (ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, req.ontology_id).await;
+
     let job_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO jobs (id, user_id, type, status, input) VALUES ($1, $2, 'kex_extract', 'pending', $3)"
@@ -51,19 +53,45 @@ async fn extract(
     .bind(job_id).bind(claims.sub)
     .bind(json!({
         "text": req.text,
-        "ontologyId": req.ontology_id,
+        "ontologyId": ontology_id,
         "discoveryMode": req.discovery_mode.unwrap_or_else(|| "extract".into()),
     }))
     .execute(&state.db).await?;
 
     let payload = json!({
         "job_id": job_id, "user_id": claims.sub, "type": "text",
-        "input": req.text, "entity_types": null,
+        "input": req.text, "entity_types": entity_types,
     });
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+}
+
+/// Resolves the ontology to use for an extraction job:
+///   1. If caller passed `ontology_id`, use it.
+///   2. Else fall back to the user's `default_ontology_id` (seeded on registration).
+///   3. Returns the resolved id + the entity type names (used by KEX as GLiNER labels).
+///      Returns `None` for entity_types if no ontology resolved → KEX uses its 87 defaults.
+async fn resolve_ontology(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    requested: Option<Uuid>,
+) -> (Option<Uuid>, Option<Vec<String>>) {
+    let ontology_id: Option<Uuid> = match requested {
+        Some(id) => Some(id),
+        None => sqlx::query_scalar::<_, Option<Uuid>>("SELECT default_ontology_id FROM users WHERE id = $1")
+            .bind(user_id).fetch_optional(db).await.ok().flatten().flatten(),
+    };
+
+    let entity_types = if let Some(oid) = ontology_id {
+        sqlx::query_scalar::<_, String>("SELECT name FROM ontology_entity_types WHERE ontology_id = $1 ORDER BY name")
+            .bind(oid).fetch_all(db).await.ok().filter(|v: &Vec<String>| !v.is_empty())
+    } else {
+        None
+    };
+
+    (ontology_id, entity_types)
 }
 
 async fn upload(
@@ -93,19 +121,40 @@ async fn upload(
     let bytes = file_bytes.ok_or(AppError::BadRequest("No file field".into()))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
+    let mimetype = match file_name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "pdf"  => "application/pdf",
+        "txt"  => "text/plain",
+        "md"   => "text/markdown",
+        "html" | "htm" => "text/html",
+        "csv"  => "text/csv",
+        "json" => "application/json",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _      => "application/octet-stream",
+    };
+
     let job_id = Uuid::new_v4();
     sqlx::query("UPDATE users SET tokens_balance = tokens_balance - 5 WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
+
+    let (resolved_ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, ontology_id).await;
+
     sqlx::query(
         "INSERT INTO jobs (id, user_id, type, status, input) VALUES ($1, $2, 'kex_upload', 'pending', $3)"
     )
     .bind(job_id).bind(claims.sub)
-    .bind(json!({ "fileName": file_name, "ontologyId": ontology_id }))
+    .bind(json!({ "fileName": file_name, "ontologyId": resolved_ontology_id }))
     .execute(&state.db).await?;
+
+    // KEX worker parses `input` as a JSON string with fileBase64, mimetype, originalFilename
+    let kex_input = json!({
+        "fileBase64": encoded,
+        "mimetype": mimetype,
+        "originalFilename": file_name,
+    }).to_string();
 
     let payload = json!({
         "job_id": job_id, "user_id": claims.sub, "type": "file",
-        "input": encoded, "file_name": file_name,
+        "input": kex_input, "file_name": file_name, "entity_types": entity_types,
     });
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
         .map_err(|e| AppError::Internal(e.to_string()))?;

@@ -35,50 +35,59 @@ JWT=""
 COMPILATION_ID=""
 JOB_ID=""
 
-# ── json helper ───────────────────────────────────────────────────────────────
-# Usage: json_get <json_string> <key>
+# ── json helper (jq preferred, python3 fallback) ──────────────────────────────
+# Usage: json_get <json_string> <key.subkey>
+JSON_TOOL=""
+if command -v jq >/dev/null 2>&1; then JSON_TOOL=jq
+elif command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then JSON_TOOL=python3
+else echo "ERROR: need jq or python3 on PATH" >&2; exit 1; fi
+
 json_get() {
-  python3 -c "
+  if [ "$JSON_TOOL" = "jq" ]; then
+    printf '%s' "$1" | jq -r ".${2} // empty" 2>/dev/null
+  else
+    python3 -c "
 import sys, json
 try:
     data = json.loads(sys.argv[1])
-    # Support dot notation: key1.key2
     keys = sys.argv[2].split('.')
-    for k in keys:
-        data = data[k]
+    for k in keys: data = data[k]
     print(data if not isinstance(data, (dict, list)) else json.dumps(data))
-except Exception as e:
-    print('')
+except Exception: print('')
 " "$1" "$2"
+  fi
 }
 
 json_has_key() {
-  python3 -c "
+  if [ "$JSON_TOOL" = "jq" ]; then
+    printf '%s' "$1" | jq -e "has(\"${2%%.*}\")" >/dev/null 2>&1
+  else
+    python3 -c "
 import sys, json
 try:
     data = json.loads(sys.argv[1])
     keys = sys.argv[2].split('.')
-    for k in keys:
-        data = data[k]
-    # Empty list/dict still counts as present
+    for k in keys: data = data[k]
     sys.exit(0)
-except Exception:
-    sys.exit(1)
+except Exception: sys.exit(1)
 " "$1" "$2"
+  fi
 }
 
 json_array_len() {
-  python3 -c "
+  if [ "$JSON_TOOL" = "jq" ]; then
+    printf '%s' "$1" | jq -r ".${2} | length" 2>/dev/null || echo 0
+  else
+    python3 -c "
 import sys, json
 try:
     data = json.loads(sys.argv[1])
     keys = sys.argv[2].split('.')
-    for k in keys:
-        data = data[k]
+    for k in keys: data = data[k]
     print(len(data))
-except Exception:
-    print(0)
+except Exception: print(0)
 " "$1" "$2"
+  fi
 }
 
 # ── core test runner ──────────────────────────────────────────────────────────

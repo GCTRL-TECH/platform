@@ -80,6 +80,9 @@ async fn register(
     .bind(id).bind(&req.email).bind(&hash).bind(&req.name)
     .execute(&state.db).await?;
 
+    // Auto-seed default ontology for new user (best-effort: failures must not break registration).
+    seed_default_ontology(&state.db, id).await;
+
     let claims = JwtClaims {
         sub: id, email: req.email.clone(), role: "viewer".into(),
         clearance: Some("PUBLIC".into()),
@@ -181,4 +184,97 @@ async fn reset_password(
         .execute(&state.db).await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Seed a "General Knowledge" default ontology for a freshly-registered user.
+///
+/// Best-effort: any DB error is logged-and-swallowed so seeding hiccups can never
+/// break the registration flow. Uses direct SQL inserts (no dependency on the
+/// ontologies route handlers) so this compiles independently.
+async fn seed_default_ontology(db: &sqlx::PgPool, user_id: Uuid) {
+    let ontology_id = Uuid::new_v4();
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO ontologies (id, user_id, name, description, scope, source, entity_type_count) \
+         VALUES ($1, $2, 'General Knowledge', \
+                 'Default ontology with common entity types — covers people, organizations, places, dates, and concepts', \
+                 'private', 'system', 10)"
+    )
+    .bind(ontology_id)
+    .bind(user_id)
+    .execute(db).await {
+        tracing::warn!(?e, %user_id, "failed to seed default ontology row");
+        return;
+    }
+
+    let entity_types: [(&str, &str, &str, &[&str]); 10] = [
+        ("Q5",        "Person",       "#6366f1", &["individual", "human", "name"]),
+        ("Q43229",    "Organization", "#f59e0b", &["company", "corporation", "agency", "institution"]),
+        ("Q17334923", "Location",     "#10b981", &["place", "city", "country", "region", "address"]),
+        ("Q205892",   "Date",         "#ec4899", &["time", "datetime", "period", "year"]),
+        ("Q2424752",  "Product",      "#8b5cf6", &["item", "goods", "service"]),
+        ("Q1656682",  "Event",        "#ef4444", &["happening", "occurrence", "meeting"]),
+        ("Q1368",     "Money",        "#22c55e", &["currency", "price", "amount", "value"]),
+        ("Q49848",    "Document",     "#06b6d4", &["file", "paper", "contract", "report"]),
+        ("Q151885",   "Concept",      "#94a3b8", &["idea", "topic", "subject"]),
+        ("Q9158",     "Email",        "#f97316", &["emailaddress"]),
+    ];
+
+    for (qid, name, color, aliases) in entity_types {
+        let aliases_vec: Vec<String> = aliases.iter().map(|s| (*s).to_string()).collect();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO ontology_entity_types (ontology_id, qid, name, aliases, color, confidence_threshold) \
+             VALUES ($1, $2, $3, $4, $5, 0.3)"
+        )
+        .bind(ontology_id)
+        .bind(qid)
+        .bind(name)
+        .bind(&aliases_vec)
+        .bind(color)
+        .execute(db).await {
+            tracing::warn!(?e, %user_id, entity_type = name, "failed to seed default entity type");
+        }
+    }
+
+    if let Err(e) = sqlx::query("UPDATE users SET default_ontology_id = $1 WHERE id = $2")
+        .bind(ontology_id)
+        .bind(user_id)
+        .execute(db).await {
+        tracing::warn!(?e, %user_id, "failed to set default_ontology_id on user");
+    }
+
+    seed_default_workspace(db, user_id).await;
+}
+
+/// Seeds a default workspace for a freshly-registered user:
+///   - 1 KG folder ("My Workspace")
+///   - 1 empty compilation ("My First Knowledge Base") inside that folder
+///
+/// This ensures KEX uploads and FUSE merges have a target out of the box —
+/// the user can ingest their first document immediately without any setup.
+async fn seed_default_workspace(db: &sqlx::PgPool, user_id: Uuid) {
+    let folder_id = Uuid::new_v4();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO kg_folders (id, user_id, name, position) VALUES ($1, $2, 'My Workspace', 0)"
+    )
+    .bind(folder_id)
+    .bind(user_id)
+    .execute(db).await {
+        tracing::warn!(?e, %user_id, "failed to seed default folder");
+        return;
+    }
+
+    let compilation_id = Uuid::new_v4();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO compilations (id, user_id, name, description, classification, folder_id) \
+         VALUES ($1, $2, 'My First Knowledge Base', \
+                 'Default knowledge graph — extractions land here unless you create a new one', \
+                 'INTERNAL', $3)"
+    )
+    .bind(compilation_id)
+    .bind(user_id)
+    .bind(folder_id)
+    .execute(db).await {
+        tracing::warn!(?e, %user_id, "failed to seed default compilation");
+    }
 }

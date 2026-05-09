@@ -120,7 +120,7 @@ async fn create(
     sqlx::query("INSERT INTO compilations (id, user_id, name, description, classification, source_job_ids, version) VALUES ($1,$2,$3,$4,$5,$6,1)")
         .bind(id).bind(claims.sub).bind(&req.name).bind(&req.description)
         .bind(req.classification.unwrap_or_else(|| "INTERNAL".into()))
-        .bind(serde_json::to_value(req.source_job_ids.unwrap_or_default()).unwrap())
+        .bind(req.source_job_ids.unwrap_or_default())
         .execute(&state.db).await?;
     Ok(Json(json!({ "id": id, "name": req.name })))
 }

@@ -129,6 +129,10 @@ def _worker_loop() -> None:
             classification = payload.get("classification", "PUBLIC")
             match_rules = payload.get("match_rules")
 
+            # Authoritative state: mark job as 'processing' in Postgres
+            # before doing the heavy merge work.
+            _update_job_status(job_id, "processing")
+
             check_result = check_credits("fuse_merge", 0)
             result = run_merge(
                 compilation_id, source_job_ids, user_id, classification,
@@ -146,9 +150,40 @@ def _worker_loop() -> None:
     logger.info("FUSE worker thread stopped")
 
 
+def _update_job_status(job_id: str, status: str, result: dict | None = None, error: str | None = None) -> None:
+    """Update jobs.status in Postgres directly. The api-rs read this column,
+    so this is the authoritative status, not the redis pubsub."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn:
+            with conn.cursor() as cur:
+                if status == "completed":
+                    import json as _json
+                    cur.execute(
+                        "UPDATE jobs SET status='completed', result=%s::jsonb, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
+                        (_json.dumps(result or {}), job_id),
+                    )
+                elif status == "processing":
+                    cur.execute(
+                        "UPDATE jobs SET status='processing', updated_at=NOW() WHERE id=%s",
+                        (job_id,),
+                    )
+                else:  # failed
+                    cur.execute(
+                        "UPDATE jobs SET status='failed', error=%s, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
+                        (error or "Unknown error", job_id),
+                    )
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"Failed to update jobs.status for {job_id}: {exc}")
+
+
 def _publish_result(
     r: redis_lib.Redis, job_id: str, compilation_id: str, result: dict
 ) -> None:
+    # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
+    _update_job_status(job_id, "completed", result=result)
     payload = json.dumps(
         {
             "job_id": job_id,
@@ -164,6 +199,8 @@ def _publish_result(
 
 
 def _publish_error(r: redis_lib.Redis, job_id: str, error: str) -> None:
+    # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
+    _update_job_status(job_id, "failed", error=error)
     payload = json.dumps(
         {
             "job_id": job_id,

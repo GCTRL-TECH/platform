@@ -222,6 +222,8 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             job_input = payload.get("input", "")
             entity_types = payload.get("entity_types")  # from ontology, or None for defaults
 
+            # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
+            _update_job_status(job_id, "processing")
             # Publish 'processing' status immediately so the UI shows it
             try:
                 r.publish("kex:results", json.dumps({"job_id": job_id, "status": "processing"}))
@@ -256,7 +258,38 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
     logger.info(f"KEX worker-{worker_id} stopped")
 
 
+def _update_job_status(job_id: str, status: str, result: dict | None = None, error: str | None = None) -> None:
+    """Update jobs.status in Postgres directly. The api-rs read this column,
+    so this is the authoritative status, not the redis pubsub."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn:
+            with conn.cursor() as cur:
+                if status == "completed":
+                    import json as _json
+                    cur.execute(
+                        "UPDATE jobs SET status='completed', result=%s::jsonb, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
+                        (_json.dumps(result or {}), job_id),
+                    )
+                elif status == "processing":
+                    cur.execute(
+                        "UPDATE jobs SET status='processing', updated_at=NOW() WHERE id=%s",
+                        (job_id,),
+                    )
+                else:  # failed
+                    cur.execute(
+                        "UPDATE jobs SET status='failed', error=%s, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
+                        (error or "Unknown error", job_id),
+                    )
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"Failed to update jobs.status for {job_id}: {exc}")
+
+
 def _publish_result(r: redis_lib.Redis, job_id: str, result: dict) -> None:
+    # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
+    _update_job_status(job_id, "completed", result=result)
     payload = json.dumps({
         "job_id": job_id,
         "status": "completed",
@@ -269,6 +302,8 @@ def _publish_result(r: redis_lib.Redis, job_id: str, result: dict) -> None:
 
 
 def _publish_error(r: redis_lib.Redis, job_id: str, error: str) -> None:
+    # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
+    _update_job_status(job_id, "failed", error=error)
     payload = json.dumps({
         "job_id": job_id,
         "status": "failed",
@@ -672,13 +707,24 @@ async def search_endpoint(req: SearchReq):
         )
 
     try:
-        hits = qc.search(
-            collection_name=config.QDRANT_COLLECTION,
-            query_vector=vector,
-            limit=max(1, req.limit),
-            query_filter=qdrant_filter,
-            with_payload=True,
-        )
+        # qdrant-client 1.7+ replaces .search() with .query_points()
+        if hasattr(qc, "query_points"):
+            resp = qc.query_points(
+                collection_name=config.QDRANT_COLLECTION,
+                query=vector,
+                limit=max(1, req.limit),
+                query_filter=qdrant_filter,
+                with_payload=True,
+            )
+            hits = resp.points
+        else:
+            hits = qc.search(
+                collection_name=config.QDRANT_COLLECTION,
+                query_vector=vector,
+                limit=max(1, req.limit),
+                query_filter=qdrant_filter,
+                with_payload=True,
+            )
     except UnexpectedResponse as exc:
         if exc.status_code == 404:
             # Collection does not exist yet — return empty results, not an error
