@@ -129,7 +129,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const register = useCallback(async (email: string, password: string, name: string) => {
-    await apiPost('/auth/register', { email, password, name })
+    const data = await apiPost<LoginResponse>('/auth/register', { email, password, name })
+    setToken(data.token)
+    setRefreshToken(data.refreshToken)
+    setTokenState(data.token)
+    setUser(data.user)
   }, [])
 
   const logout = useCallback(() => {

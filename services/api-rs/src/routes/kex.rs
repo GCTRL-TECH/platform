@@ -169,16 +169,20 @@ async fn list_jobs(
 ) -> Result<Json<Value>> {
     let limit  = q.limit.unwrap_or(20).min(100);
     let offset = q.offset.unwrap_or(0);
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, type, status, result, error, created_at FROM jobs
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs
          WHERE user_id = $1 AND type IN ('kex_extract','kex_upload')
          ORDER BY created_at DESC LIMIT $2 OFFSET $3"
     )
     .bind(claims.sub).bind(limit).bind(offset)
     .fetch_all(&state.db).await?;
 
-    let jobs: Vec<Value> = rows.into_iter().map(|(id, t, status, result, error, created)| {
-        json!({ "id": id, "type": t, "status": status, "result": result, "error": error, "createdAt": created })
+    let jobs: Vec<Value> = rows.into_iter().map(|(id, t, status, input, result, error, created, completed)| {
+        json!({
+            "id": id, "type": t, "status": status,
+            "input": input, "result": result, "error": error,
+            "createdAt": created, "completedAt": completed,
+        })
     }).collect();
     Ok(Json(json!({ "jobs": jobs })))
 }
@@ -188,14 +192,18 @@ async fn get_job(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let row = sqlx::query_as::<_, (Uuid, String, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, type, status, result, error, created_at FROM jobs WHERE id = $1 AND user_id = $2"
+    let row = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs WHERE id = $1 AND user_id = $2"
     )
     .bind(id).bind(claims.sub)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
-    let (id, t, status, result, error, created) = row;
-    Ok(Json(json!({ "id": id, "type": t, "status": status, "result": result, "error": error, "createdAt": created })))
+    let (id, t, status, input, result, error, created, completed) = row;
+    Ok(Json(json!({
+        "id": id, "type": t, "status": status,
+        "input": input, "result": result, "error": error,
+        "createdAt": created, "completedAt": completed,
+    })))
 }
 
 async fn get_result(

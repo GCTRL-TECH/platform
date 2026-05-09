@@ -75,11 +75,22 @@ async fn process_job_result(state: &AppState, result: Value) {
 }
 
 async fn recover_stale_jobs(state: &AppState) {
-    let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+    let now = chrono::Utc::now();
+    // Jobs in 'processing' for >5 min: worker likely died mid-pipeline.
+    let five_min_ago = now - chrono::Duration::minutes(5);
     let _ = sqlx::query(
-        "UPDATE jobs SET status='failed', error='Worker timeout — job stuck >1h', completed_at=NOW(), updated_at=NOW()
-         WHERE status IN ('pending','processing') AND created_at < $1"
+        "UPDATE jobs SET status='failed', error='Worker died mid-processing (>5min)', completed_at=NOW(), updated_at=NOW()
+         WHERE status='processing' AND COALESCE(updated_at, created_at) < $1"
     )
-    .bind(one_hour_ago)
+    .bind(five_min_ago)
+    .execute(&state.db).await;
+
+    // Jobs in 'pending' for >10 min: queue not draining, mark failed so the user sees something.
+    let ten_min_ago = now - chrono::Duration::minutes(10);
+    let _ = sqlx::query(
+        "UPDATE jobs SET status='failed', error='Queue stalled (>10min pending)', completed_at=NOW(), updated_at=NOW()
+         WHERE status='pending' AND created_at < $1"
+    )
+    .bind(ten_min_ago)
     .execute(&state.db).await;
 }

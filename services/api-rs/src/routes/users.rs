@@ -41,7 +41,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
 async fn me(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
-) -> Result<Json<SafeUser>> {
+) -> Result<Json<serde_json::Value>> {
     let user = sqlx::query_as::<_, SafeUser>(
         "SELECT id, email, name, role::TEXT AS role, clearance::TEXT AS clearance, tier, tokens_balance, default_ontology_id, created_at
          FROM users WHERE id = $1"
@@ -49,7 +49,7 @@ async fn me(
     .bind(claims.sub)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
-    Ok(Json(user))
+    Ok(Json(serde_json::json!({ "user": user })))
 }
 
 async fn list_users(

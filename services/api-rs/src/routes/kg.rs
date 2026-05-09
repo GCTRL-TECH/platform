@@ -37,6 +37,103 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/compilations/:id/graph",               get(get_graph))
         .route("/graph/search",                         get(graph_search))
         .route("/graph/entity/:name/neighbors",         get(entity_neighbors))
+        .route("/folders",                              get(list_folders).post(create_folder))
+        .route("/folders/:id",                          put(update_folder).delete(delete_folder))
+        .route("/folders/move/:compilation_id",         put(move_compilation_to_folder))
+}
+
+// ── Folders (workspace organisation) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateFolder {
+    name: String,
+    #[serde(rename = "parentFolderId")] parent_folder_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct UpdateFolder {
+    name: Option<String>,
+    #[serde(rename = "parentFolderId")] parent_folder_id: Option<Option<Uuid>>,
+}
+
+#[derive(Deserialize)]
+struct MoveToFolder {
+    #[serde(rename = "folderId")] folder_id: Option<Uuid>,
+}
+
+async fn list_folders(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, i32, chrono::DateTime<chrono::Utc>)>(
+        "SELECT id, name, parent_folder_id, position, created_at FROM kg_folders WHERE user_id=$1 ORDER BY position, name"
+    ).bind(claims.sub).fetch_all(&state.db).await?;
+    let folders: Vec<Value> = rows.into_iter().map(|(id, name, parent, pos, created)| {
+        json!({
+            "id": id, "name": name, "parentFolderId": parent,
+            "position": pos, "createdAt": created,
+        })
+    }).collect();
+    Ok(Json(json!({ "folders": folders })))
+}
+
+async fn create_folder(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<CreateFolder>,
+) -> Result<Json<Value>> {
+    if req.name.trim().is_empty() {
+        return Err(AppError::BadRequest("Folder name required".into()));
+    }
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO kg_folders (id, user_id, name, parent_folder_id) VALUES ($1, $2, $3, $4)")
+        .bind(id).bind(claims.sub).bind(req.name.trim()).bind(req.parent_folder_id)
+        .execute(&state.db).await?;
+    Ok(Json(json!({ "id": id, "name": req.name })))
+}
+
+async fn update_folder(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateFolder>,
+) -> Result<Json<Value>> {
+    sqlx::query(
+        "UPDATE kg_folders \
+         SET name = COALESCE($1, name), \
+             parent_folder_id = CASE WHEN $2::boolean THEN $3 ELSE parent_folder_id END, \
+             updated_at = NOW() \
+         WHERE id = $4 AND user_id = $5"
+    )
+    .bind(req.name)
+    .bind(req.parent_folder_id.is_some())
+    .bind(req.parent_folder_id.unwrap_or(None))
+    .bind(id)
+    .bind(claims.sub)
+    .execute(&state.db).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_folder(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    sqlx::query("DELETE FROM kg_folders WHERE id=$1 AND user_id=$2")
+        .bind(id).bind(claims.sub).execute(&state.db).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn move_compilation_to_folder(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(compilation_id): Path<Uuid>,
+    Json(req): Json<MoveToFolder>,
+) -> Result<Json<Value>> {
+    sqlx::query("UPDATE compilations SET folder_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
+        .bind(req.folder_id).bind(compilation_id).bind(claims.sub)
+        .execute(&state.db).await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ── neo4rs helpers ────────────────────────────────────────────────────────────
