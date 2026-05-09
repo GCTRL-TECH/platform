@@ -22,12 +22,14 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/usage/summary", get(usage_summary))
 }
 
+/// Default token allocation per tier. Must stay in sync with the license server
+/// (services/license-api/src/db/schema.ts → users.creditsBalance default = 3000).
 fn tier_limit(tier: &str) -> i32 {
     match tier {
         "starter"    => 10_000,
         "pro"        => 50_000,
         "enterprise" => 1_000_000,
-        _            => 1_000, // free
+        _            => 3_000, // free — matches license-api default
     }
 }
 

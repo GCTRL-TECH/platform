@@ -27,6 +27,11 @@ import { format, formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+
+interface KexJobsResponse {
+  jobs: SourceJobInfo[]
+}
 
 type Classification = 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'RESTRICTED'
 
@@ -140,6 +145,11 @@ function SourceJobsList({
   const [removing, setRemoving] = useState<string | null>(null)
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
 
+  // Resolve UUIDs → friendly file names. Cached against the same query key
+  // used elsewhere (FusePage, FuseJobDetail) so this is essentially free.
+  const { data: kexData } = useApiQuery<KexJobsResponse>(['kex', 'jobs'], '/kex/jobs')
+  const kexJobs = kexData?.jobs ?? []
+
   async function handleRemove(jobId: string) {
     if (confirmRemove !== jobId) {
       setConfirmRemove(jobId)
@@ -188,13 +198,13 @@ function SourceJobsList({
                 isConfirming && 'bg-red-500/5'
               )}
             >
-              <div className="flex items-center gap-3">
-                <div className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-800">
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-800">
                   <Hash size={11} className="text-blue-400" />
                 </div>
-                <span className="font-mono text-xs text-slate-400">{jobId}</span>
+                <SourceJobLabel jobId={jobId} jobs={kexJobs} />
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 {sourceJobIds.length > 1 && (
                   <button
                     onClick={() => handleRemove(jobId)}

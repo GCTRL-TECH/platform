@@ -18,6 +18,11 @@ import { format } from 'date-fns'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+
+interface KexJobsResponse {
+  jobs: SourceJobInfo[]
+}
 
 interface FuseJobData {
   id: string
@@ -105,6 +110,11 @@ export function FuseJobDetail() {
       },
     }
   )
+
+  // Fetch KEX jobs so we can resolve source-job UUIDs to their original file names.
+  // React Query dedupes this against the same key used elsewhere on FusePage etc.
+  const { data: kexData } = useApiQuery<KexJobsResponse>(['kex', 'jobs'], '/kex/jobs')
+  const kexJobs = kexData?.jobs ?? []
 
   const job = jobResponse?.job
   const statusInfo = job
@@ -333,8 +343,8 @@ export function FuseJobDetail() {
                     className="flex w-full items-center gap-3 rounded-lg border border-slate-800 bg-slate-800/30 px-4 py-2.5 text-left hover:bg-slate-800/60 transition-colors"
                   >
                     <Database size={14} className="text-slate-500 shrink-0" />
-                    <span className="font-mono text-xs text-slate-400 truncate">{jobId}</span>
-                    <span className="ml-auto text-xs text-slate-600">View →</span>
+                    <SourceJobLabel jobId={jobId} jobs={kexJobs} />
+                    <span className="ml-auto text-xs text-slate-600 shrink-0">View →</span>
                   </button>
                 ))}
               </div>

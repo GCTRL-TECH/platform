@@ -17,6 +17,9 @@ import {
   AlertCircle,
   Info,
   ChevronDown,
+  Hash,
+  GitBranch,
+  ChevronRight,
 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
@@ -419,6 +422,122 @@ function ActiveJobs({
   )
 }
 
+// ─── Knowledge Graphs Section ──────────────────────────────────────────────────
+
+function KnowledgeGraphsSection({
+  compilations,
+  isLoading,
+}: {
+  compilations: Compilation[]
+  isLoading: boolean
+}) {
+  const navigate = useNavigate()
+
+  return (
+    <div className="card p-0 overflow-hidden">
+      <div className="border-b border-slate-800 px-6 py-4 flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-200">Knowledge Graphs</h3>
+          <p className="mt-0.5 text-xs text-slate-500">
+            All compilations you own. Click to open.
+          </p>
+        </div>
+        {compilations.length > 0 && (
+          <button
+            onClick={() => navigate('/graphs')}
+            className="text-xs text-slate-500 hover:text-blue-400 transition-colors flex items-center gap-1"
+          >
+            View all <ChevronRight size={12} />
+          </button>
+        )}
+      </div>
+
+      {isLoading ? (
+        <div className="flex items-center gap-2 px-6 py-6 text-sm text-slate-500">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-700 border-t-blue-500" />
+          Loading knowledge graphs...
+        </div>
+      ) : compilations.length === 0 ? (
+        <div className="flex items-center gap-2.5 px-6 py-6">
+          <Info size={14} className="shrink-0 text-slate-600" />
+          <p className="text-sm text-slate-500">
+            No knowledge graphs yet — merge extractions above to create one.
+          </p>
+        </div>
+      ) : (
+        <table className="w-full">
+          <thead className="border-b border-slate-800 bg-slate-900/50">
+            <tr>
+              <th className="table-header">Name</th>
+              <th className="table-header">Classification</th>
+              <th className="table-header">Sources</th>
+              <th className="table-header">Nodes</th>
+              <th className="table-header">Edges</th>
+              <th className="table-header">Created</th>
+              <th className="table-header text-right"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-800/50">
+            {compilations.map((c) => (
+              <tr
+                key={c.id}
+                className="hover:bg-slate-800/30 transition-colors group cursor-pointer"
+                onClick={() => navigate(`/graphs/${c.id}`)}
+              >
+                <td className="table-cell">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-800">
+                      <Network size={12} className="text-violet-400" />
+                    </div>
+                    <span className="block text-xs font-medium text-slate-300 truncate">
+                      {c.name}
+                    </span>
+                  </div>
+                </td>
+                <td className="table-cell">
+                  <span className={CLASSIFICATION_BADGE[c.classification]}>
+                    {c.classification}
+                  </span>
+                </td>
+                <td className="table-cell">
+                  <span className="text-xs text-slate-400 font-mono">
+                    {(c.sourceJobIds?.length ?? 0).toLocaleString()}
+                  </span>
+                </td>
+                <td className="table-cell">
+                  <span className="flex items-center gap-1 text-xs text-slate-400 font-mono">
+                    <Hash size={10} className="text-slate-600" />
+                    {(c.nodeCount ?? 0).toLocaleString()}
+                  </span>
+                </td>
+                <td className="table-cell">
+                  <span className="flex items-center gap-1 text-xs text-slate-400 font-mono">
+                    <GitBranch size={10} className="text-slate-600" />
+                    {(c.edgeCount ?? 0).toLocaleString()}
+                  </span>
+                </td>
+                <td className="table-cell">
+                  <span className="text-xs text-slate-500">
+                    {c.createdAt
+                      ? formatDistanceToNow(new Date(c.createdAt), { addSuffix: true })
+                      : '—'}
+                  </span>
+                </td>
+                <td className="table-cell text-right">
+                  <ChevronRight
+                    size={14}
+                    className="ml-auto text-slate-700 opacity-0 group-hover:opacity-100 transition-opacity"
+                  />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
 // ─── Main Page ─────────────────────────────────────────────────────────────────
 
 export function FusePage() {
@@ -620,6 +739,12 @@ export function FusePage() {
 
         {/* Active jobs */}
         <ActiveJobs jobs={fuseJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
+
+        {/* Knowledge Graphs (all compilations the user owns) */}
+        <KnowledgeGraphsSection
+          compilations={compilations}
+          isLoading={compilationsLoading}
+        />
       </div>
     )
   }

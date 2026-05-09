@@ -195,7 +195,7 @@ export function LicenseBanner() {
 
       {!status.updateRequired && !status.updateAvailable && status.balance <= 0 && status.tier === 'free' && (
         <div className="flex items-center justify-center gap-2 bg-orange-500 px-4 py-2 text-sm text-white">
-          <span>Credits exhausted.</span>
+          <span>Tokens exhausted.</span>
           <a
             href="https://gctrl.tech/billing"
             className="font-medium underline"

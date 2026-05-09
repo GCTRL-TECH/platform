@@ -240,7 +240,11 @@ function CompilationCard({
   onClick: () => void
   onDelete: (id: string, name: string) => void
 }) {
-  const cls = CLASSIFICATION_STYLES[compilation.classification] ?? CLASSIFICATION_STYLES.INTERNAL
+  const cls =
+    CLASSIFICATION_STYLES[compilation.classification] ?? CLASSIFICATION_STYLES.INTERNAL
+  const sourceCount = compilation.sourceJobIds?.length ?? 0
+  const entityOrNodeCount = compilation.entityCount ?? compilation.nodeCount ?? 0
+  const edgeCount = compilation.edgeCount ?? 0
 
   return (
     <button
@@ -268,7 +272,7 @@ function CompilationCard({
       {/* Header row */}
       <div className="mb-3 flex items-start justify-between gap-2">
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800">
-          {compilation.sourceJobIds.length > 1 ? (
+          {sourceCount > 1 ? (
             <Layers size={17} className="text-violet-400 group-hover:text-violet-300 transition-colors" />
           ) : (
             <Database size={17} className="text-slate-400 group-hover:text-slate-300 transition-colors" />
@@ -279,13 +283,13 @@ function CompilationCard({
 
       {/* Name */}
       <h4 className="mb-1 text-sm font-semibold text-slate-200 group-hover:text-slate-100 transition-colors">
-        {compilation.name}
+        {compilation.name ?? '(unnamed)'}
       </h4>
 
       {/* Compilation subtitle */}
-      {compilation.sourceJobIds.length > 1 && (
+      {sourceCount > 1 && (
         <p className="mb-1 text-xs text-violet-400/70">
-          {compilation.sourceJobIds.length} sources
+          {sourceCount} sources
           {compilation.lastRefreshAt
             ? ` · Updated ${formatDistanceToNow(new Date(compilation.lastRefreshAt), { addSuffix: true })}`
             : ''}
@@ -301,11 +305,11 @@ function CompilationCard({
       <div className="mt-auto flex flex-wrap items-center gap-3 border-t border-slate-800 pt-3">
         <div className="flex items-center gap-1.5 text-xs text-slate-500">
           <Hash size={12} />
-          <span>{(compilation.entityCount || compilation.nodeCount).toLocaleString()} entities</span>
+          <span>{entityOrNodeCount.toLocaleString()} entities</span>
         </div>
         <div className="flex items-center gap-1.5 text-xs text-slate-500">
           <GitBranch size={12} />
-          <span>{compilation.edgeCount.toLocaleString()} relations</span>
+          <span>{edgeCount.toLocaleString()} relations</span>
         </div>
         {compilation.cronSchedule && (
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
@@ -368,10 +372,10 @@ export function KGListPage() {
   const compilations = data?.compilations ?? []
 
   const filtered = compilations.filter((c) => {
-    const matchesSearch =
-      searchQuery === '' ||
-      c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (c.description ?? '').toLowerCase().includes(searchQuery.toLowerCase())
+    const q = searchQuery.toLowerCase()
+    const name = (c.name ?? '').toLowerCase()
+    const desc = (c.description ?? '').toLowerCase()
+    const matchesSearch = q === '' || name.includes(q) || desc.includes(q)
     const matchesClassification =
       filterClassification === 'ALL' || c.classification === filterClassification
     return matchesSearch && matchesClassification

@@ -119,6 +119,14 @@ else
   fail "Register did not return JWT + user — frontend would force re-login"
 fi
 
+# Token allocation — must be 3000 to match license-api default
+INITIAL_TOKENS=$(jget "$RESP" "user.tokensBalance")
+if [ "$INITIAL_TOKENS" = "3000" ]; then
+  pass "New user receives 3000 free tokens (matches license-api default)"
+else
+  fail "New user got $INITIAL_TOKENS tokens (expected 3000 to match license-api)"
+fi
+
 if [ -z "$JWT" ]; then
   fail "Cannot continue without JWT — aborting remaining tests"
   echo ""
@@ -369,6 +377,21 @@ if [ -n "$JOB_ID" ]; then
       pass "Merged compilation persists sourceJobIds (count=$SRC_LEN)"
     else
       fail "Merged compilation has empty sourceJobIds (UUID[] binding broken)"
+    fi
+  fi
+
+  # Verify GET /fuse/jobs/:id returns wrapped { job: ... } shape (FuseJobDetail expects this)
+  if [ -n "$MERGE_JOB_ID" ]; then
+    RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/fuse/jobs/$MERGE_JOB_ID" 2>/dev/null || echo "")
+    if jhas "$RESP" "job.id"; then
+      pass "GET /fuse/jobs/:id returns { job: ... } wrapper (FuseJobDetail will not crash)"
+    else
+      fail "GET /fuse/jobs/:id missing { job: ... } wrapper — UI shows 'Job not found'"
+    fi
+    if jhas "$RESP" "job.input"; then
+      pass "GET /fuse/jobs/:id includes 'input' field (source extractions visible)"
+    else
+      fail "GET /fuse/jobs/:id missing 'input' — UI cannot show source extractions"
     fi
   fi
 fi

@@ -58,11 +58,15 @@ async fn list_jobs(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, status, result, error, created_at FROM jobs WHERE user_id=$1 AND type='fuse_merge' ORDER BY created_at DESC LIMIT 50"
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs
+         WHERE user_id=$1 AND type='fuse_merge' ORDER BY created_at DESC LIMIT 50"
     )
     .bind(claims.sub).fetch_all(&state.db).await?;
-    let jobs: Vec<Value> = rows.into_iter().map(|(id,s,r,e,c)| json!({ "id":id,"status":s,"result":r,"error":e,"createdAt":c })).collect();
+    let jobs: Vec<Value> = rows.into_iter().map(|(id, t, s, inp, r, e, c, cmp)| json!({
+        "id": id, "type": t, "status": s, "input": inp, "result": r, "error": e,
+        "createdAt": c, "completedAt": cmp,
+    })).collect();
     Ok(Json(json!({ "jobs": jobs })))
 }
 
@@ -71,11 +75,15 @@ async fn get_job(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let row = sqlx::query_as::<_, (Uuid, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, status, result, error, created_at FROM jobs WHERE id=$1 AND user_id=$2"
+    let row = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs WHERE id=$1 AND user_id=$2"
     ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
-    let (id,s,r,e,c) = row;
-    Ok(Json(json!({ "id":id,"status":s,"result":r,"error":e,"createdAt":c })))
+    let (id, t, s, inp, r, e, c, cmp) = row;
+    // Frontend FuseJobDetail expects `{ job: ... }` wrapper.
+    Ok(Json(json!({ "job": {
+        "id": id, "type": t, "status": s, "input": inp, "result": r, "error": e,
+        "createdAt": c, "completedAt": cmp,
+    } })))
 }
 
 async fn cancel_job(

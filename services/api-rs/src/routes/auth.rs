@@ -73,9 +73,10 @@ async fn register(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let id = Uuid::new_v4();
 
+    // 3000 free tokens — matches license-api's default and what users see in /billing.
     sqlx::query(
         "INSERT INTO users (id, email, password_hash, name, role, clearance, tokens_balance, tier)
-         VALUES ($1, $2, $3, $4, 'viewer', 'PUBLIC', 50, 'free')"
+         VALUES ($1, $2, $3, $4, 'viewer', 'PUBLIC', 3000, 'free')"
     )
     .bind(id).bind(&req.email).bind(&hash).bind(&req.name)
     .execute(&state.db).await?;
@@ -93,7 +94,7 @@ async fn register(
         refresh_token: sign_refresh(&state.cfg, id, &req.email),
         user: UserOut { id, email: req.email, name: Some(req.name), role: "viewer".into(),
                         clearance: Some("PUBLIC".into()), tier: Some("free".into()),
-                        tokens_balance: Some(50) },
+                        tokens_balance: Some(3000) },
     }))
 }
 
