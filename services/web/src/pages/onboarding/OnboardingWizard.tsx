@@ -53,9 +53,28 @@ export default function OnboardingWizard() {
     navigate('/dashboard')
   }
 
+  function handleSkip() {
+    // User opted out of the guided tour. Honor that — they can re-trigger it
+    // from Settings if they ever want it back.
+    localStorage.setItem('onboarding_complete', 'true')
+    localStorage.setItem('onboarding_skipped', 'true')
+    navigate('/dashboard')
+  }
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-950 p-6">
       <div className="w-full max-w-2xl">
+        {/* Skip link (top-right) */}
+        <div className="mb-4 flex justify-end">
+          <button
+            onClick={handleSkip}
+            className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+            type="button"
+          >
+            Skip onboarding →
+          </button>
+        </div>
+
         {/* Progress */}
         <div className="mb-8 flex items-center justify-center gap-2">
           {STEPS.map((step, i) => (

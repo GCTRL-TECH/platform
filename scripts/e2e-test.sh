@@ -463,6 +463,16 @@ for c in d.get('compilations', []):
       else
         fail "GET /kg/compilations/:id reports nodeCount=$DETAIL_NC (expected >=4)"
       fi
+
+      # Critical: the /graph endpoint must actually return nodes for the
+      # default compilation (the user's GraphExplorer renders these).
+      RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/kg/compilations/$LIVE_COMP_ID/graph?limit=200" 2>/dev/null || echo "")
+      GRAPH_NODES=$(jlen "$RESP" "nodes")
+      if [ "$GRAPH_NODES" -ge 4 ]; then
+        pass "GET /kg/compilations/:id/graph returns $GRAPH_NODES nodes (Explorer will render entities)"
+      else
+        fail "GET /kg/compilations/:id/graph returned $GRAPH_NODES nodes (Explorer would show empty/grey)"
+      fi
     fi
   elif [ "$LIVE_STATUS" = "failed" ]; then
     fail "Live-counter extraction job failed: $(jget "$RESP" job.error)"

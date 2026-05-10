@@ -18,58 +18,107 @@ struct ActivateRequest {
 }
 
 async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
-    // 1. Proxy to agent
     let client = reqwest::Client::new();
-    let resp = match client
+
+    // ── 1. Try gctrl-agent (production stack) ──────────────────────────────
+    let agent_resp = client
         .post("http://gctrl-agent:7070/activate")
         .json(&serde_json::json!({ "license_key": req.license_key }))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(5))
         .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
+        .await;
+
+    if let Ok(resp) = agent_resp {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if status.is_success() {
+            // Spawn Docker pull + resolver start in background (best-effort).
+            let registry_token = body["registry_token"].as_str().unwrap_or("").to_string();
+            let pulling_fusion = !registry_token.is_empty();
+            if pulling_fusion {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = docker_pull_fusion_engine(&registry_token) {
+                        tracing::warn!("Failed to pull fusion-engine: {e}");
+                    } else if let Err(e) = docker_start_resolver() {
+                        tracing::warn!("Failed to start resolver: {e}");
+                    } else {
+                        tracing::info!("fusion-engine pulled and gctrl-resolver started");
+                    }
+                });
+            }
             return (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("Cannot reach agent: {e}") })),
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "tier": body["tier"],
+                    "credits_balance": body["credits_balance"],
+                    "fusion_engine_pulling": pulling_fusion,
+                    "via": "agent",
+                })),
+            );
+        } else {
+            let msg = body["error"].as_str().unwrap_or("Agent rejected key").to_string();
+            return (
+                axum::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+                Json(serde_json::json!({ "error": msg })),
             );
         }
-    };
-
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["error"].as_str().unwrap_or("Activation failed").to_string();
-        return (
-            axum::http::StatusCode::from_u16(status.as_u16())
-                .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
-            Json(serde_json::json!({ "error": msg })),
-        );
     }
 
-    // 2. Spawn Docker pull + start in background (non-blocking — pull takes minutes)
-    let registry_token = body["registry_token"].as_str().unwrap_or("").to_string();
-    let pulling_fusion = !registry_token.is_empty();
-    if pulling_fusion {
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = docker_pull_fusion_engine(&registry_token) {
-                tracing::warn!("Failed to pull fusion-engine: {e}");
-            } else if let Err(e) = docker_start_resolver() {
-                tracing::warn!("Failed to start resolver: {e}");
-            } else {
-                tracing::info!("fusion-engine pulled and gctrl-resolver started");
-            }
-        });
+    // ── 2. Agent unreachable → talk directly to license-api ───────────────
+    // Production fallback (and the path that just works for local dev where
+    // gctrl-agent isn't deployed). License-api at api.gctrl.tech is the
+    // source of truth for license keys.
+    let license_api_url = std::env::var("GCTRL_LICENSE_API_URL")
+        .unwrap_or_else(|_| "https://api.gctrl.tech".into());
+    let direct = client
+        .post(format!("{license_api_url}/v1/activate"))
+        .json(&serde_json::json!({
+            "license_key": req.license_key,
+            "hardware_fingerprint": "local-dev",
+        }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await;
+
+    if let Ok(resp) = direct {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if status.is_success() {
+            return (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "tier": body["tier"],
+                    "credits_balance": body["credits_balance"],
+                    "fusion_engine_pulling": false,
+                    "via": "license-api",
+                })),
+            );
+        } else {
+            let msg = body["error"].as_str().unwrap_or("License rejected").to_string();
+            return (
+                axum::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+                Json(serde_json::json!({ "error": msg })),
+            );
+        }
     }
 
+    // ── 3. Both unreachable → record locally so dev / offline still works ─
+    // The /billing/license endpoint linked from the frontend will persist
+    // the key and tier into the local licenses table after this returns
+    // ok=true. We return a default 'free' tier so the UI is functional.
     (
         axum::http::StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "tier": body["tier"],
-            "credits_balance": body["credits_balance"],
-            "fusion_engine_pulling": pulling_fusion,
+            "tier": "free",
+            "credits_balance": 3000,
+            "fusion_engine_pulling": false,
+            "via": "local-only",
+            "warning": "Agent + license server unreachable — license recorded locally only",
         })),
     )
 }

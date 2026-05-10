@@ -520,11 +520,17 @@ async fn get_graph(
     Path(id): Path<Uuid>,
     Query(q): Query<GraphQuery>,
 ) -> Result<Json<Value>> {
-    // Verify the compilation belongs to this user.
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT true FROM compilations WHERE id=$1 AND user_id=$2"
+    // Verify the compilation belongs to this user AND fetch its source_job_ids.
+    // KEX never writes a `compilation_id` property to nodes — it tags them
+    // with `_owner` (user UUID) and `_source_job` (KEX job UUID). So the
+    // graph for a compilation is the union of its source jobs' entities,
+    // OR — for the seeded default compilation with no explicit sources —
+    // every node owned by the user.
+    let row: Option<(Vec<Uuid>,)> = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids, '{}'::uuid[])
+         FROM compilations WHERE id=$1 AND user_id=$2"
     ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
-    if exists.is_none() { return Err(AppError::NotFound); }
+    let Some((source_job_ids,)) = row else { return Err(AppError::NotFound); };
 
     // Validate node_type before interpolating it into the Cypher string.
     // A malicious value like `Foo}) MATCH (n) DETACH DELETE n //` would
@@ -536,23 +542,37 @@ async fn get_graph(
     }
 
     let limit = q.limit.unwrap_or(200).min(1000);
-    let cid   = id.to_string();
+    let user_id_str = claims.sub.to_string();
+    let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
-    // Build cypher — optionally filter by node label.
-    let cypher = match &q.node_type {
-        Some(label) => format!(
-            "MATCH (n:{label} {{compilation_id: $cid}}) \
-             OPTIONAL MATCH (n)-[r]->(m {{compilation_id: $cid}}) \
-             RETURN n, r, m LIMIT $limit"
-        ),
-        None => "MATCH (n {compilation_id: $cid}) \
-                 OPTIONAL MATCH (n)-[r]->(m {compilation_id: $cid}) \
-                 RETURN n, r, m LIMIT $limit"
-            .to_string(),
+    // Build the WHERE clause based on whether this compilation has explicit
+    // source jobs (merge result) or not (default = full user graph).
+    let where_clause = if source_job_ids.is_empty() {
+        "n._owner = $uid"
+    } else {
+        "n._source_job IN $jobIds"
     };
 
+    let cypher = match &q.node_type {
+        Some(label) => format!(
+            "MATCH (n:{label}) WHERE {where_clause} \
+             OPTIONAL MATCH (n)-[r]->(m) \
+             RETURN n, r, m LIMIT $limit"
+        ),
+        None => format!(
+            "MATCH (n) WHERE {where_clause} \
+             OPTIONAL MATCH (n)-[r]->(m) \
+             RETURN n, r, m LIMIT $limit"
+        ),
+    };
+
+    let query_with_params = neo_query(&cypher)
+        .param("uid", user_id_str)
+        .param("jobIds", job_strs)
+        .param("limit", limit);
+
     let mut stream = state.neo
-        .execute(neo_query(&cypher).param("cid", cid).param("limit", limit))
+        .execute(query_with_params)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
