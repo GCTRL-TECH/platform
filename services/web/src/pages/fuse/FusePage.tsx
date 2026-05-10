@@ -27,6 +27,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
 import { useAuth } from '@/hooks/useAuth'
+import { resolveSourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -293,12 +294,36 @@ function SourcePicker({
 
 // ─── Active Jobs Table ─────────────────────────────────────────────────────────
 
+/**
+ * Builds a human-readable name for a fuse job:
+ *   1. The merge name the user typed (job.input.name) — preferred.
+ *   2. The list of source-extraction file names, e.g.
+ *      "CV.pdf + UWG.pdf" or "CV.pdf + 2 more"
+ *   3. Fall back to a short UUID — never the bare 36-char id.
+ */
+function deriveFuseJobName(job: FuseJob, kexJobs: SourceJobInfo[]): string {
+  const input = job.input as Record<string, unknown> | undefined
+  const explicit = (input?.['name'] as string | undefined)?.trim()
+  if (explicit) return explicit
+
+  const sourceIds = (input?.['sourceJobIds'] as string[] | undefined) ?? []
+  if (sourceIds.length > 0) {
+    const labels = sourceIds.map((id) => resolveSourceJobLabel(id, kexJobs).label)
+    if (labels.length === 1) return labels[0]
+    if (labels.length === 2) return `${labels[0]} + ${labels[1]}`
+    return `${labels[0]} + ${labels.length - 1} more`
+  }
+  return `Merge ${job.id.slice(0, 8)}`
+}
+
 function ActiveJobs({
   jobs,
+  kexJobs,
   onCancel,
   onDelete,
 }: {
   jobs: FuseJob[]
+  kexJobs: SourceJobInfo[]
   onCancel: (jobId: string, e: React.MouseEvent) => void
   onDelete: (jobId: string, jobName: string) => void
 }) {
@@ -335,7 +360,7 @@ function ActiveJobs({
           {displayJobs.map((job) => {
             const statusInfo = STATUS_BADGE[job.status] ?? { className: 'badge-slate', label: job.status, dot: 'bg-slate-400' }
             const isRunning = job.status === 'processing' || job.status === 'pending'
-            const jobName = (job.input as Record<string, unknown>)?.['name'] as string | undefined
+            const jobName = deriveFuseJobName(job, kexJobs)
             const duration = job.completedAt
               ? `${((new Date(job.completedAt).getTime() - new Date(job.createdAt).getTime()) / 1000).toFixed(1)}s`
               : isRunning ? '...' : '—'
@@ -352,7 +377,7 @@ function ActiveJobs({
                     </div>
                     <div className="min-w-0">
                       <span className="block text-xs font-medium text-slate-300 truncate">
-                        {jobName ?? job.id.slice(0, 12)}
+                        {jobName}
                       </span>
                       <span className="font-mono text-[10px] text-slate-600">{job.id.slice(0, 8)}</span>
                     </div>
@@ -398,7 +423,7 @@ function ActiveJobs({
                     )}
                     {!isRunning && (
                       <button
-                        onClick={(e) => { e.stopPropagation(); onDelete(job.id, jobName ?? job.id.slice(0, 8)) }}
+                        onClick={(e) => { e.stopPropagation(); onDelete(job.id, jobName) }}
                         className="text-xs text-slate-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
                         title="Delete"
                       >
@@ -564,6 +589,15 @@ export function FusePage() {
     { refetchInterval: 5000 }
   )
   const fuseJobs = fuseData?.jobs ?? []
+
+  // Page-level kex jobs cache so ActiveJobs can resolve source UUIDs to file
+  // names. JobPicker uses the same query key so this shares the cache (no
+  // extra network call).
+  const { data: kexJobsData } = useApiQuery<KexJobsResponse>(
+    ['kex', 'jobs'],
+    '/kex/jobs'
+  )
+  const kexJobs: SourceJobInfo[] = kexJobsData?.jobs ?? []
 
   // Fetch ontologies for optional ontology selection
   const { data: ontologiesData } = useApiQuery<OntologiesResponse>(
@@ -739,7 +773,7 @@ export function FusePage() {
         </div>
 
         {/* Active jobs */}
-        <ActiveJobs jobs={fuseJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
+        <ActiveJobs jobs={fuseJobs} kexJobs={kexJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
 
         {/* Knowledge Graphs (all compilations the user owns) */}
         <KnowledgeGraphsSection
@@ -903,7 +937,7 @@ export function FusePage() {
         </div>
 
         {/* Active jobs */}
-        <ActiveJobs jobs={fuseJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
+        <ActiveJobs jobs={fuseJobs} kexJobs={kexJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
       </div>
     )
   }
@@ -1110,7 +1144,7 @@ export function FusePage() {
       </div>
 
       {/* Active jobs */}
-      <ActiveJobs jobs={fuseJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
+      <ActiveJobs jobs={fuseJobs} kexJobs={kexJobs} onCancel={handleCancel} onDelete={handleDeleteRequest} />
 
       <ConfirmDeleteModal
         open={!!deleteTarget}
