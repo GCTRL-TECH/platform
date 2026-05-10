@@ -3,9 +3,11 @@ import {
   useEffect,
   useRef,
   useCallback,
-  type MouseEvent,
+  useMemo,
+  Suspense,
+  lazy,
 } from 'react'
-import { Search, X, ZoomIn, ZoomOut, Maximize2, AlertCircle, Network } from 'lucide-react'
+import { Search, X, AlertCircle, Network, Box, Square } from 'lucide-react'
 import { apiGet } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
@@ -29,21 +31,36 @@ interface GraphData {
   edges: GraphEdge[]
 }
 
-interface NodePosition {
-  x: number
-  y: number
-}
-
 export interface GraphExplorerProps {
   compilationId: string
   className?: string
 }
 
+type ViewMode = '2d' | '3d'
+
+// react-force-graph data shape — node has free-form fields, links use source/target.
+// We extend GraphNode with optional simulation/runtime fields the libs add internally.
+interface FGNode extends GraphNode {
+  // simulation will mutate x/y/z/vx/vy/vz on the node objects directly
+  x?: number
+  y?: number
+  z?: number
+}
+
+interface FGLink {
+  source: string
+  target: string
+  type: string
+}
+
+interface FGData {
+  nodes: FGNode[]
+  links: FGLink[]
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const CANVAS_W = 800
-const CANVAS_H = 600
-const NODE_R = 20
+const MAX_DISPLAY_NODES = 500
 
 const TYPE_COLORS: Record<string, string> = {
   Person: '#6366f1',
@@ -53,134 +70,22 @@ const TYPE_COLORS: Record<string, string> = {
   Product: '#3b82f6',
   Concept: '#8b5cf6',
 }
-const DEFAULT_COLOR = '#64748b'
+const DEFAULT_COLOR = '#94a3b8'
+const BG_COLOR = '#020617'
 
 function nodeColor(type: string): string {
   return TYPE_COLORS[type] ?? DEFAULT_COLOR
 }
 
-function truncate(s: string, n = 15): string {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s
-}
+// ─── Lazy-loaded force-graph components (SSR safety + chunk split) ────────────
 
-// ─── Force-directed layout ────────────────────────────────────────────────────
+const ForceGraph2D = lazy(() =>
+  import('react-force-graph-2d').then((m) => ({ default: m.default }))
+)
 
-function buildInitialPositions(nodes: GraphNode[]): Map<string, NodePosition> {
-  const map = new Map<string, NodePosition>()
-  const count = nodes.length
-  if (count === 0) return map
-
-  if (count === 1) {
-    map.set(nodes[0].id, { x: CANVAS_W / 2, y: CANVAS_H / 2 })
-    return map
-  }
-
-  // Place in a circle initially
-  nodes.forEach((node, i) => {
-    const angle = (2 * Math.PI * i) / count - Math.PI / 2
-    const radius = Math.min(CANVAS_W, CANVAS_H) * 0.35
-    map.set(node.id, {
-      x: CANVAS_W / 2 + radius * Math.cos(angle),
-      y: CANVAS_H / 2 + radius * Math.sin(angle),
-    })
-  })
-
-  return map
-}
-
-function runForceSimulation(
-  nodes: GraphNode[],
-  edges: GraphEdge[],
-  initialPositions: Map<string, NodePosition>
-): Map<string, NodePosition> {
-  if (nodes.length === 0) return initialPositions
-
-  // Copy positions
-  const pos = new Map<string, NodePosition>()
-  nodes.forEach((n) => {
-    const p = initialPositions.get(n.id) ?? { x: CANVAS_W / 2, y: CANVAS_H / 2 }
-    pos.set(n.id, { ...p })
-  })
-
-  const ITERATIONS = 120
-  const REPULSION = 4000
-  const SPRING_LENGTH = 120
-  const SPRING_K = 0.05
-  const DAMPING = 0.85
-  const PADDING = NODE_R + 10
-
-  // Build adjacency set for quick lookup
-  const connected = new Set<string>()
-  edges.forEach((e) => {
-    connected.add(`${e.source}:${e.target}`)
-    connected.add(`${e.target}:${e.source}`)
-  })
-
-  const vel = new Map<string, NodePosition>()
-  nodes.forEach((n) => vel.set(n.id, { x: 0, y: 0 }))
-
-  for (let iter = 0; iter < ITERATIONS; iter++) {
-    const force = new Map<string, NodePosition>()
-    nodes.forEach((n) => force.set(n.id, { x: 0, y: 0 }))
-
-    // Repulsion between all pairs
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const ni = nodes[i], nj = nodes[j]
-        const pi = pos.get(ni.id)!
-        const pj = pos.get(nj.id)!
-        const dx = pi.x - pj.x
-        const dy = pi.y - pj.y
-        const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1)
-        const repForce = REPULSION / (dist * dist)
-        const fx = (dx / dist) * repForce
-        const fy = (dy / dist) * repForce
-        const fi = force.get(ni.id)!
-        const fj = force.get(nj.id)!
-        fi.x += fx; fi.y += fy
-        fj.x -= fx; fj.y -= fy
-      }
-    }
-
-    // Spring attraction on edges
-    edges.forEach((e) => {
-      const ps = pos.get(e.source)
-      const pt = pos.get(e.target)
-      if (!ps || !pt) return
-      const dx = pt.x - ps.x
-      const dy = pt.y - ps.y
-      const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1)
-      const stretch = dist - SPRING_LENGTH
-      const fx = (dx / dist) * stretch * SPRING_K
-      const fy = (dy / dist) * stretch * SPRING_K
-      const fs = force.get(e.source)!
-      const ft = force.get(e.target)!
-      fs.x += fx; fs.y += fy
-      ft.x -= fx; ft.y -= fy
-    })
-
-    // Center gravity (weak pull toward center)
-    nodes.forEach((n) => {
-      const p = pos.get(n.id)!
-      const f = force.get(n.id)!
-      f.x += (CANVAS_W / 2 - p.x) * 0.005
-      f.y += (CANVAS_H / 2 - p.y) * 0.005
-    })
-
-    // Update velocities + positions
-    nodes.forEach((n) => {
-      const v = vel.get(n.id)!
-      const f = force.get(n.id)!
-      v.x = (v.x + f.x) * DAMPING
-      v.y = (v.y + f.y) * DAMPING
-      const p = pos.get(n.id)!
-      p.x = Math.max(PADDING, Math.min(CANVAS_W - PADDING, p.x + v.x))
-      p.y = Math.max(PADDING, Math.min(CANVAS_H - PADDING, p.y + v.y))
-    })
-  }
-
-  return pos
-}
+const ForceGraph3D = lazy(() =>
+  import('react-force-graph-3d').then((m) => ({ default: m.default }))
+)
 
 // ─── Side panel ───────────────────────────────────────────────────────────────
 
@@ -201,7 +106,7 @@ function NodePanel({
   )
 
   return (
-    <div className="absolute right-0 top-0 h-full w-72 rounded-r-xl border-l border-slate-700/60 bg-slate-900/95 backdrop-blur-sm flex flex-col">
+    <div className="absolute right-0 top-0 h-full w-72 rounded-r-xl border-l border-slate-700/60 bg-slate-900/95 backdrop-blur-sm flex flex-col z-20">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
         <div className="flex items-center gap-2 min-w-0">
@@ -274,14 +179,13 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
   // Graph data
   const [nodes, setNodes] = useState<GraphNode[]>([])
   const [edges, setEdges] = useState<GraphEdge[]>([])
-  const [positions, setPositions] = useState<Map<string, NodePosition>>(new Map())
 
   // UI state
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
   const [neighborLoading, setNeighborLoading] = useState(false)
-  const [highlightedId, setHighlightedId] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<ViewMode>('2d')
 
   // Search
   const [searchQuery, setSearchQuery] = useState('')
@@ -291,26 +195,40 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
   const searchRef = useRef<HTMLInputElement>(null)
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Pan + zoom state
-  const [zoom, setZoom] = useState(1)
-  const [pan, setPan] = useState<NodePosition>({ x: 0, y: 0 })
-  const isPanning = useRef(false)
-  const panStart = useRef<{ mx: number; my: number; px: number; py: number }>({
-    mx: 0, my: 0, px: 0, py: 0
-  })
-  const svgRef = useRef<SVGSVGElement>(null)
+  // Container dimensions (force-graph needs explicit width/height)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [dimensions, setDimensions] = useState({ width: 800, height: 560 })
 
-  // ── Non-passive wheel listener for zoom (React 17+ makes onWheel passive) ─
+  // Refs to the underlying ForceGraph instances (for centering on a node etc.)
+  const fg2dRef = useRef<unknown>(null)
+  const fg3dRef = useRef<unknown>(null)
+
+  // ── Track container size with ResizeObserver ─────────────────────────────
 
   useEffect(() => {
-    const el = svgRef.current
+    const el = containerRef.current
     if (!el) return
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault()
-      setZoom((z) => Math.max(0.5, Math.min(3, z - e.deltaY * 0.001)))
+
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect()
+      // Account for ~41px top toolbar inside the container
+      const w = Math.max(300, Math.floor(rect.width))
+      const h = Math.max(300, Math.floor(rect.height) - 41)
+      setDimensions((prev) =>
+        prev.width === w && prev.height === h ? prev : { width: w, height: h }
+      )
     }
-    el.addEventListener('wheel', onWheel, { passive: false })
-    return () => el.removeEventListener('wheel', onWheel)
+
+    updateSize()
+
+    const ro = new ResizeObserver(updateSize)
+    ro.observe(el)
+
+    window.addEventListener('resize', updateSize)
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', updateSize)
+    }
   }, [])
 
   // ── Load initial graph data ──────────────────────────────────────────────
@@ -323,13 +241,8 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
     apiGet<GraphData>(`/kg/compilations/${compilationId}/graph?limit=200`)
       .then((data) => {
         if (cancelled) return
-        const newNodes = data.nodes ?? []
-        const newEdges = data.edges ?? []
-        setNodes(newNodes)
-        setEdges(newEdges)
-        const initial = buildInitialPositions(newNodes)
-        const settled = runForceSimulation(newNodes, newEdges, initial)
-        setPositions(settled)
+        setNodes(data.nodes ?? [])
+        setEdges(data.edges ?? [])
       })
       .catch((err) => {
         if (cancelled) return
@@ -342,7 +255,9 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
         if (!cancelled) setLoading(false)
       })
 
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [compilationId])
 
   // ── Merge new nodes/edges into graph ─────────────────────────────────────
@@ -355,51 +270,33 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
       return [...prev, ...added]
     })
     setEdges((prev) => {
-      const existingKeys = new Set(prev.map((e) => `${e.source}:${e.target}`))
-      const added = newEdges.filter((e) => !existingKeys.has(`${e.source}:${e.target}`))
+      const existingKeys = new Set(prev.map((e) => `${e.source}:${e.target}:${e.type}`))
+      const added = newEdges.filter(
+        (e) => !existingKeys.has(`${e.source}:${e.target}:${e.type}`)
+      )
       if (added.length === 0) return prev
       return [...prev, ...added]
     })
   }, [])
 
-  // Re-run layout when nodes change (after neighbor load)
-  const prevNodeCount = useRef(0)
-  useEffect(() => {
-    if (nodes.length > 0 && nodes.length !== prevNodeCount.current) {
-      prevNodeCount.current = nodes.length
-      setPositions((prev) => {
-        // Keep existing positions, place new nodes near center
-        const extended = new Map(prev)
-        nodes.forEach((n) => {
-          if (!extended.has(n.id)) {
-            const angle = Math.random() * 2 * Math.PI
-            const r = 80 + Math.random() * 60
-            extended.set(n.id, {
-              x: CANVAS_W / 2 + r * Math.cos(angle),
-              y: CANVAS_H / 2 + r * Math.sin(angle),
-            })
-          }
-        })
-        return runForceSimulation(nodes, edges, extended)
-      })
-    }
-  }, [nodes, edges])
-
   // ── Load neighbors ────────────────────────────────────────────────────────
 
-  const handleLoadNeighbors = useCallback(async (nodeLabel: string) => {
-    setNeighborLoading(true)
-    try {
-      const data = await apiGet<GraphData>(
-        `/kg/graph/entity/${encodeURIComponent(nodeLabel)}/neighbors?depth=1&limit=50`
-      )
-      mergeGraph(data.nodes ?? [], data.edges ?? [])
-    } catch {
-      // silent — neighbor load failures are non-critical
-    } finally {
-      setNeighborLoading(false)
-    }
-  }, [mergeGraph])
+  const handleLoadNeighbors = useCallback(
+    async (nodeLabel: string) => {
+      setNeighborLoading(true)
+      try {
+        const data = await apiGet<GraphData>(
+          `/kg/graph/entity/${encodeURIComponent(nodeLabel)}/neighbors?depth=1&limit=50`
+        )
+        mergeGraph(data.nodes ?? [], data.edges ?? [])
+      } catch {
+        // silent — neighbor load failures are non-critical
+      } finally {
+        setNeighborLoading(false)
+      }
+    },
+    [mergeGraph]
+  )
 
   // ── Search ────────────────────────────────────────────────────────────────
 
@@ -433,71 +330,105 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
   function handleSearchSelect(node: GraphNode) {
     setSearchQuery('')
     setSearchOpen(false)
-    setHighlightedId(node.id)
     setSelectedNode(node)
 
-    // If node is already in graph, pan to center on it
-    const pos = positions.get(node.id)
-    if (pos) {
-      setPan({ x: CANVAS_W / 2 - pos.x * zoom, y: CANVAS_H / 2 - pos.y * zoom })
-    } else {
-      // Node not in graph — load neighbors to bring it in
+    // If the node isn't in the local graph yet, pull it + its neighbors in.
+    const inGraph = nodes.some((n) => n.id === node.id)
+    if (!inGraph) {
       mergeGraph([node], [])
       handleLoadNeighbors(node.label)
+      return
+    }
+
+    // Try to center the camera on the node. force-graph mutates node objects
+    // with x/y(/z) during simulation, so we look up the live ref's data.
+    if (viewMode === '2d') {
+      const fg = fg2dRef.current as
+        | { centerAt?: (x: number, y: number, ms?: number) => void; graphData?: () => FGData }
+        | null
+      const live = fg?.graphData?.().nodes.find((n) => n.id === node.id)
+      if (live && typeof live.x === 'number' && typeof live.y === 'number') {
+        fg?.centerAt?.(live.x, live.y, 800)
+      }
+    } else {
+      const fg = fg3dRef.current as
+        | {
+            cameraPosition?: (
+              p: { x: number; y: number; z: number },
+              lookAt: { x: number; y: number; z: number },
+              ms?: number
+            ) => void
+            graphData?: () => FGData
+          }
+        | null
+      const live = fg?.graphData?.().nodes.find((n) => n.id === node.id)
+      if (
+        live &&
+        typeof live.x === 'number' &&
+        typeof live.y === 'number' &&
+        typeof live.z === 'number'
+      ) {
+        const distance = 120
+        const r = Math.hypot(live.x, live.y, live.z) || 1
+        fg?.cameraPosition?.(
+          {
+            x: live.x * (1 + distance / r),
+            y: live.y * (1 + distance / r),
+            z: live.z * (1 + distance / r),
+          },
+          { x: live.x, y: live.y, z: live.z },
+          800
+        )
+      }
     }
   }
 
-  // ── Pan + Zoom ────────────────────────────────────────────────────────────
+  // ── Truncate to MAX_DISPLAY_NODES + filter dangling edges ─────────────────
 
-  function handleMouseDown(e: MouseEvent<SVGSVGElement>) {
-    // Only pan on direct svg background click (not node)
-    if ((e.target as Element).tagName === 'svg' || (e.target as Element).tagName === 'rect') {
-      isPanning.current = true
-      panStart.current = { mx: e.clientX, my: e.clientY, px: pan.x, py: pan.y }
-    }
-  }
+  const truncated = useMemo(() => {
+    const limit = MAX_DISPLAY_NODES
+    const visibleNodes = nodes.length > limit ? nodes.slice(0, limit) : nodes
+    const idSet = new Set(visibleNodes.map((n) => n.id))
+    const visibleEdges = edges.filter((e) => idSet.has(e.source) && idSet.has(e.target))
+    return { nodes: visibleNodes, edges: visibleEdges, truncated: nodes.length > limit }
+  }, [nodes, edges])
 
-  function handleMouseMove(e: MouseEvent<SVGSVGElement>) {
-    if (!isPanning.current) return
-    setPan({
-      x: panStart.current.px + (e.clientX - panStart.current.mx),
-      y: panStart.current.py + (e.clientY - panStart.current.my),
-    })
-  }
+  // ── Build force-graph data shape ──────────────────────────────────────────
 
-  function handleMouseUp() {
-    isPanning.current = false
-  }
+  const graphData: FGData = useMemo(
+    () => ({
+      nodes: truncated.nodes.map((n) => ({ ...n })),
+      links: truncated.edges.map((e) => ({
+        source: e.source,
+        target: e.target,
+        type: e.type,
+      })),
+    }),
+    [truncated]
+  )
 
-  function handleReset() {
-    setZoom(1)
-    setPan({ x: 0, y: 0 })
-  }
+  // ── Click handler ────────────────────────────────────────────────────────
 
-  // ── Node click ────────────────────────────────────────────────────────────
-
-  function handleNodeClick(node: GraphNode, e: MouseEvent) {
-    e.stopPropagation()
-    setSelectedNode((prev) => (prev?.id === node.id ? null : node))
-    setHighlightedId((prev) => (prev === node.id ? null : node.id))
-  }
-
-  function handleSvgClick() {
-    setSelectedNode(null)
-    setHighlightedId(null)
-  }
-
-  // ── Derived view transform ────────────────────────────────────────────────
-
-  // We'll apply zoom + pan as a SVG group transform instead of viewBox manipulation
-  // This gives cleaner behavior with fixed-size SVG container
-  const transform = `translate(${pan.x}, ${pan.y}) scale(${zoom})`
+  const handleNodeClick = useCallback((n: object) => {
+    const node = n as FGNode
+    setSelectedNode((prev) =>
+      prev?.id === node.id
+        ? null
+        : { id: node.id, label: node.label, type: node.type, properties: node.properties ?? {} }
+    )
+  }, [])
 
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
-      <div className={cn('flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800', className)} style={{ height: 480 }}>
+      <div
+        className={cn(
+          'flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800',
+          className
+        )}
+        style={{ height: 600 }}
+      >
         <div className="flex flex-col items-center gap-3">
           <span className="h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-indigo-500" />
           <p className="text-sm text-slate-500">Loading graph…</p>
@@ -508,7 +439,13 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
 
   if (error) {
     return (
-      <div className={cn('flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800', className)} style={{ height: 480 }}>
+      <div
+        className={cn(
+          'flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800',
+          className
+        )}
+        style={{ height: 600 }}
+      >
         <div className="flex flex-col items-center gap-3 text-center">
           <AlertCircle size={28} className="text-red-400" />
           <p className="text-sm text-slate-400">{error}</p>
@@ -519,7 +456,13 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
 
   if (nodes.length === 0) {
     return (
-      <div className={cn('flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800', className)} style={{ height: 480 }}>
+      <div
+        className={cn(
+          'flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800',
+          className
+        )}
+        style={{ height: 600 }}
+      >
         <div className="flex flex-col items-center gap-3 text-center">
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-800">
             <Network size={24} className="text-slate-600" />
@@ -536,12 +479,22 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
   }
 
   return (
-    <div className={cn('relative rounded-xl border border-slate-700/60 bg-slate-950 overflow-hidden', className)}>
+    <div
+      ref={containerRef}
+      className={cn(
+        'relative rounded-xl border border-slate-700/60 bg-slate-950 overflow-hidden',
+        className
+      )}
+      style={{ height: 600 }}
+    >
       {/* ── Top bar ── */}
       <div className="absolute left-0 right-0 top-0 z-10 flex items-center gap-2 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur-sm px-3 py-2">
         {/* Search */}
         <div className="relative flex-1 max-w-xs">
-          <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+          <Search
+            size={13}
+            className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"
+          />
           <input
             ref={searchRef}
             type="text"
@@ -582,177 +535,106 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
           {nodes.length.toLocaleString()} nodes · {edges.length.toLocaleString()} edges
         </span>
 
-        {/* Zoom controls */}
-        <div className="flex items-center gap-1">
+        {/* 2D / 3D toggle */}
+        <div className="flex items-center rounded-md border border-slate-700 bg-slate-900 overflow-hidden">
           <button
-            onClick={() => setZoom((z) => Math.min(3, +(z + 0.2).toFixed(1)))}
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors"
-            title="Zoom in"
+            onClick={() => setViewMode('2d')}
+            className={cn(
+              'flex items-center gap-1 px-2.5 py-1 text-xs font-medium transition-colors',
+              viewMode === '2d'
+                ? 'bg-indigo-500/15 text-indigo-300'
+                : 'text-slate-500 hover:text-slate-300'
+            )}
+            title="2D view"
           >
-            <ZoomIn size={13} />
+            <Square size={11} />
+            2D
           </button>
           <button
-            onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.2).toFixed(1)))}
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors"
-            title="Zoom out"
+            onClick={() => setViewMode('3d')}
+            className={cn(
+              'flex items-center gap-1 px-2.5 py-1 text-xs font-medium border-l border-slate-700 transition-colors',
+              viewMode === '3d'
+                ? 'bg-indigo-500/15 text-indigo-300'
+                : 'text-slate-500 hover:text-slate-300'
+            )}
+            title="3D view"
           >
-            <ZoomOut size={13} />
-          </button>
-          <button
-            onClick={handleReset}
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors"
-            title="Reset view"
-          >
-            <Maximize2 size={12} />
+            <Box size={11} />
+            3D
           </button>
         </div>
       </div>
 
-      {/* ── SVG canvas ── */}
-      <svg
-        ref={svgRef}
-        viewBox={`0 0 ${CANVAS_W} ${CANVAS_H}`}
-        className="w-full cursor-grab select-none"
-        style={{ height: 520, marginTop: 41 /* top bar height */ }}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onClick={handleSvgClick}
+      {/* ── Truncation banner ── */}
+      {truncated.truncated && (
+        <div className="absolute left-1/2 top-12 z-10 -translate-x-1/2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-300 shadow-lg backdrop-blur-sm">
+          Showing first {MAX_DISPLAY_NODES.toLocaleString()} of{' '}
+          {nodes.length.toLocaleString()} nodes — use search to find specific entities
+        </div>
+      )}
+
+      {/* ── Graph canvas ── */}
+      <div
+        className="absolute inset-0"
+        style={{ marginTop: 41 /* top bar height */ }}
       >
-        {/* Arrow marker definition */}
-        <defs>
-          <marker
-            id="arrowhead"
-            markerWidth="8"
-            markerHeight="8"
-            refX="7"
-            refY="3"
-            orient="auto"
-          >
-            <path d="M0,0 L0,6 L8,3 z" fill="#475569" />
-          </marker>
-          <marker
-            id="arrowhead-highlight"
-            markerWidth="8"
-            markerHeight="8"
-            refX="7"
-            refY="3"
-            orient="auto"
-          >
-            <path d="M0,0 L0,6 L8,3 z" fill="#6366f1" />
-          </marker>
-        </defs>
-
-        {/* Background hit area for pan */}
-        <rect x={0} y={0} width={CANVAS_W} height={CANVAS_H} fill="transparent" />
-
-        {/* Main group with pan+zoom transform */}
-        <g transform={transform}>
-          {/* ── Edges ── */}
-          {edges.map((edge) => {
-            const src = positions.get(edge.source)
-            const tgt = positions.get(edge.target)
-            if (!src || !tgt) return null
-            const isHighlighted =
-              highlightedId === edge.source || highlightedId === edge.target
-
-            // Shorten line so arrow doesn't overlap node circle
-            const dx = tgt.x - src.x
-            const dy = tgt.y - src.y
-            const len = Math.sqrt(dx * dx + dy * dy)
-            if (len < 1) return null
-            const ux = dx / len
-            const uy = dy / len
-            const x1 = src.x + ux * NODE_R
-            const y1 = src.y + uy * NODE_R
-            const x2 = tgt.x - ux * (NODE_R + 6)
-            const y2 = tgt.y - uy * (NODE_R + 6)
-
-            return (
-              <g key={`${edge.source}:${edge.target}:${edge.type}`}>
-                <line
-                  x1={x1} y1={y1} x2={x2} y2={y2}
-                  stroke={isHighlighted ? '#6366f1' : '#334155'}
-                  strokeWidth={isHighlighted ? 1.5 : 1}
-                  strokeOpacity={isHighlighted ? 0.9 : 0.6}
-                  markerEnd={isHighlighted ? 'url(#arrowhead-highlight)' : 'url(#arrowhead)'}
-                />
-              </g>
-            )
-          })}
-
-          {/* ── Nodes ── */}
-          {nodes.map((node) => {
-            const pos = positions.get(node.id)
-            if (!pos) return null
-            const color = nodeColor(node.type)
-            const isSelected = selectedNode?.id === node.id
-            const isHighlighted = highlightedId === node.id
-            const isDimmed = highlightedId !== null && !isHighlighted && !isSelected
-
-            return (
-              <g
-                key={node.id}
-                transform={`translate(${pos.x}, ${pos.y})`}
-                onClick={(e) => handleNodeClick(node, e)}
-                className="cursor-pointer"
-                style={{ opacity: isDimmed ? 0.35 : 1 }}
-              >
-                {/* Selection ring */}
-                {(isSelected || isHighlighted) && (
-                  <circle
-                    r={NODE_R + 5}
-                    fill="none"
-                    stroke={color}
-                    strokeWidth={1.5}
-                    strokeOpacity={0.5}
-                  />
-                )}
-
-                {/* Main circle */}
-                <circle
-                  r={NODE_R}
-                  fill={`${color}33`}
-                  stroke={color}
-                  strokeWidth={isSelected ? 2.5 : 1.5}
-                />
-
-                {/* Type initial letter */}
-                <text
-                  textAnchor="middle"
-                  dominantBaseline="central"
-                  fontSize={11}
-                  fontWeight={600}
-                  fill={color}
-                  style={{ userSelect: 'none', pointerEvents: 'none' }}
-                >
-                  {(node.type?.[0] ?? '?').toUpperCase()}
-                </text>
-
-                {/* Label below */}
-                <text
-                  y={NODE_R + 12}
-                  textAnchor="middle"
-                  dominantBaseline="auto"
-                  fontSize={9}
-                  fill="#94a3b8"
-                  style={{ userSelect: 'none', pointerEvents: 'none' }}
-                >
-                  {truncate(node.label)}
-                </text>
-              </g>
-            )
-          })}
-        </g>
-      </svg>
+        <Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center">
+              <span className="h-6 w-6 animate-spin rounded-full border-2 border-slate-700 border-t-indigo-500" />
+            </div>
+          }
+        >
+          {viewMode === '2d' ? (
+            <ForceGraph2D
+              ref={fg2dRef as never}
+              graphData={graphData}
+              width={dimensions.width}
+              height={dimensions.height}
+              backgroundColor={BG_COLOR}
+              nodeLabel="label"
+              nodeColor={(n: object) => nodeColor((n as FGNode).type)}
+              nodeAutoColorBy="type"
+              nodeRelSize={5}
+              linkColor={() => '#334155'}
+              linkDirectionalArrowLength={4}
+              linkDirectionalArrowRelPos={1}
+              linkWidth={1}
+              onNodeClick={handleNodeClick}
+              cooldownTicks={100}
+              enableNodeDrag
+            />
+          ) : (
+            <ForceGraph3D
+              ref={fg3dRef as never}
+              graphData={graphData}
+              width={dimensions.width}
+              height={dimensions.height}
+              backgroundColor={BG_COLOR}
+              nodeLabel="label"
+              nodeColor={(n: object) => nodeColor((n as FGNode).type)}
+              nodeAutoColorBy="type"
+              nodeRelSize={5}
+              linkColor={() => '#475569'}
+              linkOpacity={0.6}
+              linkDirectionalArrowLength={3}
+              linkDirectionalArrowRelPos={1}
+              linkWidth={0.5}
+              onNodeClick={handleNodeClick}
+              enableNodeDrag
+              showNavInfo={false}
+            />
+          )}
+        </Suspense>
+      </div>
 
       {/* ── Type legend (bottom left) ── */}
-      <div className="absolute bottom-3 left-3 flex flex-wrap gap-2 z-10">
+      <div className="absolute bottom-3 left-3 flex flex-wrap gap-2 z-10 rounded-md bg-slate-950/70 px-2 py-1.5 backdrop-blur-sm">
         {Object.entries(TYPE_COLORS).map(([type, color]) => (
           <div key={type} className="flex items-center gap-1.5">
             <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
-            <span className="text-[10px] text-slate-500">{type}</span>
+            <span className="text-[10px] text-slate-400">{type}</span>
           </div>
         ))}
       </div>
@@ -761,7 +643,7 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
       {selectedNode && (
         <NodePanel
           node={selectedNode}
-          onClose={() => { setSelectedNode(null); setHighlightedId(null) }}
+          onClose={() => setSelectedNode(null)}
           onLoadNeighbors={handleLoadNeighbors}
           loading={neighborLoading}
         />

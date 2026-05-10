@@ -582,6 +582,7 @@ export function FusePage() {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['fuse', 'jobs'] })
       queryClient.invalidateQueries({ queryKey: ['kg', 'compilations'] })
+      queryClient.invalidateQueries({ queryKey: ['billing', 'balance'] })
       setName('')
       setSelectedJobIds([])
       setTargetCompilationId('')

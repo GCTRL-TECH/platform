@@ -25,6 +25,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useApiQuery, useApiMutation, useUploadMutation } from '@/hooks/useApi'
+import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
@@ -129,12 +130,15 @@ export function KexPage() {
   }, [selectedSource, selectedProvider, currentDriveFolderId, driveSearch])
 
   // Mutations
+  const queryClient = useQueryClient()
+  const refreshBalance = () => queryClient.invalidateQueries({ queryKey: ['billing', 'balance'] })
+
   const uploadMutation = useUploadMutation<ExtractResponse>('/kex/upload', {
-    onSuccess: () => { setRefetchKey((k) => k + 1); setSelectedFile(null); setSubmitError(null) },
+    onSuccess: () => { setRefetchKey((k) => k + 1); setSelectedFile(null); setSubmitError(null); refreshBalance() },
     onError: (err) => { setSubmitError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Upload failed') },
   })
   const extractMutation = useApiMutation<ExtractResponse>('/kex/extract', 'POST', {
-    onSuccess: () => { setRefetchKey((k) => k + 1); setUrl(''); setText(''); setSubmitError(null) },
+    onSuccess: () => { setRefetchKey((k) => k + 1); setUrl(''); setText(''); setSubmitError(null); refreshBalance() },
     onError: (err) => { setSubmitError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Extraction failed') },
   })
 

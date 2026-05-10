@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install dependencies first (cache layer)
 COPY package*.json ./
-RUN npm ci --prefer-offline
+RUN npm ci --prefer-offline --legacy-peer-deps
 
 # Copy source and build
 COPY . .

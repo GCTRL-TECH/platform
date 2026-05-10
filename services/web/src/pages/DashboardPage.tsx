@@ -62,6 +62,12 @@ const TIER_BADGE: Record<string, string> = {
   enterprise: 'badge-yellow',
 }
 
+interface BalanceResponse {
+  balance: number
+  tier: string
+  tierLimit: number
+}
+
 export function DashboardPage() {
   const { user } = useAuth()
   const navigate = useNavigate()
@@ -71,11 +77,26 @@ export function DashboardPage() {
     '/kex/jobs'
   )
 
+  // Live balance — refetches periodically + on focus so the dashboard
+  // doesn't show a stale number after KEX/FUSE deduct tokens.
+  const { data: balanceData } = useApiQuery<BalanceResponse>(
+    ['billing', 'balance'],
+    '/billing/balance',
+    {
+      enabled: !!user,
+      refetchInterval: 10_000,
+      refetchOnWindowFocus: true,
+      staleTime: 5_000,
+    }
+  )
+
   const jobs = jobsData?.jobs ?? []
   const recentJobs = jobs.slice(0, 5)
   const completedJobs = jobs.filter((j) => j.status === 'completed').length
 
-  const tierBadge = user?.tier ? TIER_BADGE[user.tier] ?? 'badge-slate' : 'badge-slate'
+  const liveTier = balanceData?.tier ?? user?.tier ?? 'free'
+  const liveBalance = balanceData?.balance ?? user?.tokensBalance ?? 0
+  const tierBadge = TIER_BADGE[liveTier] ?? 'badge-slate'
 
   return (
     <div className="space-y-8 animate-slide-up">
@@ -93,11 +114,11 @@ export function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <StatCard
           label="Token Balance"
-          value={(user?.tokensBalance ?? 0).toLocaleString()}
+          value={liveBalance.toLocaleString()}
           icon={Coins}
           iconColor="text-amber-400"
           iconBg="bg-amber-500/10"
-          badge={user?.tier}
+          badge={liveTier}
           badgeColor={tierBadge}
         />
         <StatCard

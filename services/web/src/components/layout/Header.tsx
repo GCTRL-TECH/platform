@@ -1,5 +1,6 @@
 import { Bell, Coins } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
+import { useApiQuery } from '@/hooks/useApi'
 import { cn } from '@/lib/utils'
 
 interface HeaderProps {
@@ -13,10 +14,32 @@ const TIER_COLORS: Record<string, string> = {
   enterprise: 'badge-yellow',
 }
 
+interface BalanceResponse {
+  balance: number
+  tier: string
+  tierLimit: number
+}
+
 export function Header({ title }: HeaderProps) {
   const { user } = useAuth()
 
-  const tierBadgeClass = user?.tier ? (TIER_COLORS[user.tier] ?? 'badge-slate') : 'badge-slate'
+  // Live balance: refetches every 10s and on window focus.
+  // Auth context's user.tokensBalance is set once at login; without this
+  // the header keeps stale numbers after extractions/merges deduct tokens.
+  const { data: balanceData } = useApiQuery<BalanceResponse>(
+    ['billing', 'balance'],
+    '/billing/balance',
+    {
+      enabled: !!user,
+      refetchInterval: 10_000,
+      refetchOnWindowFocus: true,
+      staleTime: 5_000,
+    }
+  )
+
+  const liveBalance = balanceData?.balance ?? user?.tokensBalance ?? 0
+  const liveTier = balanceData?.tier ?? user?.tier ?? 'free'
+  const tierBadgeClass = TIER_COLORS[liveTier] ?? 'badge-slate'
 
   return (
     <header className="flex h-16 items-center justify-between border-b border-slate-800 bg-slate-950/80 px-6 backdrop-blur-sm">
@@ -25,17 +48,17 @@ export function Header({ title }: HeaderProps) {
 
       {/* Right section */}
       <div className="flex items-center gap-3">
-        {/* Token balance */}
+        {/* Token balance — live, refetched every 10s */}
         {user && (
           <div className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900 px-3 py-1.5">
             <Coins size={14} className="text-amber-400" />
             <span className="text-sm font-medium text-slate-200">
-              {user.tokensBalance.toLocaleString()}
+              {liveBalance.toLocaleString()}
             </span>
             <span className="text-xs text-slate-500">tokens</span>
-            {user.tier && (
+            {liveTier && (
               <span className={cn(tierBadgeClass, 'ml-1 text-[10px]')}>
-                {user.tier}
+                {liveTier}
               </span>
             )}
           </div>
