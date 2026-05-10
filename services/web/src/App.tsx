@@ -25,15 +25,41 @@ import TriggersPage from '@/pages/triggers/TriggersPage'
 import OnboardingWizard from '@/pages/onboarding/OnboardingWizard'
 import GoogleDrivePage from '@/pages/connectors/GoogleDrivePage'
 
+/**
+ * Returns true if we're running on localhost / 127.x / a Vite dev server.
+ * In that case the gctrl-agent license enforcement is intentionally not
+ * deployed and the wizard would just trap the user on every refresh.
+ */
+function isLocalDev(): boolean {
+  if (typeof window === 'undefined') return false
+  const host = window.location.hostname
+  return (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host.endsWith('.local') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('10.')
+  )
+}
+
 function ActivationGate({ children }: { children: React.ReactNode }) {
   const [activated, setActivated] = useState<boolean | null>(null)
 
   const checkActivation = useCallback(() => {
+    // Local dev: gctrl-agent is not part of the local stack. Skip the gate
+    // entirely so refreshing /dashboard never bounces the user to the wizard.
+    if (isLocalDev()) {
+      localStorage.setItem('gctrl_activated', '1')
+      setActivated(true)
+      return
+    }
+
     fetch('http://localhost:7070/status')
       .then((r) => r.json())
       .then((d: { activated?: boolean }) => setActivated(d.activated ?? true))
       .catch(() => {
-        // Agent unreachable — only skip wizard if user already activated before
+        // Agent unreachable in production — fall back to the localStorage flag
+        // so a user who already activated once doesn't get re-prompted.
         setActivated(!!localStorage.getItem('gctrl_activated'))
       })
   }, [])
