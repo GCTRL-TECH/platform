@@ -33,6 +33,8 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/compilations",                         get(list).post(create))
         .route("/compilations/:id",                     get(get_one).put(update).delete(delete_one))
         .route("/compilations/:id/refresh",             post(refresh))
+        .route("/compilations/:id/schedule",            put(set_schedule))
+        .route("/compilations/:id/audit",               get(get_audit))
         .route("/compilations/:id/acl",                 get(get_acl).put(set_acl))
         .route("/compilations/:id/graph",               get(get_graph))
         .route("/graph/search",                         get(graph_search))
@@ -191,6 +193,67 @@ fn relation_to_json(r: &Relation) -> Value {
     })
 }
 
+/// Compute live node + edge counts directly from Neo4j for a compilation.
+///
+/// Scoping rules:
+/// - If `source_job_ids` is non-empty: count nodes whose `_source_job` is in
+///   the set, and relationships whose start node's `_source_job` is in the set.
+/// - If `source_job_ids` is empty (default compilation): count all nodes
+///   owned by the user (treats the default as "the user's full graph").
+///
+/// On any Neo4j error, returns `(0, 0)` and the caller falls back to the
+/// postgres-stored counts (graceful degradation).
+///
+/// UUIDs are passed as `Vec<String>` because the Neo4j Bolt protocol has no
+/// native UUID type — `kg_builder.py` writes them as strings.
+async fn live_counts(
+    neo: &neo4rs::Graph,
+    user_id: &str,
+    source_job_ids: &[Uuid],
+) -> (i64, i64) {
+    if source_job_ids.is_empty() {
+        // Default compilation → user's full graph.
+        let node_cypher = "MATCH (n) WHERE n._owner = $uid RETURN count(n) AS c";
+        let edge_cypher = "MATCH (n)-[r]->() WHERE n._owner = $uid RETURN count(r) AS c";
+
+        let nodes = match neo.execute(neo_query(node_cypher).param("uid", user_id.to_string())).await {
+            Ok(mut s) => match s.next().await {
+                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        let edges = match neo.execute(neo_query(edge_cypher).param("uid", user_id.to_string())).await {
+            Ok(mut s) => match s.next().await {
+                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        (nodes, edges)
+    } else {
+        let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
+        let node_cypher = "MATCH (n) WHERE n._source_job IN $jobIds RETURN count(n) AS c";
+        let edge_cypher = "MATCH (n)-[r]->() WHERE n._source_job IN $jobIds RETURN count(r) AS c";
+
+        let nodes = match neo.execute(neo_query(node_cypher).param("jobIds", job_strs.clone())).await {
+            Ok(mut s) => match s.next().await {
+                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        let edges = match neo.execute(neo_query(edge_cypher).param("jobIds", job_strs)).await {
+            Ok(mut s) => match s.next().await {
+                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        (nodes, edges)
+    }
+}
+
 async fn list(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -203,13 +266,23 @@ async fn list(
                 node_count, edge_count, folder_id, created_at
          FROM compilations WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
     ).bind(claims.sub).bind(limit).bind(offset).fetch_all(&state.db).await?;
-    let comps: Vec<Value> = rows.into_iter().map(|(id,n,d,cls,sji,nc,ec,fid,c)| {
-        json!({
+
+    let user_id_str = claims.sub.to_string();
+    let mut comps: Vec<Value> = Vec::with_capacity(rows.len());
+    for (id, n, d, cls, sji, nc, ec, fid, c) in rows {
+        let stored_nc = nc.unwrap_or(0);
+        let stored_ec = ec.unwrap_or(0);
+        // N+1 query — acceptable while typical users have <20 compilations.
+        // Batch later if it becomes a hotspot.
+        let (live_nodes, live_edges) = live_counts(&state.neo, &user_id_str, &sji).await;
+        let final_nodes = if live_nodes > 0 { live_nodes as i32 } else { stored_nc };
+        let final_edges = if live_edges > 0 { live_edges as i32 } else { stored_ec };
+        comps.push(json!({
             "id": id, "name": n, "description": d, "classification": cls,
-            "sourceJobIds": sji, "nodeCount": nc, "edgeCount": ec,
+            "sourceJobIds": sji, "nodeCount": final_nodes, "edgeCount": final_edges,
             "folderId": fid, "createdAt": c,
-        })
-    }).collect();
+        }));
+    }
     Ok(Json(json!({ "compilations": comps })))
 }
 
@@ -227,22 +300,60 @@ async fn create(
     Ok(Json(json!({ "id": id, "name": req.name })))
 }
 
+// Frontend KGDetailPage expects `{ compilation: ... }` wrapper with full row fields.
 async fn get_one(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let row = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Vec<Uuid>, Option<i32>, Option<i32>, Option<Uuid>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, name, description, classification, COALESCE(source_job_ids, '{}'::uuid[]),
-                node_count, edge_count, folder_id, created_at
+    let row = sqlx::query_as::<_, (
+        Uuid, Uuid, String, Option<String>, String, Vec<Uuid>,
+        i32, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>,
+        Option<i32>, Option<i32>, Option<Uuid>,
+        chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>,
+    )>(
+        "SELECT id, user_id, name, description, classification,
+                COALESCE(source_job_ids, '{}'::uuid[]),
+                version, cron_schedule, cron_mode, last_refresh_at,
+                node_count, edge_count, folder_id,
+                created_at, updated_at
          FROM compilations WHERE id=$1 AND user_id=$2"
     ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
-    let (id, n, d, cls, sji, nc, ec, fid, c) = row;
-    Ok(Json(json!({
-        "id": id, "name": n, "description": d, "classification": cls,
-        "sourceJobIds": sji, "nodeCount": nc, "edgeCount": ec,
-        "folderId": fid, "createdAt": c,
-    })))
+    let (
+        id, user_id, n, d, cls, sji,
+        version, cron_schedule, cron_mode, last_refresh_at,
+        nc, ec, fid, created_at, updated_at,
+    ) = row;
+
+    let user_id_str = claims.sub.to_string();
+    let stored_nc = nc.unwrap_or(0);
+    let stored_ec = ec.unwrap_or(0);
+    let (live_nodes, live_edges) = live_counts(&state.neo, &user_id_str, &sji).await;
+    let final_nodes = if live_nodes > 0 { live_nodes as i32 } else { stored_nc };
+    let final_edges = if live_edges > 0 { live_edges as i32 } else { stored_ec };
+
+    Ok(Json(json!({ "compilation": {
+        "id": id,
+        "userId": user_id,
+        "name": n,
+        "description": d,
+        "classification": cls,
+        "sourceJobIds": sji,
+        "version": version,
+        "cronSchedule": cron_schedule,
+        "cronMode": cron_mode.unwrap_or_else(|| "incremental".into()),
+        "lastRefreshAt": last_refresh_at,
+        "nodeCount": final_nodes,
+        "edgeCount": final_edges,
+        // entityCount/duplicateCount/linkCount aren't tracked separately yet;
+        // the frontend falls back to nodeCount when entityCount is 0.
+        "entityCount": final_nodes,
+        "duplicateCount": 0,
+        "linkCount": 0,
+        "folderId": fid,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    } })))
 }
 
 async fn update(
@@ -280,9 +391,86 @@ async fn refresh(
         .execute(&state.db).await?;
     crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({ "job_id": job_id, "compilation_id": id, "source_job_ids": source_ids }).to_string())
         .await.map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(json!({ "jobId": job_id })))
+    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
 }
 
+// PUT /compilations/:id/schedule  →  update cron schedule + mode.
+// Frontend ScheduleTab posts `{ schedule, mode }`; either may be null.
+async fn set_schedule(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>> {
+    let schedule = req.get("schedule")
+        .and_then(|v| if v.is_null() { Some(None) } else { v.as_str().map(|s| Some(s.to_string())) })
+        .unwrap_or(None);
+    let mode = req.get("mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let result = sqlx::query(
+        "UPDATE compilations
+         SET cron_schedule = $1,
+             cron_mode = COALESCE($2, cron_mode),
+             updated_at = NOW()
+         WHERE id = $3 AND user_id = $4"
+    )
+    .bind(schedule.as_deref())
+    .bind(mode.as_deref())
+    .bind(id)
+    .bind(claims.sub)
+    .execute(&state.db).await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+// GET /compilations/:id/audit  →  audit log entries scoped to this compilation.
+// Frontend AuditTab expects `{ entries: [{ id, action, userId, timestamp, details }, ...] }`.
+async fn get_audit(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    // Verify compilation belongs to this user (or user is admin) before exposing audit.
+    let exists: Option<bool> = sqlx::query_scalar(
+        "SELECT true FROM compilations WHERE id=$1 AND user_id=$2"
+    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
+    if exists.is_none() && claims.role != "admin" {
+        return Err(AppError::NotFound);
+    }
+
+    let id_str = id.to_string();
+    let rows = sqlx::query_as::<_, (
+        Uuid, String, Option<Uuid>, Option<Value>, chrono::DateTime<chrono::Utc>
+    )>(
+        "SELECT id, action, user_id, details, created_at
+         FROM audit_log
+         WHERE resource_type = 'compilation' AND resource_id = $1
+         ORDER BY created_at DESC LIMIT 200"
+    ).bind(&id_str).fetch_all(&state.db).await?;
+
+    let entries: Vec<Value> = rows.into_iter().map(|(eid, action, uid, details, created)| {
+        // Render details as a short string for the table cell.
+        let details_str = details
+            .as_ref()
+            .and_then(|v| if v.is_null() { None } else { Some(v.to_string()) });
+        json!({
+            "id": eid,
+            "action": action,
+            "userId": uid,
+            "timestamp": created,
+            "details": details_str,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "entries": entries })))
+}
+
+// Frontend KGDetailPage AclTab expects `{ acl: [{ userId, permission }, ...] }`.
 async fn get_acl(
     Extension(_claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -291,8 +479,10 @@ async fn get_acl(
     let rows = sqlx::query_as::<_, (Uuid, Uuid, String)>(
         "SELECT id, user_id, permission FROM compilation_acl WHERE compilation_id=$1"
     ).bind(id).fetch_all(&state.db).await?;
-    let entries: Vec<Value> = rows.into_iter().map(|(id,uid,perm)| json!({ "id":id,"userId":uid,"permission":perm })).collect();
-    Ok(Json(json!({ "entries": entries })))
+    let acl: Vec<Value> = rows.into_iter()
+        .map(|(_id, uid, perm)| json!({ "userId": uid, "permission": perm }))
+        .collect();
+    Ok(Json(json!({ "acl": acl })))
 }
 
 async fn set_acl(

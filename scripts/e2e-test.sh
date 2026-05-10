@@ -269,7 +269,7 @@ if [ -n "$JOB_ID" ]; then
   WAIT=0; STATUS="pending"
   while [ $WAIT -lt 180 ]; do
     RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$JOB_ID" 2>/dev/null || echo "")
-    STATUS=$(jget "$RESP" "status")
+    STATUS=$(jget "$RESP" "job.status")
     if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ]; then break; fi
     sleep 3; WAIT=$((WAIT+3)); echo -n "."
   done
@@ -278,7 +278,7 @@ if [ -n "$JOB_ID" ]; then
   if [ "$STATUS" = "completed" ]; then
     pass "Job moved to 'completed' (postgres status writeback works!)"
   elif [ "$STATUS" = "failed" ]; then
-    fail "Job failed: $(jget "$RESP" error)"
+    fail "Job failed: $(jget "$RESP" job.error)"
   else
     fail "Job stuck in '$STATUS' after 180s (status writeback broken)"
   fi
@@ -287,7 +287,8 @@ fi
 # Job result has entities
 if [ "$STATUS" = "completed" ] && [ -n "$JOB_ID" ]; then
   RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$JOB_ID/result" 2>/dev/null || echo "")
-  E_LEN=$(jlen "$RESP" "entities")
+  # /result now wraps as { jobId, status, completedAt, result: { entities, ... } }
+  E_LEN=$(jlen "$RESP" "result.entities")
   if [ "$E_LEN" -ge 2 ]; then
     pass "Job result has $E_LEN entities extracted"
   else
@@ -335,7 +336,7 @@ if [ ${#LONG_TEXT} -gt 5000 ]; then
     WAIT=0; LSTATUS="pending"
     while [ $WAIT -lt 240 ]; do
       RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$LARGE_JOB_ID" 2>/dev/null || echo "")
-      LSTATUS=$(jget "$RESP" "status")
+      LSTATUS=$(jget "$RESP" "job.status")
       if [ "$LSTATUS" = "completed" ] || [ "$LSTATUS" = "failed" ]; then break; fi
       sleep 5; WAIT=$((WAIT+5)); echo -n "."
     done
@@ -343,7 +344,7 @@ if [ ${#LONG_TEXT} -gt 5000 ]; then
     if [ "$LSTATUS" = "completed" ]; then
       pass "Large-text job (${#LONG_TEXT} chars) completed without hanging"
     elif [ "$LSTATUS" = "failed" ]; then
-      fail "Large-text job failed: $(jget "$RESP" error)"
+      fail "Large-text job failed: $(jget "$RESP" job.error)"
     else
       fail "Large-text job stuck in '$LSTATUS' after 240s — chunker likely hung"
     fi
@@ -372,7 +373,8 @@ if [ -n "$JOB_ID" ]; then
   # Verify the created compilation actually has source_job_ids stored as UUID[]
   if [ -n "$MERGE_COMP_ID" ]; then
     RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/kg/compilations/$MERGE_COMP_ID" 2>/dev/null || echo "")
-    SRC_LEN=$(jlen "$RESP" "sourceJobIds")
+    SRC_LEN=$(jlen "$RESP" "compilation.sourceJobIds")
+    [ "$SRC_LEN" = "0" ] && SRC_LEN=$(jlen "$RESP" "sourceJobIds")
     if [ "$SRC_LEN" -ge 1 ]; then
       pass "Merged compilation persists sourceJobIds (count=$SRC_LEN)"
     else
@@ -394,6 +396,81 @@ if [ -n "$JOB_ID" ]; then
       fail "GET /fuse/jobs/:id missing 'input' — UI cannot show source extractions"
     fi
   fi
+fi
+
+# ─── 6d. Live node-count writeback (regression: stale postgres counters) ─
+section "6d. Live counters — KEX writes flow through to compilation cards"
+
+# Reproduces the bug: KEX writes N entities to Neo4j, but the compilation row
+# in postgres keeps node_count=0. The /kg/compilations endpoint must compute
+# live counts from Neo4j and override the stale postgres values.
+
+LIVE_EXTRACT_BODY='{"text":"Microsoft, headquartered in Redmond, was founded by Bill Gates and Paul Allen. The company acquired GitHub in 2018 and later invested in OpenAI."}'
+RESP=$(curl -sf --max-time 10 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -d "$LIVE_EXTRACT_BODY" "$API_BASE/kex/extract" 2>/dev/null || echo "")
+LIVE_JOB_ID=$(jget "$RESP" "jobId")
+if [ -n "$LIVE_JOB_ID" ]; then
+  echo -n "  ⏳ Waiting up to 180s for live-counter extraction job..."
+  WAIT=0; LIVE_STATUS="pending"
+  while [ $WAIT -lt 180 ]; do
+    RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$LIVE_JOB_ID" 2>/dev/null || echo "")
+    LIVE_STATUS=$(jget "$RESP" "job.status")
+    if [ "$LIVE_STATUS" = "completed" ] || [ "$LIVE_STATUS" = "failed" ]; then break; fi
+    sleep 3; WAIT=$((WAIT+3)); echo -n "."
+  done
+  echo ""
+
+  if [ "$LIVE_STATUS" = "completed" ]; then
+    pass "Live-counter extraction job completed"
+
+    # Find the *default* compilation (the one seeded at registration).
+    # Its source_job_ids is empty, so live_counts() falls back to
+    # "all of the user's nodes" — which must include the entities just
+    # written by KEX.
+    RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/kg/compilations" 2>/dev/null || echo "")
+    if [ "$JSON_TOOL" = "jq" ]; then
+      LIVE_COMP_ID=$(printf '%s' "$RESP" | jq -r '.compilations[] | select(.name == "My First Knowledge Base") | .id' | head -1)
+      LIVE_NC=$(printf '%s' "$RESP" | jq -r '.compilations[] | select(.name == "My First Knowledge Base") | .nodeCount' | head -1)
+    else
+      LIVE_COMP_ID=$(python3 -c "
+import sys, json
+d = json.loads(sys.argv[1])
+for c in d.get('compilations', []):
+    if c.get('name') == 'My First Knowledge Base':
+        print(c['id']); break
+" "$RESP")
+      LIVE_NC=$(python3 -c "
+import sys, json
+d = json.loads(sys.argv[1])
+for c in d.get('compilations', []):
+    if c.get('name') == 'My First Knowledge Base':
+        print(c.get('nodeCount', 0)); break
+" "$RESP")
+    fi
+    if [ -n "$LIVE_NC" ] && [ "$LIVE_NC" -ge 4 ] 2>/dev/null; then
+      pass "Default compilation reports live nodeCount=$LIVE_NC (>=4 — counter override works)"
+    else
+      fail "Default compilation reports nodeCount=$LIVE_NC (expected >=4 — live counter broken, /graphs would show 0)"
+    fi
+
+    # Same check on the detail endpoint
+    if [ -n "$LIVE_COMP_ID" ]; then
+      RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/kg/compilations/$LIVE_COMP_ID" 2>/dev/null || echo "")
+      # /kg/compilations/:id now wraps as { compilation: { ... } }
+      DETAIL_NC=$(jget "$RESP" "compilation.nodeCount")
+      [ -z "$DETAIL_NC" ] && DETAIL_NC=$(jget "$RESP" "nodeCount")
+      if [ -n "$DETAIL_NC" ] && [ "$DETAIL_NC" -ge 4 ] 2>/dev/null; then
+        pass "GET /kg/compilations/:id also reports live nodeCount=$DETAIL_NC"
+      else
+        fail "GET /kg/compilations/:id reports nodeCount=$DETAIL_NC (expected >=4)"
+      fi
+    fi
+  elif [ "$LIVE_STATUS" = "failed" ]; then
+    fail "Live-counter extraction job failed: $(jget "$RESP" job.error)"
+  else
+    fail "Live-counter extraction job stuck in '$LIVE_STATUS' after 180s"
+  fi
+else
+  fail "Could not submit live-counter extraction job"
 fi
 
 # ─── 7. KEX semantic search (post-extraction) ────────────────────────

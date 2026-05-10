@@ -27,7 +27,7 @@ async fn merge(
     State(state): State<Arc<crate::models::AppState>>,
     Json(req): Json<MergeReq>,
 ) -> Result<Json<Value>> {
-    sqlx::query("UPDATE users SET tokens_balance = tokens_balance - 10 WHERE id = $1")
+    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 10) WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
 
     let comp_id = Uuid::new_v4();

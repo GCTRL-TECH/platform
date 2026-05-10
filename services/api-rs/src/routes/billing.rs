@@ -1,4 +1,4 @@
-use axum::{extract::{Extension, Query, State}, routing::{get, post}, Json, Router};
+use axum::{extract::{Extension, Query, State}, routing::get, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -17,9 +17,88 @@ struct RegisterLicenseBody {
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
         .route("/balance",       get(balance))
-        .route("/license",       post(register_license))
+        .route("/license",       get(get_license).post(register_license))
         .route("/usage",         get(usage))
         .route("/usage/summary", get(usage_summary))
+}
+
+#[derive(Deserialize)]
+struct LicenseQuery {
+    /// When true, return the full license_key. Otherwise return a masked version.
+    reveal: Option<bool>,
+}
+
+/// GET /api/billing/license — return the most recent active license for the
+/// authenticated user, or `{ license: null }` if none exists.
+///
+/// Shape (when present):
+/// `{ license: { licenseKey, tier, creditsAllocated, creditsUsed, status,
+///               activatedAt, masked } }`
+///
+/// `licenseKey` is masked unless `?reveal=true` is passed. `masked` is always
+/// the masked form so the UI can show it without re-fetching.
+async fn get_license(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<LicenseQuery>,
+) -> Result<Json<Value>> {
+    let row = sqlx::query_as::<_, (
+        String, String, i32, i32, String, chrono::DateTime<chrono::Utc>
+    )>(
+        "SELECT license_key, tier, credits_allocated, credits_used, status, activated_at
+         FROM licenses
+         WHERE user_id = $1 AND status = 'active'
+         ORDER BY activated_at DESC LIMIT 1"
+    ).bind(claims.sub).fetch_optional(&state.db).await?;
+
+    let Some((key, tier, allocated, used, status, activated_at)) = row else {
+        return Ok(Json(json!({ "license": null })));
+    };
+
+    let masked = mask_license_key(&key);
+    let reveal = q.reveal.unwrap_or(false);
+    let display_key = if reveal { key.clone() } else { masked.clone() };
+
+    Ok(Json(json!({
+        "license": {
+            "licenseKey":       display_key,
+            "masked":           masked,
+            "tier":             tier,
+            "creditsAllocated": allocated,
+            "creditsUsed":      used,
+            "creditsRemaining": allocated - used,
+            "status":           status,
+            "activatedAt":      activated_at,
+        }
+    })))
+}
+
+/// Mask a license key to `XXXX-...-XXXX` form: keep the first segment up to the
+/// first dash and the last 4 chars, replace everything else with `****`.
+/// Examples:
+///   `GCTRL-1234-5678-ABCD-WXYZ` → `GCTRL-****-****-****-WXYZ`
+///   `short`                     → `*****` (just stars when too short)
+fn mask_license_key(key: &str) -> String {
+    if key.len() < 8 {
+        return "*".repeat(key.len());
+    }
+    let segments: Vec<&str> = key.split('-').collect();
+    if segments.len() <= 2 {
+        // No segments / too few — fall back to first-3 + last-4 mask.
+        let prefix = &key[..3];
+        let suffix = &key[key.len() - 4..];
+        return format!("{prefix}***{suffix}");
+    }
+    let first = segments[0];
+    let last  = segments[segments.len() - 1];
+    let middle_count = segments.len() - 2;
+    let mut parts: Vec<String> = Vec::with_capacity(segments.len());
+    parts.push(first.to_string());
+    for _ in 0..middle_count {
+        parts.push("****".to_string());
+    }
+    parts.push(last.to_string());
+    parts.join("-")
 }
 
 /// Default token allocation per tier. Must stay in sync with the license server

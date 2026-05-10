@@ -41,7 +41,8 @@ async fn extract(
     if req.text.len() < 10 {
         return Err(AppError::BadRequest("Text too short (min 10 chars)".into()));
     }
-    sqlx::query("UPDATE users SET tokens_balance = tokens_balance - 5 WHERE id = $1")
+    // GREATEST(0, ...) prevents negative balances if a prior bug or race left them stuck.
+    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
 
     let (ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, req.ontology_id).await;
@@ -133,7 +134,7 @@ async fn upload(
     };
 
     let job_id = Uuid::new_v4();
-    sqlx::query("UPDATE users SET tokens_balance = tokens_balance - 5 WHERE id = $1")
+    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
 
     let (resolved_ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, ontology_id).await;
@@ -187,6 +188,7 @@ async fn list_jobs(
     Ok(Json(json!({ "jobs": jobs })))
 }
 
+// Frontend KexJobDetail expects `{ job: ... }` wrapper.
 async fn get_job(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -199,23 +201,32 @@ async fn get_job(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
     let (id, t, status, input, result, error, created, completed) = row;
-    Ok(Json(json!({
+    Ok(Json(json!({ "job": {
         "id": id, "type": t, "status": status,
         "input": input, "result": result, "error": error,
         "createdAt": created, "completedAt": completed,
-    })))
+    } })))
 }
 
+// Frontend KexJobDetail expects shape `{ jobId, status, completedAt, result }`.
 async fn get_result(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let result: Option<Value> = sqlx::query_scalar("SELECT result FROM jobs WHERE id = $1 AND user_id = $2")
-        .bind(id).bind(claims.sub)
-        .fetch_optional(&state.db).await?
-        .flatten();
-    Ok(Json(result.unwrap_or(json!(null))))
+    let row = sqlx::query_as::<_, (String, Option<Value>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT status, result, completed_at FROM jobs WHERE id = $1 AND user_id = $2"
+    )
+    .bind(id).bind(claims.sub)
+    .fetch_optional(&state.db).await?
+    .ok_or(AppError::NotFound)?;
+    let (status, result, completed_at) = row;
+    Ok(Json(json!({
+        "jobId": id,
+        "status": status,
+        "completedAt": completed_at,
+        "result": result,
+    })))
 }
 
 async fn cancel_job(

@@ -15,9 +15,19 @@ from . import config
 logger = logging.getLogger(__name__)
 
 
-def _make_uri(name: str, entity_type: str) -> str:
-    """Generate a stable URI for a node from its name and Wikidata type."""
+def _make_uri(name: str, entity_type: str, user_id: str = "") -> str:
+    """Generate a stable URI for a node from its name and Wikidata type.
+
+    Scoped to the user so each user has their own copy of "Microsoft", "Steve
+    Jobs", etc. Without this, the FIRST user to extract a given entity owns
+    it forever — subsequent users' extractions just bump the existing node's
+    `_source_job` but the node count for *their* graph stays at 0.
+    """
     slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if user_id:
+        # 12 chars of the UUID is plenty for collision-resistance per-user.
+        scope = user_id.replace("-", "")[:12]
+        return f"databorg:{scope}/{entity_type}/{slug}"
     return f"databorg:{entity_type}/{slug}"
 
 
@@ -126,7 +136,7 @@ class KGBuilder:
             if not name:
                 continue
 
-            uri = _make_uri(name, entity_type)
+            uri = _make_uri(name, entity_type, user_id)
 
             result = tx.run(
                 """

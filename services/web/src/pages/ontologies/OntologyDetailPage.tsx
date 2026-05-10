@@ -861,9 +861,12 @@ export function OntologyDetailPage() {
   const [showAddType, setShowAddType] = useState(false)
   const [settingDefault, setSettingDefault] = useState(false)
 
+  // `enabled: !!id` prevents an in-flight fetch with an undefined route param,
+  // which would otherwise hit `/ontologies/undefined` and 500.
   const { data, isLoading, error, refetch } = useApiQuery<OntologyDetailResponse>(
     ['ontologies', id],
-    `/ontologies/${id}`
+    `/ontologies/${id}`,
+    { enabled: !!id }
   )
 
   const ontology = data?.ontology
@@ -876,7 +879,8 @@ export function OntologyDetailPage() {
     if (!id) return
     setSettingDefault(true)
     try {
-      await apiPut('/users/me/settings', { defaultOntologyId: id })
+      // PUT /users/me handles default_ontology_id (see api-rs users::update_settings_handler).
+      await apiPut('/users/me', { defaultOntologyId: id })
       updateUser({ defaultOntologyId: id })
     } finally {
       setSettingDefault(false)

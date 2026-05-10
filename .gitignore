@@ -13,3 +13,4 @@ config/license.jwt
 .previous-images
 coverage/
 .pytest_cache/
+e2e-output.txt

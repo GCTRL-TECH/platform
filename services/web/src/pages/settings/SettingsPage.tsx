@@ -34,6 +34,8 @@ import {
   ArrowUpCircle,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
+import { useApiQuery } from '@/hooks/useApi'
+import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
@@ -1691,13 +1693,76 @@ function InfrastructureTab() {
 
 // ─── Tab: License ─────────────────────────────────────────────────────────────
 
+interface CurrentLicense {
+  licenseKey: string       // masked unless reveal=true
+  masked: string
+  tier: string
+  creditsAllocated: number
+  creditsUsed: number
+  creditsRemaining: number
+  status: string
+  activatedAt: string
+}
+
+interface CurrentLicenseResponse {
+  license: CurrentLicense | null
+}
+
 function LicenseTab() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const [key, setKey] = useState(() => localStorage.getItem('gctrl_license_key') ?? '')
+  const queryClient = useQueryClient()
+  const [key, setKey] = useState('')
   const [show, setShow] = useState(false)
+  const [revealedFull, setRevealedFull] = useState<string | null>(null)
+  const [revealing, setRevealing] = useState(false)
   const [activating, setActivating] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null)
+
+  // Fetch the most recent active license linked to this user.
+  const { data: licenseData, isLoading: licenseLoading, refetch: refetchLicense } =
+    useApiQuery<CurrentLicenseResponse>(['billing', 'license'], '/billing/license')
+  const license = licenseData?.license ?? null
+
+  async function handleReveal() {
+    if (revealedFull) {
+      setRevealedFull(null)
+      return
+    }
+    setRevealing(true)
+    try {
+      const { data } = await api.get<CurrentLicenseResponse>('/billing/license', {
+        params: { reveal: true },
+      })
+      if (data.license?.licenseKey) setRevealedFull(data.license.licenseKey)
+    } catch { /* silent — masked stays */ }
+    finally { setRevealing(false) }
+  }
+
+  async function handleCopy() {
+    const fullKey = revealedFull ?? null
+    if (!fullKey) {
+      // Need to fetch full key first
+      try {
+        const { data } = await api.get<CurrentLicenseResponse>('/billing/license', {
+          params: { reveal: true },
+        })
+        if (data.license?.licenseKey) {
+          await navigator.clipboard.writeText(data.license.licenseKey)
+          setResult({ ok: true, msg: 'License key copied to clipboard' })
+          setTimeout(() => setResult(null), 2500)
+        }
+      } catch {
+        setResult({ ok: false, msg: 'Could not copy license key' })
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(fullKey)
+        setResult({ ok: true, msg: 'License key copied to clipboard' })
+        setTimeout(() => setResult(null), 2500)
+      } catch { /* clipboard denied */ }
+    }
+  }
 
   async function handleActivate() {
     if (!key.trim()) return
@@ -1721,6 +1786,13 @@ function LicenseTab() {
             credits_allocated: data.credits_balance,
           })
         } catch { /* non-fatal — license stored locally, user can re-link later */ }
+        // Invalidate dependent queries so the displayed balance + license refresh.
+        queryClient.invalidateQueries({ queryKey: ['billing', 'balance'] })
+        queryClient.invalidateQueries({ queryKey: ['billing', 'license'] })
+        queryClient.invalidateQueries({ queryKey: ['users', 'me'] })
+        void refetchLicense()
+        setKey('')
+        setRevealedFull(null)
         setResult({ ok: true, msg: 'License activated and linked to your account' })
       } else {
         setResult({ ok: false, msg: data.error ?? 'Activation failed' })
@@ -1732,22 +1804,102 @@ function LicenseTab() {
     }
   }
 
-  const hasKey = !!localStorage.getItem('gctrl_license_key')
+  const displayKey = revealedFull ?? license?.licenseKey ?? ''
 
   return (
     <div className="space-y-6 max-w-xl">
+      {/* Current license card */}
       <section>
-        <SectionHeader>License Key</SectionHeader>
+        <SectionHeader>Current License</SectionHeader>
         <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-4">
-          {hasKey && (
-            <div className="flex items-center gap-2">
-              <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400">
-                <Check size={10} /> Active
-              </span>
+          {licenseLoading ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500">
+              <Loader2 size={14} className="animate-spin" />
+              Loading license…
+            </div>
+          ) : license ? (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400">
+                  <Check size={10} /> {license.status === 'active' ? 'Active' : license.status}
+                </span>
+                <span className="rounded-full bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-300 capitalize">
+                  {license.tier}
+                </span>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-400">License Key</label>
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={displayKey}
+                    className="flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-300 select-all focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleReveal()}
+                    title={revealedFull ? 'Hide full key' : 'Reveal full key'}
+                    className="rounded-md border border-slate-700 bg-slate-800 px-3 text-slate-500 hover:text-slate-300 transition-colors"
+                  >
+                    {revealing ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : revealedFull ? (
+                      <EyeOff size={14} />
+                    ) : (
+                      <Eye size={14} />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopy()}
+                    title="Copy to clipboard"
+                    className="rounded-md border border-slate-700 bg-slate-800 px-3 text-xs font-medium text-slate-400 hover:text-slate-200 transition-colors"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-3 text-xs">
+                <div>
+                  <p className="text-slate-500">Allocated</p>
+                  <p className="mt-0.5 font-medium text-slate-200">
+                    {license.creditsAllocated.toLocaleString()}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Used</p>
+                  <p className="mt-0.5 font-medium text-slate-200">
+                    {license.creditsUsed.toLocaleString()}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Remaining</p>
+                  <p className="mt-0.5 font-medium text-emerald-400">
+                    {license.creditsRemaining.toLocaleString()}
+                  </p>
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-600">
+                Activated {new Date(license.activatedAt).toLocaleString()}
+              </p>
+            </>
+          ) : (
+            <div className="flex items-start gap-2 text-sm text-slate-400">
+              <Shield size={14} className="mt-0.5 shrink-0 text-slate-500" />
+              <span>No active license linked to this account. Enter a key below to activate.</span>
             </div>
           )}
+        </div>
+      </section>
+
+      {/* Activate / replace license */}
+      <section>
+        <SectionHeader>{license ? 'Replace License Key' : 'Activate License Key'}</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-4">
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-400">License Key</label>
+            <label className="mb-1.5 block text-xs font-medium text-slate-400">
+              {license ? 'New License Key' : 'License Key'}
+            </label>
             <div className="flex gap-2">
               <input
                 type={show ? 'text' : 'password'}
@@ -1777,7 +1929,7 @@ function LicenseTab() {
             className="flex items-center gap-2 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white transition-colors"
           >
             {activating ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
-            {activating ? 'Activating…' : 'Activate / Update Key'}
+            {activating ? 'Activating…' : license ? 'Replace License Key' : 'Activate License Key'}
           </button>
         </div>
       </section>
