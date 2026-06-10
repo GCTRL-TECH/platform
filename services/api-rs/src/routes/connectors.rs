@@ -13,8 +13,39 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, Result},
     middleware::auth::JwtClaims,
+    routes::connector_configs::lookup_credentials,
     services::redis::lpush,
 };
+
+// ─── Credential resolution ───────────────────────────────────────────────────
+
+/// Resolve `(client_id, client_secret)` for `provider` by checking the
+/// `connector_configs` table first, then falling back to environment variables
+/// (currently only Google has env-var fallback for dev convenience).
+///
+/// Returns a clear `BadRequest` if neither source is set, so the UI can prompt
+/// the user to configure credentials in Settings → Integrations.
+async fn resolve_credentials(
+    db: &sqlx::PgPool,
+    cfg: &crate::config::Config,
+    provider: &str,
+) -> Result<(String, String)> {
+    if let Some(pair) = lookup_credentials(db, provider).await? {
+        return Ok(pair);
+    }
+    // Backwards-compat: dev who set GOOGLE_CLIENT_ID/SECRET in .env can still run
+    // without going through the Settings UI.
+    if provider == "google"
+        && !cfg.google_client_id.is_empty()
+        && !cfg.google_client_secret.is_empty()
+    {
+        return Ok((cfg.google_client_id.clone(), cfg.google_client_secret.clone()));
+    }
+    Err(AppError::BadRequest(format!(
+        "OAuth not configured for '{provider}'. \
+         Go to Settings → Integrations and paste your {provider} Client ID + Client Secret first."
+    )))
+}
 
 // ─── Redis helpers (OAuth state) ─────────────────────────────────────────────
 
@@ -159,7 +190,12 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/google/drive/files",      get(drive_files))
         .route("/google/drive/sync",       post(sync_selected))
         .route("/google/drive/sync/folder", post(sync_folder))
+        // Redirect-style OAuth start (302 → Google consent page). Used when the
+        // user clicks "Connect" inside the GoogleDrivePage tab.
         .route("/google/auth",             get(google_auth_start))
+        // JSON-style OAuth start: returns `{ authUrl }` for any supported
+        // provider. The Settings UI pops this in a small window.
+        .route("/auth/:provider",          get(oauth_auth_url))
 }
 
 /// Public routes — no JWT required (OAuth callback arrives from Google with no auth header).
@@ -218,9 +254,13 @@ async fn ensure_valid_token(
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("No refresh token stored; please reconnect Google".into()))?;
 
+    // Pull the live OAuth client credentials — the admin may have rotated them
+    // since this connector was created, so we re-resolve on every refresh.
+    let (client_id, client_secret) = resolve_credentials(db, cfg, "google").await?;
+
     let params = [
-        ("client_id",     cfg.google_client_id.as_str()),
-        ("client_secret", cfg.google_client_secret.as_str()),
+        ("client_id",     client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
         ("refresh_token", refresh_token),
         ("grant_type",    "refresh_token"),
     ];
@@ -311,15 +351,11 @@ async fn disconnect_connector(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// GET /api/connectors/google/auth — redirect browser to Google consent screen
-async fn google_auth_start(
-    Extension(claims): Extension<JwtClaims>,
-    State(state): State<Arc<crate::models::AppState>>,
-) -> Result<Redirect> {
-    if state.cfg.google_client_id.is_empty() {
-        return Err(AppError::BadRequest("Google OAuth not configured".into()));
-    }
-
+/// Build a Google consent-screen URL for the given user. Returns the URL
+/// string plus stores the CSRF nonce in Redis. Shared by both the redirect
+/// (`/google/auth`) and JSON (`/auth/:provider`) entrypoints.
+async fn build_google_auth_url(state: &Arc<crate::models::AppState>, user_id: Uuid) -> Result<String> {
+    let (client_id, _) = resolve_credentials(&state.db, &state.cfg, "google").await?;
     let redirect_uri = format!("{}/api/connectors/google/callback", state.cfg.frontend_url);
 
     // Generate a random nonce and store it in Redis as the CSRF state token.
@@ -328,15 +364,14 @@ async fn google_auth_start(
     // never exposed in the state parameter, preventing CSRF / account-takeover attacks.
     let nonce = Uuid::new_v4().to_string();
     let redis_key = format!("oauth_state:{nonce}");
-    redis_set_ex(&state.redis, &redis_key, &claims.sub.to_string(), 600)
+    redis_set_ex(&state.redis, &redis_key, &user_id.to_string(), 600)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to store OAuth state in Redis: {e}")))?;
 
-    // Build the URL using reqwest's query-param encoding to avoid an extra crate.
     let url = reqwest::Client::new()
         .get("https://accounts.google.com/o/oauth2/v2/auth")
         .query(&[
-            ("client_id",     state.cfg.google_client_id.as_str()),
+            ("client_id",     client_id.as_str()),
             ("redirect_uri",  redirect_uri.as_str()),
             ("scope",
              "https://www.googleapis.com/auth/drive.readonly \
@@ -350,8 +385,35 @@ async fn google_auth_start(
         .map_err(|e| AppError::Internal(format!("Failed to build OAuth URL: {e}")))?
         .url()
         .to_string();
+    Ok(url)
+}
 
+/// GET /api/connectors/google/auth — redirect browser to Google consent screen
+async fn google_auth_start(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Redirect> {
+    let url = build_google_auth_url(&state, claims.sub).await?;
     Ok(Redirect::temporary(&url))
+}
+
+/// GET /api/connectors/auth/:provider — return `{ authUrl }` as JSON so the
+/// Settings UI can open it in a popup. Currently only Google is supported;
+/// other providers return a clear 400.
+async fn oauth_auth_url(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(provider): Path<String>,
+) -> Result<Json<Value>> {
+    let url = match provider.as_str() {
+        "google" => build_google_auth_url(&state, claims.sub).await?,
+        other    => {
+            return Err(AppError::BadRequest(format!(
+                "OAuth start for '{other}' is not implemented yet"
+            )));
+        }
+    };
+    Ok(Json(json!({ "authUrl": url })))
 }
 
 /// GET /api/connectors/google/callback — exchanges code for tokens and stores them
@@ -392,9 +454,7 @@ async fn google_callback(
         .parse()
         .map_err(|_| AppError::Internal("Corrupt OAuth state in Redis".into()))?;
 
-    if state.cfg.google_client_id.is_empty() {
-        return Err(AppError::BadRequest("Google OAuth not configured".into()));
-    }
+    let (client_id, client_secret) = resolve_credentials(&state.db, &state.cfg, "google").await?;
 
     let redirect_uri = format!("{}/api/connectors/google/callback", state.cfg.frontend_url);
     let http = reqwest::Client::new();
@@ -402,8 +462,8 @@ async fn google_callback(
     // Exchange auth code for tokens
     let params = [
         ("code",          code),
-        ("client_id",     state.cfg.google_client_id.as_str()),
-        ("client_secret", state.cfg.google_client_secret.as_str()),
+        ("client_id",     client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
         ("redirect_uri",  redirect_uri.as_str()),
         ("grant_type",    "authorization_code"),
     ];

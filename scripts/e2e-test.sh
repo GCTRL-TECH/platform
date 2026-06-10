@@ -523,6 +523,175 @@ section "9. Connectors"
 RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/connectors" 2>/dev/null || echo "")
 if jhas "$RESP" "connectors"; then pass "GET /connectors returns 'connectors' array"; else fail "/connectors broken"; fi
 
+# ─── 11. Connectors self-serve (per-deployment OAuth credentials) ────
+section "11. Connectors self-serve"
+
+# We need admin role to hit the config endpoints. Most stacks have a seeded
+# admin (admin@gctrl.local / admin). Try logging in; skip the rest if not present.
+ADMIN_LOGIN=$(printf '{"email":"admin@gctrl.local","password":"admin"}')
+ADMIN_RESP=$(curl -sf --max-time 5 -X POST "$API_BASE/auth/login" -H "Content-Type: application/json" -d "$ADMIN_LOGIN" 2>/dev/null || echo "")
+ADMIN_JWT=$(jget "$ADMIN_RESP" "token")
+
+if [ -z "$ADMIN_JWT" ]; then
+  echo -e "  ${YELLOW}⚠${NC} No admin@gctrl.local found — skipping admin-gated checks (use a non-admin token for negative cases only)"
+  ADMIN_JWT=""
+fi
+
+# Without any saved config and no env vars, GET /auth/google must fail with a
+# helpful 400. We can't strip env vars from a running server, so we only check
+# the shape of the response is JSON with an authUrl OR a clear error message.
+RESP=$(curl -s --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/connectors/auth/google" 2>/dev/null || echo "")
+if jhas "$RESP" "authUrl" || jhas "$RESP" "error"; then
+  pass "GET /connectors/auth/google returns either authUrl or error JSON"
+else
+  fail "GET /connectors/auth/google did not return authUrl or error — endpoint broken"
+fi
+
+# When an authUrl is returned, it must point at accounts.google.com with our params
+AUTH_URL=$(jget "$RESP" "authUrl")
+if [ -n "$AUTH_URL" ]; then
+  if printf '%s' "$AUTH_URL" | grep -q 'accounts.google.com/o/oauth2/v2/auth' \
+     && printf '%s' "$AUTH_URL" | grep -q 'client_id=' \
+     && printf '%s' "$AUTH_URL" | grep -q 'redirect_uri=' \
+     && printf '%s' "$AUTH_URL" | grep -q 'state='; then
+    pass "authUrl points to Google consent with client_id/redirect_uri/state"
+  else
+    fail "authUrl is malformed: $AUTH_URL"
+  fi
+fi
+
+# providers list — admin route
+if [ -n "$ADMIN_JWT" ]; then
+  RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $ADMIN_JWT" "$API_BASE/connectors/config/providers" 2>/dev/null || echo "")
+  P_LEN=$(jlen "$RESP" "providers")
+  if [ "$P_LEN" -ge 4 ]; then
+    pass "GET /connectors/config/providers returns >=4 providers (count=$P_LEN)"
+  else
+    fail "GET /connectors/config/providers returned $P_LEN (expected >=4: google, microsoft, slack, github)"
+  fi
+
+  # PUT dummy creds for google
+  PUT_BODY='{"clientId":"dummy-client-id-e2e","clientSecret":"dummy-client-secret-e2e-12345"}'
+  RESP=$(curl -sf --max-time 5 -X PUT -H "Authorization: Bearer $ADMIN_JWT" -H "Content-Type: application/json" -d "$PUT_BODY" "$API_BASE/connectors/config/google" 2>/dev/null || echo "")
+  if [ "$(jget "$RESP" ok)" = "True" ] || [ "$(jget "$RESP" ok)" = "true" ]; then
+    pass "PUT /connectors/config/google upserts credentials"
+  else
+    fail "PUT /connectors/config/google did not return ok=true (resp=$RESP)"
+  fi
+
+  # GET back the row — clientId should be visible, secret masked
+  RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $ADMIN_JWT" "$API_BASE/connectors/config/google" 2>/dev/null || echo "")
+  CID=$(jget "$RESP" "clientId")
+  MASKED=$(jget "$RESP" "clientSecretMasked")
+  if [ "$CID" = "dummy-client-id-e2e" ]; then
+    pass "GET /connectors/config/google returns the saved clientId"
+  else
+    fail "GET /connectors/config/google returned clientId='$CID' (expected dummy-client-id-e2e)"
+  fi
+  if [ -n "$MASKED" ] && ! printf '%s' "$MASKED" | grep -q 'dummy-client-secret-e2e-12345'; then
+    pass "clientSecret is masked on read (got '$MASKED')"
+  else
+    fail "clientSecret leaked or empty in GET response: '$MASKED'"
+  fi
+
+  # /auth/google should now produce a real authUrl (DB creds present)
+  RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/connectors/auth/google" 2>/dev/null || echo "")
+  AUTH_URL=$(jget "$RESP" "authUrl")
+  if printf '%s' "$AUTH_URL" | grep -q 'client_id=dummy-client-id-e2e'; then
+    pass "/connectors/auth/google now uses DB-saved client_id (overrides env)"
+  else
+    fail "/connectors/auth/google did not pick up DB client_id: $AUTH_URL"
+  fi
+
+  # DELETE the row to clean up
+  if curl -sf --max-time 5 -X DELETE -H "Authorization: Bearer $ADMIN_JWT" "$API_BASE/connectors/config/google" -o /dev/null 2>/dev/null; then
+    pass "DELETE /connectors/config/google clears the row"
+  else
+    fail "DELETE /connectors/config/google failed"
+  fi
+fi
+
+# Non-admin users must be forbidden from the config endpoints (the test user $JWT is a viewer)
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/connectors/config/providers" 2>/dev/null || echo "0")
+if [ "$HTTP_STATUS" = "403" ]; then
+  pass "Non-admin gets 403 on /connectors/config/providers"
+else
+  fail "Non-admin got HTTP $HTTP_STATUS on /connectors/config/providers (expected 403)"
+fi
+
+# ─── 12. License heartbeat (background sync to license-api) ─────────
+section "12. License heartbeat — local token_usage flushes to license-api"
+
+# Smoke test the background heartbeat task without depending on the real
+# license-api server (api.gctrl.tech). We seed:
+#   1. A `licenses` row for this user with a dummy JWT
+#   2. A `token_usage` row marked synced_to_license_api=false
+# Then we wait one full heartbeat cycle (60s loop + 10s warm-up + slack).
+#
+# Outcome: either the row flips to synced=true (full success when
+# GCTRL_LICENSE_API_URL points at a reachable license-api), OR it stays false
+# but the API process is still healthy — which proves the loop ran without
+# panicking. Both are valid for this smoke test.
+
+PSQL_EXEC=""
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^gctrl-postgres$'; then
+  PSQL_EXEC="docker exec -i gctrl-postgres psql -U GCTRL -d GCTRL -t -A -q"
+fi
+
+if [ -z "$PSQL_EXEC" ]; then
+  echo "  (skipping — gctrl-postgres container not reachable)"
+elif [ -z "$USER_ID" ]; then
+  echo "  (skipping — no USER_ID from registration)"
+else
+  # Seed a license row with a dummy JWT so the heartbeat pre-filter
+  # (license_jwt IS NOT NULL) admits this user. Whether api.gctrl.tech accepts
+  # the JWT is irrelevant for the loop-ran-without-panicking smoke check.
+  DUMMY_KEY="E2E-${TIMESTAMP}"
+  DUMMY_JWT="e2e.smoke.jwt.$TIMESTAMP"
+  SEED_LICENSE_SQL="INSERT INTO licenses (user_id, license_key, tier, credits_allocated, license_jwt, license_jwt_updated_at, status) VALUES ('$USER_ID', '$DUMMY_KEY', 'free', 3000, '$DUMMY_JWT', NOW(), 'active') ON CONFLICT (license_key) DO UPDATE SET license_jwt = EXCLUDED.license_jwt, status = 'active';"
+  if echo "$SEED_LICENSE_SQL" | $PSQL_EXEC >/dev/null 2>&1; then
+    pass "Seeded licenses row with dummy JWT for heartbeat smoke"
+  else
+    fail "Could not seed licenses row (psql failed)"
+  fi
+
+  # Seed an unsynced token_usage row with a sentinel action so we can target
+  # exactly this row when checking the flag.
+  HB_ACTION="e2e_heartbeat_${TIMESTAMP}"
+  SEED_USAGE_SQL="INSERT INTO token_usage (user_id, action, tokens_spent, synced_to_license_api) VALUES ('$USER_ID', '$HB_ACTION', 7, false);"
+  if echo "$SEED_USAGE_SQL" | $PSQL_EXEC >/dev/null 2>&1; then
+    pass "Seeded token_usage row (action=$HB_ACTION, unsynced)"
+  else
+    fail "Could not seed token_usage row"
+  fi
+
+  echo -n "  ⏳ Waiting ~95s for the background heartbeat loop to tick..."
+  WAIT=0
+  SYNCED_FLAG="f"
+  while [ $WAIT -lt 95 ]; do
+    sleep 5; WAIT=$((WAIT+5)); echo -n "."
+    SYNCED_FLAG=$(echo "SELECT synced_to_license_api FROM token_usage WHERE user_id='$USER_ID' AND action='$HB_ACTION' LIMIT 1;" | $PSQL_EXEC 2>/dev/null | tr -d '[:space:]')
+    if [ "$SYNCED_FLAG" = "t" ]; then break; fi
+  done
+  echo ""
+
+  if [ "$SYNCED_FLAG" = "t" ]; then
+    pass "token_usage row flipped to synced_to_license_api=true (heartbeat reached license-api)"
+  else
+    # Verify the API process at least still answers — i.e. the loop didn't panic.
+    HEALTH=$(curl -sf --max-time 5 "$API_BASE/health" 2>/dev/null || echo "")
+    if [ "$(jget "$HEALTH" status)" = "ok" ]; then
+      pass "Heartbeat loop ran (API still healthy); row stayed unsynced — expected when GCTRL_LICENSE_API_URL is unset or unreachable"
+    else
+      fail "API health check failed after heartbeat window — loop may have panicked the runtime"
+    fi
+  fi
+
+  # Cleanup the seeded rows so reruns don't accumulate.
+  echo "DELETE FROM token_usage WHERE user_id='$USER_ID' AND action='$HB_ACTION';" | $PSQL_EXEC >/dev/null 2>&1
+  echo "DELETE FROM licenses WHERE license_key='$DUMMY_KEY';" | $PSQL_EXEC >/dev/null 2>&1
+fi
+
 # ─── 10. Cleanup ──────────────────────────────────────────────────────
 section "10. Cleanup"
 

@@ -1,8 +1,8 @@
-# BorgHive - Build Summary
+# Ground Control - Build Summary
 
-## What is BorgHive?
+## What is Ground Control?
 
-BorgHive is a structured data platform for AI. Drop any data, get knowledge graphs. Fuse them into high-quality sources. Talk to them with GDPR-compliant RAG. All no-code, all visual, all enterprise-ready.
+Ground Control is a structured data platform for AI. Drop any data, get knowledge graphs. Fuse them into high-quality sources. Talk to them with GDPR-compliant RAG. All no-code, all visual, all enterprise-ready.
 
 **Tagline**: "Drop any data. Get structured knowledge."
 
@@ -125,14 +125,14 @@ SLACK_CLIENT_SECRET=...
 - `GET /api/admin/audit` — Audit log
 
 ### MCP Server
-BorgHive exposes an MCP server for AI tool integration. Tools: borghive_extract, borghive_query, borghive_store, borghive_fuse, borghive_search_entities, borghive_list_graphs, borghive_list_ontologies, borghive_list_extractions, borghive_schema.
+Ground Control exposes an MCP server for AI tool integration. Tools: borghive_extract, borghive_query, borghive_store, borghive_fuse, borghive_search_entities, borghive_list_graphs, borghive_list_ontologies, borghive_list_extractions, borghive_schema.
 
 ## n8n Community Node
 Package: `n8n-nodes-borghive` (at borghive/n8n-nodes-borghive/)
-- BorgHive node (all operations)
-- BorgHive Trigger (job completion polling)
-- BorgHive Memory (AI Agent persistent memory)
-- BorgHive Knowledge Tool (AI Agent KG query)
+- Ground Control node (all operations)
+- Ground Control Trigger (job completion polling)
+- Ground Control Memory (AI Agent persistent memory)
+- Ground Control Knowledge Tool (AI Agent KG query)
 
 ## Tech Stack
 | Layer | Technology |

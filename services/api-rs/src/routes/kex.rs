@@ -10,7 +10,11 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{error::{AppError, Result}, middleware::auth::JwtClaims, services::redis::lpush};
+use crate::{
+    error::{AppError, Result},
+    middleware::auth::JwtClaims,
+    services::{redis::lpush, usage::record_usage},
+};
 
 #[derive(Deserialize)]
 struct ExtractReq {
@@ -58,6 +62,9 @@ async fn extract(
         "discoveryMode": req.discovery_mode.unwrap_or_else(|| "extract".into()),
     }))
     .execute(&state.db).await?;
+
+    // Record the spend locally so the heartbeat task can ship it upstream.
+    record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
     let payload = json!({
         "job_id": job_id, "user_id": claims.sub, "type": "text",
@@ -145,6 +152,8 @@ async fn upload(
     .bind(job_id).bind(claims.sub)
     .bind(json!({ "fileName": file_name, "ontologyId": resolved_ontology_id }))
     .execute(&state.db).await?;
+
+    record_usage(&state.db, claims.sub, "kex_upload", 5, Some(job_id)).await;
 
     // KEX worker parses `input` as a JSON string with fileBase64, mimetype, originalFilename
     let kex_input = json!({

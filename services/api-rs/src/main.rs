@@ -47,7 +47,8 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/billing",     routes::billing::router())
         .nest("/api/admin",       routes::admin::router())
         .nest("/api/update",      routes::update::router())
-        .nest("/api/connectors",  routes::connectors::router())
+        .nest("/api/connectors",  routes::connectors::router()
+                                        .merge(routes::connector_configs::router()))
         .nest("/api/ontologies",  routes::ontologies::router())
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 

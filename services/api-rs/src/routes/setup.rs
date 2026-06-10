@@ -1,8 +1,11 @@
-use axum::{extract::State, response::IntoResponse, routing::{get, post}, Json, Router};
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::{get, post}, Json, Router};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
+
+use crate::middleware::auth::JwtClaims;
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
@@ -17,8 +20,16 @@ struct ActivateRequest {
     license_key: String,
 }
 
-async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
+async fn activate(
+    State(state): State<Arc<crate::models::AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ActivateRequest>,
+) -> impl IntoResponse {
     let client = reqwest::Client::new();
+
+    // If the caller is authenticated (Settings page, post-login), we'll persist
+    // the license JWT to their licenses row so the heartbeat loop can use it.
+    let caller = extract_optional_claims(&headers, &state.cfg.jwt_secret);
 
     // ── 1. Try gctrl-agent (production stack) ──────────────────────────────
     let agent_resp = client
@@ -46,6 +57,7 @@ async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
                     }
                 });
             }
+            persist_license_from_response(&state.db, caller.as_ref(), &req.license_key, &body).await;
             return (
                 axum::http::StatusCode::OK,
                 Json(serde_json::json!({
@@ -86,6 +98,7 @@ async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         if status.is_success() {
+            persist_license_from_response(&state.db, caller.as_ref(), &req.license_key, &body).await;
             return (
                 axum::http::StatusCode::OK,
                 Json(serde_json::json!({
@@ -121,6 +134,74 @@ async fn activate(Json(req): Json<ActivateRequest>) -> impl IntoResponse {
             "warning": "Agent + license server unreachable — license recorded locally only",
         })),
     )
+}
+
+/// Read & verify Authorization: Bearer <jwt> if present. Unauthenticated
+/// callers (Activation Wizard) just won't get their license JWT persisted —
+/// the heartbeat loop tolerates that and stays a no-op for those users until
+/// they re-activate while logged-in (Settings → Activate).
+fn extract_optional_claims(headers: &HeaderMap, secret: &str) -> Option<JwtClaims> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))?;
+    let key = DecodingKey::from_secret(secret.as_bytes());
+    decode::<JwtClaims>(token, &key, &Validation::new(Algorithm::HS256))
+        .ok()
+        .map(|d| d.claims)
+}
+
+/// Persist the license JWT (+ tier + credits) returned by license-api/agent
+/// into the local `licenses` row. UPSERT on `license_key` (the unique key) so
+/// reactivations refresh the JWT in place. Best-effort: a DB failure here just
+/// means the heartbeat loop won't kick in until the next successful activate.
+async fn persist_license_from_response(
+    db: &sqlx::PgPool,
+    caller: Option<&JwtClaims>,
+    license_key: &str,
+    body: &serde_json::Value,
+) {
+    let Some(claims) = caller else {
+        // Unauthenticated activate (ActivationWizard before login). Frontend
+        // will follow up with /billing/license once logged in, which already
+        // stores the key+tier — but without the JWT. That's fine, the user
+        // can reactivate from Settings to enable heartbeat sync.
+        return;
+    };
+
+    let license_jwt = body["license_jwt"].as_str();
+    let tier = body["tier"].as_str().unwrap_or("free").to_string();
+    // license-api returns `credits_balance` (snake) = remaining credits.
+    let credits_remaining = body["credits_balance"].as_i64().unwrap_or(3000) as i32;
+    // We treat that as the allocation (used=0) on first activation. Subsequent
+    // heartbeats reconcile via licenses.credits_used.
+    let credits_allocated = credits_remaining.max(0);
+
+    let res = sqlx::query(
+        "INSERT INTO licenses (user_id, license_key, tier, credits_allocated, license_jwt, license_jwt_updated_at) \
+         VALUES ($1, $2, $3, $4, $5, NOW()) \
+         ON CONFLICT (license_key) DO UPDATE SET \
+            tier = EXCLUDED.tier, \
+            credits_allocated = EXCLUDED.credits_allocated, \
+            license_jwt = COALESCE(EXCLUDED.license_jwt, licenses.license_jwt), \
+            license_jwt_updated_at = CASE \
+                WHEN EXCLUDED.license_jwt IS NOT NULL THEN NOW() \
+                ELSE licenses.license_jwt_updated_at \
+            END, \
+            status = 'active', \
+            updated_at = NOW()",
+    )
+    .bind(claims.sub)
+    .bind(license_key)
+    .bind(&tier)
+    .bind(credits_allocated)
+    .bind(license_jwt)
+    .execute(db)
+    .await;
+
+    if let Err(e) = res {
+        tracing::warn!("persist_license_from_response: {e}");
+    }
 }
 
 // ─── Docker helpers ───────────────────────────────────────────────────────────

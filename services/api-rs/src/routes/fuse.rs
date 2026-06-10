@@ -3,7 +3,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
-use crate::{error::{AppError, Result}, middleware::auth::JwtClaims, services::redis::lpush};
+use crate::{
+    error::{AppError, Result},
+    middleware::auth::JwtClaims,
+    services::{redis::lpush, usage::record_usage},
+};
 
 #[derive(Deserialize)]
 struct MergeReq {
@@ -45,6 +49,8 @@ async fn merge(
         .bind(job_id).bind(claims.sub)
         .bind(json!({ "compilationId": comp_id, "sourceJobIds": req.source_job_ids, "name": req.name }))
         .execute(&state.db).await?;
+
+    record_usage(&state.db, claims.sub, "fuse_merge", 10, Some(job_id)).await;
 
     lpush(&state.redis, "fuse:jobs", &json!({
         "job_id": job_id, "user_id": claims.sub,

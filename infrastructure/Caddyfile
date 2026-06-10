@@ -1,4 +1,4 @@
-# BorgHive Production Caddyfile
+# Ground Control Production Caddyfile
 # Automatic HTTPS via Let's Encrypt
 # Replace {$DOMAIN} with your actual domain or set DOMAIN env var
 
