@@ -1,19 +1,18 @@
 import {
 	IExecuteFunctions,
-	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
 	IDataObject,
 	ISupplyDataFunctions,
 	SupplyData,
 } from 'n8n-workflow';
-import { GCTRLApiRequest } from '../../shared/GCTRLApiClient';
+import { gctrlApiRequest } from '../../shared/GctrlApiClient';
 
 /**
- * GCTRL Memory node for n8n AI Agents.
+ * Ground Control Memory node for n8n AI Agents.
  *
  * Works as an AI memory provider: the agent can store and recall
- * knowledge across workflow executions using GCTRL's knowledge graph.
+ * knowledge across workflow executions using Ground Control's knowledge graph.
  *
  * Unlike in-memory or Redis memory, this creates structured entities
  * and vector embeddings - so the agent's memory is queryable, fuseable,
@@ -21,7 +20,7 @@ import { GCTRLApiRequest } from '../../shared/GCTRLApiClient';
  */
 
 // Minimal LangChain-compatible memory interface
-class GCTRLMemoryProvider {
+class GctrlMemoryProvider {
 	private ctx: IExecuteFunctions | ISupplyDataFunctions;
 	private compilationId: string;
 	private sessionId: string;
@@ -37,7 +36,7 @@ class GCTRLMemoryProvider {
 	}
 
 	async loadMemoryVariables(_values: Record<string, unknown>): Promise<Record<string, string>> {
-		// Query GCTRL for this session's memory
+		// Query Ground Control for this session's memory
 		const body: IDataObject = {
 			question: `What do you remember from session ${this.sessionId}?`,
 		};
@@ -46,7 +45,7 @@ class GCTRLMemoryProvider {
 		}
 
 		try {
-			const result = await GCTRLApiRequest(
+			const result = await gctrlApiRequest(
 				this.ctx as IExecuteFunctions,
 				'POST',
 				'/rag/query',
@@ -72,7 +71,7 @@ class GCTRLMemoryProvider {
 		const text = `Session ${this.sessionId} conversation:\nHuman: ${input}\nAI: ${output}`;
 
 		try {
-			await GCTRLApiRequest(
+			await gctrlApiRequest(
 				this.ctx as IExecuteFunctions,
 				'POST',
 				'/kex/extract',
@@ -84,20 +83,20 @@ class GCTRLMemoryProvider {
 	}
 
 	async clear(): Promise<void> {
-		// No-op: GCTRL knowledge is append-only (version-controlled)
+		// No-op: Ground Control knowledge is append-only (version-controlled)
 	}
 }
 
-export class GCTRLMemory implements INodeType {
+export class GctrlMemory implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'GCTRL Memory',
-		name: 'GCTRLMemory',
-		icon: 'file:GCTRL.svg',
+		displayName: 'Ground Control Memory',
+		name: 'gctrlMemory',
+		icon: 'file:gctrl.svg',
 		group: ['transform'],
 		version: 1,
-		description: 'Use GCTRL as persistent knowledge graph memory for AI agents. Memory survives across workflow executions and is queryable.',
+		description: 'Use Ground Control as persistent knowledge graph memory for AI agents. Memory survives across workflow executions and is queryable.',
 		defaults: {
-			name: 'GCTRL Memory',
+			name: 'Ground Control Memory',
 		},
 		// This is a memory provider for AI agents
 		inputs: [],
@@ -109,13 +108,13 @@ export class GCTRLMemory implements INodeType {
 		],
 		credentials: [
 			{
-				name: 'GCTRLApi',
+				name: 'gctrlApi',
 				required: true,
 			},
 		],
 		properties: [
 			{
-				displayName: 'This node provides persistent memory backed by GCTRL knowledge graphs. Connect it to an AI Agent node.',
+				displayName: 'This node provides persistent memory backed by Ground Control knowledge graphs. Connect it to an AI Agent node.',
 				name: 'notice',
 				type: 'notice',
 				default: '',
@@ -170,11 +169,10 @@ export class GCTRLMemory implements INodeType {
 		const sessionId = this.getNodeParameter('sessionId', 0, 'default') as string;
 		const compilationId = this.getNodeParameter('compilationId', 0, '') as string;
 
-		const memory = new GCTRLMemoryProvider(this, compilationId, sessionId);
+		const memory = new GctrlMemoryProvider(this, compilationId, sessionId);
 
 		return {
 			response: memory,
 		};
 	}
 }
-

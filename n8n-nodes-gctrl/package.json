@@ -1,11 +1,12 @@
 {
   "name": "n8n-nodes-gctrl",
-  "version": "0.1.0",
-  "description": "n8n community node for GCTRL - structured knowledge graphs for AI. Extract, query, fuse, and manage knowledge graphs. Use as memory for AI agents.",
+  "version": "1.0.0",
+  "description": "n8n community node for Ground Control (GCTRL) - structured knowledge graphs for AI. Extract, query, fuse, and manage knowledge graphs. Use as memory for AI agents.",
   "keywords": [
     "n8n-community-node-package",
     "n8n",
-    "GCTRL",
+    "gctrl",
+    "ground-control",
     "knowledge-graph",
     "rag",
     "ai-memory",
@@ -13,14 +14,14 @@
     "graph-fusion"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/GCTRL/n8n-nodes-GCTRL",
+  "homepage": "https://gctrl.tech",
   "author": {
-    "name": "gctrl",
-    "url": "https://GCTRL.ai"
+    "name": "Ground Control",
+    "url": "https://gctrl.tech"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/GCTRL/n8n-nodes-GCTRL.git"
+    "url": "https://github.com/gctrl/n8n-nodes-gctrl.git"
   },
   "main": "dist/index.js",
   "scripts": {
@@ -35,13 +36,13 @@
   "n8n": {
     "n8nNodesApiVersion": 1,
     "credentials": [
-      "dist/credentials/GCTRLApi.credentials.js"
+      "dist/credentials/GctrlApi.credentials.js"
     ],
     "nodes": [
-      "dist/nodes/GCTRL/GCTRL.node.js",
-      "dist/nodes/GCTRLTrigger/GCTRLTrigger.node.js",
-      "dist/nodes/GCTRLMemory/GCTRLMemory.node.js",
-      "dist/nodes/GCTRLKnowledgeTool/GCTRLKnowledgeTool.node.js"
+      "dist/nodes/Gctrl/Gctrl.node.js",
+      "dist/nodes/GctrlTrigger/GctrlTrigger.node.js",
+      "dist/nodes/GctrlMemory/GctrlMemory.node.js",
+      "dist/nodes/GctrlKnowledgeTool/GctrlKnowledgeTool.node.js"
     ]
   },
   "devDependencies": {
@@ -54,5 +55,3 @@
     "n8n-workflow": "*"
   }
 }
-
-

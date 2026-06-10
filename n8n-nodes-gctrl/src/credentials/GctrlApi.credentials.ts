@@ -5,10 +5,10 @@ import {
 	INodeProperties,
 } from 'n8n-workflow';
 
-export class GCTRLApi implements ICredentialType {
-	name = 'GCTRLApi';
-	displayName = 'GCTRL API';
-	documentationUrl = 'https://docs.GCTRL.ai/api';
+export class GctrlApi implements ICredentialType {
+	name = 'gctrlApi';
+	displayName = 'Ground Control API';
+	documentationUrl = 'https://docs.gctrl.tech/api';
 	properties: INodeProperties[] = [
 		{
 			displayName: 'Base URL',
@@ -16,7 +16,7 @@ export class GCTRLApi implements ICredentialType {
 			type: 'string',
 			default: 'http://localhost:4000',
 			placeholder: 'http://localhost:4000',
-			description: 'The base URL of the GCTRL API (without /api)',
+			description: 'The base URL of the Ground Control API (without /api)',
 		},
 		{
 			displayName: 'Authentication Method',
@@ -27,7 +27,7 @@ export class GCTRLApi implements ICredentialType {
 				{
 					name: 'API Key',
 					value: 'apiKey',
-					description: 'Use a GCTRL API key',
+					description: 'Use a Ground Control API key',
 				},
 				{
 					name: 'Email & Password',
@@ -51,7 +51,7 @@ export class GCTRLApi implements ICredentialType {
 			name: 'email',
 			type: 'string',
 			default: '',
-			placeholder: 'admin@GCTRL.dev',
+			placeholder: 'admin@gctrl.tech',
 			displayOptions: {
 				show: { authMethod: ['emailPassword'] },
 			},
@@ -85,4 +85,3 @@ export class GCTRLApi implements ICredentialType {
 		},
 	};
 }
-

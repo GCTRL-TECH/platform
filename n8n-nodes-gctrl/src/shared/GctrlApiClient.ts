@@ -5,7 +5,7 @@ import {
 } from 'n8n-workflow';
 
 /**
- * Shared API client for GCTRL nodes.
+ * Shared API client for Ground Control (GCTRL) nodes.
  * Handles JWT login for email/password auth, API key pass-through, and token caching.
  *
  * Uses a loose context type to support IExecuteFunctions, IPollFunctions,
@@ -25,7 +25,7 @@ interface IContextLike {
 const tokenCache: Map<string, { token: string; expiry: number }> = new Map();
 
 export async function getAuthToken(ctx: IContextLike): Promise<string> {
-	const credentials = await ctx.getCredentials('GCTRLApi');
+	const credentials = await ctx.getCredentials('gctrlApi');
 	const authMethod = credentials.authMethod as string;
 
 	if (authMethod === 'apiKey') {
@@ -52,7 +52,7 @@ export async function getAuthToken(ctx: IContextLike): Promise<string> {
 
 	const response = (await ctx.helpers.httpRequest(options)) as { token: string };
 	if (!response.token) {
-		throw new Error('GCTRL login failed: no token in response');
+		throw new Error('Ground Control login failed: no token in response');
 	}
 
 	tokenCache.set(cacheKey, {
@@ -63,14 +63,14 @@ export async function getAuthToken(ctx: IContextLike): Promise<string> {
 	return response.token;
 }
 
-export async function GCTRLApiRequest(
+export async function gctrlApiRequest(
 	ctx: IContextLike,
 	method: IHttpRequestMethods,
 	path: string,
 	body?: IDataObject,
 	qs?: IDataObject,
 ): Promise<IDataObject> {
-	const credentials = await ctx.getCredentials('GCTRLApi');
+	const credentials = await ctx.getCredentials('gctrlApi');
 	const baseUrl = credentials.baseUrl as string;
 	const token = await getAuthToken(ctx);
 
@@ -97,4 +97,3 @@ export async function GCTRLApiRequest(
 		throw error;
 	}
 }
-

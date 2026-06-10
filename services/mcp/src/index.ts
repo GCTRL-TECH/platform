@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * GCTRL MCP Server
+ * Ground Control (GCTRL) MCP Server
  *
- * Exposes GCTRL's knowledge management capabilities as MCP tools
+ * Exposes Ground Control's knowledge management capabilities as MCP tools
  * so that Claude and other AI agents can:
  *   - Extract knowledge from text/files (KEX)
  *   - Query knowledge graphs (RAG)
@@ -11,6 +11,13 @@
  *   - Store and retrieve structured knowledge
  *
  * Transport: stdio (for Claude Code / Claude Desktop integration)
+ *
+ * Tool naming
+ * ───────────
+ * Primary tool names use the `gctrl_*` prefix. The legacy `borghive_*`
+ * names are also registered as DEPRECATED aliases for backwards compat
+ * with existing `.mcp.json` configs. The aliases log a warning on each
+ * invocation and will be removed in v2.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -18,7 +25,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const API_BASE = process.env['GCTRL_API_URL'] || 'http://localhost:4000/api';
-const GCTRL_EMAIL = process.env['GCTRL_EMAIL'] || 'admin@GCTRL.dev';
+const GCTRL_EMAIL = process.env['GCTRL_EMAIL'] || 'admin@gctrl.tech';
 const GCTRL_PASSWORD = process.env['GCTRL_PASSWORD'] || 'GCTRL2026';
 
 // ── Auto-authentication ──────────────────────────────────────────────────────
@@ -104,21 +111,68 @@ async function appendJobToCompilation(compilationId: string, jobId: string): Pro
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const server = new McpServer({
-  name: 'GCTRL',
-  version: '0.1.0',
+  name: 'gctrl',
+  version: '1.0.0',
 });
+
+// ── Deprecation helper ───────────────────────────────────────────────────────
+// Registers a tool under both its primary `gctrl_*` name and the legacy
+// `borghive_*` alias. The alias path logs a warning to stderr and will be
+// removed in v2.
+
+// We need a tight type for the handler since @modelcontextprotocol/sdk's
+// `tool()` is heavily overloaded. The signature mirrors what server.tool
+// accepts for shape-style schemas.
+type ToolHandler<TArgs> = (args: TArgs) => Promise<{
+  content: Array<{ type: 'text'; text: string }>;
+}>;
+
+function registerToolWithAlias<TArgs>(
+  newName: string,
+  oldName: string,
+  description: string,
+  schema: z.ZodRawShape,
+  handler: ToolHandler<TArgs>,
+): void {
+  // Primary (canonical) name — new gctrl_* form.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server.tool as any)(newName, description, schema, handler);
+
+  // DEPRECATED — remove in v2. Legacy borghive_* alias kept for backwards
+  // compat with existing `.mcp.json` configs.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server.tool as any)(
+    oldName,
+    `[DEPRECATED — use '${newName}' instead, alias will be removed in v2] ${description}`,
+    schema,
+    async (args: TArgs) => {
+      console.error(
+        `[GCTRL MCP] Tool name '${oldName}' is deprecated and will be removed in v2. Use '${newName}'.`,
+      );
+      return handler(args);
+    },
+  );
+}
 
 // ── Tool: Extract Knowledge (KEX) ────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_extract',
-  'Extract structured knowledge (entities, relations) from text. Creates a knowledge graph in Neo4j and vector embeddings in Qdrant. Use this to ingest new information into GCTRL. Specify a compilationId to add the results to a specific knowledge graph (e.g. an agent\'s dedicated graph).',
-  {
-    text: z.string().describe('The text content to extract knowledge from'),
-    compilationId: z.string().optional().describe('Optional: target knowledge graph compilation ID. The extracted job will be auto-linked to this compilation. Use GCTRL_list_graphs to find IDs.'),
-    ontologyId: z.string().optional().describe('Optional ontology ID to guide entity type extraction'),
-    discoveryMode: z.enum(['strict', 'discover']).default('discover').describe('strict = only ontology types, discover = find all types and extend ontology'),
-  },
+const extractSchema = {
+  text: z.string().describe('The text content to extract knowledge from'),
+  compilationId: z.string().optional().describe('Optional: target knowledge graph compilation ID. The extracted job will be auto-linked to this compilation. Use gctrl_list_graphs to find IDs.'),
+  ontologyId: z.string().optional().describe('Optional ontology ID to guide entity type extraction'),
+  discoveryMode: z.enum(['strict', 'discover']).default('discover').describe('strict = only ontology types, discover = find all types and extend ontology'),
+};
+
+registerToolWithAlias<{
+  text: string;
+  compilationId?: string;
+  ontologyId?: string;
+  discoveryMode: 'strict' | 'discover';
+}>(
+  'gctrl_extract',
+  'borghive_extract',
+  'Extract structured knowledge (entities, relations) from text. Creates a knowledge graph in Neo4j and vector embeddings in Qdrant. Use this to ingest new information into Ground Control. Specify a compilationId to add the results to a specific knowledge graph (e.g. an agent\'s dedicated graph).',
+  extractSchema,
   async ({ text, compilationId, ontologyId, discoveryMode }) => {
     const result = await apiCall('POST', '/kex/extract', {
       text,
@@ -167,13 +221,16 @@ server.tool(
 
 // ── Tool: Query Knowledge Graph (RAG) ────────────────────────────────────────
 
-server.tool(
-  'GCTRL_query',
-  'Ask a natural language question about the knowledge stored in GCTRL. Searches across Neo4j graph entities, Qdrant vector chunks, and optionally the web. Returns grounded answers with sources and confidence scores.',
-  {
-    question: z.string().describe('Natural language question about the knowledge graph'),
-    compilationId: z.string().optional().describe('Optional: query a specific knowledge graph compilation. Omit to search all graphs.'),
-  },
+const querySchema = {
+  question: z.string().describe('Natural language question about the knowledge graph'),
+  compilationId: z.string().optional().describe('Optional: query a specific knowledge graph compilation. Omit to search all graphs.'),
+};
+
+registerToolWithAlias<{ question: string; compilationId?: string }>(
+  'gctrl_query',
+  'borghive_query',
+  'Ask a natural language question about the knowledge stored in Ground Control. Searches across Neo4j graph entities, Qdrant vector chunks, and optionally the web. Returns grounded answers with sources and confidence scores.',
+  querySchema,
   async ({ question, compilationId }) => {
     const result = await apiCall('POST', '/rag/query', {
       message: question,
@@ -197,15 +254,18 @@ server.tool(
 
 // ── Tool: Search Entities ────────────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_search_entities',
+const searchEntitiesSchema = {
+  query: z.string().describe('Search term (entity name or partial match)'),
+  entityType: z.string().optional().describe('Filter by entity type label (e.g. "company", "person", "technology")'),
+  limit: z.number().default(20).describe('Maximum results to return'),
+};
+
+registerToolWithAlias<{ query: string; entityType?: string; limit: number }>(
+  'gctrl_search_entities',
+  'borghive_search_entities',
   'Search for specific entities in the knowledge graph by name or type. Returns matching entities with their properties and relationships.',
-  {
-    query: z.string().describe('Search term (entity name or partial match)'),
-    entityType: z.string().optional().describe('Filter by entity type label (e.g. "company", "person", "technology")'),
-    limit: z.number().default(20).describe('Maximum results to return'),
-  },
-  async ({ query, entityType, limit }) => {
+  searchEntitiesSchema,
+  async ({ query, entityType }) => {
     // Use RAG with a specific Cypher-oriented question
     const result = await apiCall('POST', '/rag/query', {
       message: `Find all entities matching "${query}"${entityType ? ` of type ${entityType}` : ''}`,
@@ -223,9 +283,10 @@ server.tool(
 
 // ── Tool: List Knowledge Graphs ──────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_list_graphs',
-  'List all knowledge graph compilations available in GCTRL. Shows name, entity count, relation count, and classification level.',
+registerToolWithAlias<Record<string, never>>(
+  'gctrl_list_graphs',
+  'borghive_list_graphs',
+  'List all knowledge graph compilations available in Ground Control. Shows name, entity count, relation count, and classification level.',
   {},
   async () => {
     const result = await apiCall('GET', '/kg/compilations') as {
@@ -248,7 +309,7 @@ server.tool(
         type: 'text' as const,
         text: lines.length > 0
           ? `**Knowledge Graphs:**\n\n${lines.join('\n')}`
-          : 'No knowledge graphs found. Use GCTRL_extract to create one.',
+          : 'No knowledge graphs found. Use gctrl_extract to create one.',
       }],
     };
   },
@@ -256,14 +317,17 @@ server.tool(
 
 // ── Tool: Fuse Knowledge Graphs ──────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_fuse',
+const fuseSchema = {
+  name: z.string().describe('Name for the new fused knowledge graph'),
+  sourceJobIds: z.array(z.string()).describe('Array of KEX job IDs to merge'),
+  description: z.string().optional().describe('Optional description'),
+};
+
+registerToolWithAlias<{ name: string; sourceJobIds: string[]; description?: string }>(
+  'gctrl_fuse',
+  'borghive_fuse',
   'Merge multiple extraction jobs into a unified knowledge graph. Uses entity matching to find duplicates across sources and creates a consolidated graph.',
-  {
-    name: z.string().describe('Name for the new fused knowledge graph'),
-    sourceJobIds: z.array(z.string()).describe('Array of KEX job IDs to merge'),
-    description: z.string().optional().describe('Optional description'),
-  },
+  fuseSchema,
   async ({ name, sourceJobIds, description }) => {
     const result = await apiCall('POST', '/fuse/merge', {
       name,
@@ -274,7 +338,7 @@ server.tool(
     return {
       content: [{
         type: 'text' as const,
-        text: `Fusion job started:\n- Job ID: ${result.jobId}\n- Compilation ID: ${result.compilationId}\n- Status: ${result.status}\n\nUse GCTRL_query to ask questions about this graph once processing completes.`,
+        text: `Fusion job started:\n- Job ID: ${result.jobId}\n- Compilation ID: ${result.compilationId}\n- Status: ${result.status}\n\nUse gctrl_query to ask questions about this graph once processing completes.`,
       }],
     };
   },
@@ -282,9 +346,10 @@ server.tool(
 
 // ── Tool: List Ontologies ────────────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_list_ontologies',
-  'List all ontologies available in GCTRL. Ontologies define entity types and matching rules for knowledge extraction.',
+registerToolWithAlias<Record<string, never>>(
+  'gctrl_list_ontologies',
+  'borghive_list_ontologies',
+  'List all ontologies available in Ground Control. Ontologies define entity types and matching rules for knowledge extraction.',
   {},
   async () => {
     const result = await apiCall('GET', '/ontologies') as {
@@ -313,12 +378,15 @@ server.tool(
 
 // ── Tool: List Extraction Jobs ───────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_list_extractions',
+const listExtractionsSchema = {
+  limit: z.number().default(10).describe('Maximum jobs to return'),
+};
+
+registerToolWithAlias<{ limit: number }>(
+  'gctrl_list_extractions',
+  'borghive_list_extractions',
   'List recent knowledge extraction jobs with their status, entity counts, and source info.',
-  {
-    limit: z.number().default(10).describe('Maximum jobs to return'),
-  },
+  listExtractionsSchema,
   async ({ limit }) => {
     const result = await apiCall('GET', '/kex/jobs') as {
       jobs: Array<{
@@ -349,15 +417,23 @@ server.tool(
 
 // ── Tool: Store Knowledge (extract from agent context) ───────────────────────
 
-server.tool(
-  'GCTRL_store',
-  'Store information into GCTRL by extracting knowledge from the provided text. This is the primary way for agents to persist knowledge — like saving notes to Obsidian but with automatic entity extraction and graph construction. IMPORTANT: Always specify a compilationId to store into a specific knowledge graph (e.g. your agent\'s dedicated graph). Use GCTRL_list_graphs to find the right compilation ID.',
-  {
-    text: z.string().describe('Text content to store as knowledge'),
-    title: z.string().optional().describe('Optional title/label for this knowledge'),
-    compilationId: z.string().optional().describe('Target knowledge graph compilation ID. RECOMMENDED: always specify this to store into the correct agent graph. Use GCTRL_list_graphs to find IDs.'),
-    ontologyId: z.string().optional().describe('Optional ontology to guide extraction'),
-  },
+const storeSchema = {
+  text: z.string().describe('Text content to store as knowledge'),
+  title: z.string().optional().describe('Optional title/label for this knowledge'),
+  compilationId: z.string().optional().describe('Target knowledge graph compilation ID. RECOMMENDED: always specify this to store into the correct agent graph. Use gctrl_list_graphs to find IDs.'),
+  ontologyId: z.string().optional().describe('Optional ontology to guide extraction'),
+};
+
+registerToolWithAlias<{
+  text: string;
+  title?: string;
+  compilationId?: string;
+  ontologyId?: string;
+}>(
+  'gctrl_store',
+  'borghive_store',
+  'Store information into Ground Control by extracting knowledge from the provided text. This is the primary way for agents to persist knowledge — like saving notes to Obsidian but with automatic entity extraction and graph construction. IMPORTANT: Always specify a compilationId to store into a specific knowledge graph (e.g. your agent\'s dedicated graph). Use gctrl_list_graphs to find the right compilation ID.',
+  storeSchema,
   async ({ text, title, compilationId, ontologyId }) => {
     const fullText = title ? `${title}\n\n${text}` : text;
 
@@ -389,12 +465,12 @@ server.tool(
 
     const targetInfo = compilationId
       ? `\n- Linked to compilation: ${compilationId} (${linkedToCompilation ? 'success' : 'FAILED - check logs'})`
-      : '\n- WARNING: No compilationId specified — entities are floating unlinked. Use GCTRL_list_graphs to find the right compilation ID.';
+      : '\n- WARNING: No compilationId specified — entities are floating unlinked. Use gctrl_list_graphs to find the right compilation ID.';
 
     return {
       content: [{
         type: 'text' as const,
-        text: `Knowledge stored! Extraction job ${result.jobId} is processing.\nThe text will be:\n- Chunked and embedded in Qdrant (for semantic search)\n- Entity-extracted into Neo4j (for graph queries)${targetInfo}\n- Available via GCTRL_query once complete`,
+        text: `Knowledge stored! Extraction job ${result.jobId} is processing.\nThe text will be:\n- Chunked and embedded in Qdrant (for semantic search)\n- Entity-extracted into Neo4j (for graph queries)${targetInfo}\n- Available via gctrl_query once complete`,
       }],
     };
   },
@@ -402,8 +478,9 @@ server.tool(
 
 // ── Tool: Get Graph Schema ───────────────────────────────────────────────────
 
-server.tool(
-  'GCTRL_schema',
+registerToolWithAlias<Record<string, never>>(
+  'gctrl_schema',
+  'borghive_schema',
   'Get the schema of the knowledge graph — available entity types, relationship types, and property keys. Useful for understanding what data is stored.',
   {},
   async () => {
@@ -426,11 +503,15 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('GCTRL MCP Server running on stdio');
+  console.error('[GCTRL MCP] Server running on stdio');
+  console.error(
+    '[GCTRL MCP] Tools exposed under primary name `gctrl_*`. ' +
+      'Legacy `borghive_*` aliases are still registered for backwards ' +
+      'compat and will be removed in v2 — please migrate your `.mcp.json`.',
+  );
 }
 
 main().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });
-

@@ -5,26 +5,26 @@ import {
 	INodeExecutionData,
 	IDataObject,
 } from 'n8n-workflow';
-import { GCTRLApiRequest } from '../../shared/GCTRLApiClient';
+import { gctrlApiRequest } from '../../shared/GctrlApiClient';
 
-export class GCTRLTrigger implements INodeType {
+export class GctrlTrigger implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'GCTRL Trigger',
-		name: 'GCTRLTrigger',
-		icon: 'file:GCTRL.svg',
+		displayName: 'Ground Control Trigger',
+		name: 'gctrlTrigger',
+		icon: 'file:gctrl.svg',
 		group: ['trigger'],
 		version: 1,
 		subtitle: '={{$parameter["event"]}}',
-		description: 'Triggers when a GCTRL extraction or fusion job completes',
+		description: 'Triggers when a Ground Control extraction or fusion job completes',
 		defaults: {
-			name: 'GCTRL Trigger',
+			name: 'Ground Control Trigger',
 		},
 		polling: true,
 		inputs: [],
 		outputs: ['main'],
 		credentials: [
 			{
-				name: 'GCTRLApi',
+				name: 'gctrlApi',
 				required: true,
 			},
 		],
@@ -64,13 +64,13 @@ export class GCTRLTrigger implements INodeType {
 		let jobs: IDataObject[] = [];
 
 		if (event === 'extractionCompleted' || event === 'anyCompleted') {
-			const kexResult = await GCTRLApiRequest(this, 'GET', '/kex/jobs');
+			const kexResult = await gctrlApiRequest(this, 'GET', '/kex/jobs');
 			const kexJobs = (kexResult.jobs as IDataObject[]) || [];
 			jobs.push(...kexJobs);
 		}
 
 		if (event === 'fusionCompleted' || event === 'anyCompleted') {
-			const fuseResult = await GCTRLApiRequest(this, 'GET', '/fuse/jobs');
+			const fuseResult = await gctrlApiRequest(this, 'GET', '/fuse/jobs');
 			const fuseJobs = (fuseResult.jobs as IDataObject[]) || [];
 			jobs.push(...fuseJobs);
 		}
@@ -94,4 +94,3 @@ export class GCTRLTrigger implements INodeType {
 		return [newJobs.map((job) => ({ json: job }))];
 	}
 }
-

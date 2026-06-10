@@ -6,23 +6,23 @@ import {
 	ISupplyDataFunctions,
 	SupplyData,
 } from 'n8n-workflow';
-import { GCTRLApiRequest } from '../../shared/GCTRLApiClient';
+import { gctrlApiRequest } from '../../shared/GctrlApiClient';
 
 /**
- * GCTRL Knowledge Tool for n8n AI Agents.
+ * Ground Control Knowledge Tool for n8n AI Agents.
  *
- * Gives AI agents the ability to query GCTRL knowledge graphs
+ * Gives AI agents the ability to query Ground Control knowledge graphs
  * as a tool during their reasoning process. The agent can ask
  * questions about structured knowledge and get grounded answers
  * with sources and confidence scores.
  */
 
-class GCTRLKnowledgeToolProvider {
+class GctrlKnowledgeToolProvider {
 	private ctx: IExecuteFunctions | ISupplyDataFunctions;
 	private compilationId: string;
 	private toolDescription: string;
 
-	name = 'GCTRL_knowledge';
+	name = 'gctrl_knowledge';
 	description: string;
 
 	constructor(
@@ -43,7 +43,7 @@ class GCTRLKnowledgeToolProvider {
 		}
 
 		try {
-			const result = await GCTRLApiRequest(
+			const result = await gctrlApiRequest(
 				this.ctx as IExecuteFunctions,
 				'POST',
 				'/rag/query',
@@ -68,21 +68,21 @@ class GCTRLKnowledgeToolProvider {
 
 			return response;
 		} catch (error) {
-			return `Error querying GCTRL: ${(error as Error).message}`;
+			return `Error querying Ground Control: ${(error as Error).message}`;
 		}
 	}
 }
 
-export class GCTRLKnowledgeTool implements INodeType {
+export class GctrlKnowledgeTool implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'GCTRL Knowledge Tool',
-		name: 'GCTRLKnowledgeTool',
-		icon: 'file:GCTRL.svg',
+		displayName: 'Ground Control Knowledge Tool',
+		name: 'gctrlKnowledgeTool',
+		icon: 'file:gctrl.svg',
 		group: ['transform'],
 		version: 1,
-		description: 'Give AI agents access to GCTRL knowledge graphs. Agents can query structured knowledge and get grounded answers.',
+		description: 'Give AI agents access to Ground Control knowledge graphs. Agents can query structured knowledge and get grounded answers.',
 		defaults: {
-			name: 'GCTRL Knowledge',
+			name: 'Ground Control Knowledge',
 		},
 		inputs: [],
 		outputs: [
@@ -93,7 +93,7 @@ export class GCTRLKnowledgeTool implements INodeType {
 		],
 		credentials: [
 			{
-				name: 'GCTRLApi',
+				name: 'gctrlApi',
 				required: true,
 			},
 		],
@@ -109,7 +109,7 @@ export class GCTRLKnowledgeTool implements INodeType {
 				name: 'toolDescription',
 				type: 'string',
 				typeOptions: { rows: 3 },
-				default: 'Search the GCTRL knowledge graph for information about entities, relationships, and facts. Use this tool when you need to find specific information from the structured knowledge base.',
+				default: 'Search the Ground Control knowledge graph for information about entities, relationships, and facts. Use this tool when you need to find specific information from the structured knowledge base.',
 				description: 'Description shown to the AI agent so it knows when to use this tool',
 			},
 			{
@@ -126,11 +126,10 @@ export class GCTRLKnowledgeTool implements INodeType {
 		const compilationId = this.getNodeParameter('compilationId', 0, '') as string;
 		const toolDescription = this.getNodeParameter('toolDescription', 0, '') as string;
 
-		const tool = new GCTRLKnowledgeToolProvider(this, compilationId, toolDescription);
+		const tool = new GctrlKnowledgeToolProvider(this, compilationId, toolDescription);
 
 		return {
 			response: tool,
 		};
 	}
 }
-

@@ -3,29 +3,27 @@ import {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
-	ILoadOptionsFunctions,
-	INodePropertyOptions,
 	IDataObject,
 } from 'n8n-workflow';
-import { GCTRLApiRequest } from '../../shared/GCTRLApiClient';
+import { gctrlApiRequest } from '../../shared/GctrlApiClient';
 
-export class GCTRL implements INodeType {
+export class Gctrl implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'GCTRL',
-		name: 'GCTRL',
-		icon: 'file:GCTRL.svg',
+		displayName: 'Ground Control',
+		name: 'gctrl',
+		icon: 'file:gctrl.svg',
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
-		description: 'Interact with GCTRL knowledge graphs - extract, query, fuse, search, and manage structured knowledge',
+		description: 'Interact with Ground Control knowledge graphs - extract, query, fuse, search, and manage structured knowledge',
 		defaults: {
-			name: 'GCTRL',
+			name: 'Ground Control',
 		},
 		inputs: ['main'],
 		outputs: ['main'],
 		credentials: [
 			{
-				name: 'GCTRLApi',
+				name: 'gctrlApi',
 				required: true,
 			},
 		],
@@ -395,21 +393,21 @@ export class GCTRL implements INodeType {
 					const discoveryMode = this.getNodeParameter('discoveryMode', i, 'discover') as string;
 					const body: IDataObject = { text, discoveryMode };
 					if (ontologyId) body.ontologyId = ontologyId;
-					responseData = await GCTRLApiRequest(this, 'POST', '/kex/extract', body);
+					responseData = await gctrlApiRequest(this, 'POST', '/kex/extract', body);
 
 				} else if (operation === 'store') {
 					const text = this.getNodeParameter('text', i) as string;
 					const title = this.getNodeParameter('title', i, '') as string;
 					const body: IDataObject = { text };
 					if (title) body.title = title;
-					responseData = await GCTRLApiRequest(this, 'POST', '/kex/extract', body);
+					responseData = await gctrlApiRequest(this, 'POST', '/kex/extract', body);
 
 				} else if (operation === 'listJobs') {
-					responseData = await GCTRLApiRequest(this, 'GET', '/kex/jobs');
+					responseData = await gctrlApiRequest(this, 'GET', '/kex/jobs');
 
 				} else if (operation === 'getJob') {
 					const jobId = this.getNodeParameter('jobId', i) as string;
-					responseData = await GCTRLApiRequest(this, 'GET', `/kex/jobs/${jobId}`);
+					responseData = await gctrlApiRequest(this, 'GET', `/kex/jobs/${jobId}`);
 
 				} else {
 					responseData = {};
@@ -422,10 +420,10 @@ export class GCTRL implements INodeType {
 					const compilationId = this.getNodeParameter('compilationId', i, '') as string;
 					const body: IDataObject = { question };
 					if (compilationId) body.compilationId = compilationId;
-					responseData = await GCTRLApiRequest(this, 'POST', '/rag/query', body);
+					responseData = await gctrlApiRequest(this, 'POST', '/rag/query', body);
 
 				} else if (operation === 'schema') {
-					responseData = await GCTRLApiRequest(this, 'GET', '/kg/schema');
+					responseData = await gctrlApiRequest(this, 'GET', '/kg/schema');
 
 				} else {
 					responseData = {};
@@ -434,27 +432,27 @@ export class GCTRL implements INodeType {
 			// ─── Graph ──────────────────────────────────────────────────────
 			} else if (resource === 'graph') {
 				if (operation === 'list') {
-					responseData = await GCTRLApiRequest(this, 'GET', '/kg/compilations');
+					responseData = await gctrlApiRequest(this, 'GET', '/kg/compilations');
 
 				} else if (operation === 'get') {
 					const compilationId = this.getNodeParameter('compilationId', i) as string;
-					responseData = await GCTRLApiRequest(this, 'GET', `/kg/compilations/${compilationId}`);
+					responseData = await gctrlApiRequest(this, 'GET', `/kg/compilations/${compilationId}`);
 
 				} else if (operation === 'create') {
 					const name = this.getNodeParameter('name', i) as string;
 					const classification = this.getNodeParameter('classification', i) as string;
-					responseData = await GCTRLApiRequest(this, 'POST', '/kg/compilations', {
+					responseData = await gctrlApiRequest(this, 'POST', '/kg/compilations', {
 						name,
 						classification,
 					});
 
 				} else if (operation === 'refresh') {
 					const compilationId = this.getNodeParameter('compilationId', i) as string;
-					responseData = await GCTRLApiRequest(this, 'POST', `/kg/compilations/${compilationId}/refresh`);
+					responseData = await gctrlApiRequest(this, 'POST', `/kg/compilations/${compilationId}/refresh`);
 
 				} else if (operation === 'delete') {
 					const compilationId = this.getNodeParameter('compilationId', i) as string;
-					responseData = await GCTRLApiRequest(this, 'DELETE', `/kg/compilations/${compilationId}`);
+					responseData = await gctrlApiRequest(this, 'DELETE', `/kg/compilations/${compilationId}`);
 
 				} else {
 					responseData = {};
@@ -469,14 +467,14 @@ export class GCTRL implements INodeType {
 					const sourceJobIds = sourceJobIdsStr.split(',').map((s) => s.trim()).filter(Boolean);
 					const body: IDataObject = { name, sourceJobIds };
 					if (targetCompilationId) body.targetCompilationId = targetCompilationId;
-					responseData = await GCTRLApiRequest(this, 'POST', '/fuse/merge', body);
+					responseData = await gctrlApiRequest(this, 'POST', '/fuse/merge', body);
 
 				} else if (operation === 'getJob') {
 					const jobId = this.getNodeParameter('jobId', i) as string;
-					responseData = await GCTRLApiRequest(this, 'GET', `/fuse/jobs/${jobId}`);
+					responseData = await gctrlApiRequest(this, 'GET', `/fuse/jobs/${jobId}`);
 
 				} else if (operation === 'listJobs') {
-					responseData = await GCTRLApiRequest(this, 'GET', '/fuse/jobs');
+					responseData = await gctrlApiRequest(this, 'GET', '/fuse/jobs');
 
 				} else {
 					responseData = {};
@@ -490,7 +488,7 @@ export class GCTRL implements INodeType {
 					const limit = this.getNodeParameter('limit', i, 20) as number;
 					const qs: IDataObject = { query, limit };
 					if (entityType) qs.entityType = entityType;
-					responseData = await GCTRLApiRequest(this, 'GET', '/kg/entities/search', undefined, qs);
+					responseData = await gctrlApiRequest(this, 'GET', '/kg/entities/search', undefined, qs);
 
 				} else {
 					responseData = {};
@@ -499,7 +497,7 @@ export class GCTRL implements INodeType {
 			// ─── Ontology ───────────────────────────────────────────────────
 			} else if (resource === 'ontology') {
 				if (operation === 'list') {
-					responseData = await GCTRLApiRequest(this, 'GET', '/ontologies');
+					responseData = await gctrlApiRequest(this, 'GET', '/ontologies');
 				} else {
 					responseData = {};
 				}
@@ -514,4 +512,3 @@ export class GCTRL implements INodeType {
 		return [returnData];
 	}
 }
-

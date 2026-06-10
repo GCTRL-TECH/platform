@@ -980,15 +980,15 @@ function McpTab() {
   }, null, 2)
 
   const tools = [
-    { name: 'GCTRL_extract', desc: 'Extract knowledge from text → Neo4j entities + Qdrant vectors' },
-    { name: 'GCTRL_query', desc: 'Ask questions about knowledge graphs (hybrid RAG)' },
-    { name: 'GCTRL_store', desc: 'Store knowledge — like Obsidian notes but with KG extraction' },
-    { name: 'GCTRL_search_entities', desc: 'Search entities by name or type' },
-    { name: 'GCTRL_list_graphs', desc: 'List all knowledge graph compilations' },
-    { name: 'GCTRL_fuse', desc: 'Merge extraction jobs into unified graphs' },
-    { name: 'GCTRL_list_ontologies', desc: 'List available ontologies' },
-    { name: 'GCTRL_list_extractions', desc: 'List recent extraction jobs' },
-    { name: 'GCTRL_schema', desc: 'Get the knowledge graph schema' },
+    { name: 'gctrl_extract', desc: 'Extract knowledge from text → Neo4j entities + Qdrant vectors' },
+    { name: 'gctrl_query', desc: 'Ask questions about knowledge graphs (hybrid RAG)' },
+    { name: 'gctrl_store', desc: 'Store knowledge — like Obsidian notes but with KG extraction' },
+    { name: 'gctrl_search_entities', desc: 'Search entities by name or type' },
+    { name: 'gctrl_list_graphs', desc: 'List all knowledge graph compilations' },
+    { name: 'gctrl_fuse', desc: 'Merge extraction jobs into unified graphs' },
+    { name: 'gctrl_list_ontologies', desc: 'List available ontologies' },
+    { name: 'gctrl_list_extractions', desc: 'List recent extraction jobs' },
+    { name: 'gctrl_schema', desc: 'Get the knowledge graph schema' },
   ]
 
   return (

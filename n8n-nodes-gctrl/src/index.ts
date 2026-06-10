@@ -1,9 +1,8 @@
-// n8n-nodes-GCTRL - Community node package for GCTRL
+// n8n-nodes-gctrl - Community node package for Ground Control (GCTRL)
 // Exports all nodes and credentials
 
-export { GCTRLApi } from './credentials/GCTRLApi.credentials';
-export { GCTRL } from './nodes/GCTRL/GCTRL.node';
-export { GCTRLTrigger } from './nodes/GCTRLTrigger/GCTRLTrigger.node';
-export { GCTRLMemory } from './nodes/GCTRLMemory/GCTRLMemory.node';
-export { GCTRLKnowledgeTool } from './nodes/GCTRLKnowledgeTool/GCTRLKnowledgeTool.node';
-
+export { GctrlApi } from './credentials/GctrlApi.credentials';
+export { Gctrl } from './nodes/Gctrl/Gctrl.node';
+export { GctrlTrigger } from './nodes/GctrlTrigger/GctrlTrigger.node';
+export { GctrlMemory } from './nodes/GctrlMemory/GctrlMemory.node';
+export { GctrlKnowledgeTool } from './nodes/GctrlKnowledgeTool/GctrlKnowledgeTool.node';
