@@ -12,4 +12,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 EXPOSE 4000
-CMD ["node", "dist/index.js"]
+# Reconcile schema on every boot (idempotent), then start the API.
+# If migrate.ts fails fatally the container exits and Docker restarts it —
+# but the script is written to log warnings and continue on per-statement errors.
+CMD ["sh", "-c", "node dist/db/migrate.js && node dist/index.js"]
