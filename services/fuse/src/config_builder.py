@@ -2,13 +2,29 @@
 Semantic Resolver Configuration Builder
 Generates XML configurations for link discovery from Python dicts.
 Supports Neo4j/SPARQL endpoints and CSV data sources.
+
+RDF namespace
+-------------
+The default RDF namespace for Ground Control entity URIs is
+``http://gctrl.tech/entity/`` and can be overridden at runtime via the
+``GCTRL_RDF_NAMESPACE`` environment variable. Legacy graphs created
+under the previous ``http://borghive.dev/entity/`` namespace must be
+rewritten with ``scripts/migrate-rdf-namespace.cypher`` before cutover.
 """
 
 import logging
+import os
 import xml.etree.ElementTree as ET
 from xml.dom.minidom import parseString
 
 logger = logging.getLogger(__name__)
+
+# Default RDF namespace for entity URIs. Overridable via environment so
+# that historical deployments can pin the legacy namespace while data is
+# migrated with scripts/migrate-rdf-namespace.cypher.
+DEFAULT_RDF_NAMESPACE = os.environ.get(
+    "GCTRL_RDF_NAMESPACE", "http://gctrl.tech/entity/"
+)
 
 # Default metric presets per entity type
 DEFAULT_METRICS: dict[str, str] = {
@@ -69,7 +85,7 @@ def build_neo4j_config(
     # Prefixes
     _add_prefix(root, "rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
     _add_prefix(root, "owl", "http://www.w3.org/2002/07/owl#")
-    _add_prefix(root, "bg", "http://borghive.dev/entity/")
+    _add_prefix(root, "bg", DEFAULT_RDF_NAMESPACE)
 
     # Source
     source = ET.SubElement(root, "SOURCE")

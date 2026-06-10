@@ -59,8 +59,8 @@ docker compose up -d
 - **Neo4j Browser**: http://localhost:7474 (neo4j/password)
 
 ### Default Credentials
-- Admin: admin@borghive.dev / BorgHive2026 (dev only)
-- Test user: test@borghive.dev
+- Admin: admin@gctrl.tech / GCTRL_admin_change_me_now (dev only)
+- Test user: test@gctrl.test
 
 ### Environment Variables (Optional)
 ```bash
@@ -128,7 +128,7 @@ SLACK_CLIENT_SECRET=...
 Ground Control exposes an MCP server for AI tool integration. Tools: borghive_extract, borghive_query, borghive_store, borghive_fuse, borghive_search_entities, borghive_list_graphs, borghive_list_ontologies, borghive_list_extractions, borghive_schema.
 
 ## n8n Community Node
-Package: `n8n-nodes-borghive` (at borghive/n8n-nodes-borghive/)
+Package: `n8n-nodes-gctrl` (at borghive/n8n-nodes-gctrl/)
 - Ground Control node (all operations)
 - Ground Control Trigger (job completion polling)
 - Ground Control Memory (AI Agent persistent memory)
