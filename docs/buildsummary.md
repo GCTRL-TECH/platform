@@ -125,7 +125,14 @@ SLACK_CLIENT_SECRET=...
 - `GET /api/admin/audit` — Audit log
 
 ### MCP Server
-Ground Control exposes an MCP server for AI tool integration. Tools: borghive_extract, borghive_query, borghive_store, borghive_fuse, borghive_search_entities, borghive_list_graphs, borghive_list_ontologies, borghive_list_extractions, borghive_schema.
+Ground Control exposes an MCP server for AI tool integration.
+
+Tools: `gctrl_extract`, `gctrl_query`, `gctrl_store`, `gctrl_fuse`, `gctrl_search_entities`, `gctrl_list_graphs`, `gctrl_list_ontologies`, `gctrl_list_extractions`, `gctrl_schema`.
+
+> **Deprecated names (alias, removal in v2):** the legacy `borghive_*` names
+> (e.g. `borghive_extract`) are still accepted by the server for backwards
+> compatibility with existing `.mcp.json` configs, but invocations log a
+> warning and will be removed in v2.0. Migrate to the `gctrl_*` names.
 
 ## n8n Community Node
 Package: `n8n-nodes-gctrl` (at borghive/n8n-nodes-gctrl/)

@@ -37,6 +37,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/compilations/:id/audit",               get(get_audit))
         .route("/compilations/:id/acl",                 get(get_acl).put(set_acl))
         .route("/compilations/:id/graph",               get(get_graph))
+        .route("/compilations/:id/entity/:name",        get(entity_detail))
         .route("/graph/search",                         get(graph_search))
         .route("/graph/entity/:name/neighbors",         get(entity_neighbors))
         .route("/folders",                              get(list_folders).post(create_folder))
@@ -732,4 +733,121 @@ async fn entity_neighbors(
     }
 
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
+}
+
+/// GET /compilations/:id/entity/:name
+/// Returns full detail for a single entity within a compilation's scope:
+/// properties, in/out degree, chunk count, and last source-job metadata.
+/// Powers the Obsidian-style Node Detail drawer (Overview + Source tabs).
+async fn entity_detail(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<Json<Value>> {
+    // 1. Verify compilation ownership AND fetch its source_job_ids.
+    //    Same scoping rules as `get_graph` — empty source_job_ids means
+    //    "default compilation = the user's full graph".
+    let row: Option<(Vec<Uuid>,)> = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids, '{}'::uuid[])
+         FROM compilations WHERE id=$1 AND user_id=$2"
+    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
+    let Some((source_job_ids,)) = row else { return Err(AppError::NotFound); };
+
+    let user_id_str = claims.sub.to_string();
+    let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
+
+    // 2. Build scope clause — mirrors get_graph.
+    let where_clause = if source_job_ids.is_empty() {
+        "n._owner = $uid"
+    } else {
+        "n._source_job IN $jobIds"
+    };
+
+    // 3. Run the Cypher. `name` is bound as a parameter — never interpolated.
+    let cypher = format!(
+        "MATCH (n {{name: $name}}) WHERE {where_clause} \
+         OPTIONAL MATCH (n)-[ro]->() \
+         OPTIONAL MATCH ()-[ri]->(n) \
+         WITH n, count(DISTINCT ro) AS outDegree, count(DISTINCT ri) AS inDegree \
+         RETURN n, outDegree, inDegree LIMIT 1"
+    );
+
+    let mut stream = state.neo
+        .execute(
+            neo_query(&cypher)
+                .param("name", name.clone())
+                .param("uid", user_id_str)
+                .param("jobIds", job_strs),
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let row = stream.next().await.map_err(|e| AppError::Internal(e.to_string()))?;
+    let Some(row) = row else { return Err(AppError::NotFound); };
+
+    let n: Node = row.get::<Node>("n").map_err(|_| AppError::NotFound)?;
+    let out_degree: i64 = row.get::<i64>("outDegree").unwrap_or(0);
+    let in_degree:  i64 = row.get::<i64>("inDegree").unwrap_or(0);
+
+    let node_json = node_to_json(&n);
+    let props     = node_props(&n);
+
+    // Extract `_source_job` from node properties for the postgres enrichment
+    // step. Neo4j only stores the most-recent extraction — that's by design.
+    let source_job_uuid: Option<Uuid> = props.get("_source_job")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    // 4. Postgres enrichment — file name + created_at for the source job.
+    let last_source_job: Value = if let Some(sj_id) = source_job_uuid {
+        let row: Option<(Uuid, String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                "SELECT id, type,
+                        input->>'fileName' AS file_name,
+                        input->>'text'     AS text_input,
+                        created_at
+                   FROM jobs
+                  WHERE id = $1 AND user_id = $2"
+            ).bind(sj_id).bind(claims.sub).fetch_optional(&state.db).await?;
+        match row {
+            Some((jid, _jtype, file_name, text_input, created_at)) => {
+                // Fall back to a truncated text preview when no fileName
+                // (i.e. raw text extraction, not file upload).
+                let source = file_name.unwrap_or_else(|| {
+                    text_input
+                        .map(|t| {
+                            let trimmed: String = t.chars().take(60).collect();
+                            if t.chars().count() > 60 { format!("{trimmed}…") } else { trimmed }
+                        })
+                        .unwrap_or_else(|| "(unknown source)".into())
+                });
+                json!({ "id": jid, "source": source, "createdAt": created_at })
+            }
+            None => Value::Null,
+        }
+    } else {
+        Value::Null
+    };
+
+    // 5. Chunk count — how many text chunks mention this entity (user-scoped).
+    let chunk_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM text_chunks
+          WHERE user_id = $1
+            AND entity_mentions @> jsonb_build_array(jsonb_build_object('name', $2))"
+    ).bind(claims.sub).bind(&name).fetch_one(&state.db).await.unwrap_or(0);
+
+    // 6. Compose the response — reuse fields from node_to_json, add the extras.
+    Ok(Json(json!({
+        "entity": {
+            "id":            node_json.get("id").cloned().unwrap_or(Value::Null),
+            "name":          name,
+            "label":         node_json.get("label").cloned().unwrap_or(Value::Null),
+            "type":          node_json.get("type").cloned().unwrap_or(Value::Null),
+            "properties":    node_json.get("properties").cloned().unwrap_or(Value::Null),
+            "inDegree":      in_degree,
+            "outDegree":     out_degree,
+            "chunkCount":    chunk_count,
+            "lastSourceJob": last_source_job,
+        }
+    })))
 }

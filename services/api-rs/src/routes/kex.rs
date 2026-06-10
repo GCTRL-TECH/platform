@@ -34,6 +34,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/jobs/:id",        get(get_job).delete(delete_job))
         .route("/jobs/:id/result", get(get_result))
         .route("/jobs/:id/cancel", post(cancel_job))
+        .route("/chunks",          get(list_chunks))
         .route("/queue",           get(queue_depth))
 }
 
@@ -262,4 +263,82 @@ async fn queue_depth(State(state): State<Arc<crate::models::AppState>>) -> Resul
     let depth = crate::services::redis::llen(&state.redis, "kex:jobs").await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(json!({ "depth": depth })))
+}
+
+// ── Chunks lookup (powers the Node Detail drawer's "Chunks" tab) ──────────────
+
+#[derive(Deserialize)]
+struct ChunksQuery {
+    entity:         String,
+    #[serde(rename = "compilationId")]
+    compilation_id: Option<Uuid>,
+    limit:          Option<i64>,
+    offset:         Option<i64>,
+}
+
+/// GET /api/kex/chunks?entity=Berlin[&compilationId=...&limit=20&offset=0]
+///
+/// List text chunks that mention a given entity name, scoped to the
+/// authenticated user. Matches either the structured `entity_mentions`
+/// JSONB array (preferred — exact name match via `@>`) or a raw ILIKE
+/// fallback against the chunk content (catches mentions the extractor
+/// missed in the structured field). A single round-trip via a window
+/// function returns the total row count alongside the page.
+async fn list_chunks(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<ChunksQuery>,
+) -> Result<Json<Value>> {
+    if q.entity.trim().is_empty() {
+        return Err(AppError::BadRequest("entity is required".into()));
+    }
+    let limit  = q.limit.unwrap_or(20).min(100);
+    let offset = q.offset.unwrap_or(0);
+
+    let rows = sqlx::query_as::<_, (
+        Uuid, Option<Uuid>, Option<Uuid>, String,
+        Option<i32>, Option<i32>, Option<i32>,
+        Option<Value>, chrono::DateTime<chrono::Utc>, i64,
+    )>(
+        "SELECT id, job_id, compilation_id, content, start_char, end_char,
+                chunk_sequence, entity_mentions, created_at,
+                COUNT(*) OVER () AS total
+           FROM text_chunks
+          WHERE user_id = $1
+            AND ($2::uuid IS NULL OR compilation_id = $2)
+            AND (
+                 entity_mentions @> jsonb_build_array(jsonb_build_object('name', $3))
+              OR content ILIKE '%' || $3 || '%'
+            )
+          ORDER BY created_at DESC
+          LIMIT $4 OFFSET $5"
+    )
+    .bind(claims.sub)
+    .bind(q.compilation_id)
+    .bind(&q.entity)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db).await?;
+
+    let total: i64 = rows.first().map(|r| r.9).unwrap_or(0);
+
+    let chunks: Vec<Value> = rows.into_iter().map(|(
+        id, job_id, compilation_id, content,
+        start_char, end_char, chunk_sequence,
+        entity_mentions, created_at, _total,
+    )| {
+        json!({
+            "id":             id,
+            "jobId":          job_id,
+            "compilationId":  compilation_id,
+            "content":        content,
+            "startChar":      start_char,
+            "endChar":        end_char,
+            "chunkSequence":  chunk_sequence,
+            "entityMentions": entity_mentions,
+            "createdAt":      created_at,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "chunks": chunks, "total": total })))
 }

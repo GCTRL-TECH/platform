@@ -523,6 +523,60 @@ section "9. Connectors"
 RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" "$API_BASE/connectors" 2>/dev/null || echo "")
 if jhas "$RESP" "connectors"; then pass "GET /connectors returns 'connectors' array"; else fail "/connectors broken"; fi
 
+# ─── 9b. Graph Explorer detail endpoints ─────────────────────────────
+section "9b. Graph Explorer detail endpoints (chunks + entity)"
+
+# Pull a known entity from the default compilation's graph (set in section 6d).
+# jget's dot-path syntax doesn't support array indices on jq; use direct jq/python.
+if [ -n "$LIVE_COMP_ID" ]; then
+  RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" \
+    "$API_BASE/kg/compilations/$LIVE_COMP_ID/graph?limit=200" 2>/dev/null || echo "")
+  if [ "$JSON_TOOL" = "jq" ]; then
+    KNOWN_ENTITY=$(printf '%s' "$RESP" | jq -r '.nodes[0].label // empty' 2>/dev/null)
+  else
+    KNOWN_ENTITY=$(python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    print(d['nodes'][0].get('label', ''))
+except Exception: print('')
+" "$RESP")
+  fi
+  if [ -z "$KNOWN_ENTITY" ] || [ "$KNOWN_ENTITY" = "null" ]; then
+    KNOWN_ENTITY=""
+  fi
+fi
+
+if [ -n "${KNOWN_ENTITY:-}" ]; then
+  # Endpoint A: chunks?entity=
+  RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" \
+    "$API_BASE/kex/chunks?entity=$(printf '%s' "$KNOWN_ENTITY" | sed 's/ /%20/g')&compilationId=$LIVE_COMP_ID&limit=5" 2>/dev/null || echo "")
+  if jhas "$RESP" "chunks"; then
+    CHUNK_COUNT=$(jlen "$RESP" "chunks")
+    pass "GET /kex/chunks returns 'chunks' array (count=$CHUNK_COUNT for entity '$KNOWN_ENTITY')"
+  else
+    fail "GET /kex/chunks missing 'chunks' key — drawer Chunks tab will fail"
+  fi
+
+  # Endpoint B: compilations/:id/entity/:name
+  RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $JWT" \
+    "$API_BASE/kg/compilations/$LIVE_COMP_ID/entity/$(printf '%s' "$KNOWN_ENTITY" | sed 's/ /%20/g')" 2>/dev/null || echo "")
+  if jhas "$RESP" "entity.name"; then
+    DETAIL_NAME=$(jget "$RESP" "entity.name")
+    DETAIL_IN=$(jget "$RESP" "entity.inDegree")
+    DETAIL_OUT=$(jget "$RESP" "entity.outDegree")
+    if [ "$DETAIL_NAME" = "$KNOWN_ENTITY" ] && [ -n "$DETAIL_IN" ] && [ -n "$DETAIL_OUT" ]; then
+      pass "GET /kg/compilations/:id/entity/:name returns entity (in=$DETAIL_IN out=$DETAIL_OUT)"
+    else
+      fail "GET /kg/.../entity/:name returned wrong name or missing degree fields"
+    fi
+  else
+    fail "GET /kg/compilations/:id/entity/:name missing 'entity' wrapper"
+  fi
+else
+  echo -e "  ${YELLOW}⚠${NC} Skipping detail-endpoint checks (no known entity in default compilation)"
+fi
+
 # ─── 11. Connectors self-serve (per-deployment OAuth credentials) ────
 section "11. Connectors self-serve"
 

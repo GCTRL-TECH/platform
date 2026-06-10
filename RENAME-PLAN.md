@@ -158,42 +158,80 @@ old default until you are ready.
 
 ---
 
-## Still pending — needs deliberate work
-
-These items are intentionally out of scope for this sweep because
-they have wide blast radius and break installed users / configured
-clients.
+## Done in THIS commit — npm rename + MCP tool rename (with deprecation)
 
 ### 1. npm package rename — `n8n-nodes-borghive` → `n8n-nodes-gctrl`
 
-The on-disk folder and `package.json` name field have already been
-updated to `n8n-nodes-gctrl`, but **publishing under the new npm
-name is a breaking change for anyone who already installed
-`n8n-nodes-borghive`** in their n8n instance.
+The package is now a clean Ground Control package end-to-end:
 
-Required follow-up:
-- Decide on deprecation strategy for the old npm name (publish a
-  final shim release that re-exports from the new package, or push a
-  migration notice).
-- Publish `n8n-nodes-gctrl` to npm and tag a clean v1.
-- Update install docs and the n8n community-nodes listing.
+- `package.json#name` = `n8n-nodes-gctrl`, version bumped to **1.0.0**
+  (major bump — this is a breaking change for anyone who already
+  installed `n8n-nodes-borghive`).
+- TypeScript identifiers renamed throughout `src/`: `BorgHive` →
+  `Gctrl`, `borghive` → `gctrl`. Source files and folders renamed to
+  match (`nodes/Gctrl/Gctrl.node.ts`, `credentials/GctrlApi.credentials.ts`,
+  `shared/GctrlApiClient.ts`, etc.).
+- Credential type id renamed from `GCTRLApi` (transitional) to
+  `gctrlApi` (n8n camelCase convention).
+- Node `displayName` values switched to "Ground Control" / "Ground
+  Control Trigger" / "Ground Control Memory" / "Ground Control
+  Knowledge Tool".
+- `package.json#n8n.nodes` and `package.json#n8n.credentials` updated
+  to point at the renamed dist paths.
+- Icons renamed `borghive.svg` → `gctrl.svg`, referenced via
+  `icon: 'file:gctrl.svg'`.
+- README rewritten under the Ground Control brand.
+- New `MIGRATION.md` documents the user-side steps for moving from
+  `n8n-nodes-borghive` (uninstall old, install new, restart n8n,
+  re-select nodes in existing workflows, credentials carry over).
 
-### 2. MCP tool rename — `borghive_*` → `gctrl_*`
+Builds clean with `npm run build` (tsc + gulp icons).
 
-Tool names are part of the wire contract with any client `.mcp.json`
-that already references them (Claude Desktop, Cursor, custom
-agents). Renaming them requires:
-- A coordinated server-side change (the tool list the server
-  exposes).
-- A user-side migration of every `.mcp.json` referencing
-  `borghive_extract`, `borghive_query`, `borghive_store`,
-  `borghive_fuse`, `borghive_search_entities`, `borghive_list_graphs`,
-  `borghive_list_ontologies`, `borghive_list_extractions`,
-  `borghive_schema`.
-- Either a deprecation window where both names are accepted, or a
-  hard cutover with comms.
+### 2. MCP tool rename — `borghive_*` → `gctrl_*` (with deprecation aliases)
 
-### 3. `borghive/` repo folder rename — huge blast radius
+Tool names in `services/mcp/src/index.ts` rewritten through a small
+`registerToolWithAlias()` helper that registers each tool under both
+its new canonical `gctrl_*` name and its legacy `borghive_*` name.
+
+- Canonical names: `gctrl_extract`, `gctrl_query`, `gctrl_store`,
+  `gctrl_fuse`, `gctrl_search_entities`, `gctrl_list_graphs`,
+  `gctrl_list_ontologies`, `gctrl_list_extractions`, `gctrl_schema`.
+- Each legacy `borghive_*` alias forwards to the same handler, logs a
+  `console.error` deprecation warning naming both the old and the new
+  tool name, and carries a `[DEPRECATED — use 'gctrl_X' instead,
+  alias will be removed in v2]` prefix on its description.
+- Aliases marked in code with `// DEPRECATED — remove in v2`.
+- Startup logs a clear notice that the deprecated names are still
+  exposed.
+- `services/mcp/README.md` documents the new names with a
+  "Deprecated names (alias, removal in v2)" callout listing every
+  alias.
+- `borghive/.mcp.json` (actually `Databorg/.mcp.json` — the only
+  example config in the repo) updated to the new env-var names
+  (`GCTRL_*`).
+- `docs/buildsummary.md` updated to the new tool names with a
+  deprecation callout.
+- `services/web/src/pages/settings/SettingsPage.tsx` "MCP Server"
+  panel updated to display the `gctrl_*` names.
+
+Builds clean with `npm run build` (tsc). Both old and new names are
+present in `dist/index.js` (18 registrations = 9 tools × 2 names).
+
+### Removal schedule
+
+- **MCP server v2.0**: drop the `registerToolWithAlias()` helper and
+  call `server.tool()` directly. Remove every `borghive_*` alias and
+  the deprecation-warning code path.
+- **n8n package**: publish a single final `n8n-nodes-borghive` release
+  whose only purpose is to surface a "use `n8n-nodes-gctrl` instead"
+  notice (e.g. an error-throwing stub or a `deprecated` field in
+  package.json). Do not re-export — see `MIGRATION.md` for why.
+
+---
+
+## Still pending — needs deliberate work
+
+### 1. `borghive/` repo folder rename — huge blast radius
 
 Renaming the top-level `borghive/` directory affects:
 - Every absolute and relative path in scripts (`scripts/run-e2e.ps1`,
@@ -213,8 +251,7 @@ quiet day with all collaborators warned in advance.
 - Database column / table names.
 - Docker container names and the `borghive_*` Docker network.
 - The `borghive/` repo folder.
-- MCP tool names (`borghive_*`).
-- npm package distribution name on the registry.
 
-Only the **values** of env-vars, the **defaults** of secrets, and
-**user-facing display strings** are in scope here.
+MCP tool names and the npm package were renamed in the latest commit;
+the deprecation aliases / migration guide cover the transition. See
+the "Removal schedule" above for when the legacy paths disappear.
