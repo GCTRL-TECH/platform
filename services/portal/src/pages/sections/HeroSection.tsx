@@ -1,9 +1,54 @@
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 
+/**
+ * Parallax factor. 0 = fixed, 1 = scrolls at page speed. ~0.4 makes the
+ * image trail the page so the hero feels deeper than the text layer.
+ */
+const PARALLAX_FACTOR = 0.4
+
 export function HeroSection() {
+  const [scrollY, setScrollY] = useState(0)
+  const rafRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    const onScroll = () => {
+      if (rafRef.current != null) return
+      rafRef.current = requestAnimationFrame(() => {
+        setScrollY(window.scrollY)
+        rafRef.current = null
+      })
+    }
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
+    }
+  }, [])
+
   return (
     <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#020617] px-6 pt-20">
-      {/* Grid background */}
+      {/* Parallax hero image — sits at the very back, scrolls slower than the page */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-x-0 top-0 -z-0 h-[140vh]"
+        style={{
+          transform: `translate3d(0, ${scrollY * PARALLAX_FACTOR}px, 0)`,
+          willChange: 'transform',
+        }}
+      >
+        <img
+          src="/hero-bg.png"
+          alt=""
+          className="h-full w-full object-cover object-center opacity-55"
+        />
+        {/* Vignette + bottom fade so the image dissolves into the page bg
+            and the text on top stays legible. */}
+        <div className="absolute inset-0 bg-gradient-to-b from-[#020617]/40 via-[#020617]/30 to-[#020617]" />
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_transparent_30%,_#020617_85%)]" />
+      </div>
+
+      {/* Grid background (on top of the image, gives it the techy lattice) */}
       <div className="hero-grid-bg pointer-events-none absolute inset-0" />
 
       {/* Radial glow */}
