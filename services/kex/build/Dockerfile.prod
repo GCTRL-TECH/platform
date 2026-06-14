@@ -1,12 +1,7 @@
-# Stage 1: Obfuscate source with PyArmor
-FROM python:3.11-slim AS obfuscator
-WORKDIR /build
-RUN pip install pyarmor==8.5.11
-COPY requirements.txt ./
-COPY src/ ./src/
-RUN pyarmor gen --output dist/obfuscated --recursive --platform linux.x86_64 src/
-
-# Stage 2: Runtime — CUDA + obfuscated source only
+# KEX prod image — CUDA runtime with the IP-heavy engine compiled to native .so.
+# Cython compilation runs INLINE in this image (not a separate stage) so the .so
+# is built against the exact CPython 3.11 (deadsnakes) it will run on — zero ABI
+# risk. The Python source never ships: a repo-dropper gets compiled binaries.
 FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 WORKDIR /app
 
@@ -15,7 +10,7 @@ RUN apt-get update && \
     apt-get install -y software-properties-common && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && \
-    apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip gcc g++ \
+    apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip gcc g++ libc6-dev \
     tesseract-ocr tesseract-ocr-deu tesseract-ocr-fra tesseract-ocr-spa libtesseract-dev \
     ffmpeg && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
@@ -24,9 +19,18 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir -r requirements.txt lxml_html_clean
 
-# Copy obfuscated source — dist/obfuscated/ contains src/ + pyarmor_runtime_000000/
-# both must land at /app/ so uvicorn can resolve src.main from WORKDIR
-COPY --from=obfuscator /build/dist/obfuscated ./
+# Copy source, compile the engine to native .so, strip the .py source. Every
+# module is compiled EXCEPT the FastAPI entrypoint (main.py — runtime
+# introspection) and package __init__.py files. Cython is removed afterwards.
+COPY src/ ./src/
+RUN python3 -m pip install --no-cache-dir cython==3.0.11 setuptools && \
+    find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -print0 \
+      | xargs -0 python3 -m Cython.Build.Cythonize -3 -i -j 4 && \
+    find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -delete && \
+    find src -name '*.c' -delete && \
+    rm -rf build && \
+    python3 -m pip uninstall -y cython && \
+    echo "=== shipped modules ===" && find src -name '*.so' -o -name '*.py' | sort
 
 ENV TRANSFORMERS_CACHE=/app/models
 ENV NVIDIA_VISIBLE_DEVICES=all

@@ -1,10 +1,24 @@
-# Stage 1: Obfuscate
-FROM python:3.11-slim AS obfuscator
+# Stage 1: Compile the IP-heavy engine to native .so via Cython.
+# Cython transpiles each module to C and builds a CPython extension, so the
+# Python source NEVER ships in the final image — a repo-dropper gets compiled
+# binaries, not readable code. No file-size limits (unlike PyArmor's trial),
+# and the .so is ABI-compatible because this stage shares the runtime base
+# (python:3.11-slim → python:3.11-slim, identical CPython 3.11 / x86_64).
+FROM python:3.11-slim AS compiler
 WORKDIR /build
-RUN pip install pyarmor==8.5.11
-COPY requirements.txt ./
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir cython==3.0.11 setuptools
 COPY src/ ./src/
-RUN pyarmor gen --output dist/obfuscated --recursive --platform linux.x86_64 src/
+# Compile every module EXCEPT the FastAPI entrypoint (main.py — FastAPI uses
+# runtime introspection on route handlers) and package __init__.py files.
+# Then delete the .py source and the generated .c so only .so binaries remain.
+RUN set -e; \
+    find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -print0 \
+      | xargs -0 python -m Cython.Build.Cythonize -3 -i -j 4; \
+    find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -delete; \
+    find src -name '*.c' -delete; \
+    rm -rf build; \
+    echo "=== shipped modules ===" && find src -name '*.so' -o -name '*.py' | sort
 
 # Stage 2: Runtime
 FROM python:3.11-slim
@@ -17,6 +31,7 @@ COPY requirements.txt .
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir torch==2.4.0 --index-url ${TORCH_INDEX_URL}
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --from=obfuscator /build/dist/obfuscated .
+# Compiled engine (.so) + the thin .py entrypoint/__init__ only — no engine source.
+COPY --from=compiler /build/src ./src
 EXPOSE 4020
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4020"]

@@ -1,14 +1,16 @@
 #!/bin/bash
+# Compile the KEX engine to native .so via Cython (source never ships).
+# Mirrors the inline compile in Dockerfile.prod. Run from services/kex/.
 set -e
 
-echo "=== PyArmor: obfuscating KEX ==="
-pip install pyarmor==8.5.11 --quiet
+echo "=== Cython: compiling KEX engine to native .so ==="
+pip install cython==3.0.11 setuptools --quiet
 
-pyarmor gen \
-  --output dist/obfuscated \
-  --recursive \
-  --platform linux.x86_64 \
-  src/
+find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -print0 \
+  | xargs -0 python -m Cython.Build.Cythonize -3 -i -j 4
+find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -delete
+find src -name '*.c' -delete
+rm -rf build
 
-echo "=== Obfuscation complete ==="
-ls -la dist/obfuscated/
+echo "=== Compilation complete — shipped modules ==="
+find src -name '*.so' -o -name '*.py' | sort
