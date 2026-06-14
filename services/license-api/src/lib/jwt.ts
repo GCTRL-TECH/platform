@@ -48,6 +48,22 @@ export async function verifyLicenseJWT(token: string): Promise<LicenseJWTClaims>
   return payload as unknown as LicenseJWTClaims;
 }
 
+/**
+ * Sign the FUSE entity-resolution tuning profile with the SAME license RS256 key.
+ * The agent verifies it with the public key it already embeds — a repo-dropper
+ * can't read it (it's not in the public repo) or forge it (no private key).
+ */
+export async function signTuningJWT(profile: unknown, version: number): Promise<string> {
+  const key = await getPrivateKey();
+  return new SignJWT({ tuningVersion: version, profile })
+    .setProtectedHeader({ alg: 'RS256' })
+    .setIssuedAt()
+    .setIssuer('api.gctrl.tech')
+    .setSubject('tuning')
+    .setExpirationTime('30d')
+    .sign(key);
+}
+
 export async function signAdminJWT(userId: string): Promise<string> {
   const key = await getPrivateKey();
   return new SignJWT({ sub: userId, role: 'admin' })

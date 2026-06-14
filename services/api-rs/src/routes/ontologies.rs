@@ -28,6 +28,10 @@ use crate::{
     middleware::auth::JwtClaims,
 };
 
+/// The shared canonical "General Knowledge" ontology (see migration 036). It is
+/// created at install, is the default for every user, and is **not deletable**.
+const CANONICAL_ONTOLOGY_ID: Uuid = Uuid::from_u128(0xa1);
+
 // ─── Templates (returned by GET /templates; not stored in DB) ────────────────
 
 fn templates() -> Value {
@@ -205,9 +209,11 @@ fn validate_scope(scope: &str) -> Result<()> {
 }
 
 /// Internal row shape used for ownership/visibility checks.
+/// `user_id` is nullable: the shared canonical "General Knowledge" ontology is
+/// system-owned (no specific user).
 #[derive(sqlx::FromRow)]
 struct OntologyOwnerRow {
-    user_id: Uuid,
+    user_id: Option<Uuid>,
     scope:   String,
 }
 
@@ -232,7 +238,7 @@ async fn check_read_access(
     .await?
     .ok_or(AppError::NotFound)?;
 
-    if role == "admin" || row.user_id == user_id || row.scope == "shared" || row.scope == "public" {
+    if role == "admin" || row.user_id == Some(user_id) || row.scope == "shared" || row.scope == "public" {
         Ok(row)
     } else {
         Err(AppError::NotFound)
@@ -254,7 +260,7 @@ async fn check_write_access(
     .await?
     .ok_or(AppError::NotFound)?;
 
-    if role == "admin" || row.user_id == user_id {
+    if role == "admin" || row.user_id == Some(user_id) {
         Ok(())
     } else {
         Err(AppError::Forbidden(
@@ -284,7 +290,7 @@ async fn refresh_entity_type_count(db: &sqlx::PgPool, ontology_id: Uuid) -> Resu
 #[derive(sqlx::FromRow)]
 struct OntologyRow {
     id:                                   Uuid,
-    user_id:                              Uuid,
+    user_id:                              Option<Uuid>,
     name:                                 String,
     description:                          Option<String>,
     version:                              i32,
@@ -626,6 +632,13 @@ async fn delete_one(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
+    // The shared default ontology is permanent — present from install, never deletable.
+    if id == CANONICAL_ONTOLOGY_ID {
+        return Err(AppError::Forbidden(
+            "The default ontology cannot be deleted.".into(),
+        ));
+    }
+
     check_write_access(&state.db, id, claims.sub, &claims.role).await?;
 
     sqlx::query("DELETE FROM ontologies WHERE id = $1")

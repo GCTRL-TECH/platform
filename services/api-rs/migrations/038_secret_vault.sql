@@ -1,0 +1,24 @@
+-- Secret vault: application-level encryption at rest for sensitive credential
+-- columns. No schema change — the columns stay TEXT. Encryption/decryption is
+-- performed in the API layer (services/crypto.rs) using AES-256-GCM.
+--
+-- Stored format:  v1:<base64(nonce12)>:<base64(ciphertext+tag)>
+--   - `v1:` version prefix lets the app distinguish ciphertext from legacy
+--     plaintext (open() passes any value without the prefix through unchanged).
+--   - A fresh random 96-bit nonce is generated per write; nonces are never reused.
+--
+-- Key: env GCTRL_SECRET_KEY (base64 of 32 bytes) in production; in dev a stable
+-- key is derived from JWT_SECRET via SHA-256. Losing the key makes all sealed
+-- secrets unrecoverable — rotate via a re-encrypt migration, never silently.
+--
+-- Encrypted columns (backfilled idempotently on API startup):
+--   oauth_connectors.access_token
+--   oauth_connectors.refresh_token
+--   connector_configs.client_secret
+--   obsidian_vaults.api_token
+--   sharepoint_tenant_configs.client_secret
+--
+-- This migration is intentionally a no-op DDL; it exists to document the scheme
+-- and keep the migration counter moving (next: 039).
+
+SELECT 1;

@@ -11,11 +11,24 @@ const REPORT_INTERVAL:    Duration = Duration::from_secs(15 * 60);
 #[derive(Serialize)]
 struct HeartbeatPayload {
     usage_report: Vec<crate::usage_queue::UsageRecord>,
+    /// The agent's cached ER-tuning version (version-delta: the server only sends
+    /// a tuning blob when this is stale, so steady state carries nothing extra).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tuning_version: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct TuningDelta {
+    #[allow(dead_code)]
+    version: i64,
+    jws: String,
 }
 
 #[derive(Deserialize)]
 struct HeartbeatResponse {
     license_jwt: Option<String>,
+    #[serde(default)]
+    tuning: Option<TuningDelta>,
 }
 
 pub async fn beat(
@@ -24,10 +37,13 @@ pub async fn beat(
     cfg:   &Config,
 ) {
     let records    = queue.lock().await.flush();
-    let payload    = HeartbeatPayload { usage_report: records.clone() };
+    // Tell the server our cached tuning version so it only re-sends on a bump.
+    let tuning_version = crate::tuning::read_cache(&cfg.tuning_profile_path).await.map(|t| t.version);
+    let payload    = HeartbeatPayload { usage_report: records.clone(), tuning_version };
     let jwt        = tokio::fs::read_to_string(&cfg.license_jwt_path).await.unwrap_or_default();
     let license_jwt_path = cfg.license_jwt_path.clone();
     let license_public_key = cfg.license_public_key.clone();
+    let tuning_profile_path = cfg.tuning_profile_path.clone();
     let api_url    = cfg.api_url.clone();
 
     let client = reqwest::Client::new();
@@ -43,14 +59,30 @@ pub async fn beat(
                 if let Some(new_jwt) = body.license_jwt {
                     if let Err(e) = tokio::fs::write(&license_jwt_path, new_jwt.trim()).await {
                         tracing::warn!("Failed to persist JWT: {e}");
-                        return;
-                    }
-                    match LicenseCache::load_from_disk(&license_jwt_path, &license_public_key).await {
-                        Ok(new_cache) => {
-                            *cache.write().await = new_cache;
-                            tracing::info!("Heartbeat OK — balance={}", cache.read().await.balance());
+                    } else {
+                        match LicenseCache::load_from_disk(&license_jwt_path, &license_public_key).await {
+                            Ok(new_cache) => {
+                                *cache.write().await = new_cache;
+                                tracing::info!("Heartbeat OK — balance={}", cache.read().await.balance());
+                            }
+                            Err(e) => tracing::warn!("JWT reload failed: {e}"),
                         }
-                        Err(e) => tracing::warn!("JWT reload failed: {e}"),
+                    }
+                }
+
+                // ER tuning delta: only trust a tuning blob while the license is
+                // valid. Verify the JWS with the embedded public key; on success
+                // persist it as the new last-good cache, otherwise keep the prior
+                // one (a tuning miss never breaks FUSE — it falls back to generic).
+                if let Some(td) = body.tuning {
+                    if cache.read().await.is_valid() {
+                        match crate::tuning::verify_tuning_jws(&td.jws, &license_public_key) {
+                            Ok(ct) => match crate::tuning::write_cache(&tuning_profile_path, &ct).await {
+                                Ok(()) => tracing::info!("ER tuning profile updated to v{}", ct.version),
+                                Err(e) => tracing::warn!("tuning cache write failed: {e}"),
+                            },
+                            Err(e) => tracing::warn!("tuning JWS rejected (keeping last-good): {e}"),
+                        }
                     }
                 }
             }

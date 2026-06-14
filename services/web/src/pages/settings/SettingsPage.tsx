@@ -19,11 +19,8 @@ import {
   Slack,
   Globe,
   Mic,
-  BarChart2,
-  Table2,
   Code2,
   Search,
-  Palette,
   Server,
   RefreshCw,
   Wifi,
@@ -32,17 +29,29 @@ import {
   Shield,
   Loader2,
   ArrowUpCircle,
+  Bot,
+  Lock,
+  ExternalLink,
+  Webhook,
+  Sparkles,
+  Trash2,
+  Plus,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
-import { useQueryClient } from '@tanstack/react-query'
+import { usePublicConfig } from '@/hooks/usePublicConfig'
+import { useTokenBalance } from '@/hooks/useTokenBalance'
+import { useQueryClient, useQuery } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
-import { api } from '@/lib/api'
+import { api, apiGet } from '@/lib/api'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
+import ObsidianVaultManager from '@/components/connectors/ObsidianVaultManager'
+import SSOPage from './SSOPage'
+import WebhooksPage from './WebhooksPage'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'license' | 'models' | 'integrations' | 'skills' | 'mcp' | 'n8n' | 'account' | 'infrastructure'
+type TabId = 'license' | 'models' | 'integrations' | 'skills' | 'agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso'
 
 interface Tab {
   id: TabId
@@ -74,24 +83,21 @@ interface Connector {
   available: boolean
 }
 
-interface RagSkill {
-  id: string
-  name: string
-  description: string
-  icon: typeof Brain
-  implemented: boolean
-}
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TABS: Tab[] = [
   { id: 'license', label: 'License', icon: Shield },
   { id: 'models', label: 'AI Models', icon: Brain },
-  { id: 'integrations', label: 'Integrations', icon: Plug },
   { id: 'skills', label: 'Skills & Plugins', icon: Puzzle },
+  { id: 'agent', label: 'Agent', icon: Bot },
+  { id: 'integrations', label: 'Integrations', icon: Plug },
   { id: 'mcp', label: 'MCP Server', icon: Code2 },
   { id: 'n8n', label: 'n8n', icon: Plug },
+  { id: 'webhooks', label: 'Webhooks', icon: Webhook },
   { id: 'infrastructure', label: 'Infrastructure', icon: Server },
+  { id: 'memory', label: 'Memory', icon: Brain },
+  { id: 'profile', label: 'Personal Memory', icon: Sparkles },
+  { id: 'sso', label: 'SSO / SCIM', icon: KeyRound },
   { id: 'account', label: 'Account', icon: User },
 ]
 
@@ -170,44 +176,6 @@ const CONNECTORS: Connector[] = [
   { id: 'whisper', name: 'Audio/Video (Whisper)', category: 'Other', icon: Mic, available: true },
 ]
 
-const RAG_SKILLS: RagSkill[] = [
-  {
-    id: 'excalidraw',
-    name: 'Excalidraw Diagrams',
-    description: 'Generate visual diagrams from knowledge',
-    icon: Palette,
-    implemented: false,
-  },
-  {
-    id: 'web-search',
-    name: 'Web Search',
-    description: 'Enrich answers with web results',
-    icon: Search,
-    implemented: true,
-  },
-  {
-    id: 'chart-gen',
-    name: 'Chart Generation',
-    description: 'Render charts from structured data',
-    icon: BarChart2,
-    implemented: false,
-  },
-  {
-    id: 'table-analysis',
-    name: 'Table Analysis',
-    description: 'Parse and reason over tabular data',
-    icon: Table2,
-    implemented: false,
-  },
-  {
-    id: 'code-execution',
-    name: 'Code Execution',
-    description: 'Run code snippets and return results',
-    icon: Code2,
-    implemented: false,
-  },
-]
-
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
 function SectionHeader({ children }: { children: React.ReactNode }) {
@@ -216,40 +184,104 @@ function SectionHeader({ children }: { children: React.ReactNode }) {
   )
 }
 
-function ApiKeyRow({ field }: { field: ApiKeyField }) {
-  const storageKey = `apikey_${field.id}`
-  const [value, setValue] = useState(() => localStorage.getItem(storageKey) ?? '')
-  const [show, setShow] = useState(false)
-  const [saved, setSaved] = useState(false)
+interface LlmProviderState {
+  provider: string
+  connected: boolean
+  isActive: boolean
+  baseUrl: string | null
+  defaultModel: string | null
+  hasKey: boolean
+}
 
-  function handleSave() {
-    if (value.trim()) {
-      localStorage.setItem(storageKey, value.trim())
-    } else {
-      localStorage.removeItem(storageKey)
+/// Per-provider Connect card backed by `/api/llm/providers`. Cloud providers take
+/// an API key (+ Test); the stored key is never shown (masked/omitted by the API).
+function ProviderCard({
+  field,
+  state,
+  onChanged,
+}: {
+  field: ApiKeyField
+  state: LlmProviderState | undefined
+  onChanged: () => void
+}) {
+  const [value, setValue] = useState('')
+  const [show, setShow] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [testResult, setTestResult] = useState<'ok' | 'error' | null>(null)
+  const [testMsg, setTestMsg] = useState<string>('')
+
+  const connected = !!state?.connected
+
+  async function handleSave() {
+    if (!value.trim()) return
+    setBusy(true)
+    setTestResult(null)
+    try {
+      await api.put('/llm/providers', { provider: field.id, apiKey: value.trim() })
+      setValue('')
+      onChanged()
+    } finally {
+      setBusy(false)
     }
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
   }
 
-  const hasKey = !!localStorage.getItem(storageKey)
+  async function handleTest() {
+    setBusy(true)
+    setTestResult(null)
+    try {
+      // Save first if a fresh key was typed, so Test exercises it.
+      if (value.trim()) {
+        await api.put('/llm/providers', { provider: field.id, apiKey: value.trim() })
+        setValue('')
+        onChanged()
+      }
+      const { data } = await api.post(`/llm/providers/${field.id}/test`)
+      setTestResult(data.ok ? 'ok' : 'error')
+      setTestMsg(data.ok ? 'Connection OK' : (data.error ?? 'Test failed'))
+    } catch {
+      setTestResult('error')
+      setTestMsg('Test failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleDisconnect() {
+    setBusy(true)
+    try {
+      await api.delete(`/llm/providers/${field.id}`)
+      setTestResult(null)
+      onChanged()
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
     <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
       <div className="mb-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-slate-200">{field.label}</span>
-          {hasKey ? (
+          {connected ? (
             <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
               <Check size={9} />
-              Active
+              Connected
             </span>
           ) : (
             <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-500">
-              Not set
+              Not connected
             </span>
           )}
         </div>
+        {connected && (
+          <button
+            onClick={handleDisconnect}
+            disabled={busy}
+            className="text-[11px] text-slate-500 hover:text-red-400 disabled:opacity-50"
+          >
+            Disconnect
+          </button>
+        )}
       </div>
 
       <div className="flex gap-2">
@@ -258,7 +290,7 @@ function ApiKeyRow({ field }: { field: ApiKeyField }) {
             type={show ? 'text' : 'password'}
             value={value}
             onChange={(e) => setValue(e.target.value)}
-            placeholder={field.placeholder}
+            placeholder={connected ? '•••••••• (key stored — enter new to replace)' : field.placeholder}
             className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 pr-10 text-sm text-slate-200 placeholder-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
           />
           <button
@@ -271,33 +303,40 @@ function ApiKeyRow({ field }: { field: ApiKeyField }) {
         </div>
         <button
           onClick={handleSave}
-          className={cn(
-            'flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-            saved
-              ? 'bg-emerald-500/20 text-emerald-400'
-              : 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30'
-          )}
+          disabled={busy || !value.trim()}
+          className="flex items-center gap-1.5 rounded-md bg-blue-500/20 px-3 py-2 text-sm font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
         >
-          {saved ? <Check size={14} /> : <Save size={14} />}
-          {saved ? 'Saved' : 'Save'}
+          {busy ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+          Save
+        </button>
+        <button
+          onClick={handleTest}
+          disabled={busy || (!connected && !value.trim())}
+          className="flex items-center gap-1.5 rounded-md bg-slate-800 px-3 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700 disabled:opacity-50"
+        >
+          Test
         </button>
       </div>
 
-      {hasKey && (
-        <div className="mt-3">
-          <p className="mb-1.5 text-[11px] text-slate-500">Models unlocked:</p>
-          <div className="flex flex-wrap gap-1.5">
-            {field.modelsEnabled.map((model) => (
-              <span
-                key={model}
-                className="rounded-md bg-slate-800 px-2 py-0.5 text-[10px] font-mono text-slate-400"
-              >
-                {model}
-              </span>
-            ))}
-          </div>
-        </div>
+      {testResult && (
+        <p className={cn('mt-2 text-[11px]', testResult === 'ok' ? 'text-emerald-400' : 'text-red-400')}>
+          {testMsg}
+        </p>
       )}
+
+      <div className="mt-3">
+        <p className="mb-1.5 text-[11px] text-slate-500">Models:</p>
+        <div className="flex flex-wrap gap-1.5">
+          {field.modelsEnabled.map((model) => (
+            <span
+              key={model}
+              className="rounded-md bg-slate-800 px-2 py-0.5 text-[10px] font-mono text-slate-400"
+            >
+              {model}
+            </span>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }
@@ -307,13 +346,85 @@ function ApiKeyRow({ field }: { field: ApiKeyField }) {
 // ─── Tab: AI Models ───────────────────────────────────────────────────────────
 
 function ModelsTab() {
+  const [providers, setProviders] = useState<LlmProviderState[]>([])
+  const [ollamaBase, setOllamaBase] = useState('')
+  const [ollamaKey, setOllamaKey] = useState('')
+  const [ollamaHasKey, setOllamaHasKey] = useState(false)
+  const [ollamaSaved, setOllamaSaved] = useState(false)
+  const [ollamaTesting, setOllamaTesting] = useState(false)
+  const [ollamaTest, setOllamaTest] = useState<{ ok: boolean; msg: string } | null>(null)
+
+  const loadProviders = useCallback(async () => {
+    try {
+      const { data } = await api.get('/llm/providers')
+      const list = (data.providers ?? []) as LlmProviderState[]
+      setProviders(list)
+      const ollama = list.find((p) => p.provider === 'ollama')
+      if (ollama?.baseUrl) setOllamaBase(ollama.baseUrl)
+      setOllamaHasKey(Boolean(ollama?.hasKey))
+    } catch { /* non-fatal */ }
+  }, [])
+
+  useEffect(() => { void loadProviders() }, [loadProviders])
+
+  const stateFor = (id: string) => providers.find((p) => p.provider === id)
+
+  async function saveOllamaBase() {
+    try {
+      const body: { provider: string; baseUrl?: string; apiKey?: string } = {
+        provider: 'ollama',
+        baseUrl: ollamaBase.trim() || undefined,
+      }
+      // Only send the key when the user typed one (sealed server-side). Empty input
+      // leaves the existing stored key untouched.
+      if (ollamaKey.trim()) body.apiKey = ollamaKey.trim()
+      await api.put('/llm/providers', body)
+      setOllamaKey('')
+      setOllamaSaved(true)
+      setTimeout(() => setOllamaSaved(false), 2000)
+      void loadProviders()
+    } catch { /* non-fatal */ }
+  }
+
+  async function testOllama() {
+    setOllamaTesting(true)
+    setOllamaTest(null)
+    try {
+      // Persist the current base + (if typed) key first so Test exercises them.
+      const body: { provider: string; baseUrl?: string; apiKey?: string } = {
+        provider: 'ollama',
+        baseUrl: ollamaBase.trim() || undefined,
+      }
+      if (ollamaKey.trim()) body.apiKey = ollamaKey.trim()
+      await api.put('/llm/providers', body)
+      if (ollamaKey.trim()) setOllamaKey('')
+      const { data } = await api.post('/llm/providers/ollama/test')
+      setOllamaTest({
+        ok: !!data.ok,
+        msg: data.ok
+          ? (data.models ? `Connection OK — ${data.models} model(s) reachable` : 'Connection OK')
+          : (data.error ?? 'Test failed'),
+      })
+      void loadProviders()
+    } catch {
+      setOllamaTest({ ok: false, msg: 'Test failed — is the URL reachable?' })
+    } finally {
+      setOllamaTesting(false)
+    }
+  }
+
   return (
     <div className="space-y-8">
       <section>
-        <SectionHeader>API Keys for Cloud Models</SectionHeader>
+        <SectionHeader>Cloud Model Providers</SectionHeader>
         <div className="space-y-3">
           {API_KEY_FIELDS.map((field) => (
-            <ApiKeyRow key={field.id} field={field} />
+            <ProviderCard
+              key={field.id}
+              field={field}
+              state={stateFor(field.id)}
+              onChanged={loadProviders}
+            />
           ))}
         </div>
       </section>
@@ -324,13 +435,57 @@ function ModelsTab() {
             <div className="h-2 w-2 rounded-full bg-emerald-400" />
             <span className="text-sm font-medium text-slate-300">Local Ollama</span>
             <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
-              Always Available
+              Connected / local
             </span>
           </div>
           <p className="mt-1.5 text-xs text-slate-500">
             Local Ollama models (llama3.2, mistral, qwen2.5, etc.) run on your machine and are always
-            available without API keys — fully GDPR-compliant, no data leaves your device.
+            available without API keys — fully GDPR-compliant, no data leaves your device. For a
+            remote or auth-protected Ollama (e.g. ollama.com / <code>:cloud</code> models), set the
+            base URL and an API key below.
           </p>
+          <div className="mt-3 space-y-2">
+            <input
+              value={ollamaBase}
+              onChange={(e) => setOllamaBase(e.target.value)}
+              placeholder="http://localhost:11434"
+              className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+            />
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={ollamaKey}
+                onChange={(e) => setOllamaKey(e.target.value)}
+                placeholder={ollamaHasKey ? '•••••••• (key stored — leave blank to keep)' : 'API key (optional, for remote/cloud Ollama)'}
+                className="flex-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+              />
+              <button
+                onClick={saveOllamaBase}
+                className={cn(
+                  'flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap',
+                  ollamaSaved
+                    ? 'bg-emerald-500/20 text-emerald-400'
+                    : 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30'
+                )}
+              >
+                {ollamaSaved ? <Check size={14} /> : <Save size={14} />}
+                {ollamaSaved ? 'Saved' : 'Save'}
+              </button>
+              <button
+                onClick={testOllama}
+                disabled={ollamaTesting}
+                className="flex items-center gap-1.5 rounded-md bg-slate-800 px-3 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700 disabled:opacity-50 whitespace-nowrap"
+              >
+                {ollamaTesting ? <Loader2 size={14} className="animate-spin" /> : null}
+                Test
+              </button>
+            </div>
+            {ollamaTest && (
+              <p className={cn('text-[11px]', ollamaTest.ok ? 'text-emerald-400' : 'text-red-400')}>
+                {ollamaTest.msg}
+              </p>
+            )}
+          </div>
         </div>
       </section>
     </div>
@@ -627,6 +782,16 @@ function IntegrationsTab() {
         </div>
       </section>
 
+      {/* ── Obsidian Vaults (not OAuth — local / server / REST) ────── */}
+      <section>
+        <SectionHeader>Obsidian Vaults</SectionHeader>
+        <p className="mb-3 text-xs text-slate-500">
+          Connect Obsidian vaults from a local drive, a server-mounted folder, or the REST API plugin,
+          then extract them in <span className="text-slate-400">KEX → Sources → Obsidian</span>.
+        </p>
+        <ObsidianVaultManager />
+      </section>
+
       {/* ── Added Data Sources (list + add button) ────────────────── */}
       <section>
         <div className="mb-3 flex items-center justify-between">
@@ -882,75 +1047,372 @@ function SourceConfigForm({ sourceId }: { sourceId: string; sourceName: string; 
 
 // ─── Tab: Skills & Plugins ────────────────────────────────────────────────────
 
-function SkillsTab() {
-  const [enabled, setEnabled] = useState<Record<string, boolean>>(() => {
-    try {
-      return JSON.parse(localStorage.getItem('rag_skills') ?? '{}')
-    } catch {
-      return {}
-    }
-  })
+interface AgentSkill {
+  id: string
+  slug: string
+  name: string
+  description: string | null
+  kind: 'builtin' | 'curated' | 'github'
+  repoUrl: string | null
+  locked: boolean
+  enabled: boolean
+  system: boolean
+}
 
-  function toggle(id: string, implemented: boolean) {
-    if (!implemented) return
-    const next = { ...enabled, [id]: !enabled[id] }
-    setEnabled(next)
-    localStorage.setItem('rag_skills', JSON.stringify(next))
+function skillIcon(kind: AgentSkill['kind'], slug: string) {
+  if (kind === 'github') return Github
+  if (slug === 'rag-expert') return Search
+  if (slug === 'database-engineer') return Database
+  if (kind === 'builtin') return Brain
+  return Puzzle
+}
+
+function SkillsTab() {
+  const [skills, setSkills] = useState<AgentSkill[]>([])
+  const [loading, setLoading] = useState(true)
+  const [repoUrl, setRepoUrl] = useState('')
+  const [adding, setAdding] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const { data } = await api.get('/skills')
+      setSkills(data.skills ?? [])
+    } catch {
+      setError('Failed to load skills')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  async function toggle(skill: AgentSkill) {
+    if (skill.locked) return
+    // Optimistic flip
+    const next = !skill.enabled
+    setSkills((prev) => prev.map((s) => (s.slug === skill.slug ? { ...s, enabled: next } : s)))
+    try {
+      await api.post(`/skills/${skill.slug}/toggle`, { enabled: next })
+    } catch {
+      // Revert on failure
+      setSkills((prev) => prev.map((s) => (s.slug === skill.slug ? { ...s, enabled: !next } : s)))
+    }
   }
+
+  async function addGithub() {
+    if (!repoUrl.trim()) return
+    setAdding(true); setError(null)
+    try {
+      await api.post('/skills', { repoUrl: repoUrl.trim() })
+      setRepoUrl('')
+      await load()
+    } catch (err: unknown) {
+      setError((err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Could not add skill')
+    } finally {
+      setAdding(false)
+    }
+  }
+
+  async function removeGithub(id: string) {
+    setSkills((prev) => prev.filter((s) => s.id !== id))
+    try {
+      await api.delete(`/skills/id/${id}`)
+    } catch {
+      await load()
+    }
+  }
+
+  const systemSkills = skills.filter((s) => s.system)
+  const githubSkills = skills.filter((s) => !s.system && s.kind === 'github')
 
   return (
     <div className="space-y-8">
       <section>
-        <SectionHeader>RAG Skills</SectionHeader>
-        <div className="space-y-2">
-          {RAG_SKILLS.map((skill) => (
-            <div
-              key={skill.id}
-              className={cn(
-                'flex items-center justify-between rounded-lg border p-4 transition-colors',
-                skill.implemented
-                  ? 'border-slate-800 bg-slate-900/50 hover:border-slate-700'
-                  : 'border-slate-800/60 bg-slate-900/20 opacity-60'
-              )}
-            >
-              <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-800">
-                  <skill.icon size={16} className="text-slate-400" />
+        <SectionHeader>Agent Skills</SectionHeader>
+        <p className="mb-4 text-xs text-slate-500">
+          Skills shape what the Pi agent is good at. Built-in tools are always on; curated skills can be toggled per account.
+        </p>
+        {loading ? (
+          <div className="flex items-center gap-2 text-xs text-slate-500"><Loader2 size={14} className="animate-spin" /> Loading…</div>
+        ) : (
+          <div className="space-y-2">
+            {systemSkills.map((skill) => {
+              const Icon = skillIcon(skill.kind, skill.slug)
+              return (
+                <div
+                  key={skill.slug}
+                  className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/50 p-4 transition-colors hover:border-slate-700"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-800">
+                      <Icon size={16} className="text-slate-400" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm font-medium text-slate-200">{skill.name}</p>
+                        {skill.locked && (
+                          <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[9px] font-medium text-emerald-400">
+                            Built-in · always on
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-500">{skill.description}</p>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => void toggle(skill)}
+                    disabled={skill.locked}
+                    title={skill.locked ? 'Built-in skill — cannot be disabled' : undefined}
+                    className={cn(
+                      'relative h-5 w-9 rounded-full transition-colors focus:outline-none',
+                      skill.enabled ? 'bg-blue-500' : 'bg-slate-700',
+                      skill.locked && 'cursor-not-allowed opacity-70'
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform',
+                        skill.enabled ? 'left-[18px]' : 'left-0.5'
+                      )}
+                    />
+                  </button>
                 </div>
-                <div>
-                  <div className="flex items-center gap-2">
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <SectionHeader>Skills from GitHub</SectionHeader>
+        <p className="mb-3 text-xs text-slate-500">
+          Add any public skill repo — we'll use its <code className="text-slate-400">SKILL.md</code>, a <code className="text-slate-400">manifest.json</code>/<code className="text-slate-400">plugin.json</code>, or fall back to its <code className="text-slate-400">README.md</code>. Paste a repo or a link to a specific skill folder. Its guidance is folded into the agent.
+        </p>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={repoUrl}
+            onChange={(e) => setRepoUrl(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void addGithub() }}
+            placeholder="https://github.com/owner/repo"
+            className="flex-1 rounded border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+          />
+          <button
+            onClick={() => void addGithub()}
+            disabled={adding || !repoUrl.trim()}
+            className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+          >
+            {adding ? <Loader2 size={13} className="animate-spin" /> : <Github size={13} />} Add
+          </button>
+        </div>
+        {error && <p className="mt-2 text-[11px] text-red-400">{error}</p>}
+
+        {githubSkills.length > 0 && (
+          <div className="mt-4 space-y-2">
+            {githubSkills.map((skill) => (
+              <div key={skill.id} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-800">
+                    <Github size={16} className="text-slate-400" />
+                  </div>
+                  <div>
                     <p className="text-sm font-medium text-slate-200">{skill.name}</p>
-                    {!skill.implemented && (
-                      <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[9px] font-medium text-amber-500">
-                        Coming Soon
-                      </span>
+                    {skill.repoUrl && (
+                      <a href={skill.repoUrl} target="_blank" rel="noreferrer" className="text-xs text-indigo-400 hover:underline">
+                        {skill.repoUrl.replace('https://github.com/', '')}
+                      </a>
                     )}
                   </div>
-                  <p className="text-xs text-slate-500">{skill.description}</p>
                 </div>
+                <button
+                  onClick={() => void removeGithub(skill.id)}
+                  className="rounded p-1.5 text-slate-600 hover:bg-slate-800 hover:text-red-400 transition-colors"
+                  title="Remove skill"
+                >
+                  <X size={14} />
+                </button>
               </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
 
-              {/* Toggle */}
-              <button
-                onClick={() => toggle(skill.id, skill.implemented)}
-                disabled={!skill.implemented}
-                className={cn(
-                  'relative h-5 w-9 rounded-full transition-colors focus:outline-none',
-                  enabled[skill.id] && skill.implemented
-                    ? 'bg-blue-500'
-                    : 'bg-slate-700',
-                  !skill.implemented && 'cursor-not-allowed'
-                )}
-              >
-                <span
-                  className={cn(
-                    'absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform',
-                    enabled[skill.id] && skill.implemented ? 'left-[18px]' : 'left-0.5'
-                  )}
-                />
-              </button>
+// ─── Tab: Agent ───────────────────────────────────────────────────────────────
+
+function AgentTab() {
+  const [providers, setProviders] = useState<LlmProviderState[]>([])
+  const [skills, setSkills] = useState<AgentSkill[]>([])
+  const [gatewayEnabled, setGatewayEnabled] = useState<boolean | null>(null)
+  const [copied, setCopied] = useState('')
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const { data } = await api.get('/llm/providers')
+        setProviders((data.providers ?? []) as LlmProviderState[])
+      } catch { /* non-fatal */ }
+      try {
+        const { data } = await api.get('/skills')
+        setSkills((data.skills ?? []) as AgentSkill[])
+      } catch { /* non-fatal */ }
+      try {
+        const { data } = await api.get('/agent/gateway/status')
+        setGatewayEnabled(!!data.enabled)
+      } catch { setGatewayEnabled(false) }
+    })()
+  }, [])
+
+  function copyText(text: string, id: string) {
+    void navigator.clipboard.writeText(text)
+    setCopied(id)
+    setTimeout(() => setCopied(''), 2000)
+  }
+
+  const activeProvider = providers.find((p) => p.isActive)
+    ?? providers.find((p) => p.connected)
+    ?? providers.find((p) => p.provider === 'ollama')
+  const activeModel = activeProvider?.defaultModel ?? null
+  const enabledSkills = skills.filter((s) => s.enabled).length
+
+  const origin = window.location.origin
+  const endpoint = `${origin}/api/agent/mcp`
+
+  const mcpConfig = JSON.stringify({
+    gctrl: {
+      url: endpoint,
+      headers: {
+        Authorization: 'ApiKey <your-access-token>',
+      },
+    },
+  }, null, 2)
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold text-slate-100">Pi Agent Harness</h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Pi is GCTRL&apos;s built-in knowledge agent. It reasons over your graphs with a
+          connected LLM and a set of clearance-scoped tools. You can expose it to external
+          multi-agent orchestrators over the network via the MCP gateway below.
+        </p>
+      </div>
+
+      {/* ── Harness summary ─────────────────────────────────────────── */}
+      <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center gap-2">
+            <Brain size={15} className="text-blue-400" />
+            <span className="text-sm font-medium text-slate-200">Connected LLM</span>
+          </div>
+          <p className="mt-2 text-sm text-slate-300 capitalize">
+            {activeProvider ? activeProvider.provider : 'Local Ollama'}
+          </p>
+          <p className="text-xs text-slate-500 font-mono">
+            {activeModel ?? 'default model'}
+          </p>
+        </div>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center gap-2">
+            <Puzzle size={15} className="text-violet-400" />
+            <span className="text-sm font-medium text-slate-200">Enabled Skills</span>
+          </div>
+          <p className="mt-2 text-2xl font-semibold text-slate-100">{enabledSkills}</p>
+          <p className="text-xs text-slate-500">
+            shaping Pi&apos;s behavior — manage in <span className="text-slate-400">Skills &amp; Plugins</span>
+          </p>
+        </div>
+      </section>
+
+      {/* ── External access (MCP gateway) ───────────────────────────── */}
+      <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Server size={16} className="text-slate-300" />
+            <h3 className="text-sm font-semibold text-slate-200">External Access — MCP Gateway</h3>
+          </div>
+          {gatewayEnabled === null ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] text-slate-400">
+              <Loader2 size={10} className="animate-spin" /> Checking…
+            </span>
+          ) : gatewayEnabled ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-400">
+              <Wifi size={11} /> Enabled
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-400">
+              <WifiOff size={11} /> Disabled (default)
+            </span>
+          )}
+        </div>
+
+        <p className="text-xs text-slate-500">
+          Exposes the Pi harness as a remote{' '}
+          <span className="text-slate-400">MCP-over-HTTP</span> endpoint so external orchestrators
+          (Hermes, OpenClaw, Codex, any MCP client) can drive it over the network. Every call is
+          authenticated with a scoped Access Token, filtered to that token&apos;s clearance and
+          per-graph grants, and written to the access audit log.
+        </p>
+
+        {!gatewayEnabled && gatewayEnabled !== null && (
+          <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2.5">
+            <Lock size={13} className="mt-0.5 shrink-0 text-amber-400" />
+            <div className="text-[11px] text-amber-200/90">
+              <p className="font-medium text-amber-300">Off by default.</p>
+              <p className="mt-0.5 text-amber-200/70">
+                Enabling external access requires a server-side change: set{' '}
+                <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">GCTRL_AGENT_GATEWAY_ENABLED=true</code>{' '}
+                in the API server environment and restart the service. It cannot be toggled from the UI.
+              </p>
             </div>
-          ))}
+          </div>
+        )}
+
+        {/* Endpoint */}
+        <div className="mt-4">
+          <label className="text-xs text-slate-500">Endpoint URL</label>
+          <div className="mt-1 flex items-center gap-2">
+            <code className="flex-1 rounded-lg bg-slate-800 px-3 py-2 font-mono text-xs text-slate-300 break-all">
+              {endpoint}
+            </code>
+            <button
+              onClick={() => copyText(endpoint, 'endpoint')}
+              className="btn-ghost text-slate-500 hover:text-slate-300"
+            >
+              {copied === 'endpoint' ? <Check size={14} /> : <ChevronRight size={14} />}
+            </button>
+          </div>
+        </div>
+
+        {/* Client config */}
+        <div className="mt-4">
+          <label className="text-xs text-slate-500">MCP client config (remote, HTTP transport)</label>
+          <div className="relative mt-1">
+            <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-4 font-mono text-xs text-slate-300">
+{mcpConfig}
+            </pre>
+            <button
+              onClick={() => copyText(mcpConfig, 'config')}
+              className="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[10px] text-slate-400 hover:text-slate-200 transition-colors"
+            >
+              {copied === 'config' ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+          <p className="mt-2 text-[11px] text-slate-600">
+            Replace <code className="text-amber-400">&lt;your-access-token&gt;</code> with a scoped
+            Access Token. Create and scope one (clearance + per-graph grants) on the{' '}
+            <a href="/access" className="inline-flex items-center gap-0.5 text-blue-400 hover:underline">
+              Access Control page <ExternalLink size={10} />
+            </a>
+            . All tool calls made through it are audited and clearance-scoped.
+          </p>
         </div>
       </section>
     </div>
@@ -961,6 +1423,8 @@ function SkillsTab() {
 
 function McpTab() {
   const [copied, setCopied] = useState('')
+  const cfg = usePublicConfig()
+  const mcpEndpoint = cfg.mcpEndpoint // e.g. http://localhost:3001/api
 
   function copyText(text: string, id: string) {
     void navigator.clipboard.writeText(text)
@@ -968,13 +1432,21 @@ function McpTab() {
     setTimeout(() => setCopied(''), 2000)
   }
 
+  // The MCP server runs on the USER's machine over stdio, so its filesystem
+  // path is client-side and unknown to the server. Ship a portable placeholder
+  // the user replaces with their own checkout/install path — never a baked-in
+  // absolute developer path.
+  const mcpServerPath = '/path/to/gctrl/services/mcp/dist/index.js'
+
   const mcpConfig = JSON.stringify({
-    GCTRL: {
-      command: 'node',
-      args: ['d:/N8N/Projekte/Databorg/GCTRL/services/mcp/dist/index.js'],
-      env: {
-        GCTRL_API_URL: 'http://localhost:4000/api',
-        GCTRL_API_TOKEN: '<your-jwt-token>',
+    mcpServers: {
+      gctrl: {
+        command: 'node',
+        args: [mcpServerPath],
+        env: {
+          GCTRL_API_URL: mcpEndpoint,
+          GCTRL_API_TOKEN: '<your-access-token>',
+        },
       },
     },
   }, null, 2)
@@ -1023,10 +1495,10 @@ function McpTab() {
             <label className="text-xs text-slate-500">API Endpoint</label>
             <div className="mt-1 flex items-center gap-2">
               <code className="flex-1 rounded-lg bg-slate-800 px-3 py-2 text-xs text-slate-300 font-mono">
-                http://localhost:4000/api
+                {mcpEndpoint}
               </code>
               <button
-                onClick={() => copyText('http://localhost:4000/api', 'endpoint')}
+                onClick={() => copyText(mcpEndpoint, 'endpoint')}
                 className="btn-ghost text-slate-500 hover:text-slate-300"
               >
                 {copied === 'endpoint' ? <Check size={14} /> : <ChevronRight size={14} />}
@@ -1034,13 +1506,15 @@ function McpTab() {
             </div>
           </div>
           <div>
-            <label className="text-xs text-slate-500">MCP Server Path</label>
+            <label className="text-xs text-slate-500">
+              MCP Server Path <span className="text-slate-600">— replace with your local checkout path</span>
+            </label>
             <div className="mt-1 flex items-center gap-2">
               <code className="flex-1 rounded-lg bg-slate-800 px-3 py-2 text-xs text-slate-300 font-mono break-all">
-                d:/N8N/Projekte/Databorg/GCTRL/services/mcp/dist/index.js
+                {mcpServerPath}
               </code>
               <button
-                onClick={() => copyText('d:/N8N/Projekte/Databorg/GCTRL/services/mcp/dist/index.js', 'path')}
+                onClick={() => copyText(mcpServerPath, 'path')}
                 className="btn-ghost text-slate-500 hover:text-slate-300"
               >
                 {copied === 'path' ? <Check size={14} /> : <ChevronRight size={14} />}
@@ -1068,8 +1542,10 @@ function McpTab() {
           </button>
         </div>
         <p className="mt-3 text-xs text-slate-600">
-          Replace <code className="text-amber-400">&lt;your-jwt-token&gt;</code> with a token from{' '}
-          <code className="text-blue-400">POST /api/auth/login</code>
+          Replace <code className="text-amber-400">&lt;your-access-token&gt;</code> with a scoped
+          Access Token (created on the{' '}
+          <a href="/access" className="text-blue-400 hover:underline">Access Control</a> page). It
+          is sent as <code className="text-blue-400">Authorization: ApiKey &lt;token&gt;</code>.
         </p>
       </div>
 
@@ -1122,6 +1598,7 @@ function McpTab() {
 
 function N8nTab() {
   const [copied, setCopied] = useState('')
+  const cfg = usePublicConfig()
 
   function copyText(text: string, id: string) {
     void navigator.clipboard.writeText(text)
@@ -1131,7 +1608,7 @@ function N8nTab() {
 
   const installCmd = 'cd ~/.n8n && npm install n8n-nodes-GCTRL'
   const credentialConfig = JSON.stringify({
-    baseUrl: 'http://localhost:4000',
+    baseUrl: cfg.apiOrigin,
     authMethod: 'emailPassword',
     email: '(your email)',
     password: '(your password)',
@@ -1312,10 +1789,328 @@ function N8nTab() {
   )
 }
 
+// ─── Tab: Personal Memory (A6 — user-profile personalization, GDPR-aware) ──────
+
+interface ProfileFact {
+  category: string
+  fact: string
+}
+
+interface UserProfile {
+  enabled: boolean
+  facts: ProfileFact[]
+  summary: string
+  updatedAt: string | null
+}
+
+const FACT_CATEGORIES = ['role', 'expertise', 'preference', 'working_style', 'context', 'other']
+
+function PersonalMemoryTab() {
+  const [profile, setProfile] = useState<UserProfile | null>(null)
+  const [facts, setFacts] = useState<ProfileFact[]>([])
+  const [summary, setSummary] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [building, setBuilding] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const { data } = await api.get<UserProfile>('/user/profile')
+      setProfile(data)
+      setFacts(Array.isArray(data.facts) ? data.facts : [])
+      setSummary(data.summary || '')
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Failed to load profile')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  async function toggleEnabled(next: boolean) {
+    setSaving(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const { data } = await api.put<UserProfile>('/user/profile', { enabled: next })
+      setProfile(data)
+      setNotice(next ? 'Personal memory enabled.' : 'Personal memory disabled.')
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Failed to update')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function buildProfile() {
+    setBuilding(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const { data } = await api.post<UserProfile & { messageCount?: number }>('/user/profile/build')
+      setProfile(data)
+      setFacts(Array.isArray(data.facts) ? data.facts : [])
+      setSummary(data.summary || '')
+      const n = (data as any).messageCount
+      setNotice(
+        n === 0
+          ? 'No standard-mode conversation history yet — have a few standard chats first, then rebuild.'
+          : `Profile built from ${n ?? 'your'} standard-mode messages.`,
+      )
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Build failed')
+    } finally {
+      setBuilding(false)
+    }
+  }
+
+  async function saveEdits() {
+    setSaving(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const clean = facts
+        .map((f) => ({ category: (f.category || 'other').trim(), fact: (f.fact || '').trim() }))
+        .filter((f) => f.fact)
+      const { data } = await api.put<UserProfile>('/user/profile', { facts: clean, summary: summary.trim() })
+      setProfile(data)
+      setFacts(Array.isArray(data.facts) ? data.facts : [])
+      setSummary(data.summary || '')
+      setNotice('Saved.')
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function eraseAll() {
+    if (!window.confirm('Delete your personal memory permanently? This wipes all distilled facts and your summary. This cannot be undone.')) {
+      return
+    }
+    setSaving(true)
+    setError(null)
+    setNotice(null)
+    try {
+      await api.delete('/user/profile')
+      setProfile({ enabled: false, facts: [], summary: '', updatedAt: null })
+      setFacts([])
+      setSummary('')
+      setNotice('Your personal memory was erased.')
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Erase failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const enabled = profile?.enabled ?? false
+
+  return (
+    <div className="space-y-8">
+      {/* Opt-in */}
+      <section>
+        <SectionHeader>Personal Memory</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-4">
+          <div className="flex items-start gap-3">
+            <Sparkles size={18} className="mt-0.5 shrink-0 text-violet-400" />
+            <div className="flex-1">
+              <p className="text-sm text-slate-300">
+                Let the assistant distil durable facts about you (your role, expertise, preferences, working
+                style) from your <span className="font-medium text-slate-200">standard-mode</span> conversations,
+                and use them to personalize answers.
+              </p>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Privacy by design: this is <span className="text-slate-400">opt-in</span>. Incognito chats are
+                never read and never personalized. You can view, edit, and permanently erase this memory at any
+                time.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={saving || loading}
+              onClick={() => toggleEnabled(!enabled)}
+              className={cn(
+                'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors',
+                enabled ? 'bg-violet-500' : 'bg-slate-700',
+                (saving || loading) && 'opacity-50',
+              )}
+              aria-pressed={enabled}
+              aria-label="Toggle personal memory"
+            >
+              <span
+                className={cn(
+                  'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                  enabled ? 'translate-x-6' : 'translate-x-1',
+                )}
+              />
+            </button>
+          </div>
+
+          {error && (
+            <div className="flex items-center gap-2 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-300">
+              <X size={14} /> {error}
+            </div>
+          )}
+          {notice && (
+            <div className="flex items-center gap-2 rounded-md border border-emerald-900/50 bg-emerald-950/40 px-3 py-2 text-xs text-emerald-300">
+              <Check size={14} /> {notice}
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!enabled || building || saving}
+              onClick={buildProfile}
+              className={cn(
+                'inline-flex items-center gap-2 rounded-md bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500',
+                (!enabled || building || saving) && 'cursor-not-allowed opacity-50',
+              )}
+            >
+              {building ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+              {building ? 'Building…' : 'Build my profile'}
+            </button>
+            {profile?.updatedAt && (
+              <span className="inline-flex items-center text-[11px] text-slate-500">
+                Last updated {new Date(profile.updatedAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* View / edit */}
+      <section>
+        <SectionHeader>Distilled Facts</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-4">
+          {loading ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500">
+              <Loader2 size={16} className="animate-spin" /> Loading…
+            </div>
+          ) : (
+            <>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-slate-500">Summary</label>
+                <textarea
+                  value={summary}
+                  onChange={(e) => setSummary(e.target.value)}
+                  rows={3}
+                  placeholder="A short summary of who you are and how you like to work. Build your profile to auto-fill this, or write it yourself."
+                  className="w-full resize-y rounded-md border border-slate-700 bg-slate-800/60 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-600 focus:border-violet-500 focus:outline-none"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-xs font-medium text-slate-500">Facts</label>
+                {facts.length === 0 && (
+                  <p className="text-xs text-slate-600">
+                    No facts yet. Build your profile or add facts manually.
+                  </p>
+                )}
+                {facts.map((f, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <select
+                      value={FACT_CATEGORIES.includes(f.category) ? f.category : 'other'}
+                      onChange={(e) => {
+                        const next = [...facts]
+                        next[i] = { ...next[i], category: e.target.value }
+                        setFacts(next)
+                      }}
+                      className="rounded-md border border-slate-700 bg-slate-800/60 px-2 py-1.5 text-xs text-slate-300 focus:border-violet-500 focus:outline-none"
+                    >
+                      {FACT_CATEGORIES.map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                    <input
+                      value={f.fact}
+                      onChange={(e) => {
+                        const next = [...facts]
+                        next[i] = { ...next[i], fact: e.target.value }
+                        setFacts(next)
+                      }}
+                      className="flex-1 rounded-md border border-slate-700 bg-slate-800/60 px-3 py-1.5 text-sm text-slate-200 focus:border-violet-500 focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setFacts(facts.filter((_, j) => j !== i))}
+                      className="rounded-md p-1.5 text-slate-500 hover:bg-slate-800 hover:text-red-400"
+                      aria-label="Remove fact"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setFacts([...facts, { category: 'other', fact: '' }])}
+                  className="inline-flex items-center gap-1.5 text-xs text-violet-400 hover:text-violet-300"
+                >
+                  <Plus size={14} /> Add fact
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={saveEdits}
+                  className={cn(
+                    'inline-flex items-center gap-2 rounded-md bg-slate-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-600',
+                    saving && 'cursor-not-allowed opacity-50',
+                  )}
+                >
+                  {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                  Save
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </section>
+
+      {/* Erase (right-to-be-forgotten) */}
+      <section>
+        <SectionHeader>Right to be Forgotten</SectionHeader>
+        <div className="rounded-lg border border-red-900/40 bg-red-950/20 p-4">
+          <div className="flex items-start gap-3">
+            <Trash2 size={18} className="mt-0.5 shrink-0 text-red-400" />
+            <div className="flex-1">
+              <p className="text-sm text-slate-300">Delete my personal memory</p>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Permanently wipes all distilled facts and your summary (GDPR / DSGVO erasure). This cannot be
+                undone.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={saving}
+              onClick={eraseAll}
+              className={cn(
+                'inline-flex items-center gap-2 rounded-md border border-red-700 bg-red-900/40 px-3 py-1.5 text-xs font-medium text-red-200 hover:bg-red-900/70',
+                saving && 'cursor-not-allowed opacity-50',
+              )}
+            >
+              <Trash2 size={14} /> Delete my personal memory
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 // ─── Tab: Account ─────────────────────────────────────────────────────────────
 
 function AccountTab() {
   const { user, logout } = useAuth()
+  const { balance: liveBalance } = useTokenBalance()
   const navigate = useNavigate()
 
   function handleLogout() {
@@ -1376,7 +2171,7 @@ function AccountTab() {
             <Coins size={20} className="text-amber-400" />
             <div>
               <p className="text-xl font-semibold text-slate-100">
-                {user?.tokensBalance.toLocaleString() ?? '0'}
+                {liveBalance.toLocaleString()}
               </p>
               <p className="text-xs text-slate-500">tokens remaining</p>
             </div>
@@ -1420,6 +2215,31 @@ function AccountTab() {
         </div>
       </section>
 
+      {/* Access Tokens — managed in Access Control (no duplicate CRUD here) */}
+      <section>
+        <SectionHeader>Access Tokens</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <KeyRound size={18} className="text-slate-500" />
+              <div>
+                <p className="text-sm text-slate-300">Manage access tokens in Access Control</p>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Create, scope (clearance + per-graph grants), and revoke API tokens there.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => navigate('/access')}
+              className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
+            >
+              Access Control
+              <ChevronRight size={12} />
+            </button>
+          </div>
+        </div>
+      </section>
+
       {/* Danger Zone */}
       <section>
         <SectionHeader>Session</SectionHeader>
@@ -1449,6 +2269,8 @@ interface ServiceStatus {
   connected: boolean
   latencyMs: number | null
   url: string
+  source?: 'default' | 'override'
+  swappable?: boolean
 }
 
 interface SetupStatus {
@@ -1461,58 +2283,255 @@ interface SetupStatus {
   }
 }
 
+// `swap` is the backend service id used by /api/infra/overrides/:service. Only
+// services GCTRL can be pointed at an external instance of are swappable; Redis
+// (job queue/cache) stays bundled. `placeholder` is the URL format hint.
 const SERVICE_META: Array<{
   key: keyof SetupStatus['services']
   label: string
   description: string
   icon: string
+  swap?: { service: 'neo4j' | 'qdrant' | 'ollama' | 'postgres'; placeholder: string; hasAuth: boolean }
 }> = [
-  { key: 'neo4j',    label: 'Neo4j',        description: 'Knowledge graph database',  icon: '🔵' },
-  { key: 'qdrant',   label: 'Qdrant',        description: 'Vector store for RAG',       icon: '🟣' },
-  { key: 'ollama',   label: 'Ollama',        description: 'Local LLM inference',        icon: '🦙' },
-  { key: 'postgres', label: 'PostgreSQL',    description: 'Metadata & job storage',     icon: '🐘' },
+  { key: 'neo4j',    label: 'Neo4j',        description: 'Knowledge graph database',  icon: '🔵', swap: { service: 'neo4j',    placeholder: 'bolt://host:7687',          hasAuth: true } },
+  { key: 'qdrant',   label: 'Qdrant',        description: 'Vector store for RAG',       icon: '🟣', swap: { service: 'qdrant',   placeholder: 'http://host:6333',          hasAuth: false } },
+  { key: 'ollama',   label: 'Ollama',        description: 'Local LLM inference',        icon: '🦙', swap: { service: 'ollama',   placeholder: 'http://host:11434',         hasAuth: false } },
+  { key: 'postgres', label: 'PostgreSQL',    description: 'Metadata & job storage',     icon: '🐘', swap: { service: 'postgres', placeholder: 'postgres://user@host:5432/db', hasAuth: true } },
   { key: 'redis',    label: 'Redis',         description: 'Job queue & cache',          icon: '🔴' },
 ]
 
-function ServiceRow({ label, description, icon, status, loading }: {
+interface ServiceOverride {
+  service: 'neo4j' | 'qdrant' | 'ollama' | 'postgres'
+  url: string | null
+  username: string | null
+  hasSecret: boolean
+  updatedAt: string | null
+  source?: 'default' | 'override'
+  defaultUrl?: string
+  note: string
+}
+
+type SwapMeta = NonNullable<(typeof SERVICE_META)[number]['swap']>
+
+function ServiceRow({ label, description, icon, status, loading, swap, override, onOverrideChanged }: {
   label: string
   description: string
   icon: string
   status: ServiceStatus | undefined
   loading: boolean
+  swap?: SwapMeta
+  override?: ServiceOverride
+  onOverrideChanged?: () => void
 }) {
   const connected = status?.connected ?? false
   const latency = status?.latencyMs
   const url = status?.url
+  const [expanded, setExpanded] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  // "override" wins from either source (status probe or the overrides list).
+  const usingExternal = status?.source === 'override' || !!override?.url
+
+  async function handleReset() {
+    if (!swap) return
+    if (!confirm(`Reset ${label} to the bundled default? (Restart GCTRL to apply across services.)`)) return
+    setResetting(true)
+    try {
+      await api.delete(`/infra/overrides/${swap.service}`)
+      onOverrideChanged?.()
+    } catch { /* non-fatal */ } finally { setResetting(false) }
+  }
 
   return (
-    <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3">
-      <div className="flex items-center gap-3 min-w-0">
-        <span className="text-xl">{icon}</span>
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-slate-200">{label}</span>
-            {!loading && (
-              connected
-                ? <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"><Wifi size={9} />connected</span>
-                : <span className="flex items-center gap-1 text-[10px] font-medium text-red-400"><WifiOff size={9} />offline</span>
-            )}
-            {loading && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-slate-500" />}
+    <div className="rounded-lg border border-slate-800 bg-slate-900/50">
+      <div className="flex items-center justify-between px-4 py-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="text-xl">{icon}</span>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-slate-200">{label}</span>
+              {usingExternal ? (
+                <span className="rounded-full bg-indigo-500/10 px-2 py-0.5 text-[9px] font-medium text-indigo-300">External</span>
+              ) : (
+                <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[9px] font-medium text-emerald-300/80">Default · bundled</span>
+              )}
+              {!loading && (
+                connected
+                  ? <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"><Wifi size={9} />Online</span>
+                  : <span className="flex items-center gap-1 text-[10px] font-medium text-red-400"><WifiOff size={9} />Offline</span>
+              )}
+              {loading && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-slate-500" />}
+            </div>
+            <p className="text-[11px] text-slate-500 truncate">{description}</p>
           </div>
-          <p className="text-[11px] text-slate-500 truncate">{description}</p>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          {url && (
+            <span className="hidden sm:block text-[10px] font-mono text-slate-500 max-w-[160px] truncate">{url}</span>
+          )}
+          {latency !== null && latency !== undefined && (
+            <span className="text-[10px] text-slate-500">{latency}ms</span>
+          )}
+          <div className={cn(
+            'h-2 w-2 rounded-full',
+            loading ? 'animate-pulse bg-slate-600' : connected ? 'bg-emerald-500' : 'bg-red-500'
+          )} />
+          {swap && usingExternal && (
+            <button
+              onClick={() => void handleReset()}
+              disabled={resetting}
+              title="Remove the external override and return to the bundled service"
+              className="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] font-medium text-amber-400/90 hover:bg-slate-700 disabled:opacity-50"
+            >
+              {resetting ? <Loader2 size={11} className="animate-spin" /> : 'Reset to default'}
+            </button>
+          )}
+          {swap && (
+            <button
+              onClick={() => setExpanded((v) => !v)}
+              className={cn(
+                'rounded border px-2 py-1 text-[10px] font-medium transition-colors',
+                expanded
+                  ? 'border-indigo-700 bg-indigo-950/40 text-indigo-300'
+                  : 'border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-300'
+              )}
+            >
+              Swap
+            </button>
+          )}
         </div>
       </div>
-      <div className="flex items-center gap-3 shrink-0">
-        {url && url !== '(configured)' && (
-          <span className="hidden sm:block text-[10px] font-mono text-slate-500 max-w-[160px] truncate">{url}</span>
+      {swap && expanded && (
+        <SwapForm swap={swap} override={override} onChanged={onOverrideChanged} />
+      )}
+    </div>
+  )
+}
+
+/// Per-service form to point GCTRL at an EXTERNAL instance. Test hits the backend
+/// connectivity probe for the typed (or saved) target; Save persists the override
+/// (secret sealed server-side). The apply-note is honest: Ollama/Qdrant take
+/// effect for new requests; Postgres/Neo4j need a restart.
+function SwapForm({ swap, override, onChanged }: {
+  swap: SwapMeta
+  override?: ServiceOverride
+  onChanged?: () => void
+}) {
+  const [url, setUrl] = useState(override?.url ?? '')
+  const [username, setUsername] = useState(override?.username ?? '')
+  const [secret, setSecret] = useState('')
+  const [showSecret, setShowSecret] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  async function handleTest() {
+    setBusy(true); setTestResult(null)
+    try {
+      const { data } = await api.post(`/infra/overrides/${swap.service}/test`, {
+        url: url.trim() || undefined,
+      })
+      setTestResult({
+        ok: !!data.ok,
+        msg: data.ok ? `Reachable${data.latencyMs != null ? ` · ${data.latencyMs}ms` : ''}` : (data.error ?? 'Unreachable'),
+      })
+    } catch {
+      setTestResult({ ok: false, msg: 'Test request failed' })
+    } finally { setBusy(false) }
+  }
+
+  async function handleSave() {
+    if (!url.trim()) return
+    setBusy(true); setSaved(false); setTestResult(null)
+    try {
+      await api.put(`/infra/overrides/${swap.service}`, {
+        url: url.trim(),
+        username: swap.hasAuth ? (username.trim() || undefined) : undefined,
+        secret: swap.hasAuth ? (secret.trim() || undefined) : undefined,
+      })
+      setSecret('')
+      setSaved(true)
+      onChanged?.()
+      setTimeout(() => setSaved(false), 4000)
+    } catch {
+      setTestResult({ ok: false, msg: 'Save failed' })
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="border-t border-slate-800 bg-slate-950/50 px-4 py-3 space-y-2">
+      <p className="text-[11px] text-slate-500">
+        Point GCTRL at an external {swap.service} instance instead of the bundled one.
+      </p>
+      <div className="grid grid-cols-2 gap-2">
+        <div className="col-span-2">
+          <label className="text-[10px] font-medium text-slate-500">URL</label>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder={swap.placeholder}
+            className="mt-0.5 w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+          />
+        </div>
+        {swap.hasAuth && (
+          <>
+            <div>
+              <label className="text-[10px] font-medium text-slate-500">Username</label>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="username"
+                className="mt-0.5 w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-medium text-slate-500">
+                Password / secret {override?.hasSecret && <span className="text-slate-600">(stored)</span>}
+              </label>
+              <div className="relative mt-0.5">
+                <input
+                  type={showSecret ? 'text' : 'password'}
+                  value={secret}
+                  onChange={(e) => setSecret(e.target.value)}
+                  placeholder={override?.hasSecret ? '•••••• (enter to replace)' : 'secret'}
+                  className="w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 pr-8 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+                />
+                <button type="button" onClick={() => setShowSecret((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                  {showSecret ? <EyeOff size={12} /> : <Eye size={12} />}
+                </button>
+              </div>
+            </div>
+          </>
         )}
-        {latency !== null && latency !== undefined && (
-          <span className="text-[10px] text-slate-500">{latency}ms</span>
-        )}
-        <div className={cn(
-          'h-2 w-2 rounded-full',
-          loading ? 'animate-pulse bg-slate-600' : connected ? 'bg-emerald-500' : 'bg-red-500'
-        )} />
+      </div>
+
+      {testResult && (
+        <p className={cn('text-[11px]', testResult.ok ? 'text-emerald-400' : 'text-red-400')}>{testResult.msg}</p>
+      )}
+
+      {/* Honest apply note */}
+      <p className="text-[10px] text-amber-400/80">
+        Saved overrides apply across all services after a GCTRL restart. Reset any time to return to the bundled default.
+      </p>
+
+      <div className="flex items-center justify-end gap-2">
+        <button
+          onClick={() => void handleTest()}
+          disabled={busy}
+          className="rounded border border-slate-700 bg-slate-800 px-3 py-1 text-[10px] font-medium text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+        >
+          {busy ? <Loader2 size={11} className="animate-spin" /> : 'Test'}
+        </button>
+        <button
+          onClick={() => void handleSave()}
+          disabled={busy || !url.trim()}
+          className={cn(
+            'flex items-center gap-1 rounded px-3 py-1 text-[10px] font-medium text-white disabled:opacity-50',
+            saved ? 'bg-emerald-600' : 'bg-indigo-600 hover:bg-indigo-500'
+          )}
+        >
+          {saved ? <Check size={11} /> : <Save size={11} />}
+          {saved ? 'Saved — restart to apply' : 'Save'}
+        </button>
       </div>
     </div>
   )
@@ -1520,10 +2539,26 @@ function ServiceRow({ label, description, icon, status, loading }: {
 
 function InfrastructureTab() {
   const [status, setStatus] = useState<SetupStatus | null>(null)
+  const [overrides, setOverrides] = useState<ServiceOverride[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showUpdateModal, setShowUpdateModal] = useState(false)
   const { status: agentStatus } = useLicenseStatus()
+  const { data: updateCheck } = useQuery<{ current: string; latest: string; updateAvailable: boolean }>({
+    queryKey: ['update', 'check'],
+    queryFn: () => apiGet('/update/check'),
+    refetchInterval: 60 * 60 * 1000,
+    refetchOnWindowFocus: false,
+    staleTime: 55 * 60 * 1000,
+    retry: false,
+  })
+
+  const loadOverrides = useCallback(async () => {
+    try {
+      const { data } = await api.get('/infra/overrides')
+      setOverrides((data.overrides ?? []) as ServiceOverride[])
+    } catch { /* non-fatal */ }
+  }, [])
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -1538,7 +2573,9 @@ function InfrastructureTab() {
     }
   }, [])
 
-  useEffect(() => { void refresh() }, [refresh])
+  useEffect(() => { void refresh(); void loadOverrides() }, [refresh, loadOverrides])
+
+  const overrideFor = (svc?: SwapMeta['service']) => overrides.find((o) => o.service === svc)
 
   const allConnected = status
     ? Object.values(status.services).every((s) => s.connected)
@@ -1548,10 +2585,10 @@ function InfrastructureTab() {
     <div className="space-y-8">
       {/* Status Overview */}
       <section>
-        <div className="flex items-center justify-between mb-4">
-          <SectionHeader>Service Status</SectionHeader>
+        <div className="flex items-center justify-between mb-1">
+          <SectionHeader>Standard Infrastructure</SectionHeader>
           <button
-            onClick={() => void refresh()}
+            onClick={() => { void refresh(); void loadOverrides() }}
             disabled={loading}
             className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors disabled:opacity-50"
           >
@@ -1559,6 +2596,9 @@ function InfrastructureTab() {
             Refresh
           </button>
         </div>
+        <p className="mb-4 text-xs text-slate-500">
+          This is your bundled stack — it runs locally and comes <span className="text-emerald-300/80">online out of the box</span>. Each service shows live status. Only change a part if you need to: <span className="text-slate-400">Swap</span> points it at an external instance, and <span className="text-amber-400/80">Reset to default</span> returns it to the bundled one.
+        </p>
 
         {error && (
           <div className="mb-4 rounded-lg border border-red-900/40 bg-red-950/20 px-4 py-2 text-sm text-red-400">
@@ -1574,7 +2614,7 @@ function InfrastructureTab() {
         )}
 
         <div className="space-y-2">
-          {SERVICE_META.map(({ key, label, description, icon }) => (
+          {SERVICE_META.map(({ key, label, description, icon, swap }) => (
             <ServiceRow
               key={key}
               label={label}
@@ -1582,6 +2622,9 @@ function InfrastructureTab() {
               icon={icon}
               status={status?.services[key]}
               loading={loading}
+              swap={swap}
+              override={overrideFor(swap?.service)}
+              onOverrideChanged={loadOverrides}
             />
           ))}
         </div>
@@ -1653,8 +2696,21 @@ function InfrastructureTab() {
                 </p>
               )}
               {!agentStatus?.updateAvailable && !agentStatus?.updateRequired && (
-                <p className="text-sm text-slate-400">
-                  {agentStatus ? 'Your installation is up to date.' : 'Agent unreachable — status unknown.'}
+                updateCheck?.updateAvailable ? (
+                  <p className="text-sm font-medium text-yellow-400">
+                    Update available — v{updateCheck.latest}
+                  </p>
+                ) : (
+                  <p className="text-sm text-slate-400">
+                    {agentStatus || updateCheck
+                      ? 'Your installation is up to date.'
+                      : 'Agent unreachable — status unknown.'}
+                  </p>
+                )
+              )}
+              {updateCheck?.current && (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Current version: v{updateCheck.current}
                 </p>
               )}
               <p className="mt-1 text-[11px] text-slate-500">
@@ -1691,6 +2747,249 @@ function InfrastructureTab() {
   )
 }
 
+// ─── Tab: Memory Health ───────────────────────────────────────────────────────
+
+interface MemoryHealth {
+  coverage: number
+  stores: {
+    entities: number
+    edges: number
+    chunks: { live: number; archived: number }
+    dossiers: { live: number; archived: number; pinned: number }
+    wikiPages: number
+  }
+  heat: { hot: number; warm: number; cold: number }
+  trust: { high: number; mid: number; low: number }
+  lastRun: {
+    startedAt: string
+    finishedAt: string | null
+    durationMs: number
+    trigger: string
+    summary: {
+      decayed_dossiers?: number
+      decayed_chunks?: number
+      deduped_chunks?: number
+      promoted?: number
+      evicted_dossiers?: number
+      evicted_chunks?: number
+    }
+  } | null
+}
+
+/** A small labelled metric tile. */
+function MetricTile({ label, value, sub, accent }: { label: string; value: React.ReactNode; sub?: string; accent?: string }) {
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">{label}</p>
+      <p className={cn('mt-1.5 text-2xl font-semibold', accent ?? 'text-slate-100')}>{value}</p>
+      {sub && <p className="mt-0.5 text-[11px] text-slate-500">{sub}</p>}
+    </div>
+  )
+}
+
+/** A horizontal 3-segment distribution bar (hot/warm/cold, high/mid/low). */
+function DistBar({ segments }: { segments: Array<{ label: string; value: number; color: string }> }) {
+  const total = segments.reduce((a, s) => a + s.value, 0) || 1
+  return (
+    <div>
+      <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
+        {segments.map((s) => (
+          <div key={s.label} className={s.color} style={{ width: `${(s.value / total) * 100}%` }} title={`${s.label}: ${s.value}`} />
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+        {segments.map((s) => (
+          <span key={s.label} className="flex items-center gap-1.5 text-[11px] text-slate-400">
+            <span className={cn('h-2 w-2 rounded-full', s.color)} />
+            {s.label} <span className="font-mono text-slate-300">{s.value}</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function MemoryTab() {
+  const [health, setHealth] = useState<MemoryHealth | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [running, setRunning] = useState(false)
+  const [error, setError] = useState('')
+  const [lastResult, setLastResult] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true); setError('')
+    try {
+      const { data } = await api.get<MemoryHealth>('/memory/health')
+      setHealth(data)
+    } catch {
+      setError('Failed to load memory health')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  async function runMaintenance() {
+    setRunning(true); setLastResult(null)
+    try {
+      const { data } = await api.post('/memory/maintenance/run')
+      const s = data.summary ?? {}
+      setLastResult(
+        `Cycle complete in ${s.durationMs ?? 0}ms — decayed ${(s.decayedDossiers ?? 0) + (s.decayedChunks ?? 0)}, ` +
+        `deduped ${s.dedupedChunks ?? 0}, promoted ${s.promoted ?? 0}, ` +
+        `evicted ${(s.evictedDossiers ?? 0) + (s.evictedChunks ?? 0)}.`
+      )
+      await load()
+    } catch {
+      setLastResult('Maintenance run failed.')
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  if (loading) {
+    return <div className="flex items-center gap-2 text-xs text-slate-500"><Loader2 size={14} className="animate-spin" /> Loading memory health…</div>
+  }
+  if (error || !health) {
+    return (
+      <div className="rounded-lg border border-red-900/40 bg-red-950/20 px-4 py-3 text-sm text-red-400">
+        {error || 'No data'}
+        <button onClick={() => void load()} className="ml-3 underline">Retry</button>
+      </div>
+    )
+  }
+
+  const { stores, heat, trust, lastRun } = health
+  const coveragePct = Math.round(health.coverage * 100)
+
+  return (
+    <div className="space-y-8">
+      {/* ── Header + Run-now ─────────────────────────────────────────── */}
+      <section>
+        <div className="mb-1 flex items-center justify-between">
+          <SectionHeader>Memory Health</SectionHeader>
+          <button
+            onClick={() => void runMaintenance()}
+            disabled={running}
+            className="flex items-center gap-1.5 rounded-md bg-blue-500/20 px-3 py-1.5 text-xs font-medium text-blue-400 hover:bg-blue-500/30 transition-colors disabled:opacity-50"
+          >
+            {running ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {running ? 'Running…' : 'Run maintenance now'}
+          </button>
+        </div>
+        <p className="mb-4 text-xs text-slate-500">
+          The memory-governance cycle (decay → dedup → promote → evict → refresh) runs automatically every
+          10 minutes and keeps your knowledge base self-maintaining — fully local, no data leaves the machine.
+        </p>
+        {lastResult && (
+          <div className="mb-4 rounded-lg border border-emerald-900/40 bg-emerald-950/10 px-4 py-2 text-sm text-emerald-400 flex items-center gap-2">
+            <Check size={14} /> {lastResult}
+          </div>
+        )}
+      </section>
+
+      {/* ── Top metrics ──────────────────────────────────────────────── */}
+      <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <MetricTile
+          label="Dossier coverage"
+          value={`${coveragePct}%`}
+          sub={`${stores.dossiers.live} / ${stores.entities} entities`}
+          accent={coveragePct >= 50 ? 'text-emerald-400' : coveragePct >= 20 ? 'text-amber-400' : 'text-slate-100'}
+        />
+        <MetricTile label="Entities" value={stores.entities} sub={`${stores.edges} edges`} />
+        <MetricTile label="Chunks" value={stores.chunks.live} sub={`${stores.chunks.archived} archived`} />
+        <MetricTile
+          label="Dossiers"
+          value={stores.dossiers.live}
+          sub={`${stores.dossiers.pinned} pinned · ${stores.dossiers.archived} archived`}
+        />
+      </section>
+
+      {/* ── Distributions ────────────────────────────────────────────── */}
+      <section className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+          <p className="mb-3 text-xs font-medium text-slate-300">Chunk heat distribution</p>
+          <DistBar segments={[
+            { label: 'Hot', value: heat.hot, color: 'bg-rose-500' },
+            { label: 'Warm', value: heat.warm, color: 'bg-amber-500' },
+            { label: 'Cold', value: heat.cold, color: 'bg-slate-600' },
+          ]} />
+        </div>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+          <p className="mb-3 text-xs font-medium text-slate-300">Dossier trust distribution</p>
+          <DistBar segments={[
+            { label: 'High (≥0.8)', value: trust.high, color: 'bg-emerald-500' },
+            { label: 'Mid', value: trust.mid, color: 'bg-amber-500' },
+            { label: 'Low (<0.4)', value: trust.low, color: 'bg-rose-500' },
+          ]} />
+        </div>
+      </section>
+
+      {/* ── Store sizes ──────────────────────────────────────────────── */}
+      <section>
+        <SectionHeader>Store sizes</SectionHeader>
+        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-2 text-sm">
+          {[
+            ['Graph entities (Neo4j)', stores.entities],
+            ['Graph edges (Neo4j)', stores.edges],
+            ['Text chunks — live (Postgres/Qdrant)', stores.chunks.live],
+            ['Text chunks — archived', stores.chunks.archived],
+            ['Entity dossiers — live', stores.dossiers.live],
+            ['Entity dossiers — archived', stores.dossiers.archived],
+            ['Entity dossiers — pinned', stores.dossiers.pinned],
+            ['Wiki pages', stores.wikiPages],
+          ].map(([label, value]) => (
+            <div key={label as string} className="flex items-center justify-between">
+              <span className="text-slate-500">{label}</span>
+              <span className="font-mono text-[12px] text-slate-300">{value as number}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ── Last maintenance run ─────────────────────────────────────── */}
+      <section>
+        <SectionHeader>Last maintenance run</SectionHeader>
+        {lastRun ? (
+          <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+            <div className="mb-3 flex items-center gap-2 text-xs">
+              <span className={cn(
+                'rounded-full px-2 py-0.5 text-[10px] font-medium',
+                lastRun.trigger === 'manual' ? 'bg-blue-500/10 text-blue-400' : 'bg-slate-800 text-slate-400'
+              )}>
+                {lastRun.trigger}
+              </span>
+              <span className="text-slate-500">
+                {new Date(lastRun.startedAt).toLocaleString()} · {lastRun.durationMs}ms
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-sm sm:grid-cols-3">
+              {[
+                ['Decayed dossiers', lastRun.summary.decayed_dossiers],
+                ['Decayed chunks', lastRun.summary.decayed_chunks],
+                ['Deduped chunks', lastRun.summary.deduped_chunks],
+                ['Promoted', lastRun.summary.promoted],
+                ['Evicted dossiers', lastRun.summary.evicted_dossiers],
+                ['Evicted chunks', lastRun.summary.evicted_chunks],
+              ].map(([label, value]) => (
+                <div key={label as string} className="flex items-center justify-between">
+                  <span className="text-slate-500">{label}</span>
+                  <span className="font-mono text-[12px] text-slate-300">{(value as number) ?? 0}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-slate-800 py-6 text-center text-xs text-slate-500">
+            No maintenance run recorded yet — it runs automatically every 10 minutes, or press “Run maintenance now”.
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
 // ─── Tab: License ─────────────────────────────────────────────────────────────
 
 interface CurrentLicense {
@@ -1710,6 +3009,7 @@ interface CurrentLicenseResponse {
 
 function LicenseTab() {
   const { user } = useAuth()
+  const { balance: liveBalance } = useTokenBalance()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [key, setKey] = useState('')
@@ -1869,13 +3169,13 @@ function LicenseTab() {
                 <div>
                   <p className="text-slate-500">Used</p>
                   <p className="mt-0.5 font-medium text-slate-200">
-                    {license.creditsUsed.toLocaleString()}
+                    {Math.max(0, license.creditsAllocated - liveBalance).toLocaleString()}
                   </p>
                 </div>
                 <div>
                   <p className="text-slate-500">Remaining</p>
                   <p className="mt-0.5 font-medium text-emerald-400">
-                    {license.creditsRemaining.toLocaleString()}
+                    {liveBalance.toLocaleString()}
                   </p>
                 </div>
               </div>
@@ -1940,7 +3240,7 @@ function LicenseTab() {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-2xl font-bold text-slate-100">
-                {(user?.tokensBalance ?? 0).toLocaleString()}
+                {liveBalance.toLocaleString()}
                 <span className="ml-1 text-sm font-normal text-slate-500">tokens remaining</span>
               </p>
               <p className="mt-1 text-xs text-slate-500">
@@ -1963,7 +3263,12 @@ function LicenseTab() {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export function SettingsPage() {
-  const [activeTab, setActiveTab] = useState<TabId>('models')
+  // Deep-linkable via `?tab=<id>` (e.g. /settings?tab=models). Defaults to
+  // 'models' when the param is missing or unknown — non-breaking.
+  const [activeTab, setActiveTab] = useState<TabId>(() => {
+    const param = new URLSearchParams(window.location.search).get('tab')
+    return TABS.some((t) => t.id === param) ? (param as TabId) : 'models'
+  })
 
   const currentTab = TABS.find((t) => t.id === activeTab)!
 
@@ -2010,9 +3315,14 @@ export function SettingsPage() {
         {activeTab === 'models' && <ModelsTab />}
         {activeTab === 'integrations' && <IntegrationsTab />}
         {activeTab === 'skills' && <SkillsTab />}
+        {activeTab === 'agent' && <AgentTab />}
         {activeTab === 'mcp' && <McpTab />}
         {activeTab === 'n8n' && <N8nTab />}
+        {activeTab === 'webhooks' && <WebhooksPage />}
         {activeTab === 'infrastructure' && <InfrastructureTab />}
+        {activeTab === 'memory' && <MemoryTab />}
+        {activeTab === 'profile' && <PersonalMemoryTab />}
+        {activeTab === 'sso' && <SSOPage />}
         {activeTab === 'account' && <AccountTab />}
       </main>
     </div>

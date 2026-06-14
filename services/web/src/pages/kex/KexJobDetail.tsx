@@ -12,9 +12,11 @@ import {
   AlertCircle,
   ThumbsUp,
   ThumbsDown,
+  Shield,
 } from 'lucide-react'
 import { format } from 'date-fns'
 import { useApiQuery } from '@/hooks/useApi'
+import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { cn } from '@/lib/utils'
 
 interface Entity {
@@ -58,6 +60,11 @@ interface JobResultData {
         relations_created?: number
         nodes_total?: number
       }
+    }
+    pii_findings?: {
+      has_pii: boolean
+      total_count: number
+      findings: { type: string; count: number }[]
     }
   }
 }
@@ -109,6 +116,7 @@ export function KexJobDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const [feedback, setFeedback] = useState<Record<number, 'up' | 'down'>>({})
+  const { neo4jBrowser } = usePublicConfig()
 
   // Fetch job status
   const { data: jobResponse, isLoading, error } = useApiQuery<{ job: JobData }>(
@@ -183,7 +191,7 @@ export function KexJobDetail() {
           <p className="mt-1 font-mono text-xs text-slate-600">{job.id}</p>
         </div>
         <a
-          href="http://localhost:7474"
+          href={neo4jBrowser}
           target="_blank"
           rel="noopener noreferrer"
           className="btn-secondary"
@@ -252,6 +260,39 @@ export function KexJobDetail() {
               <p className="text-xs text-slate-500">Relations</p>
               <p className="text-xl font-bold text-slate-100">{relations.length}</p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* PII Shield */}
+      {job.status === 'completed' && resultData?.result?.pii_findings && (
+        <div className={cn(
+          "card flex items-start gap-4 border",
+          resultData.result.pii_findings.has_pii
+            ? "border-amber-500/30 bg-amber-500/5"
+            : "border-emerald-500/30 bg-emerald-500/5"
+        )}>
+          <div className={cn(
+            "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl",
+            resultData.result.pii_findings.has_pii ? "bg-amber-500/10" : "bg-emerald-500/10"
+          )}>
+            <Shield size={18} className={resultData.result.pii_findings.has_pii ? "text-amber-400" : "text-emerald-400"} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-slate-200">
+              {resultData.result.pii_findings.has_pii
+                ? `PII Detected — ${resultData.result.pii_findings.total_count} instance${resultData.result.pii_findings.total_count !== 1 ? 's' : ''}`
+                : "No PII Detected"}
+            </p>
+            {resultData.result.pii_findings.has_pii && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {resultData.result.pii_findings.findings.map((f) => (
+                  <span key={f.type} className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-300 ring-1 ring-inset ring-amber-500/20">
+                    {f.type.replace(/_/g, ' ')}: {f.count}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

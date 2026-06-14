@@ -20,6 +20,12 @@ const GRAPH_KEY = (compilationId: string) =>
 interface UseGraphDataResult {
   nodes: GraphNode[]
   edges: GraphEdge[]
+  /** TRUE total node count in scope (falls back to rendered count if absent). */
+  nodeCount: number
+  /** TRUE total edge count in scope. */
+  edgeCount: number
+  /** True when the canvas is showing a degree-ordered subset of the whole graph. */
+  truncated: boolean
   isLoading: boolean
   error: Error | null
   mergeNeighbors: (entityName: string) => Promise<void>
@@ -32,7 +38,10 @@ export function useGraphData(compilationId: string): UseGraphDataResult {
 
   const query = useQuery<GraphData, Error>({
     queryKey: key,
-    queryFn: () => apiGet<GraphData>(`/kg/compilations/${compilationId}/graph?limit=200`),
+    // Pull the WHOLE graph (degree-ordered; API ceiling 20000). The canvas shows
+    // every node and bounds the on-screen density via zoom/pan rather than a
+    // server truncation, so nothing is hidden from exploration.
+    queryFn: () => apiGet<GraphData>(`/kg/compilations/${compilationId}/graph?limit=20000`),
     staleTime: 60_000,
   })
 
@@ -65,7 +74,18 @@ export function useGraphData(compilationId: string): UseGraphDataResult {
               existingEdges.add(k)
             }
           }
-          return { nodes: mergedNodes, edges: mergedEdges }
+          // Preserve the true totals from the original /graph response. Bump them
+          // if a merge surfaced a node/edge the first page didn't include, so the
+          // "showing N of M" counter never claims fewer than what's on screen.
+          const nodeCount = Math.max(base.nodeCount ?? 0, mergedNodes.length)
+          const edgeCount = Math.max(base.edgeCount ?? 0, mergedEdges.length)
+          return {
+            nodes: mergedNodes,
+            edges: mergedEdges,
+            nodeCount,
+            edgeCount,
+            truncated: mergedNodes.length < nodeCount || mergedEdges.length < edgeCount,
+          }
         })
       } catch {
         // silent — neighbor merges are best-effort
@@ -74,9 +94,16 @@ export function useGraphData(compilationId: string): UseGraphDataResult {
     [key, queryClient],
   )
 
+  const nodes = query.data?.nodes ?? []
+  const edges = query.data?.edges ?? []
   return {
-    nodes: query.data?.nodes ?? [],
-    edges: query.data?.edges ?? [],
+    nodes,
+    edges,
+    // Fall back to the rendered length when the server omitted a total (e.g. a
+    // cache seeded purely from a neighbor merge) so callers always get a number.
+    nodeCount: query.data?.nodeCount ?? nodes.length,
+    edgeCount: query.data?.edgeCount ?? edges.length,
+    truncated: query.data?.truncated ?? false,
     isLoading: query.isLoading,
     error: query.error ?? null,
     mergeNeighbors,

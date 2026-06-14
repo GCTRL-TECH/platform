@@ -6,7 +6,15 @@ import os
 
 # Ollama LLM backend
 OLLAMA_BASE: str = os.environ.get("OLLAMA_BASE", "http://host.docker.internal:11434")
-RELEX_MODEL: str = os.environ.get("RELEX_MODEL", "llama3.2")
+# Relation-extraction model. qwen2.5:7b (4.7 GB, ~6 GB RAM resident) is the
+# selected winner: closed-vocab + direction-enforced prompt + validation yields
+# relation F1 ~0.86 on the gold set vs ~0.45 for the old free-form llama3.2.
+# SETUP REQUIREMENT (zero-cost-local): the model MUST be pulled in the Ollama
+# container before KEX can extract relations:
+#     docker exec ollama ollama pull qwen2.5:7b
+# If absent, relation extraction degrades gracefully to an empty list (entities
+# still extracted). See bench/kex/REPORT.md.
+RELEX_MODEL: str = os.environ.get("RELEX_MODEL", "qwen2.5:7b")
 
 # Neo4j graph database
 NEO4J_URI: str = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
@@ -667,4 +675,238 @@ WIKIDATA_TYPE_MAP: dict[str, dict[str, str]] = {
     "ORG":                  {"qid": "Q43229",     "label": "organization"},
     "MISC":                 {"qid": "Q35120",     "label": "entity"},
 }
+
+
+# ── COARSE TYPE VOCABULARY ────────────────────────────────────────────────────
+# A small CLOSED set of buckets used as the STABLE merge-blocking key.
+#
+# Problem solved: GLiNER assigns ~403 fine labels and the fine Wikidata QID
+# lands in each entity's `type`. The same real entity ("Ground Control") gets a
+# DIFFERENT QID per document (software Q7397 / framework Q271680 / library
+# Q188860 / organization Q43229 / product Q2424752 / …), so the merger's
+# same-`type` blocking rule never collapses the duplicates. Bucketing every
+# fine label into one of these coarse types — and blocking on the bucket — lets
+# the merger see "all of these are the same kind of thing" while the precise
+# fine QID stays on the node as metadata.
+#
+# Buckets (12):
+#   person        — humans and human roles
+#   organization  — companies, institutions, teams, agencies
+#   location      — places, geography, structures-as-places
+#   technology    — software / hardware / products / brands / methods / IT
+#                   concepts (DELIBERATELY broad: software∪framework∪library∪
+#                   product∪tool∪platform∪database∪language all collapse here,
+#                   which is exactly what un-fragments "Ground Control").
+#   work          — creative/published works (book, film, song, artwork, patent…)
+#   event         — happenings (war, election, conference, historical event…)
+#   field         — abstract concepts, disciplines, ideologies, languages,
+#                   theories, awards, certifications, biological/medical concepts
+#   temporal      — dates, years, periods, eras
+#   financial     — money, currency, securities, taxes, payment instruments
+#   quantity      — numeric measurements, percentages, statistics, ratios
+#   other         — anything unmapped (safe catch-all)
+#
+# (No standalone "product" bucket: products and technologies fragment into each
+# other constantly in real extractions, so they share one bucket. No standalone
+# "medical" bucket for the same reason — diseases/drugs/anatomy live under
+# `field`, devices/equipment under `technology`.)
+COARSE_TYPES: list[str] = [
+    "person", "organization", "location", "technology", "work",
+    "event", "field", "temporal", "financial", "quantity", "other",
+]
+
+# Map of lowercased label -> coarse bucket. Keyed on BOTH the GLiNER label
+# (DEFAULT_ENTITY_TYPES) AND the human-readable Wikidata `label` produced by
+# WIKIDATA_TYPE_MAP, because:
+#   * the live KEX path has `gliner_label` available (preferred key), but
+#   * old nodes / backfill only persisted the human `label`.
+# Covering both vocabularies in one dict means a single lookup works for either.
+# Anything not present falls back to "other".
+COARSE_MAP: dict[str, str] = {}
+
+
+def _coarse_register(bucket: str, labels: list[str]) -> None:
+    for lab in labels:
+        COARSE_MAP[lab.lower()] = bucket
+
+
+# person — humans + human roles (gliner labels + their human-label synonyms)
+_coarse_register("person", [
+    "person", "per", "human", "politician", "scientist", "artist", "athlete",
+    "author", "writer", "musician", "actor", "director", "film director",
+    "entrepreneur", "military person", "military personnel", "engineer",
+    "doctor", "physician", "lawyer", "judge", "teacher", "professor",
+    "journalist", "philosopher", "mathematician", "physicist", "chemist",
+    "biologist", "economist", "psychologist", "architect", "designer",
+    "photographer", "composer", "painter", "sculptor", "dancer", "chef",
+    "cook", "surgeon", "nurse", "dentist", "veterinarian", "pilot",
+    "aircraft pilot", "astronaut", "soldier", "general", "admiral", "monarch",
+    "king", "queen", "queen regnant", "prince", "princess", "emperor",
+    "dictator", "president", "prime minister", "senator", "mayor", "governor",
+    "ambassador", "diplomat", "spy", "criminal", "victim", "witness",
+    "plaintiff", "defendant", "founder", "ceo", "researcher",
+])
+
+# organization — collective bodies
+_coarse_register("organization", [
+    "company", "business", "organization", "org", "government agency",
+    "political party", "university", "research institute", "nonprofit",
+    "nonprofit organization", "non-governmental organization", "ngo",
+    "sports team", "military organization", "military unit",
+    "religious organization", "bank", "hospital", "school", "public library",
+    "library", "museum", "theater", "theatre", "restaurant", "hotel",
+    "factory", "mine", "farm", "embassy", "consulate", "club", "association",
+    "union", "trade union", "cooperative", "foundation", "charity",
+    "charitable organization", "think tank", "law firm", "consulting firm",
+    "design studio", "advertising agency", "publishing house", "publisher",
+    "record label", "broadcasting company", "broadcaster", "news agency",
+    "corporation", "llc", "limited liability company", "partnership",
+    "sole proprietorship", "startup", "startup company",
+    "venture capital firm", "venture capital", "private equity firm",
+    "private equity", "hedge fund", "team",
+])
+
+# location — places + geography + structures regarded as places
+_coarse_register("location", [
+    "country", "city", "state", "region", "geographic region", "continent",
+    "mountain", "river", "lake", "ocean", "island", "building", "airport",
+    "bridge", "stadium", "location", "loc", "village", "town", "county",
+    "district", "neighborhood", "suburb", "capital", "port", "harbor",
+    "beach", "desert", "forest", "jungle", "valley", "plateau", "peninsula",
+    "archipelago", "sea", "bay", "strait", "channel", "canal", "dam",
+    "waterfall", "reservoir", "glacier", "volcano", "cave", "cliff", "hill",
+    "mountain range", "plain", "prairie", "tundra", "savanna", "wetland",
+    "oasis", "geographical feature", "address", "building complex",
+    "monument", "memorial", "statue", "fountain", "square", "town square",
+    "park", "garden", "zoo", "aquarium", "theme park", "cemetery", "palace",
+    "castle", "fortress", "temple", "church", "church building", "mosque",
+    "synagogue", "shrine", "mausoleum", "courthouse", "prison", "jail",
+    "data center", "warehouse", "power plant", "power station",
+    "telecommunications tower", "internet exchange point", "place",
+    # linear / transport infrastructure — treated as places on the map
+    "road", "highway", "railway", "railway line", "subway", "rapid transit",
+    "tram", "bus route", "bicycle path", "cycling infrastructure", "pipeline",
+    "pipeline transport", "electrical grid", "water treatment", "sewer system",
+    "sanitary sewer",
+])
+
+# technology — software, hardware, products, brands, methods, IT artefacts.
+# Intentionally the BROADEST bucket: this is where "Ground Control"'s many
+# fine types (software / framework / library / product / organization-as-tool)
+# converge so the merger can finally collapse them.
+_coarse_register("technology", [
+    "software", "video game", "mobile app", "app", "application software",
+    "web app", "web application", "plugin", "plug-in", "software library",
+    "software framework", "framework", "sdk", "software development kit",
+    "technology", "programming language", "algorithm", "machine", "tool",
+    "sensor", "processor", "central processing unit", "integrated circuit",
+    "transistor", "computer", "smartphone", "tablet", "tablet computer",
+    "server", "network protocol", "communication protocol",
+    "encryption algorithm", "encryption", "data structure", "design pattern",
+    "software design pattern", "programming paradigm", "dataset", "data set",
+    "machine learning model", "machine learning",
+    "neural network architecture", "neural network", "robot", "drone",
+    "unmanned aerial vehicle", "satellite", "artificial satellite",
+    "telescope", "microscope", "scientific instrument", "rocket",
+    "spacecraft", "operating system", "database", "marketplace",
+    "retail chain", "website", "blog", "podcast", "youtube channel",
+    "search engine", "browser", "web browser", "social media platform",
+    "social media", "product", "brand", "vehicle", "vehicle model",
+    "automobile model", "aircraft model", "aircraft", "ship", "cargo ship",
+    "oil tanker", "aircraft carrier", "submarine", "helicopter", "balloon",
+    "motorcycle", "train", "locomotive", "freight train", "weapon",
+    "material", "mineral", "food", "medical device", "prosthetic",
+    "prosthesis", "implant", "medical implant", "defibrillator", "ambulance",
+    "scientific method", "methodology", "method", "experiment",
+    "diagnostic test", "shipping container", "tool",
+])
+
+# work — creative / published / intellectual-property works
+_coarse_register("work", [
+    "book", "film", "song", "album", "tv show", "television series",
+    "newspaper", "magazine", "artwork", "work of art", "patent", "novel",
+    "poem", "short story", "essay", "biography", "memoir", "diary",
+    "manuscript", "comic book", "graphic novel", "manga", "screenplay",
+    "play", "opera", "ballet", "musical", "symphony", "concerto", "sonata",
+    "hymn", "anthem", "jingle", "podcast episode", "documentary",
+    "documentary film", "animation", "cartoon", "sculpture", "painting",
+    "drawing", "photograph", "mural", "mosaic", "tapestry", "ceramic",
+    "ceramic art", "pottery", "fashion design", "costume", "choreography",
+    "recipe", "board game", "card game", "role playing game",
+    "role-playing game", "video game franchise", "video game series",
+    "slogan", "proverb", "parable", "fairy tale", "folktale", "legend",
+])
+
+# event — discrete happenings
+_coarse_register("event", [
+    "historical event", "event", "holiday", "festival", "anniversary",
+    "birthday", "ceremony", "war", "peace agreement", "peace treaty",
+    "military operation", "terrorist attack", "election", "referendum",
+    "campaign", "political campaign", "epidemic", "pandemic",
+    "clinical trial", "lawsuit", "court case", "legal case",
+])
+
+# field — abstract concepts, disciplines, ideologies, languages, theories,
+# qualifications, and biomedical/scientific concepts (non-device).
+_coarse_register("field", [
+    "scientific theory", "theory", "philosophical concept", "concept",
+    "religion", "language", "award", "degree", "academic degree",
+    "certification", "emotion", "virtue", "vice", "ideology",
+    "political ideology", "principle", "value", "belief", "cultural concept",
+    "culture", "ritual", "custom", "tradition", "taboo", "mythology",
+    "hypothesis", "equation", "formula", "law of physics", "physical law",
+    "constant", "physical constant", "unit of measurement", "law", "treaty",
+    "regulation", "policy", "constitution", "statute", "ordinance",
+    "amendment", "executive order", "verdict", "sentence",
+    "international organization", "sanction", "sanctions", "embargo",
+    "chemical compound", "disease", "medical treatment", "treatment", "drug",
+    "medication", "biological process", "gene", "protein", "species",
+    "chemical element", "molecule", "cell", "organ", "organism", "virus",
+    "bacterium", "fungus", "plant", "animal", "ecosystem", "biome",
+    "symptom", "syndrome", "anatomical part", "anatomical structure",
+    "body system", "biological system", "surgical procedure", "surgery",
+    "therapy", "vaccine", "antibiotic", "painkiller", "analgesic",
+    "supplement", "dietary supplement", "mental health condition",
+    "mental disorder", "addiction", "allergy", "injury", "fracture",
+    "bone fracture", "infection", "public health initiative", "public health",
+    "healthcare system", "health care system", "medical specialty",
+    "hospital department", "accounting standard",
+])
+
+# temporal — time points / spans
+_coarse_register("temporal", [
+    "date", "calendar date", "time period", "time interval", "century",
+    "decade", "year", "month", "week", "day", "hour", "era", "age", "period",
+    "historical period", "season",
+])
+
+# financial — money, securities, financial instruments
+_coarse_register("financial", [
+    "currency", "cryptocurrency", "stock", "bond", "derivative",
+    "mutual fund", "etf", "exchange-traded fund", "exchange", "stock exchange",
+    "market index", "stock market index", "commodity", "contract", "invoice",
+    "receipt", "tax", "fee", "tariff", "subsidy", "grant", "loan", "mortgage",
+    "mortgage loan", "credit card", "debit card", "payment system",
+    "monetary value", "money", "insurance plan", "insurance",
+])
+
+# quantity — bare numbers / measurements / statistics
+_coarse_register("quantity", [
+    "quantity", "percentage", "measurement", "ratio", "statistic",
+    "probability", "average", "median", "percentile", "trend",
+])
+
+
+def coarse_for(gliner_label: str = "", human_label: str = "") -> str:
+    """Resolve an entity's coarse bucket.
+
+    Tries the GLiNER label first (live KEX path), then the human Wikidata label
+    (backfill / old nodes that only persisted `label`). Falls back to "other".
+    """
+    for key in (gliner_label, human_label):
+        if key:
+            bucket = COARSE_MAP.get(str(key).strip().lower())
+            if bucket:
+                return bucket
+    return "other"
 

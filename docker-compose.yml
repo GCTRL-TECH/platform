@@ -9,6 +9,7 @@ services:
     environment:
       - NODE_ENV=development
       - PORT=4000
+      - RUST_LOG=${RUST_LOG:-info,gctrl_api=debug}
       - DATABASE_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL
       - REDIS_URL=redis://redis:6379
       - NEO4J_URI=bolt://neo4j:7687
@@ -16,14 +17,40 @@ services:
       - NEO4J_PASSWORD=password
       - JWT_SECRET=${JWT_SECRET:-GCTRL-dev-jwt-secret-change-in-production}
       - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET:-GCTRL-dev-refresh-secret-change-in-production}
+      # AES-256-GCM key (base64 of 32 bytes) for at-rest secret encryption.
+      # MUST be set & rotated in prod; losing it makes encrypted secrets unrecoverable.
+      - GCTRL_SECRET_KEY=${GCTRL_SECRET_KEY:-rjFL483r7bwkbIpLSqYokmRqmZvq4Jt0XHUrEqczQ9g=}
       - MAIL_HOST=maildev
       - MAIL_PORT=1025
-      - FRONTEND_URL=http://localhost:3000
+      # Origin the user's browser actually hits. The dockerized web (nginx) is
+      # published on 3001 below, so the OAuth redirect_uri sent to Google and the
+      # post-login redirect must point there too. Override via .env for prod/dev.
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3001}
       - KEX_WORKER_URL=http://kex:4010
+      - FUSE_URL=http://fuse:4020
       - QDRANT_URL=http://qdrant:6333
       - OLLAMA_BASE=http://ollama:11434
       # OAuth Connectors (set in .env or override here)
       - GCTRL_BASE_URL=${GCTRL_BASE_URL:-http://localhost:4000}
+      # Root under which server-side Obsidian folder vaults must live (read-only mount below).
+      - GCTRL_VAULTS_ROOT=/vaults
+      # Remote MCP gateway (/api/agent/mcp) — lets external multi-agent
+      # orchestrators drive the Pi harness over the network. OFF by default;
+      # every call is api-key authed, clearance-scoped and audited. Enable only
+      # when you intend to expose the harness, then restart the api service.
+      - GCTRL_AGENT_GATEWAY_ENABLED=${GCTRL_AGENT_GATEWAY_ENABLED:-false}
+      # ── Single source of truth for user-visible endpoint URLs ──────────────
+      # The UI fetches GET /api/config/public and derives EVERY displayed URL
+      # (MCP/n8n setup strings, Neo4j Browser links, agent health) from one
+      # canonical external origin = FRONTEND_URL (above). Change the published
+      # ports + FRONTEND_URL here / in .env and all displayed references update
+      # automatically — no hardcoded host:port is baked into the web bundle.
+      # The two vars below override the auto-derived Neo4j Browser / agent URLs.
+      # Leave empty to let the frontend derive http://<browser-host>:7474 / :7070.
+      - GCTRL_NEO4J_BROWSER_URL=${GCTRL_NEO4J_BROWSER_URL:-}
+      - GCTRL_AGENT_URL=${GCTRL_AGENT_URL:-}
+      # A4 memory-maintenance worker cadence (seconds). Default 600 (10 min).
+      - GCTRL_MEMORY_TICK_SECS=${GCTRL_MEMORY_TICK_SECS:-600}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - MICROSOFT_CLIENT_ID=${MICROSOFT_CLIENT_ID:-}
@@ -37,6 +64,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    volumes:
+      # Expose operator-chosen vault folders read-only. The API reads .md bytes
+      # from here for server-side Obsidian folder vaults (under GCTRL_VAULTS_ROOT).
+      - ${GCTRL_VAULTS_ROOT_HOST:-./vaults}:/vaults:ro
     networks:
       - GCTRL
       - ollama-net
@@ -98,6 +129,15 @@ services:
       - PORT=4020
       - SIMILARITY_THRESHOLD=0.85
       - RESOLVER_URL=http://resolver:8080
+      # WIKI distillation: Postgres (wiki_pages), Qdrant (grounding chunks),
+      # Ollama (page generation). Provider/model configurable; defaults are
+      # zero-config local Ollama llama3.2.
+      - PG_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=GCTRL_chunks
+      - OLLAMA_BASE=http://ollama:11434
+      - GCTRL_DISTILL_PROVIDER=${GCTRL_DISTILL_PROVIDER:-ollama}
+      - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
     depends_on:
       redis:
         condition: service_started
@@ -105,6 +145,7 @@ services:
         condition: service_healthy
     networks:
       - GCTRL
+      - ollama-net
     restart: unless-stopped
 
   resolver:

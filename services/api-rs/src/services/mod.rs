@@ -1,3 +1,9 @@
+pub mod audit;
+pub mod classify_resolver;
+pub mod cron;
+pub mod crypto;
+pub mod llm;
 pub mod neo4j;
+pub mod obsidian;
 pub mod redis;
 pub mod usage;

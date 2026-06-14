@@ -15,6 +15,8 @@ import {
   FolderPlus,
   Folder,
   ChevronLeft,
+  BookOpenText,
+  Lock,
 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
@@ -43,6 +45,8 @@ interface Compilation {
   createdAt: string
   updatedAt: string
   folderId: string | null
+  type?: 'RAW' | 'WIKI'
+  isSystem?: boolean
 }
 
 interface CompilationsResponse {
@@ -108,12 +112,17 @@ const CLASSIFICATION_OPTIONS: Classification[] = [
 interface CreateModalProps {
   onClose: () => void
   onCreated: (id: string) => void
+  rawCompilations: Compilation[]
 }
 
-function CreateModal({ onClose, onCreated }: CreateModalProps) {
+type GraphType = 'RAW' | 'WIKI'
+
+function CreateModal({ onClose, onCreated, rawCompilations }: CreateModalProps) {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [classification, setClassification] = useState<Classification>('INTERNAL')
+  const [graphType, setGraphType] = useState<GraphType>('RAW')
+  const [wikiSourceId, setWikiSourceId] = useState<string>('')
   const [error, setError] = useState<string | null>(null)
   const queryClient = useQueryClient()
 
@@ -123,7 +132,11 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
     {
       onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: ['kg', 'compilations'] })
-        onCreated(data.compilation.id)
+        // data shape from POST is { id, name, type } — normalise to an id.
+        const id =
+          (data as unknown as { id?: string }).id ??
+          (data as CreateCompilationResponse).compilation?.id
+        if (id) onCreated(id)
       },
       onError: (err) => {
         setError(
@@ -136,11 +149,19 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
 
   function handleSubmit() {
     setError(null)
+    if (graphType === 'WIKI' && !wikiSourceId) {
+      setError('A WIKI graph needs a source RAW graph to distil from.')
+      return
+    }
     createMutation.mutate({
       data: {
         name: name.trim(),
         description: description.trim() || undefined,
         classification,
+        type: graphType,
+        ...(graphType === 'WIKI' && wikiSourceId
+          ? { wikiSourceCompilationId: wikiSourceId }
+          : {}),
       },
     })
   }
@@ -151,6 +172,70 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
         <h3 className="mb-4 text-base font-semibold text-slate-100">New Knowledge Graph</h3>
 
         <div className="space-y-4">
+          {/* Type selector: RAW (default) vs WIKI */}
+          <div>
+            <label className="label">Type</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setGraphType('RAW')}
+                className={cn(
+                  'flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2 text-left transition-colors',
+                  graphType === 'RAW'
+                    ? 'border-blue-500/60 bg-blue-500/10'
+                    : 'border-slate-700 bg-slate-900 hover:border-slate-600'
+                )}
+              >
+                <span className="flex items-center gap-1.5 text-sm font-medium text-slate-200">
+                  <Database size={14} /> RAW
+                </span>
+                <span className="text-[11px] text-slate-500">Source graph from extractions</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setGraphType('WIKI')}
+                className={cn(
+                  'flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2 text-left transition-colors',
+                  graphType === 'WIKI'
+                    ? 'border-violet-500/60 bg-violet-500/10'
+                    : 'border-slate-700 bg-slate-900 hover:border-slate-600'
+                )}
+              >
+                <span className="flex items-center gap-1.5 text-sm font-medium text-slate-200">
+                  <BookOpenText size={14} /> WIKI
+                </span>
+                <span className="text-[11px] text-slate-500">Distilled pages from a source</span>
+              </button>
+            </div>
+          </div>
+
+          {/* WIKI source picker — only when WIKI is selected */}
+          {graphType === 'WIKI' && (
+            <div>
+              <label className="label">
+                Source graph <span className="text-red-400">*</span>
+              </label>
+              {rawCompilations.length === 0 ? (
+                <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
+                  No RAW graphs available. Create or extract a RAW graph first.
+                </p>
+              ) : (
+                <select
+                  value={wikiSourceId}
+                  onChange={(e) => setWikiSourceId(e.target.value)}
+                  className="input-field"
+                >
+                  <option value="">Select a RAW graph…</option>
+                  {rawCompilations.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
+
           <div>
             <label className="label">
               Name <span className="text-red-400">*</span>
@@ -245,40 +330,61 @@ function CompilationCard({
   const sourceCount = compilation.sourceJobIds?.length ?? 0
   const entityOrNodeCount = compilation.entityCount ?? compilation.nodeCount ?? 0
   const edgeCount = compilation.edgeCount ?? 0
+  const isWiki = compilation.type === 'WIKI'
+  const isSystem = compilation.isSystem === true
 
   return (
     <button
-      draggable
+      draggable={!isSystem}
       onDragStart={(e) => {
         e.dataTransfer.setData('application/x-compilation-id', compilation.id)
         e.dataTransfer.effectAllowed = 'move'
       }}
       onClick={onClick}
       className={cn(
-        'group relative flex w-full flex-col rounded-xl border bg-slate-900 p-5 text-left transition-all hover:border-slate-600 hover:bg-slate-800/60 cursor-grab active:cursor-grabbing',
+        'group relative flex w-full flex-col rounded-xl border bg-slate-900 p-5 text-left transition-all hover:border-slate-600 hover:bg-slate-800/60',
+        isSystem ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing',
         cls.border
       )}
     >
-      {/* Delete button (top right, visible on hover) */}
-      <div
-        className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity"
-        onClick={(e) => { e.stopPropagation(); onDelete(compilation.id, compilation.name) }}
-        role="button"
-        title="Delete compilation"
-      >
-        <Trash2 size={14} className="text-slate-600 hover:text-red-400 transition-colors" />
-      </div>
+      {/* Delete button (top right, visible on hover) — hidden for system graphs */}
+      {isSystem ? (
+        <div
+          className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity"
+          title="System graph — cannot be deleted"
+        >
+          <Lock size={13} className="text-slate-600" />
+        </div>
+      ) : (
+        <div
+          className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity"
+          onClick={(e) => { e.stopPropagation(); onDelete(compilation.id, compilation.name) }}
+          role="button"
+          title="Delete compilation"
+        >
+          <Trash2 size={14} className="text-slate-600 hover:text-red-400 transition-colors" />
+        </div>
+      )}
 
       {/* Header row */}
       <div className="mb-3 flex items-start justify-between gap-2">
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800">
-          {sourceCount > 1 ? (
+          {isWiki ? (
+            <BookOpenText size={17} className="text-violet-400 group-hover:text-violet-300 transition-colors" />
+          ) : sourceCount > 1 ? (
             <Layers size={17} className="text-violet-400 group-hover:text-violet-300 transition-colors" />
           ) : (
             <Database size={17} className="text-slate-400 group-hover:text-slate-300 transition-colors" />
           )}
         </div>
-        <span className={cls.badge}>{cls.label}</span>
+        <div className="flex items-center gap-1.5">
+          {isWiki && (
+            <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-300 ring-1 ring-violet-500/30">
+              WIKI
+            </span>
+          )}
+          <span className={cls.badge}>{cls.label}</span>
+        </div>
       </div>
 
       {/* Name */}
@@ -654,7 +760,11 @@ export function KGListPage() {
             <CompilationCard
               key={compilation.id}
               compilation={compilation}
-              onClick={() => navigate(`/graphs/${compilation.id}`)}
+              onClick={() =>
+                compilation.type === 'WIKI' && compilation.isSystem
+                  ? navigate('/wiki')
+                  : navigate(`/graphs/${compilation.id}/workspace`)
+              }
               onDelete={(id, name) => setDeleteTarget({ id, name })}
             />
           ))}
@@ -664,6 +774,7 @@ export function KGListPage() {
       {/* Create modal */}
       {showCreateModal && (
         <CreateModal
+          rawCompilations={compilations.filter((c) => (c.type ?? 'RAW') === 'RAW')}
           onClose={() => setShowCreateModal(false)}
           onCreated={(id) => {
             setShowCreateModal(false)

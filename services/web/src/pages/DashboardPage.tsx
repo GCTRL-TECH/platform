@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { Zap, Network, Coins, ArrowRight, Clock, ExternalLink, type LucideIcon } from 'lucide-react'
+import { Zap, Network, ArrowRight, Clock, type LucideIcon } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
@@ -55,19 +55,6 @@ const STATUS_BADGE: Record<string, { className: string; label: string }> = {
   failed: { className: 'badge-red', label: 'Failed' },
 }
 
-const TIER_BADGE: Record<string, string> = {
-  free: 'badge-slate',
-  starter: 'badge-blue',
-  pro: 'badge-green',
-  enterprise: 'badge-yellow',
-}
-
-interface BalanceResponse {
-  balance: number
-  tier: string
-  tierLimit: number
-}
-
 export function DashboardPage() {
   const { user } = useAuth()
   const navigate = useNavigate()
@@ -76,27 +63,15 @@ export function DashboardPage() {
     ['kex', 'jobs'],
     '/kex/jobs'
   )
-
-  // Live balance — refetches periodically + on focus so the dashboard
-  // doesn't show a stale number after KEX/FUSE deduct tokens.
-  const { data: balanceData } = useApiQuery<BalanceResponse>(
-    ['billing', 'balance'],
-    '/billing/balance',
-    {
-      enabled: !!user,
-      refetchInterval: 10_000,
-      refetchOnWindowFocus: true,
-      staleTime: 5_000,
-    }
+  const { data: compsData } = useApiQuery<{ compilations: unknown[] }>(
+    ['kg', 'compilations'],
+    '/kg/compilations'
   )
 
   const jobs = jobsData?.jobs ?? []
   const recentJobs = jobs.slice(0, 5)
   const completedJobs = jobs.filter((j) => j.status === 'completed').length
-
-  const liveTier = balanceData?.tier ?? user?.tier ?? 'free'
-  const liveBalance = balanceData?.balance ?? user?.tokensBalance ?? 0
-  const tierBadge = TIER_BADGE[liveTier] ?? 'badge-slate'
+  const graphCount = compsData?.compilations?.length ?? 0
 
   return (
     <div className="space-y-8 animate-slide-up">
@@ -111,16 +86,7 @@ export function DashboardPage() {
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard
-          label="Token Balance"
-          value={liveBalance.toLocaleString()}
-          icon={Coins}
-          iconColor="text-amber-400"
-          iconBg="bg-amber-500/10"
-          badge={liveTier}
-          badgeColor={tierBadge}
-        />
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <StatCard
           label="Total Extractions"
           value={jobs?.length ?? 0}
@@ -131,13 +97,11 @@ export function DashboardPage() {
           badgeColor="badge-green"
         />
         <StatCard
-          label="Knowledge Nodes"
-          value="—"
+          label="Knowledge Graphs"
+          value={graphCount}
           icon={Network}
           iconColor="text-violet-400"
           iconBg="bg-violet-500/10"
-          badge="Neo4j"
-          badgeColor="badge-slate"
         />
       </div>
 
@@ -150,15 +114,13 @@ export function DashboardPage() {
           <Zap size={15} />
           New Extraction
         </button>
-        <a
-          href="http://localhost:7474"
-          target="_blank"
-          rel="noopener noreferrer"
+        <button
+          onClick={() => navigate('/graphs')}
           className="btn-secondary"
         >
-          <ExternalLink size={14} />
-          Open Neo4j Browser
-        </a>
+          <Network size={14} />
+          Browse Graphs
+        </button>
       </div>
 
       {/* Recent Jobs */}

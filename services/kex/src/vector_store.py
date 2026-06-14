@@ -21,11 +21,37 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from . import config
 
 logger = logging.getLogger(__name__)
+
+# Embedding vector dimensionality for the Qdrant collection. nomic-embed-text
+# (the default local Ollama embedder) emits 768-dim vectors. Override via
+# QDRANT_VECTOR_SIZE if a different embedding model is configured.
+_VECTOR_SIZE = int(getattr(config, "QDRANT_VECTOR_SIZE", 768))
+
+# Namespace for deriving a stable UUID from a non-UUID identifier. Real KEX jobs
+# always carry a UUID job_id (jobs.id = uuid_generate_v4()), but bench harnesses /
+# direct KEX callers can pass an arbitrary string (e.g. "typecheck-01-r0"). The
+# text_chunks id columns are typed UUID in Postgres (api-rs reads them as Uuid and
+# joins jobs.id = text_chunks.job_id), so a non-UUID value aborts the whole insert
+# batch and the chunk TEXT silently never persists. Coercing to a deterministic
+# UUIDv5 keeps the row insertable AND keeps the value stable across re-extraction.
+_CHUNK_ID_NS = uuid_lib.UUID("6f3c1d2e-0000-5000-a000-6b657863686b")  # "kex" chunk ns
+
+
+def _as_uuid(value: Optional[str]) -> Optional[str]:
+    """Return `value` if it is already a valid UUID, else a deterministic UUIDv5
+    derived from it. None passes through (nullable columns)."""
+    if value is None:
+        return None
+    s = str(value)
+    try:
+        return str(uuid_lib.UUID(s))
+    except (ValueError, AttributeError, TypeError):
+        return str(uuid_lib.uuid5(_CHUNK_ID_NS, s))
 
 
 class VectorStore:
@@ -52,24 +78,74 @@ class VectorStore:
         self.collection = collection
         self.pg_url = pg_url or config.PG_URL
         self._qdrant: Optional[QdrantClient] = None
+        self._collection_ready = False
         self._pg_conn = None
 
     # ── Qdrant ──────────────────────────────────────────────────────────
 
     def _get_qdrant(self) -> Optional[QdrantClient]:
-        """Lazy-init Qdrant client. Returns None if unreachable."""
-        if self._qdrant is not None:
+        """Lazy-init Qdrant client. Returns None if unreachable.
+
+        Also ensures the target collection exists (create-if-missing). Without
+        this, a fresh install / post-purge Qdrant has zero collections and EVERY
+        upsert silently no-ops (the collection 404s), leaving the RAG with no
+        vectors to retrieve. Idempotent: the collection is created at most once
+        per process, then a cheap flag short-circuits subsequent calls.
+        """
+        if self._qdrant is not None and self._collection_ready:
             return self._qdrant
-        try:
-            client = QdrantClient(url=self.qdrant_url, timeout=10)
-            # Verify connectivity with a lightweight collections list call
-            client.get_collections()
-            self._qdrant = client
-            logger.info(f"VectorStore: Qdrant connected at {self.qdrant_url}")
-        except Exception as exc:
-            logger.warning(f"VectorStore: Qdrant unavailable at {self.qdrant_url}: {exc}")
-            self._qdrant = None
+        if self._qdrant is None:
+            try:
+                client = QdrantClient(url=self.qdrant_url, timeout=10)
+                # Verify connectivity with a lightweight collections list call
+                client.get_collections()
+                self._qdrant = client
+                logger.info(f"VectorStore: Qdrant connected at {self.qdrant_url}")
+            except Exception as exc:
+                logger.warning(f"VectorStore: Qdrant unavailable at {self.qdrant_url}: {exc}")
+                self._qdrant = None
+                return None
+        # Client is up — make sure the collection exists before any upsert.
+        self.ensure_collection()
         return self._qdrant
+
+    def ensure_collection(self) -> bool:
+        """Create the configured collection if it does not already exist.
+
+        Idempotent and safe to call at startup AND before the first upsert.
+        Returns True if the collection exists (or was created), False on error.
+        """
+        if self._collection_ready:
+            return True
+        client = self._qdrant
+        if client is None:
+            return False
+        try:
+            if client.collection_exists(self.collection):
+                self._collection_ready = True
+                return True
+            client.create_collection(
+                collection_name=self.collection,
+                vectors_config=VectorParams(size=_VECTOR_SIZE, distance=Distance.COSINE),
+            )
+            logger.info(
+                f"VectorStore: created Qdrant collection '{self.collection}' "
+                f"(size={_VECTOR_SIZE}, distance=cosine)"
+            )
+            self._collection_ready = True
+            return True
+        except Exception as exc:
+            # A concurrent creator may have raced us — re-check existence.
+            try:
+                if client.collection_exists(self.collection):
+                    self._collection_ready = True
+                    return True
+            except Exception:
+                pass
+            logger.warning(
+                f"VectorStore: failed to ensure collection '{self.collection}': {exc}"
+            )
+            return False
 
     def _upsert_to_qdrant(
         self,
@@ -89,8 +165,10 @@ class VectorStore:
             return True
         except Exception as exc:
             logger.warning(f"VectorStore: Qdrant upsert failed for point {point_id}: {exc}")
-            # Reset client so next call re-probes connectivity
+            # Reset client + collection flag so next call re-probes connectivity
+            # AND re-ensures the collection exists.
             self._qdrant = None
+            self._collection_ready = False
             return False
 
     def _upsert_batch_to_qdrant(
@@ -109,6 +187,7 @@ class VectorStore:
         except Exception as exc:
             logger.warning(f"VectorStore: Qdrant batch upsert failed: {exc}")
             self._qdrant = None
+            self._collection_ready = False
             # Fall back to one-by-one to salvage as many as possible
             stored = 0
             for p in points:
@@ -147,7 +226,8 @@ class VectorStore:
 
         Row tuple: (id, job_id, compilation_id, user_id, content,
                     start_char, end_char, chunk_sequence,
-                    qdrant_point_id, entity_mentions)
+                    qdrant_point_id, entity_mentions,
+                    classification_level_id, min_rank, class_labels)
         Returns count inserted.
         """
         if not rows:
@@ -160,7 +240,8 @@ class VectorStore:
             INSERT INTO text_chunks (
                 id, job_id, compilation_id, user_id,
                 content, start_char, end_char, chunk_sequence,
-                qdrant_point_id, entity_mentions
+                qdrant_point_id, entity_mentions,
+                classification_level_id, min_rank, class_labels
             ) VALUES %s
             ON CONFLICT (id) DO NOTHING
         """
@@ -189,6 +270,7 @@ class VectorStore:
         compilation_id: Optional[str] = None,
         entity_mentions: Optional[list[list[dict]]] = None,
         source_document_id: Optional[str] = None,
+        classification: Optional[dict] = None,
     ) -> int:
         """
         Store text chunks in Qdrant (vectors) and PostgreSQL (text).
@@ -233,6 +315,20 @@ class VectorStore:
         if len(entity_mentions) != len(chunks):
             entity_mentions = [[] for _ in chunks]
 
+        # Classification tagging: every chunk carries the ingest level so RAG /
+        # /kex/chunks can gate retrieval by the caller's clearance. min_rank is
+        # the denormalized filter key; class_labels keeps the rich provenance.
+        cls = classification or {"id": None, "name": "PUBLIC", "rank": 0}
+        cls_rank = int(cls.get("rank", 0))
+        cls_level_id = cls.get("id")
+        cls_labels_json = json.dumps([{
+            "rank": cls_rank,
+            "level_id": cls_level_id,
+            "level_name": cls.get("name", "PUBLIC"),
+            "source_job": job_id,
+            "ingested_by": user_id,
+        }], separators=(",", ":"))
+
         # Generate one UUID per chunk — shared between Qdrant and PostgreSQL
         point_ids = [str(uuid_lib.uuid4()) for _ in chunks]
 
@@ -253,6 +349,11 @@ class VectorStore:
             payload = {
                 "text": chunk["content"],  # full text for RAG retrieval
                 "job_id": job_id,
+                # `source_job` mirrors job_id under the same key the graph uses
+                # (_source_job). A compilation's source_job_ids are known to the
+                # RAG even when compilation_id is NULL on the chunk, so retrieval
+                # can scope by source_job without the compilation-link race.
+                "source_job": job_id,
                 "user_id": user_id,
                 "compilation_id": compilation_id,
                 "source_document_id": source_document_id,
@@ -261,6 +362,8 @@ class VectorStore:
                 "end_char": chunk["end_char"],
                 "entity_mentions": mentions_payload,
                 "entity_count": len(entity_mentions[i]),
+                "min_rank": cls_rank,                       # vector-search clearance pre-filter
+                "classification_level_id": cls_level_id,
             }
             qdrant_points.append(PointStruct(id=pid, vector=vector, payload=payload))
 
@@ -275,18 +378,35 @@ class VectorStore:
         pg_rows: list[tuple] = []
         for i, (chunk, pid) in enumerate(zip(chunks, point_ids)):
             has_vector = embeddings[i] is not None
-            mentions_json = json.dumps(entity_mentions[i]) if entity_mentions[i] else None
+            # Normalize entity mentions to {name,type,label} so the api-rs queries
+            # (`entity_mentions @> [{"name":…}]`, chunkCount) match — raw NER dicts
+            # use "text" not "name", which silently broke structured chunk lookup.
+            norm_mentions = [
+                {
+                    "name": e.get("text", e.get("name", "")),
+                    "type": e.get("type", ""),
+                    "label": e.get("label", ""),
+                }
+                for e in entity_mentions[i]
+            ]
+            mentions_json = json.dumps(norm_mentions) if norm_mentions else None
+            # Coerce id-typed columns to valid UUIDs so a non-UUID job_id /
+            # compilation_id / user_id can never abort the insert batch (the bug
+            # that left chunk TEXT unpersisted and broke lexical/BM25 retrieval).
             pg_rows.append((
-                pid,                        # id (UUID)
-                job_id,                     # job_id
-                compilation_id,             # compilation_id (nullable)
-                user_id,                    # user_id
-                chunk["content"],           # content
-                chunk["start_char"],        # start_char
-                chunk["end_char"],          # end_char
-                chunk["chunk_sequence"],    # chunk_sequence
-                pid if has_vector else None,  # qdrant_point_id (None if no vector)
-                mentions_json,              # entity_mentions (JSON string)
+                pid,                            # id (already a fresh UUID)
+                _as_uuid(job_id),               # job_id
+                _as_uuid(compilation_id),       # compilation_id (nullable)
+                _as_uuid(user_id),              # user_id
+                chunk["content"],               # content / chunk text
+                chunk["start_char"],            # start_char
+                chunk["end_char"],              # end_char
+                chunk["chunk_sequence"],        # chunk_sequence
+                pid if has_vector else None,    # qdrant_point_id (None if no vector)
+                mentions_json,                  # entity_mentions (JSON string)
+                _as_uuid(cls_level_id),         # classification_level_id (nullable UUID)
+                cls_rank,                       # min_rank
+                cls_labels_json,                # class_labels (JSON string)
             ))
 
         pg_stored = self._insert_chunks_pg(pg_rows)
@@ -314,6 +434,7 @@ class VectorStore:
             except Exception:
                 pass
             self._qdrant = None
+            self._collection_ready = False
 
 
 # ── Module-level singleton ────────────────────────────────────────────

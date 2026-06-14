@@ -264,6 +264,7 @@ export function NodeDetailDrawer({
             <NodeDetailConnections
               entityName={entityName}
               entityId={localNode?.id ?? null}
+              compilationId={compilationId}
               nodes={nodes}
               edges={edges}
               colorBy={colorBy}
@@ -272,7 +273,14 @@ export function NodeDetailDrawer({
             />
           )}
           {tab === 'source' && (
-            <NodeDetailSource detail={detail} isLoading={detailLoading} />
+            <NodeDetailSource
+              detail={detail}
+              isLoading={detailLoading}
+              entityName={entityName}
+              compilationId={compilationId}
+              enabled={open && tab === 'source'}
+              onNavigateToEntity={onNavigateToEntity}
+            />
           )}
         </div>
       </aside>

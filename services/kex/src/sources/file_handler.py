@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -110,25 +111,135 @@ def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -
 
 
 def _extract_pdf(data: bytes) -> str:
-    """Extract text from all pages of a PDF."""
-    try:
-        import PyPDF2  # type: ignore
-    except ImportError:
-        raise ValueError("PyPDF2 is not installed")
+    """Extract text from all pages of a PDF.
 
-    reader = PyPDF2.PdfReader(io.BytesIO(data))
-    parts: list[str] = []
-    for page_num, page in enumerate(reader.pages):
+    Strategy (best layout fidelity first):
+      1. PyMuPDF (fitz) text layer — reads glyphs in proper reading order and
+         does NOT insert the per-character spacing / column-of-blanks padding
+         that PyPDF2 emits on multi-column or custom-spaced layouts (the exact
+         bug that turned a CV into "F A B I O  C H I A R A M O N T E").
+      2. PyPDF2 text layer — fallback if PyMuPDF is unavailable.
+      3. OCR (render each page, Tesseract) — only when there is no text layer
+         (scanned / signed PDFs). Languages: eng+spa+deu+fra.
+
+    Whatever text layer wins is run through `_clean_pdf_text` to collapse any
+    residual intra-word spacing and blank-column artefacts so downstream
+    NER / relation extraction and RAG answers get clean prose."""
+    text = ""
+
+    # 1. PyMuPDF — preferred extractor.
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=data, filetype="pdf")
+        parts: list[str] = []
+        for page in doc:
+            # "text" mode preserves reading order without the brittle per-glyph
+            # spacing PyPDF2 produces. ("blocks" sorted by position is an option
+            # but "text" already reads top-to-bottom, left-to-right correctly.)
+            t = page.get_text("text")
+            if t and t.strip():
+                parts.append(t.strip())
+        doc.close()
+        text = "\n\n".join(parts)
+    except ImportError:
+        logger.info("PyMuPDF not available — falling back to PyPDF2 for PDF text")
+    except Exception as exc:
+        logger.warning(f"PyMuPDF extraction failed ({exc}) — falling back to PyPDF2")
+
+    # 2. PyPDF2 fallback.
+    if not text.strip():
         try:
-            text = page.extract_text()
-            if text:
+            import PyPDF2  # type: ignore
+            reader = PyPDF2.PdfReader(io.BytesIO(data))
+            parts = []
+            for page_num, page in enumerate(reader.pages):
+                try:
+                    t = page.extract_text()
+                    if t:
+                        parts.append(t.strip())
+                except Exception as exc:
+                    logger.warning(f"PDF page {page_num} extraction failed: {exc}")
+            text = "\n\n".join(parts)
+        except ImportError:
+            pass  # neither lib present → fall through to OCR
+
+    if text.strip():
+        return _clean_pdf_text(text)
+
+    # 3. No text layer → scanned/image PDF. OCR fallback.
+    logger.info("PDF has no embedded text — falling back to OCR")
+    return _clean_pdf_text(_ocr_pdf(data))
+
+
+# Matches a run of single characters separated by single spaces, e.g.
+# "F A B I O" or "C H I A R A M O N T E" — the classic letter-spacing artefact.
+_LETTER_SPACED_RE = re.compile(r"(?:\b\w\s){2,}\w\b")
+
+
+def _clean_pdf_text(text: str) -> str:
+    """Collapse PDF extraction artefacts into clean prose.
+
+    Fixes two common problems:
+      * letter-spaced words ("F A B I O" → "FABIO"): detected as runs of
+        single chars separated by single spaces, then de-spaced.
+      * column-of-blanks padding (many trailing spaces / lines of only spaces
+        from a two-column layout): trailing whitespace stripped, runs of 3+
+        interior spaces collapsed to one, blank-only lines dropped.
+
+    Conservative by design — it only touches obvious artefacts so normal prose
+    (single spaces between real words) is left untouched."""
+    if not text:
+        return text
+
+    def _despace(match: "re.Match[str]") -> str:
+        return match.group(0).replace(" ", "")
+
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        # Drop column-padding lines that are only whitespace.
+        if not line.strip():
+            out_lines.append("")
+            continue
+        # De-space letter-spaced runs within the line.
+        line = _LETTER_SPACED_RE.sub(_despace, line)
+        # Collapse runs of 3+ spaces (blank-column gaps) to a single space.
+        line = re.sub(r" {3,}", " ", line)
+        out_lines.append(line.rstrip())
+
+    cleaned = "\n".join(out_lines)
+    # Collapse 3+ consecutive blank lines (column padding) to a paragraph break.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _ocr_pdf(data: bytes) -> str:
+    """OCR a scanned/image PDF by rendering each page and running Tesseract."""
+    try:
+        import fitz  # PyMuPDF
+        import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
+    except ImportError as exc:
+        raise ValueError(f"OCR dependencies missing ({exc})")
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    parts: list[str] = []
+    # 2.5x zoom ≈ 180 DPI — enough for Tesseract without huge images.
+    matrix = fitz.Matrix(2.5, 2.5)
+    for page_num in range(doc.page_count):
+        try:
+            pix = doc.load_page(page_num).get_pixmap(matrix=matrix)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(img, lang="eng+spa+deu+fra")
+            if text and text.strip():
                 parts.append(text.strip())
         except Exception as exc:
-            logger.warning(f"PDF page {page_num} extraction failed: {exc}")
+            logger.warning(f"OCR failed on PDF page {page_num}: {exc}")
 
+    doc.close()
     if not parts:
-        raise ValueError("PDF contained no extractable text")
+        raise ValueError("PDF contained no extractable text (OCR found nothing)")
 
+    logger.info(f"OCR extracted text from {len(parts)} page(s)")
     return "\n\n".join(parts)
 
 

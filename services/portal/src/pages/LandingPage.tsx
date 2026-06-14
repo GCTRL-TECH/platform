@@ -4,6 +4,7 @@ import { useScrollReveal } from '@/hooks/useScrollReveal'
 import { HeroSection } from './sections/HeroSection'
 import { ProblemSection } from './sections/ProblemSection'
 import { SolutionSection } from './sections/SolutionSection'
+import { SpeedOfTrustSection } from './sections/SpeedOfTrustSection'
 import { FeaturesSection } from './sections/FeaturesSection'
 import { HowItWorksSection } from './sections/HowItWorksSection'
 import { ExplainabilitySection } from './sections/ExplainabilitySection'
@@ -22,7 +23,13 @@ function LandingNav() {
 
   return (
     <header
-      className={`fixed left-0 right-0 top-0 z-50 transition-all duration-300 ${
+      // landing-nav declares `border-bottom: 1px solid transparent` so the
+      // border-bottom is *defined* even at rest. Without it, the transition
+      // interpolates border-color from `currentcolor` (white text → white) to
+      // the scrolled indigo-low-alpha — which produces a white flash on the
+      // first scroll tick. With a transparent baseline, the interpolation is
+      // transparent → indigo. No flash.
+      className={`landing-nav fixed left-0 right-0 top-0 z-50 transition-all duration-300 ${
         scrolled ? 'landing-nav-scrolled' : 'bg-transparent'
       }`}
     >
@@ -34,6 +41,7 @@ function LandingNav() {
         <nav className="hidden items-center gap-6 md:flex">
           {[
             ['Platform', '#features'],
+            ['Trust', '#trust'],
             ['How It Works', '#how-it-works'],
             ['Integrations', '#integrations'],
           ].map(([label, href]) => (
@@ -122,7 +130,7 @@ function LandingFooter() {
             },
             {
               title: 'Integrations',
-              links: [['Neo4j', '#'], ['Qdrant', '#'], ['Google Drive', '#'], ['Microsoft 365', '#']],
+              links: [['Neo4j', '#'], ['Qdrant', '#'], ['Google Drive', '#'], ['Notion', '#']],
             },
             {
               title: 'Company',
@@ -169,6 +177,7 @@ export function LandingPage() {
         <HeroSection />
         <ProblemSection />
         <SolutionSection />
+        <section id="trust"><SpeedOfTrustSection /></section>
         <section id="features"><FeaturesSection /></section>
         <section id="how-it-works"><HowItWorksSection /></section>
         <ExplainabilitySection />

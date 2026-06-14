@@ -26,14 +26,24 @@ DEFAULT_RDF_NAMESPACE = os.environ.get(
     "GCTRL_RDF_NAMESPACE", "http://gctrl.tech/entity/"
 )
 
-# Default metric presets per entity type
+# Per-entity-type link-spec presets. These are the GENERIC, conservative defaults
+# shipped with the open-source service — a single uniform cosine-name family that
+# is functional but measurably below the tuned profile. The tuned per-type specs
+# (the real entity-resolution edge) are NOT in this repo: they are delivered to
+# licensed deployments over the license channel and applied at runtime through
+# `tuning.load_tuning()` (which mutates this dict in place). Any tuning miss falls
+# back to exactly these defaults — see services/fuse/src/tuning.py.
 DEFAULT_METRICS: dict[str, str] = {
-    "person": "AND(jaro(x.name, y.name)|0.85, exactmatch(x.type, y.type)|1.0)",
-    "company": "AND(trigrams(x.name, y.name)|0.75, exactmatch(x.type, y.type)|1.0)",
-    "organization": "AND(trigrams(x.name, y.name)|0.80, exactmatch(x.type, y.type)|1.0)",
-    "location": "AND(jaro(x.name, y.name)|0.90, exactmatch(x.type, y.type)|1.0)",
+    "person": "AND(cosine(x.name, y.name)|0.80, exactmatch(x.type, y.type)|1.0)",
+    "company": "AND(cosine(x.name, y.name)|0.80, exactmatch(x.type, y.type)|1.0)",
+    "organization": "AND(cosine(x.name, y.name)|0.80, exactmatch(x.type, y.type)|1.0)",
+    "location": "AND(cosine(x.name, y.name)|0.80, exactmatch(x.type, y.type)|1.0)",
     "default": "AND(cosine(x.name, y.name)|0.80, exactmatch(x.type, y.type)|1.0)",
 }
+
+# Snapshot of the generic baseline so the tuning seam can always restore it if a
+# delivered profile is later revoked/cleared without a service restart.
+GENERIC_DEFAULT_METRICS: dict[str, str] = dict(DEFAULT_METRICS)
 
 
 def build_neo4j_config(
@@ -167,6 +177,46 @@ def build_simple_metric(
     for sp, tp, measure, threshold in property_pairs:
         parts.append(f"{measure}(x.{sp}, y.{tp})|{threshold}")
 
+    return f"{operator}({', '.join(parts)})"
+
+
+def build_field_metric(
+    field_specs: list[tuple[str, str, float]],
+    operator: str = "AND",
+) -> str:
+    """Build an ATTRIBUTE-AWARE (per-field) LIMES metric from field specs.
+
+    Each spec is ``(property, measure, threshold)`` and emits one thresholded
+    measure ``measure(x.property, y.property)|threshold``. The specs are combined
+    with ``operator`` (``AND`` = conjunctive blocking, the precise choice for
+    multi-attribute entity resolution; ``OR``/``MAX``/``MIN`` also valid).
+
+    This is the lever that breaks the single-composite-name precision ceiling:
+    instead of one fuzzy match over ``title | authors | venue year`` (where two
+    distinct papers sharing domain boilerplate over-merge), every field is scored
+    on its OWN axis and ALL must clear their floor, e.g.
+
+        AND(trigrams(x.title,y.title)|0.7, jaccard(x.authors,y.authors)|0.6,
+            exactmatch(x.year,y.year)|1.0)
+
+    A near-duplicate that shares boilerplate in the title but has a different
+    year / author set now fails the conjunction and stays apart.
+
+    Example::
+
+        >>> build_field_metric([("title","trigrams",0.7),
+        ...                      ("authors","jaccard",0.6),
+        ...                      ("year","exactmatch",1.0)])
+        'AND(trigrams(x.title, y.title)|0.7, jaccard(x.authors, y.authors)|0.6, exactmatch(x.year, y.year)|1.0)'
+    """
+    if not field_specs:
+        raise ValueError("build_field_metric requires at least one field spec")
+    parts = [
+        f"{measure}(x.{prop}, y.{prop})|{threshold}"
+        for prop, measure, threshold in field_specs
+    ]
+    if len(parts) == 1:
+        return parts[0]
     return f"{operator}({', '.join(parts)})"
 
 

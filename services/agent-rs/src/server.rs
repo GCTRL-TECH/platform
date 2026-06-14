@@ -216,6 +216,20 @@ async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+/// GET /tuning — serve the cached, signature-verified ER tuning profile to the
+/// local FUSE service. License-bound: returns the profile ONLY while the license
+/// is valid; otherwise 204 (FUSE then falls back to generic defaults). Same
+/// internal trust boundary as /check — only the local stack reaches this port.
+async fn handle_tuning(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.cache.read().await.is_valid() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    match crate::tuning::read_cache(&state.cfg.tuning_profile_path).await {
+        Some(t) => Json(t).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
 pub async fn run(
     cache: Arc<RwLock<LicenseCache>>,
     queue: Arc<Mutex<UsageQueue>>,
@@ -234,6 +248,7 @@ pub async fn run(
         .route("/check",    post(handle_check))
         .route("/report",   post(handle_report))
         .route("/status",   get(handle_status))
+        .route("/tuning",   get(handle_tuning))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));

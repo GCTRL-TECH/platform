@@ -12,6 +12,9 @@ import {
   Coins,
   ChevronDown,
   Plug,
+  Building2,
+  BookMarked,
+  HardDrive,
   FolderOpen,
   FileSpreadsheet,
   Image,
@@ -30,10 +33,26 @@ import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
 import { ExtractionsTable } from './components/ExtractionsTable'
+import {
+  listLocalVaults,
+  getLocalVaultHandle,
+  listVaultMarkdown,
+  ensureReadPermission,
+  type LocalVault,
+} from '@/lib/localVaults'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface ExtractResponse { jobId: string; status: string }
+
+interface ClassificationLevel {
+  id: string
+  display_name: string
+  name: string
+  rank: number
+  color: string
+  is_system: boolean
+}
 
 interface OntologyOption {
   id: string
@@ -74,6 +93,7 @@ export function KexPage() {
   const [triggerCron, setTriggerCron] = useState('0 */6 * * *')
   const [autoFuseTarget, setAutoFuseTarget] = useState<string | null>(null)
   const [forceSingleGraphs, setForceSingleGraphs] = useState(false)
+  const [classificationLevelId, setClassificationLevelId] = useState<string | null>(null)
   const [refetchKey, setRefetchKey] = useState(0)
 
   // Connected sources state
@@ -88,12 +108,33 @@ export function KexPage() {
   const [driveSyncing, setDriveSyncing] = useState(false)
   // driveSyncResult state removed — info now shown via statusInfo bar
 
+  // ── Obsidian source state ──
+  type ObsidianVaultKind = 'local' | 'folder' | 'rest'
+  interface ObsidianVaultOption { id: string; label: string; kind: ObsidianVaultKind; detail: string }
+  interface ObsidianNote { path: string; name: string }
+  const [obsidianVaults, setObsidianVaults] = useState<ObsidianVaultOption[]>([])
+  const [obsidianVaultId, setObsidianVaultId] = useState<string | null>(null)
+  const [obsidianNotes, setObsidianNotes] = useState<ObsidianNote[]>([])
+  const [obsidianSelected, setObsidianSelected] = useState<Set<string>>(new Set())
+  const [obsidianSearch, setObsidianSearch] = useState('')
+  const [obsidianLoadingNotes, setObsidianLoadingNotes] = useState(false)
+  const [obsidianNotesError, setObsidianNotesError] = useState<string | null>(null)
+  const [obsidianProgress, setObsidianProgress] = useState<{ done: number; total: number } | null>(null)
+  // Local FS directory handles, fetched lazily per vault (not serializable into state cleanly).
+  const obsidianLocalMeta = obsidianVaults.find((v) => v.id === obsidianVaultId)
+  const selectedObsidianVault = obsidianLocalMeta ?? null
+  const obsidianLocalSelected =
+    activeTab === 'sources' && selectedProvider === 'obsidian' && selectedObsidianVault?.kind === 'local'
+
   // Ontologies
   const { data: ontologiesData } = useApiQuery<OntologiesResponse>(['ontologies'], '/ontologies')
   const ontologies = ontologiesData?.ontologies ?? []
 
   // Compilations for Auto-FUSE dropdown
   const { data: compilationsData } = useApiQuery<{ compilations: Array<{ id: string; name: string; nodeCount: number }> }>(['compilations'], '/kg/compilations')
+
+  // Classification levels for Classification dropdown
+  const { data: classificationData } = useApiQuery<{ levels: ClassificationLevel[] }>(['classification', 'levels'], '/classification/levels')
   const compilationsList = compilationsData?.compilations ?? []
 
   useEffect(() => {
@@ -109,6 +150,61 @@ export function KexPage() {
       } catch { /* ignore */ }
     })()
   }, [])
+
+  // Load Obsidian vaults (server: rest+folder, plus browser-local).
+  const loadObsidianVaults = useCallback(async () => {
+    const out: ObsidianVaultOption[] = []
+    try {
+      const local = await listLocalVaults()
+      for (const v of local as LocalVault[]) out.push({ id: v.id, label: v.label, kind: 'local', detail: 'Local drive (this browser)' })
+    } catch { /* ignore */ }
+    try {
+      const { data } = await api.get('/connectors/obsidian/vaults')
+      for (const v of (data.vaults || []) as Array<{ id: string; label: string; kind?: string; vault_url: string; folder_path?: string | null }>) {
+        const kind: ObsidianVaultKind = v.kind === 'folder' ? 'folder' : 'rest'
+        out.push({ id: v.id, label: v.label, kind, detail: kind === 'folder' ? (v.folder_path ?? 'server folder') : v.vault_url })
+      }
+    } catch { /* ignore */ }
+    setObsidianVaults(out)
+  }, [])
+
+  useEffect(() => { void loadObsidianVaults() }, [loadObsidianVaults])
+
+  // Local Obsidian vaults can't be cron-triggered — force the trigger off.
+  useEffect(() => { if (obsidianLocalSelected && triggerMode !== 'none') setTriggerMode('none') }, [obsidianLocalSelected, triggerMode])
+
+  // List notes when an Obsidian vault is selected.
+  useEffect(() => {
+    if (selectedProvider !== 'obsidian' || !obsidianVaultId) return
+    const vault = obsidianVaults.find((v) => v.id === obsidianVaultId)
+    if (!vault) return
+    void (async () => {
+      setObsidianLoadingNotes(true)
+      setObsidianNotesError(null)
+      setObsidianSelected(new Set())
+      try {
+        if (vault.kind === 'local') {
+          const handle = await getLocalVaultHandle(vault.id)
+          if (!handle) throw new Error('This local vault is no longer available in this browser.')
+          const granted = await ensureReadPermission(handle)
+          if (!granted) throw new Error('Read permission was denied for this folder.')
+          const md = await listVaultMarkdown(handle)
+          setObsidianNotes(md.map((m) => ({ path: m.relPath, name: m.name })))
+        } else if (vault.kind === 'folder') {
+          const { data } = await api.get(`/connectors/obsidian/folder-vaults/${vault.id}/files`)
+          setObsidianNotes((data.files || []).map((f: { path: string; basename: string }) => ({ path: f.path, name: f.basename })))
+        } else {
+          const { data } = await api.get(`/connectors/obsidian/files?vaultId=${vault.id}`)
+          setObsidianNotes((data.files || []).map((f: { path: string; basename: string }) => ({ path: f.path, name: f.basename })))
+        }
+      } catch (err: unknown) {
+        setObsidianNotes([])
+        setObsidianNotesError(err instanceof Error ? err.message : 'Failed to list notes')
+      } finally {
+        setObsidianLoadingNotes(false)
+      }
+    })()
+  }, [selectedProvider, obsidianVaultId, obsidianVaults])
 
   // Sources tab always available (web crawler works without OAuth)
 
@@ -180,6 +276,7 @@ export function KexPage() {
         connectorId: selectedSource, fileIds: Array.from(driveSelected),
         ontologyId: selectedOntologyId || undefined, discoveryMode,
         compilationId: autoFuseTarget || undefined, forceSingleGraphs: forceSingleGraphs || undefined,
+        classificationLevelId: classificationLevelId || undefined,
       })
       setDriveSelected(new Set()); setRefetchKey((k) => k + 1)
       // Show status info
@@ -204,6 +301,7 @@ export function KexPage() {
         connectorId: selectedSource, folderId: currentDriveFolderId, maxDepth: 5,
         ontologyId: selectedOntologyId || undefined, discoveryMode,
         compilationId: autoFuseTarget || undefined, forceSingleGraphs: forceSingleGraphs || undefined,
+        classificationLevelId: classificationLevelId || undefined,
       })
       setRefetchKey((k) => k + 1)
       // Check if a trigger already exists for this folder
@@ -232,6 +330,79 @@ export function KexPage() {
     } finally { setDriveSyncing(false) }
   }
 
+  // ── Obsidian extraction ──
+  const handleObsidianExtract = async () => {
+    const vault = obsidianVaults.find((v) => v.id === obsidianVaultId)
+    if (!vault || obsidianSelected.size === 0) return
+    const paths = Array.from(obsidianSelected)
+    setDriveSyncing(true); setSubmitError(null); setStatusInfo(null)
+    try {
+      if (vault.kind === 'local') {
+        // Browser-driven: read each note from the directory handle and POST to /kex/extract.
+        const handle = await getLocalVaultHandle(vault.id)
+        if (!handle) throw new Error('This local vault is no longer available in this browser.')
+        if (!(await ensureReadPermission(handle))) throw new Error('Read permission denied.')
+        const byPath = new Map((await listVaultMarkdown(handle)).map((m) => [m.relPath, m]))
+        let sent = 0, skipped = 0, done = 0
+        setObsidianProgress({ done: 0, total: paths.length })
+        const queue = [...paths]
+        const worker = async () => {
+          for (;;) {
+            const p = queue.shift()
+            if (!p) break
+            const entry = byPath.get(p)
+            try {
+              if (!entry) { skipped++; continue }
+              const file = await entry.fileHandle.getFile()
+              const raw = await file.text()
+              const body = `# ${entry.name}\n\n${raw}`.trim()
+              if (body.replace(/\s+/g, '').length < 10) { skipped++; continue }
+              await api.post('/kex/extract', {
+                text: body,
+                ontologyId: selectedOntologyId || undefined,
+                discoveryMode,
+                classificationLevelId: classificationLevelId || undefined,
+                // Traceable origin: vault label + the note's path within the vault.
+                sourceRef: `Obsidian (${vault.label}) / ${p}`,
+              })
+              sent++
+            } catch { skipped++ }
+            finally { done++; setObsidianProgress({ done, total: paths.length }) }
+          }
+        }
+        await Promise.all([worker(), worker(), worker()])
+        setObsidianProgress(null)
+        setObsidianSelected(new Set())
+        setRefetchKey((k) => k + 1); refreshBalance()
+        setStatusInfo(`${sent} note${sent !== 1 ? 's' : ''} sent for extraction${skipped > 0 ? `, ${skipped} skipped` : ''}. Track them in Your Extractions.`)
+        // Local vaults can't be cron-triggered — no maybeCreateTrigger here.
+      } else if (vault.kind === 'folder') {
+        const { data } = await api.post(`/connectors/obsidian/folder-vaults/${vault.id}/sync`, {
+          paths,
+          ontologyId: selectedOntologyId || undefined, discoveryMode,
+          compilationId: autoFuseTarget || undefined, forceSingleGraphs: forceSingleGraphs || undefined,
+          classificationLevelId: classificationLevelId || undefined,
+        })
+        setObsidianSelected(new Set()); setRefetchKey((k) => k + 1); refreshBalance()
+        setStatusInfo(`${data.synced ?? paths.length} note${(data.synced ?? paths.length) !== 1 ? 's' : ''} sent for extraction.`)
+        await maybeCreateTrigger(`Obsidian: ${vault.label}`, { vaultId: vault.id, kind: 'folder', paths })
+      } else {
+        const { data } = await api.post('/connectors/obsidian/sync', {
+          vaultId: vault.id, paths,
+          ontologyId: selectedOntologyId || undefined, discoveryMode,
+          compilationId: autoFuseTarget || undefined, forceSingleGraphs: forceSingleGraphs || undefined,
+          classificationLevelId: classificationLevelId || undefined,
+        })
+        setObsidianSelected(new Set()); setRefetchKey((k) => k + 1); refreshBalance()
+        setStatusInfo(`${data.synced ?? paths.length} note${(data.synced ?? paths.length) !== 1 ? 's' : ''} sent for extraction.`)
+        await maybeCreateTrigger(`Obsidian: ${vault.label}`, { vaultId: vault.id, kind: 'rest', paths })
+      }
+    } catch (err: unknown) {
+      setObsidianProgress(null)
+      setSubmitError(err instanceof Error ? err.message : 'Obsidian extraction failed')
+    } finally { setDriveSyncing(false) }
+  }
+
   // Dropzone
   const onDrop = useCallback((accepted: File[]) => { if (accepted[0]) setSelectedFile(accepted[0]) }, [])
   const { getRootProps, getInputProps, isDragActive, fileRejections } = useDropzone({ onDrop, accept: ACCEPTED_TYPES, maxFiles: 1 })
@@ -245,14 +416,17 @@ export function KexPage() {
     if (activeTab === 'upload' && selectedFile) {
       const fd = new FormData(); fd.append('file', selectedFile)
       if (selectedOntologyId) { fd.append('ontologyId', selectedOntologyId); fd.append('discoveryMode', discoveryMode) }
+      if (classificationLevelId) fd.append('classificationLevelId', classificationLevelId)
       uploadMutation.mutate(fd)
     } else if (activeTab === 'url' && url) {
-      extractMutation.mutate({ data: { text: url, ontologyId: selectedOntologyId || undefined, discoveryMode } })
+      extractMutation.mutate({ data: { text: url, ontologyId: selectedOntologyId || undefined, discoveryMode, classificationLevelId: classificationLevelId || undefined } })
     } else if (activeTab === 'text' && text) {
-      extractMutation.mutate({ data: { text, ontologyId: selectedOntologyId || undefined, discoveryMode } })
-    } else if (activeTab === 'sources' && driveSelected.size > 0) {
+      extractMutation.mutate({ data: { text, ontologyId: selectedOntologyId || undefined, discoveryMode, classificationLevelId: classificationLevelId || undefined } })
+    } else if (activeTab === 'sources' && selectedProvider === 'obsidian' && obsidianSelected.size > 0) {
+      void handleObsidianExtract()
+    } else if (activeTab === 'sources' && selectedProvider !== 'obsidian' && driveSelected.size > 0) {
       void handleDriveExtractSelected()
-    } else if (activeTab === 'sources' && driveSelected.size === 0 && currentDriveFolderId !== 'root') {
+    } else if (activeTab === 'sources' && selectedProvider === 'google' && driveSelected.size === 0 && currentDriveFolderId !== 'root') {
       void handleDriveSyncFolder()
     } else if (activeTab === 'sources' && selectedProvider === 'webcrawler' && url.trim()) {
       // Web crawler extraction
@@ -282,6 +456,11 @@ export function KexPage() {
     if (isSubmitting) return 'Extracting...'
     if (activeTab === 'sources') {
       if (selectedProvider === 'webcrawler') return url.trim() ? 'Crawl & Extract Website' : 'Enter a URL to crawl'
+      if (selectedProvider === 'obsidian') {
+        if (obsidianSelected.size === 1) return 'Extract 1 note'
+        if (obsidianSelected.size > 1) return `Extract ${obsidianSelected.size} notes`
+        return obsidianVaultId ? 'Select notes to extract' : 'Select a vault'
+      }
       if (driveSelected.size === 1) return 'Extract Knowledge from File'
       if (driveSelected.size > 1) return `Extract Knowledge from ${driveSelected.size} Files`
       if (currentDriveFolderId !== 'root') return 'Extract Knowledge from Folder'
@@ -297,7 +476,8 @@ export function KexPage() {
     (activeTab === 'upload' && !!selectedFile) ||
     (activeTab === 'url' && !!url.trim()) ||
     (activeTab === 'text' && !!text.trim()) ||
-    (activeTab === 'sources' && (driveSelected.size > 0 || currentDriveFolderId !== 'root' || (selectedProvider === 'webcrawler' && !!url.trim())))
+    (activeTab === 'sources' && selectedProvider === 'obsidian' && obsidianSelected.size > 0) ||
+    (activeTab === 'sources' && selectedProvider !== 'obsidian' && (driveSelected.size > 0 || (selectedProvider === 'google' && currentDriveFolderId !== 'root') || (selectedProvider === 'webcrawler' && !!url.trim())))
 
   const tabs: { id: Tab; label: string; icon: LucideIcon }[] = [
     { id: 'sources' as Tab, label: 'Sources', icon: Plug },
@@ -404,6 +584,48 @@ export function KexPage() {
                     <p className="text-[10px] text-slate-500">Extract from any URL recursively</p>
                   </div>
                 </button>
+                {/* Google Drive — configure tile if not connected */}
+                {!connectedSources.some((s) => s.provider === 'google') && (
+                  <a href="/drive"
+                    className="flex items-center gap-3 rounded-lg border border-dashed border-slate-700 bg-slate-800/20 px-3 py-2.5 text-left hover:border-emerald-500/40 hover:bg-emerald-500/5 transition-colors">
+                    <HardDrive size={13} className="text-slate-500" />
+                    <div>
+                      <p className="text-xs font-medium text-slate-400">Google Drive</p>
+                      <p className="text-[10px] text-emerald-400/70">Connect →</p>
+                    </div>
+                  </a>
+                )}
+                {/* SharePoint — configure tile if not connected */}
+                {!connectedSources.some((s) => s.provider === 'microsoft' || s.provider === 'sharepoint') && (
+                  <a href="/sharepoint"
+                    className="flex items-center gap-3 rounded-lg border border-dashed border-slate-700 bg-slate-800/20 px-3 py-2.5 text-left hover:border-blue-500/40 hover:bg-blue-500/5 transition-colors">
+                    <Building2 size={13} className="text-slate-500" />
+                    <div>
+                      <p className="text-xs font-medium text-slate-400">SharePoint</p>
+                      <p className="text-[10px] text-blue-400/70">Connect →</p>
+                    </div>
+                  </a>
+                )}
+                {/* Obsidian — real source tile when vaults exist, else a "Connect" link */}
+                {obsidianVaults.length > 0 ? (
+                  <button onClick={() => { setSelectedSource('obsidian'); setSelectedProvider('obsidian'); setDriveSelected(new Set()); setObsidianVaultId(obsidianVaults[0]?.id ?? null); setObsidianSelected(new Set()) }}
+                    className="flex items-center gap-3 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2.5 text-left hover:border-slate-600 transition-colors">
+                    <BookMarked size={13} className="text-violet-400" />
+                    <div>
+                      <p className="text-xs font-medium text-slate-200">Obsidian</p>
+                      <p className="text-[10px] text-slate-500">{obsidianVaults.length} vault{obsidianVaults.length !== 1 ? 's' : ''}</p>
+                    </div>
+                  </button>
+                ) : (
+                  <a href="/obsidian"
+                    className="flex items-center gap-3 rounded-lg border border-dashed border-slate-700 bg-slate-800/20 px-3 py-2.5 text-left hover:border-violet-500/40 hover:bg-violet-500/5 transition-colors">
+                    <BookMarked size={13} className="text-slate-500" />
+                    <div>
+                      <p className="text-xs font-medium text-slate-400">Obsidian</p>
+                      <p className="text-[10px] text-violet-400/70">Connect →</p>
+                    </div>
+                  </a>
+                )}
               </div>
             ) : selectedProvider === 'webcrawler' ? (
               /* ── Web Crawler inline form ─────────────── */
@@ -488,6 +710,84 @@ export function KexPage() {
                   )}
                 </div>
               </div>
+            ) : selectedProvider === 'obsidian' ? (
+              <div className="space-y-2">
+                {/* Vault selector */}
+                <div className="flex items-center gap-2">
+                  <button onClick={() => { setSelectedSource(null); setSelectedProvider(null); setObsidianVaultId(null); setObsidianNotes([]); setObsidianSelected(new Set()) }} className="rounded p-0.5 text-slate-500 hover:bg-slate-800 hover:text-slate-300"><X size={12} /></button>
+                  <BookMarked size={12} className="shrink-0 text-violet-400" />
+                  <select
+                    value={obsidianVaultId || ''}
+                    onChange={(e) => { setObsidianVaultId(e.target.value || null); setObsidianSelected(new Set()) }}
+                    className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 focus:border-indigo-500 focus:outline-none"
+                  >
+                    {obsidianVaults.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.label} — {v.kind === 'local' ? 'Local drive' : v.kind === 'folder' ? 'Server folder' : 'REST API'}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="relative">
+                    <Search size={9} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500" />
+                    <input type="text" value={obsidianSearch} onChange={(e) => setObsidianSearch(e.target.value)} placeholder="Search..." className="w-32 rounded border border-slate-700 bg-slate-800 py-1 pl-5 pr-2 text-[10px] text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none" />
+                  </div>
+                </div>
+
+                {/* Local-vault trigger caveat */}
+                {selectedObsidianVault?.kind === 'local' && (
+                  <p className="text-[10px] text-amber-400/80">Scheduled triggers need a server-mounted or REST vault.</p>
+                )}
+
+                {/* Select all */}
+                {(() => {
+                  const filtered = obsidianSearch
+                    ? obsidianNotes.filter((n) => n.name.toLowerCase().includes(obsidianSearch.toLowerCase()) || n.path.toLowerCase().includes(obsidianSearch.toLowerCase()))
+                    : obsidianNotes
+                  return (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => setObsidianSelected(new Set(filtered.map((n) => n.path)))} className="text-[10px] text-indigo-400 hover:text-indigo-300">Select all</button>
+                        {obsidianSelected.size > 0 && <span className="text-[10px] text-slate-500">{obsidianSelected.size} selected</span>}
+                      </div>
+
+                      {/* Note list */}
+                      <div className="max-h-52 overflow-y-auto rounded border border-slate-800">
+                        {obsidianLoadingNotes ? (
+                          <div className="flex items-center justify-center py-6"><Loader2 size={14} className="animate-spin text-slate-500" /></div>
+                        ) : obsidianNotesError ? (
+                          <p className="py-4 px-3 text-center text-[10px] text-red-400">{obsidianNotesError}</p>
+                        ) : filtered.length === 0 ? (
+                          <p className="py-4 text-center text-[10px] text-slate-500">{obsidianSearch ? 'No matches' : 'No notes in this vault'}</p>
+                        ) : (
+                          <div className="divide-y divide-slate-800/50">
+                            {filtered.map((n) => {
+                              const sel = obsidianSelected.has(n.path)
+                              return (
+                                <div key={n.path} onClick={() => setObsidianSelected((prev) => { const next = new Set(prev); if (next.has(n.path)) next.delete(n.path); else next.add(n.path); return next })} className={cn('flex cursor-pointer items-center gap-2 px-3 py-1.5 hover:bg-slate-800/50', sel && 'bg-indigo-950/30')}>
+                                  {sel ? <CheckSquare size={11} className="shrink-0 text-indigo-400" /> : <Square size={11} className="shrink-0 text-slate-600" />}
+                                  <FileText size={11} className="shrink-0 text-slate-400" />
+                                  <span className="min-w-0 flex-1 truncate text-[11px] text-slate-300">{n.name}</span>
+                                  <span className="shrink-0 truncate text-[9px] text-slate-600">{n.path}</span>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )
+                })()}
+
+                {/* Local extraction progress */}
+                {obsidianProgress && (
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 text-[10px] text-slate-400"><Loader2 size={11} className="animate-spin text-indigo-400" /> Extracting… {obsidianProgress.done}/{obsidianProgress.total}</div>
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                      <div className="h-full bg-indigo-500 transition-all" style={{ width: `${obsidianProgress.total ? (obsidianProgress.done / obsidianProgress.total) * 100 : 0}%` }} />
+                    </div>
+                  </div>
+                )}
+              </div>
             ) : (
               <p className="text-xs text-slate-500">Browser for "{selectedProvider}" coming soon.</p>
             )}
@@ -530,7 +830,7 @@ export function KexPage() {
               <span className="w-24 shrink-0 pt-1 text-[11px] text-slate-400">Trigger</span>
               <div className="flex-1 space-y-1.5">
                 <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-0.5 rounded bg-slate-800/50 p-0.5">
+                  <div className={cn('flex items-center gap-0.5 rounded bg-slate-800/50 p-0.5', obsidianLocalSelected && 'opacity-40 pointer-events-none')}>
                     <button onClick={() => setTriggerMode('none')} className={cn('rounded px-2.5 py-1 text-[10px] font-medium transition-colors', triggerMode === 'none' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300')}>None</button>
                     <button onClick={() => setTriggerMode('cron')} className={cn('rounded px-2.5 py-1 text-[10px] font-medium transition-colors', triggerMode === 'cron' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300')}>Schedule</button>
                     {activeTab === 'sources' && (
@@ -538,7 +838,7 @@ export function KexPage() {
                     )}
                   </div>
                   <span className="text-[10px] text-slate-600">
-                    {triggerMode === 'none' ? 'One-time extraction' : triggerMode === 'cron' ? 'Re-extract on a fixed schedule' : 'Re-checks on every heartbeat tick'}
+                    {obsidianLocalSelected ? 'Scheduled triggers need a server-mounted or REST vault.' : triggerMode === 'none' ? 'One-time extraction' : triggerMode === 'cron' ? 'Re-extract on a fixed schedule' : 'Re-checks on every heartbeat tick'}
                   </span>
                 </div>
                 {triggerMode === 'cron' && (
@@ -583,6 +883,24 @@ export function KexPage() {
                     <span className="text-[10px] text-slate-500">Force single graphs — each file gets its own graph instead of merging into one</span>
                   </label>
                 )}
+              </div>
+            </div>
+            {/* Classification */}
+            <div className="flex items-center gap-3">
+              <span className="w-24 shrink-0 text-[11px] text-slate-400">Classification</span>
+              <div className="relative flex items-center gap-2">
+                <select value={classificationLevelId || ''} onChange={(e) => setClassificationLevelId(e.target.value || null)}
+                  className="w-44 appearance-none rounded border border-slate-700 bg-slate-800 px-2 py-1 pr-6 text-[10px] text-slate-300 focus:border-indigo-500 focus:outline-none">
+                  <option value="">Auto-detect</option>
+                  {(classificationData?.levels ?? []).map((l) => (
+                    <option key={l.id} value={l.id}>{l.display_name}</option>
+                  ))}
+                </select>
+                <ChevronDown size={9} className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-500" />
+                {classificationLevelId && (() => {
+                  const level = (classificationData?.levels ?? []).find(l => l.id === classificationLevelId)
+                  return level ? <span className="h-3 w-3 rounded-full" style={{ backgroundColor: level.color }} /> : null
+                })()}
               </div>
             </div>
           </div>

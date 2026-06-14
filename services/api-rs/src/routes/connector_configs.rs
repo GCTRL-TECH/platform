@@ -23,7 +23,7 @@
 
 use axum::{
     extract::{Extension, Path, State},
-    routing::{delete, get, put},
+    routing::{get},
     Json, Router,
 };
 use serde::Deserialize;
@@ -121,7 +121,8 @@ pub async fn lookup_credentials(
     .await?;
     Ok(row.and_then(|(id, secret, active)| {
         if active && !id.is_empty() && !secret.is_empty() {
-            Some((id, secret))
+            // Decrypt the at-rest secret for use (legacy plaintext passes through).
+            Some((id, crate::services::crypto::open(&secret)))
         } else {
             None
         }
@@ -181,7 +182,7 @@ async fn list_providers(
                 "configured":   configured,
                 // Mask the secret if present
                 "clientId":     row.map(|r| r.client_id.clone()).unwrap_or_default(),
-                "clientSecretMasked": row.map(|r| mask_secret(&r.client_secret)).unwrap_or_default(),
+                "clientSecretMasked": row.map(|r| mask_secret(&crate::services::crypto::open(&r.client_secret))).unwrap_or_default(),
                 "updatedAt":    row.map(|r| r.updated_at.to_rfc3339()),
             })
         })
@@ -227,7 +228,7 @@ async fn get_provider(
     Ok(Json(json!({
         "provider":           row.provider,
         "clientId":           row.client_id,
-        "clientSecretMasked": mask_secret(&row.client_secret),
+        "clientSecretMasked": mask_secret(&crate::services::crypto::open(&row.client_secret)),
         "configured":         row.is_active && !row.client_secret.is_empty(),
         "updatedAt":          row.updated_at.to_rfc3339(),
     })))
@@ -256,10 +257,11 @@ async fn upsert_provider(
         ));
     }
 
-    // TODO(security): wrap client_secret in pgcrypto's pgp_sym_encrypt() before
-    // public release. For v1 the value is plaintext — fine for self-hosted dev,
-    // not fine for a managed offering.
+    // client_secret is encrypted at rest via application-level AES-256-GCM
+    // (see services/crypto.rs). Stored as `v1:<nonce>:<ciphertext>`; decrypted
+    // on read by `lookup_credentials` and masked on GET.
     let caller: Uuid = claims.sub;
+    let client_secret_sealed = crate::services::crypto::seal(req.client_secret.trim());
     sqlx::query(
         "INSERT INTO connector_configs (provider, client_id, client_secret, updated_by)
          VALUES ($1, $2, $3, $4)
@@ -272,7 +274,7 @@ async fn upsert_provider(
     )
     .bind(&provider)
     .bind(req.client_id.trim())
-    .bind(req.client_secret.trim())
+    .bind(&client_secret_sealed)
     .bind(caller)
     .execute(&state.db)
     .await?;

@@ -22,7 +22,7 @@ jsonwebtoken    = "9"
 bcrypt          = "0.15"
 redis           = { version = "0.25", features = ["tokio-comp", "aio"] }
 neo4rs          = "0.7"
-reqwest         = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest         = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 dotenvy         = "0.15"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -31,6 +31,12 @@ bytes           = "1"
 base64          = "0.22"
 futures         = "0.3"
 async-stream    = "0.3"
+sha2            = "0.10"
+hmac            = "0.12"
+hex             = "0.4"
+url             = "2"
+aes-gcm         = "0.10"
+rand            = "0.8"
 
 [profile.release]
 opt-level = 3

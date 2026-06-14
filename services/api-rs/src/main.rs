@@ -19,8 +19,18 @@ async fn main() {
         .init();
 
     let cfg   = Arc::new(config::Config::from_env());
+
+    // Initialise the at-rest encryption key (GCTRL_SECRET_KEY, or stable dev key
+    // derived from JWT_SECRET) before anything reads/writes sealed secrets.
+    services::crypto::init(&cfg.jwt_secret);
+
     let db    = db::connect(&cfg.database_url).await;
     sqlx::migrate!().run(&db).await.expect("DB migrations failed");
+
+    // Encrypt any legacy plaintext secrets in place (idempotent — skips v1:* rows).
+    services::crypto::backfill_encrypt_secrets(&db).await;
+    // Ensure the system 'gctrl-memory' skill is present/current (single source).
+    routes::agent::ensure_system_skills(&db).await;
     let neo   = services::neo4j::connect(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password).await;
     let redis = services::redis::connect(&cfg.redis_url).await;
 
@@ -40,7 +50,7 @@ fn build_router(state: Arc<models::AppState>) -> Router {
     use crate::middleware::auth::{require_auth, optional_auth};
 
     let protected = Router::new()
-        .nest("/api/users",       routes::users::router())
+        .nest("/api/users",       routes::users::router().merge(routes::api_keys::router()))
         .nest("/api/kex",         routes::kex::router())
         .nest("/api/fuse",        routes::fuse::router())
         .nest("/api/kg",          routes::kg::router())
@@ -49,7 +59,18 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/update",      routes::update::router())
         .nest("/api/connectors",  routes::connectors::router()
                                         .merge(routes::connector_configs::router()))
-        .nest("/api/ontologies",  routes::ontologies::router())
+        .nest("/api/ontologies",      routes::ontologies::router())
+        .nest("/api/agent",           routes::agent::router().merge(routes::agent_gateway::router()))
+        .nest("/api/skills",          routes::skills::router())
+        .nest("/api/llm",             routes::llm::router())
+        .nest("/api/classification",  routes::classification::router())
+        .nest("/api/audit",           routes::audit::router())
+        .nest("/api/auth/sso",        routes::sso::protected_router())
+        .nest("/api/webhooks",        routes::webhooks::router())
+        .nest("/api/triggers",        routes::triggers::router())
+        .nest("/api/infra",           routes::infra::router())
+        .nest("/api/memory",          routes::memory::router())
+        .nest("/api/user",            routes::profile::router())
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let optional = Router::new()
@@ -58,7 +79,10 @@ fn build_router(state: Arc<models::AppState>) -> Router {
 
     Router::new()
         .nest("/api/health", routes::health::router())
+        .nest("/api/config", routes::config::router())
         .nest("/api/auth",   routes::auth::router())
+        .nest("/api/auth/sso", routes::sso::public_router())
+        .nest("/api/scim",   routes::sso::scim_router())
         .nest("/api/setup",  routes::setup::router())
         .merge(routes::connectors::public_router())
         .merge(protected)

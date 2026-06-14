@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Zap,
@@ -10,6 +10,9 @@ import {
   Plug,
   Globe,
   ArrowRight,
+  Brain,
+  Server,
+  Loader2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
@@ -17,12 +20,13 @@ import { useAuth } from '@/hooks/useAuth'
 
 const STEPS = [
   { id: 'welcome', title: 'Welcome', icon: Zap },
+  { id: 'model', title: 'Connect AI', icon: Brain },
   { id: 'source', title: 'Add a Source', icon: Upload },
   { id: 'extract', title: 'First Extraction', icon: Database },
   { id: 'chat', title: 'Talk to Your Data', icon: MessageSquare },
 ]
 
-type StepId = 'welcome' | 'source' | 'extract' | 'chat'
+type StepId = 'welcome' | 'model' | 'source' | 'extract' | 'chat'
 
 export default function OnboardingWizard() {
   const navigate = useNavigate()
@@ -34,6 +38,60 @@ export default function OnboardingWizard() {
   const [extracting, setExtracting] = useState(false)
   const [extracted, setExtracted] = useState(false)
   const [_jobId, setJobId] = useState<string | null>(null)
+
+  // ── LLM connection gate ──────────────────────────────────────────────
+  // GCTRL is agent-first: the user must connect at least one LLM provider
+  // before continuing past the "Connect AI" step.
+  const [llmConnected, setLlmConnected] = useState<boolean | null>(null)
+  const [checkingLlm, setCheckingLlm] = useState(false)
+  const [connectingOllama, setConnectingOllama] = useState(false)
+
+  const checkLlm = useCallback(async () => {
+    setCheckingLlm(true)
+    try {
+      // Connected if any provider reports connected, OR any model is returned.
+      const [provRes, modelRes] = await Promise.allSettled([
+        api.get('/llm/providers'),
+        api.get('/llm/models'),
+      ])
+      let connected = false
+      if (provRes.status === 'fulfilled') {
+        const providers = (provRes.value.data?.providers ?? []) as Array<{ connected?: boolean }>
+        connected = providers.some((p) => p.connected)
+      }
+      if (!connected && modelRes.status === 'fulfilled') {
+        const models = (modelRes.value.data?.models ?? []) as Array<{ available?: boolean }>
+        connected = models.some((m) => m.available !== false)
+      }
+      setLlmConnected(connected)
+    } catch {
+      setLlmConnected(false)
+    } finally {
+      setCheckingLlm(false)
+    }
+  }, [])
+
+  // Re-check whenever the model step regains focus (e.g. returning from
+  // Settings) and on initial mount of that step.
+  useEffect(() => {
+    if (currentStep !== 'model') return
+    void checkLlm()
+    const onFocus = () => { void checkLlm() }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [currentStep, checkLlm])
+
+  async function handleUseOllama() {
+    setConnectingOllama(true)
+    try {
+      await api.put('/llm/providers', { provider: 'ollama' })
+      await checkLlm()
+    } catch {
+      setLlmConnected(false)
+    } finally {
+      setConnectingOllama(false)
+    }
+  }
 
   const stepIndex = STEPS.findIndex((s) => s.id === currentStep)
 
@@ -121,9 +179,81 @@ export default function OnboardingWizard() {
                   </div>
                 ))}
               </div>
-              <button onClick={() => setCurrentStep('source')} className="btn-primary mx-auto">
+              <button onClick={() => setCurrentStep('model')} className="btn-primary mx-auto">
                 Get Started <ArrowRight size={14} />
               </button>
+            </div>
+          )}
+
+          {/* ── Connect AI Model ───────────────────────── */}
+          {currentStep === 'model' && (
+            <div className="space-y-6">
+              <div className="text-center">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
+                  <Brain size={32} className="text-indigo-400" />
+                </div>
+                <h2 className="mt-4 text-xl font-bold text-slate-100">Connect Your AI Model</h2>
+                <p className="mx-auto mt-2 max-w-md text-sm text-slate-400">
+                  GCTRL runs on an LLM — connect one to use extraction chat, Talk-to-Graph,
+                  and the in-app agent. Pick a cloud provider or run locally with Ollama.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <button
+                  onClick={() => {
+                    // Deep-link to the AI Models settings tab. Mark onboarding
+                    // continuable — the gate re-checks on window focus / return.
+                    navigate('/settings?tab=models')
+                  }}
+                  className="btn-primary w-full justify-center"
+                >
+                  <Brain size={14} /> Open AI Model settings
+                </button>
+
+                <button
+                  onClick={() => void handleUseOllama()}
+                  disabled={connectingOllama}
+                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 py-2.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700 disabled:opacity-50"
+                >
+                  {connectingOllama ? <Loader2 size={14} className="animate-spin" /> : <Server size={14} />}
+                  Use local Ollama
+                </button>
+              </div>
+
+              {/* Connection status / gate hint */}
+              <div className="flex items-center justify-center gap-2 text-xs">
+                {checkingLlm ? (
+                  <span className="flex items-center gap-1.5 text-slate-500">
+                    <Loader2 size={12} className="animate-spin" /> Checking connection…
+                  </span>
+                ) : llmConnected ? (
+                  <span className="flex items-center gap-1.5 text-emerald-400">
+                    <Check size={12} /> AI model connected
+                  </span>
+                ) : (
+                  <span className="text-slate-500">No model connected yet</span>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between pt-2">
+                <button onClick={() => setCurrentStep('welcome')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <div className="flex items-center gap-4">
+                  <button
+                    onClick={handleSkip}
+                    className="text-xs text-slate-500 hover:text-slate-300"
+                  >
+                    Skip for now
+                  </button>
+                  <button
+                    onClick={() => setCurrentStep('source')}
+                    disabled={!llmConnected}
+                    className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Continue <ArrowRight size={14} />
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -153,7 +283,7 @@ export default function OnboardingWizard() {
                 ))}
               </div>
               <div className="flex justify-between pt-2">
-                <button onClick={() => setCurrentStep('welcome')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <button onClick={() => setCurrentStep('model')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
                 <button onClick={() => setCurrentStep('extract')} className="text-xs text-indigo-400 hover:text-indigo-300">Skip — use sample text</button>
               </div>
             </div>

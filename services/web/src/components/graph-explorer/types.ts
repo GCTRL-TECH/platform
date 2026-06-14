@@ -19,11 +19,21 @@ export interface GraphEdge {
   source: string
   target: string
   type: string
+  /** Per-edge extraction confidence (0..1), written by KEX relex. May be null
+   *  for edges from sources that predate confidence scoring or for manual edges. */
+  confidence?: number | null
 }
 
 export interface GraphData {
   nodes: GraphNode[]
   edges: GraphEdge[]
+  /** TRUE total node count in scope (not just the returned subset). Present on
+   *  the /graph endpoint; optional because neighbor-merge responses omit it. */
+  nodeCount?: number
+  /** TRUE total edge count in scope. */
+  edgeCount?: number
+  /** True when the returned nodes/edges are a degree-ordered subset of the whole. */
+  truncated?: boolean
 }
 
 // react-force-graph mutates simulation fields onto node objects in place.
@@ -40,6 +50,9 @@ export interface FGLink {
   source: string | FGNode
   target: string | FGNode
   type: string
+  /** Per-edge confidence (0..1) carried through so the canvas can encode it as
+   *  edge width/opacity. Undefined/null → rendered at a neutral baseline. */
+  confidence?: number | null
 }
 
 export interface FGData {
@@ -63,6 +76,7 @@ export interface EntityDetail {
   chunkCount: number
   lastSourceJob?: {
     id: string
+    type?: string
     source?: string
     createdAt?: string
   } | null
@@ -79,7 +93,9 @@ export interface ChunkRecord {
   sourceJobId?: string
   source?: string
   createdAt?: string
-  entityMentions?: string[]
+  // The backend returns objects ({text,label,type,…}), not strings — callers must
+  // normalize to a display name before rendering. Typed loosely on purpose.
+  entityMentions?: Array<string | { text?: string; name?: string; label?: string }>
 }
 
 export interface ChunksResponse {

@@ -44,7 +44,7 @@ Add to your Claude Code MCP settings (`.claude/settings.json` or via `/mcp add`)
   "mcpServers": {
     "gctrl": {
       "command": "node",
-      "args": ["d:/N8N/Projekte/Databorg/borghive/services/mcp/dist/index.js"],
+      "args": ["/path/to/gctrl/services/mcp/dist/index.js"],
       "env": {
         "GCTRL_API_URL": "http://localhost:4000/api",
         "GCTRL_API_TOKEN": "<your-jwt-token>"

@@ -71,9 +71,21 @@ class ResolverClient:
             logger.warning(f"resolver submit error: {exc}")
             return None
 
+    # Adaptive poll cadence. LIMES itself returns sub-second on small/medium
+    # jobs, so a flat 2 s poll made wall-clock IDLE-DOMINATED (one ~0.3 s merge
+    # paid a full 2 s of polling latency). We poll TIGHT at first (150 ms) and
+    # back off GENTLY (×1.5) up to a 1 s ceiling for genuinely long jobs, so
+    # short jobs return in ~one tight interval and long jobs don't hammer the
+    # resolver. Total wall is still capped at ``max_wait`` seconds.
+    POLL_START_S = 0.15
+    POLL_MAX_S = 1.0
+    POLL_BACKOFF = 1.5
+
     def wait_for_completion(self, request_id: str, max_wait: int = 120) -> bool:
-        """Poll /status/{id} until done. Returns True if completed."""
-        for _ in range(max_wait // 2):
+        """Poll /status/{id} until done, with adaptive backoff. Returns True if completed."""
+        deadline = time.monotonic() + max_wait
+        interval = self.POLL_START_S
+        while time.monotonic() < deadline:
             try:
                 resp = requests.get(f"{self.base_url}/status/{request_id}", timeout=10)
                 if resp.status_code == 200:
@@ -89,12 +101,27 @@ class ResolverClient:
                     # code 0 (queued) or 1 (running) — keep waiting
             except Exception:
                 pass
-            time.sleep(2)
+            # Don't oversleep past the deadline.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
+            interval = min(interval * self.POLL_BACKOFF, self.POLL_MAX_S)
         logger.warning(f"resolver job {request_id} timed out after {max_wait}s")
         return False
 
-    def get_results(self, request_id: str) -> list[dict]:
-        """Download result files and parse N3 triples."""
+    def get_results(self, request_id: str, accepted_only: bool = True) -> list[dict]:
+        """Download result files and parse N3 triples.
+
+        LIMES writes TWO files: ``accepted.nt`` (similarity ≥ acceptance
+        threshold — confident auto-matches) and ``review.nt`` (similarity in the
+        [review, acceptance) band — flagged for HUMAN verification, NOT confident
+        matches). Treating both as confident sameAs is what produced the
+        false-positive merges on DBLP-ACM. By default we return ONLY the accepted
+        links for auto-merge; review-band links are parsed but tagged
+        ``method='resolver_review'`` and only included when ``accepted_only`` is
+        False (so a caller can surface them for review without auto-merging).
+        """
         try:
             resp = requests.get(f"{self.base_url}/results/{request_id}", timeout=10)
             if resp.status_code != 200:
@@ -107,12 +134,16 @@ class ResolverClient:
 
             links = []
             for filename in files:
+                is_review = "review" in filename.lower()
+                if is_review and accepted_only:
+                    continue  # skip the human-review band for auto-merge
+                method = "resolver_review" if is_review else "resolver"
                 try:
                     file_resp = requests.get(
                         f"{self.base_url}/result/{request_id}/{filename}", timeout=30
                     )
                     if file_resp.status_code == 200:
-                        links.extend(self._parse_n3(file_resp.text))
+                        links.extend(self._parse_n3(file_resp.text, method=method))
                 except Exception as exc:
                     logger.warning(f"resolver result download failed for {filename}: {exc}")
             return links
@@ -127,11 +158,31 @@ class ResolverClient:
         metric: str = "trigrams(x.name, y.name)|0.80",
         acceptance_threshold: float = 0.85,
         review_threshold: float = 0.70,
+        accepted_only: bool = False,
+        properties: list[str] | None = None,
     ) -> list[dict]:
         """
         Full flow: upload CSVs → build config → submit → wait → get results.
+
+        ``properties`` (default ``["name","type","label"]``) is the set of entity
+        attributes EXPORTED as CSV columns and declared as LIMES PROPERTY fields.
+        For ATTRIBUTE-AWARE (per-field) matching the caller passes the extra
+        attribute keys (e.g. ``["name","type","title","authors","venue","year"]``)
+        AND a metric that references them (see ``config_builder.build_field_metric``).
+        ``name``/``type`` are always retained so the single-name default path and
+        type-blocking are unchanged when no extra attributes are supplied.
+
+        ``accepted_only`` (default False): the LIMES ACCEPTANCE/REVIEW split is
+        driven by the same string-similarity score the METRIC threshold already
+        gates, so for an unsupervised string metric the two bands are NOT
+        well-separated — most genuine co-references land in the review band when
+        acceptance is set conservatively (0.85). We therefore include BOTH bands
+        by default (review links tagged ``method='resolver_review'``,
+        confidence 0.75, so the merger's highest-confidence dedup still prefers an
+        accepted link on the same pair). Callers wanting a precision-first,
+        human-in-the-loop merge can pass ``accepted_only=True``.
         """
-        props = ["name", "type", "label"]
+        props = properties if properties else ["name", "type", "label"]
 
         source_csv = self._entities_to_csv(source_entities, props)
         target_csv = self._entities_to_csv(target_entities, props)
@@ -153,7 +204,7 @@ class ResolverClient:
         if not self.wait_for_completion(request_id):
             return []
 
-        return self.get_results(request_id)
+        return self.get_results(request_id, accepted_only=accepted_only)
 
     def _entities_to_csv(self, entities: list[dict], properties: list[str]) -> str:
         output = io.StringIO()
@@ -172,10 +223,31 @@ class ResolverClient:
         properties: list[str], metric: str,
         acceptance_threshold: float, review_threshold: float,
     ) -> str:
+        # CRITICAL: the LIMES server validates the config against limes.dtd with a
+        # VALIDATING parser (DocumentBuilderFactory.setValidating(true)). The DTD
+        # checker (DtdChecker) flips `valid=false` on ANY warning — and a config
+        # WITHOUT a <!DOCTYPE …> declaration triggers the warnings
+        #   "Document root element LIMES, must match DOCTYPE root null"
+        #   "no grammar found"
+        # which silently abort the ENTIRE config body. Source/Target KBInfo are
+        # then left at their construction defaults (type="sparql", var=null), so
+        # LIMES tries to run `SELECT DISTINCT null` against a non-existent SPARQL
+        # endpoint, fails, returns zero links — and the merger fell back to the
+        # O(n²) python matcher. The DOCTYPE below is what makes the REAL LIMES
+        # CSV path fire. The DTD itself is resolved from the server's classpath
+        # (/limes.dtd), so we only need the declaration, not a shipped file.
+        #
+        # DTD element ORDER for SOURCE/TARGET is a strict sequence:
+        #   ID, ENDPOINT, VAR, PAGESIZE, RESTRICTION+, PROPERTY+, TYPE*
+        # RESTRICTION+ and PROPERTY+ each require AT LEAST ONE element. We emit an
+        # empty <RESTRICTION/> (no class filter — CSV has no rdf:type) and keep
+        # TYPE last. <ENDPOINT> carries the uploadId UUID; the server rewrites it
+        # to the on-disk .csv path before CsvQueryModule reads it.
         prop_src = "\n".join(f"    <PROPERTY>{p} AS lowercase</PROPERTY>" for p in properties)
         prop_tgt = "\n".join(f"    <PROPERTY>{p} AS lowercase</PROPERTY>" for p in properties)
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE LIMES SYSTEM "limes.dtd">
 <LIMES>
   <PREFIX><NAMESPACE>http://www.w3.org/2002/07/owl#</NAMESPACE><LABEL>owl</LABEL></PREFIX>
   <SOURCE>
@@ -183,16 +255,18 @@ class ResolverClient:
     <ENDPOINT>{source_id}</ENDPOINT>
     <VAR>?x</VAR>
     <PAGESIZE>-1</PAGESIZE>
-    <TYPE>CSV</TYPE>
+    <RESTRICTION></RESTRICTION>
 {prop_src}
+    <TYPE>CSV</TYPE>
   </SOURCE>
   <TARGET>
     <ID>target</ID>
     <ENDPOINT>{target_id}</ENDPOINT>
     <VAR>?y</VAR>
     <PAGESIZE>-1</PAGESIZE>
-    <TYPE>CSV</TYPE>
+    <RESTRICTION></RESTRICTION>
 {prop_tgt}
+    <TYPE>CSV</TYPE>
   </TARGET>
   <METRIC>{metric}</METRIC>
   <ACCEPTANCE>
@@ -213,7 +287,7 @@ class ResolverClient:
   <OUTPUT>N3</OUTPUT>
 </LIMES>"""
 
-    def _parse_n3(self, text: str) -> list[dict]:
+    def _parse_n3(self, text: str, method: str = "resolver") -> list[dict]:
         links = []
         for line in text.strip().split("\n"):
             line = line.strip()
@@ -225,10 +299,10 @@ class ResolverClient:
                     "source": match.group(1),
                     "target": match.group(3),
                     "predicate": match.group(2),
-                    "confidence": 1.0,
-                    "method": "resolver",
+                    "confidence": 1.0 if method == "resolver" else 0.75,
+                    "method": method,
                 })
-        logger.info(f"resolver: parsed {len(links)} links from N3")
+        logger.info(f"resolver: parsed {len(links)} {method} links from N3")
         return links
 
 

@@ -1,0 +1,33 @@
+{
+  "name": "gctrl-agent",
+  "version": "1.0.0",
+  "title": "GCTRL Knowledge Agent (Pi)",
+  "description": "A drop-in data-engineer agent for an agent team. Ingests data, searches and reads access-controlled knowledge graphs and their source text, merges graphs, and surfaces classification conflicts — every result is automatically filtered to the calling token's clearance level and per-graph grants, so the agent can hand teammates exactly the data they're allowed to see and nothing more.",
+  "auth": {
+    "type": "access_token",
+    "header": "Authorization",
+    "scheme": "ApiKey",
+    "how_to_obtain": "Create a scoped Access Token in GCTRL → Access Control → Access Tokens. Pick a base clearance (PUBLIC/INTERNAL/CONFIDENTIAL/STRICTLY_CONFIDENTIAL) and optionally grant access to specific graphs. The token enforces least privilege server-side.",
+    "env": "GCTRL_API_TOKEN"
+  },
+  "transport": {
+    "base_url_env": "GCTRL_API_URL",
+    "base_url_default": "http://localhost:4000/api",
+    "tool_endpoint": "POST {base_url}/agent/tools/{tool}",
+    "request_body": "JSON object of the tool's args",
+    "response_body": "JSON result, already clearance-filtered",
+    "conversational_endpoint": "POST {base_url}/agent/chat (SSE) — natural-language access to the same tools"
+  },
+  "tools": [
+    { "name": "list_graphs",       "description": "List knowledge graphs the token can access.", "args": {} },
+    { "name": "search_entities",   "description": "Find entities by name (clearance-filtered).", "args": { "query": "string", "limit": "number?" } },
+    { "name": "get_entity",        "description": "Read one entity and its outgoing connections.", "args": { "name": "string" } },
+    { "name": "search_chunks",     "description": "Retrieve the source-text passages behind a question (RAG retrieval), filtered to the token's clearance. Use this to ground answers and cite sources.", "args": { "query": "string", "compilationId": "string?" } },
+    { "name": "list_conflicts",    "description": "List open classification conflicts awaiting review.", "args": {} },
+    { "name": "list_sources",      "description": "List connected data sources.", "args": {} },
+    { "name": "check_balance",     "description": "Check the account's token balance.", "args": {} },
+    { "name": "create_extraction", "description": "Ingest text into the knowledge graph at a given classification.", "args": { "text": "string", "classificationLevelId": "string?" } },
+    { "name": "fuse_graphs",       "description": "Merge graphs by their source job ids; the merge preserves each element's classification.", "args": { "name": "string", "sourceJobIds": "string[]" } }
+  ],
+  "security_model": "Access is enforced at the API, not by convention. A token with PUBLIC clearance physically cannot retrieve INTERNAL+ data through any tool, unless explicitly granted a specific graph. Every tool call is recorded in the audit trail (which token accessed what)."
+}

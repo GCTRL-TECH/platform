@@ -21,10 +21,11 @@ import {
   ChevronDown,
   CheckCircle,
   Workflow,
+  GitFork,
 } from 'lucide-react'
-import { GraphExplorer } from '@/components/GraphExplorer'
 import { format, formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
+import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
@@ -42,6 +43,7 @@ interface Compilation {
   userId: string
   sourceJobIds: string[]
   classification: Classification
+  classificationLevelId: string | null
   version: number
   cronSchedule: string | null
   cronMode: string
@@ -115,13 +117,6 @@ const CLASSIFICATION_STYLES: Record<
   CONFIDENTIAL: { badge: 'badge-yellow', label: 'Confidential' },
   RESTRICTED: { badge: 'badge-red', label: 'Restricted' },
 }
-
-const CLASSIFICATION_OPTIONS: Classification[] = [
-  'PUBLIC',
-  'INTERNAL',
-  'CONFIDENTIAL',
-  'RESTRICTED',
-]
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: 'overview', label: 'Overview', icon: Network },
@@ -403,6 +398,7 @@ function OverviewTab({
   isRefreshing: boolean
 }) {
   const cls = CLASSIFICATION_STYLES[compilation.classification]
+  const { neo4jBrowser } = usePublicConfig()
 
   return (
     <div className="space-y-5">
@@ -534,7 +530,7 @@ function OverviewTab({
           3 tokens
         </div>
         <a
-          href="http://localhost:7474"
+          href={neo4jBrowser}
           target="_blank"
           rel="noopener noreferrer"
           className="btn-ghost text-slate-500 hover:text-slate-300 ml-auto"
@@ -692,9 +688,11 @@ function AclTab({ compilation }: { compilation: Compilation }) {
   const [newUserId, setNewUserId] = useState('')
   const [newPermission, setNewPermission] = useState<Permission>('read')
   const [saveError, setSaveError] = useState<string | null>(null)
-  const [classificationOverride, setClassificationOverride] = useState<Classification>(
-    compilation.classification
+  const [levelId, setLevelId] = useState<string>(compilation.classificationLevelId ?? '')
+  const { data: levelsData } = useApiQuery<{ levels: { id: string; display_name: string; rank: number }[] }>(
+    ['classification', 'levels'], '/classification/levels',
   )
+  const levels = (levelsData?.levels ?? []).slice().sort((a, b) => a.rank - b.rank)
   const queryClient = useQueryClient()
 
   const { data: aclData, isLoading: aclLoading } = useApiQuery<AclResponse>(
@@ -755,7 +753,7 @@ function AclTab({ compilation }: { compilation: Compilation }) {
   }
 
   function handleClassificationSave() {
-    classificationMutation.mutate({ data: { classification: classificationOverride } })
+    classificationMutation.mutate({ data: { classificationLevelId: levelId } })
   }
 
   return (
@@ -769,15 +767,14 @@ function AclTab({ compilation }: { compilation: Compilation }) {
           </p>
           <div className="flex items-center gap-3">
             <select
-              value={classificationOverride}
-              onChange={(e) =>
-                setClassificationOverride(e.target.value as Classification)
-              }
+              value={levelId}
+              onChange={(e) => setLevelId(e.target.value)}
               className="input-field w-auto"
             >
-              {CLASSIFICATION_OPTIONS.map((c) => (
-                <option key={c} value={c}>
-                  {CLASSIFICATION_STYLES[c].label}
+              <option value="">— select level —</option>
+              {levels.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.display_name}
                 </option>
               ))}
             </select>
@@ -785,7 +782,8 @@ function AclTab({ compilation }: { compilation: Compilation }) {
               onClick={handleClassificationSave}
               disabled={
                 classificationMutation.isPending ||
-                classificationOverride === compilation.classification
+                !levelId ||
+                levelId === (compilation.classificationLevelId ?? '')
               }
               className="btn-secondary"
             >
@@ -1068,6 +1066,22 @@ export function KGDetailPage() {
           </div>
           <p className="mt-1 font-mono text-xs text-slate-600">{compilation.id}</p>
         </div>
+        <button
+          onClick={() => navigate(`/graphs/${compilation.id}/lineage`)}
+          className="btn-ghost shrink-0 text-slate-500 hover:text-slate-300"
+          title="View data lineage"
+        >
+          <GitFork size={15} />
+          Lineage
+        </button>
+        <button
+          onClick={() => navigate(`/graphs/${compilation.id}/workspace`)}
+          className="btn-primary shrink-0"
+          title="Open the multi-viewport graph workspace"
+        >
+          <Workflow size={15} />
+          Explore
+        </button>
       </div>
 
       {/* Refresh error */}
@@ -1111,7 +1125,22 @@ export function KGDetailPage() {
         />
       )}
       {activeTab === 'explorer' && (
-        <GraphExplorer compilationId={compilation.id} className="w-full" />
+        <div className="card flex flex-col items-center justify-center gap-3 py-16 text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-blue-500/10">
+            <Workflow size={22} className="text-blue-400" />
+          </div>
+          <div>
+            <p className="text-sm font-medium text-slate-200">Open the Graph Workspace</p>
+            <p className="mx-auto mt-1 max-w-md text-xs text-slate-500">
+              Explore this graph in a full multi-viewport workspace — navigate the graph, click any node,
+              and read the source text behind it side-by-side.
+            </p>
+          </div>
+          <button onClick={() => navigate(`/graphs/${compilation.id}/workspace`)} className="btn-primary mt-1">
+            <Workflow size={15} />
+            Open Workspace
+          </button>
+        </div>
       )}
       {activeTab === 'schedule' && <ScheduleTab compilation={compilation} />}
       {activeTab === 'acl' && <AclTab compilation={compilation} />}

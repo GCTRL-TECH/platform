@@ -1,16 +1,20 @@
 import { Plug2 } from 'lucide-react'
 
+// simpleicons CDN supports a /COLOR suffix that recolours the SVG server-side,
+// so we don't have to fake white-out with brightness-0/invert (which broke a
+// couple of multi-fill icons like the old Microsoft tile).
 const CDN = 'https://cdn.simpleicons.org'
+const WHITE = 'FFFFFF'
 
 const INTEGRATIONS = [
-  { name: 'Neo4j',         logo: `${CDN}/neo4j`,        desc: 'Native KG storage'     },
-  { name: 'Qdrant',        logo: `${CDN}/qdrant`,        desc: 'Vector RAG backend'    },
-  { name: 'Google Drive',  logo: `${CDN}/googledrive`,   desc: 'Cloud document source' },
-  { name: 'Microsoft 365', logo: `${CDN}/microsoft`,     desc: 'Office & SharePoint'   },
-  { name: 'Confluence',    logo: `${CDN}/confluence`,    desc: 'Wiki & documentation'  },
-  { name: 'GitHub',        logo: `${CDN}/github`,        desc: 'Code & docs'           },
-  { name: 'Slack',         logo: `${CDN}/slack`,         desc: 'Messages & threads'    },
-  { name: 'REST API',      logo: null,                    desc: 'Any custom source'     },
+  { name: 'Neo4j',         logo: `${CDN}/neo4j/${WHITE}`,        desc: 'Native KG storage'     },
+  { name: 'Qdrant',        logo: `${CDN}/qdrant/${WHITE}`,       desc: 'Vector RAG backend'    },
+  { name: 'Google Drive',  logo: `${CDN}/googledrive/${WHITE}`,  desc: 'Cloud document source' },
+  { name: 'Notion',        logo: `${CDN}/notion/${WHITE}`,      desc: 'Workspace & docs'      },
+  { name: 'Confluence',    logo: `${CDN}/confluence/${WHITE}`,   desc: 'Wiki & documentation'  },
+  { name: 'GitHub',        logo: `${CDN}/github/${WHITE}`,       desc: 'Code & docs'           },
+  { name: 'Obsidian',      logo: `${CDN}/obsidian/${WHITE}`,     desc: 'Knowledge vault'       },
+  { name: 'REST API',      logo: null,                            desc: 'Any custom source'     },
 ]
 
 export function IntegrationsSection() {
@@ -32,7 +36,7 @@ export function IntegrationsSection() {
               className={`reveal reveal-delay-${(i % 4) + 1} flex flex-col items-center gap-2 rounded-2xl border border-slate-800 bg-slate-900/40 p-5 text-center backdrop-blur-sm transition-all hover:border-indigo-500/30 hover:bg-slate-800/60`}
             >
               {int.logo
-                ? <img src={int.logo} alt={int.name} width={32} height={32} className="w-8 h-8 brightness-0 invert" loading="lazy" />
+                ? <img src={int.logo} alt={int.name} width={32} height={32} className="w-8 h-8" loading="lazy" />
                 : <Plug2 size={32} className="text-slate-400" />
               }
               <span className="text-sm font-semibold text-slate-200">{int.name}</span>

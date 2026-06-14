@@ -73,27 +73,45 @@ async fn register(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let id = Uuid::new_v4();
 
+    // Fresh-install bootstrap: the VERY FIRST registered user owns the install,
+    // so they become an admin (with INTERNAL clearance) rather than a viewer.
+    // Every subsequent registration is a normal 'viewer'. We count inside the
+    // same request right before the insert; the unique-email guard above already
+    // serializes obvious races, and a second concurrent first-user would simply
+    // also get admin — acceptable for a single-operator first-run.
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await?;
+    let is_first_user = user_count == 0;
+    let (role, clearance): (&str, &str) = if is_first_user {
+        ("admin", "INTERNAL")
+    } else {
+        ("viewer", "PUBLIC")
+    };
+
     // 3000 free tokens — matches license-api's default and what users see in /billing.
     sqlx::query(
         "INSERT INTO users (id, email, password_hash, name, role, clearance, tokens_balance, tier)
-         VALUES ($1, $2, $3, $4, 'viewer', 'PUBLIC', 3000, 'free')"
+         VALUES ($1, $2, $3, $4, $5, $6, 3000, 'free')"
     )
-    .bind(id).bind(&req.email).bind(&hash).bind(&req.name)
+    .bind(id).bind(&req.email).bind(&hash).bind(&req.name).bind(role).bind(clearance)
     .execute(&state.db).await?;
 
     // Auto-seed default ontology for new user (best-effort: failures must not break registration).
     seed_default_ontology(&state.db, id).await;
 
     let claims = JwtClaims {
-        sub: id, email: req.email.clone(), role: "viewer".into(),
-        clearance: Some("PUBLIC".into()),
+        sub: id, email: req.email.clone(), role: role.into(),
+        clearance: Some(clearance.into()),
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
+        api_key_rank: None,
+        api_key_id: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
         refresh_token: sign_refresh(&state.cfg, id, &req.email),
-        user: UserOut { id, email: req.email, name: Some(req.name), role: "viewer".into(),
-                        clearance: Some("PUBLIC".into()), tier: Some("free".into()),
+        user: UserOut { id, email: req.email, name: Some(req.name), role: role.into(),
+                        clearance: Some(clearance.into()), tier: Some("free".into()),
                         tokens_balance: Some(3000) },
     }))
 }
@@ -102,15 +120,17 @@ async fn login(
     State(state): State<Arc<crate::models::AppState>>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<AuthTokens>> {
-    let user = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>, Option<String>, Option<i32>, String)>(
-        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance, password_hash
+    let user = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>, Option<String>, Option<i32>, String, bool)>(
+        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance, password_hash, is_active
          FROM users WHERE email = $1 LIMIT 1"
     )
     .bind(&req.email)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::Unauthorized)?;
 
-    let (id, email, name, role, clearance, tier, balance, hash) = user;
+    let (id, email, name, role, clearance, tier, balance, hash, is_active) = user;
+    // SEC-2: deprovisioned accounts cannot log in.
+    if !is_active { return Err(AppError::Unauthorized); }
     let valid = bcrypt::verify(&req.password, &hash)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if !valid { return Err(AppError::Unauthorized); }
@@ -119,6 +139,8 @@ async fn login(
         sub: id, email: email.clone(), role: role.clone(),
         clearance: clearance.clone(),
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
+        api_key_rank: None,
+        api_key_id: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
@@ -139,18 +161,22 @@ async fn refresh(
     let data = decode::<RefClaims>(&req.refresh_token, &key, &Validation::new(Algorithm::HS256))
         .map_err(|_| AppError::Unauthorized)?;
 
-    let user = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>, Option<String>, Option<i32>)>(
-        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance FROM users WHERE id = $1"
+    let user = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>, Option<String>, Option<i32>, bool)>(
+        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance, is_active FROM users WHERE id = $1"
     )
     .bind(data.claims.sub)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::Unauthorized)?;
 
-    let (id, email, name, role, clearance, tier, balance) = user;
+    let (id, email, name, role, clearance, tier, balance, is_active) = user;
+    // SEC-2: a deprovisioned user can't mint fresh access tokens via refresh.
+    if !is_active { return Err(AppError::Unauthorized); }
     let claims = JwtClaims {
         sub: id, email: email.clone(), role: role.clone(),
         clearance: clearance.clone(),
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
+        api_key_rank: None,
+        api_key_id: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
@@ -187,58 +213,18 @@ async fn reset_password(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// Seed a "General Knowledge" default ontology for a freshly-registered user.
+/// Canonical shared "General Knowledge" ontology (see migration 036). Every user
+/// defaults to this single shared ontology; KEX extends it in place. We no longer
+/// create a private per-user copy on registration (that produced 35+ duplicates).
+const CANONICAL_ONTOLOGY_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00a1);
+
+/// Point a freshly-registered user at the shared default ontology.
 ///
 /// Best-effort: any DB error is logged-and-swallowed so seeding hiccups can never
-/// break the registration flow. Uses direct SQL inserts (no dependency on the
-/// ontologies route handlers) so this compiles independently.
+/// break the registration flow.
 async fn seed_default_ontology(db: &sqlx::PgPool, user_id: Uuid) {
-    let ontology_id = Uuid::new_v4();
-
-    if let Err(e) = sqlx::query(
-        "INSERT INTO ontologies (id, user_id, name, description, scope, source, entity_type_count) \
-         VALUES ($1, $2, 'General Knowledge', \
-                 'Default ontology with common entity types — covers people, organizations, places, dates, and concepts', \
-                 'private', 'system', 10)"
-    )
-    .bind(ontology_id)
-    .bind(user_id)
-    .execute(db).await {
-        tracing::warn!(?e, %user_id, "failed to seed default ontology row");
-        return;
-    }
-
-    let entity_types: [(&str, &str, &str, &[&str]); 10] = [
-        ("Q5",        "Person",       "#6366f1", &["individual", "human", "name"]),
-        ("Q43229",    "Organization", "#f59e0b", &["company", "corporation", "agency", "institution"]),
-        ("Q17334923", "Location",     "#10b981", &["place", "city", "country", "region", "address"]),
-        ("Q205892",   "Date",         "#ec4899", &["time", "datetime", "period", "year"]),
-        ("Q2424752",  "Product",      "#8b5cf6", &["item", "goods", "service"]),
-        ("Q1656682",  "Event",        "#ef4444", &["happening", "occurrence", "meeting"]),
-        ("Q1368",     "Money",        "#22c55e", &["currency", "price", "amount", "value"]),
-        ("Q49848",    "Document",     "#06b6d4", &["file", "paper", "contract", "report"]),
-        ("Q151885",   "Concept",      "#94a3b8", &["idea", "topic", "subject"]),
-        ("Q9158",     "Email",        "#f97316", &["emailaddress"]),
-    ];
-
-    for (qid, name, color, aliases) in entity_types {
-        let aliases_vec: Vec<String> = aliases.iter().map(|s| (*s).to_string()).collect();
-        if let Err(e) = sqlx::query(
-            "INSERT INTO ontology_entity_types (ontology_id, qid, name, aliases, color, confidence_threshold) \
-             VALUES ($1, $2, $3, $4, $5, 0.3)"
-        )
-        .bind(ontology_id)
-        .bind(qid)
-        .bind(name)
-        .bind(&aliases_vec)
-        .bind(color)
-        .execute(db).await {
-            tracing::warn!(?e, %user_id, entity_type = name, "failed to seed default entity type");
-        }
-    }
-
     if let Err(e) = sqlx::query("UPDATE users SET default_ontology_id = $1 WHERE id = $2")
-        .bind(ontology_id)
+        .bind(CANONICAL_ONTOLOGY_ID)
         .bind(user_id)
         .execute(db).await {
         tracing::warn!(?e, %user_id, "failed to set default_ontology_id on user");
@@ -277,5 +263,50 @@ async fn seed_default_workspace(db: &sqlx::PgPool, user_id: Uuid) {
     .bind(folder_id)
     .execute(db).await {
         tracing::warn!(?e, %user_id, "failed to seed default compilation");
+    }
+
+    seed_default_wiki(db, user_id).await;
+}
+
+/// Seeds the default, non-deletable "Knowledge Wiki" for a freshly-registered
+/// user (mirrors migration 047's backfill for existing users):
+///   - 1 WIKI compilation ("Knowledge Wiki", `is_system = true`, hourly-ish
+///     `*/10 * * * *` cron) — the delete handler refuses to remove it.
+///   - 1 active `distill` cron trigger whose `config.compilationId` points at the
+///     wiki, so the background cron executor re-distils it automatically.
+///
+/// No source graph is selected at seed time — the user wires sources via
+/// `PUT /kg/compilations/:id/wiki/sources`; distillation writes 0 pages until then.
+/// Best-effort: any DB error is logged-and-swallowed so a seeding hiccup can never
+/// break registration.
+async fn seed_default_wiki(db: &sqlx::PgPool, user_id: Uuid) {
+    let wiki_id = Uuid::new_v4();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO compilations \
+            (id, user_id, name, description, classification, type, is_system, cron_schedule, cron_mode) \
+         VALUES ($1, $2, 'Knowledge Wiki', \
+                 'Your automatically maintained, LLM-distilled knowledge wiki. Pick which graphs feed it; it re-distils itself on a schedule.', \
+                 'INTERNAL', 'WIKI'::compilation_type, TRUE, '*/10 * * * *', 'incremental')"
+    )
+    .bind(wiki_id)
+    .bind(user_id)
+    .execute(db).await {
+        tracing::warn!(?e, %user_id, "failed to seed default Knowledge Wiki");
+        return;
+    }
+
+    // Auto-distill trigger: the cron executor re-distils this wiki every 10 min.
+    if let Err(e) = sqlx::query(
+        "INSERT INTO triggers \
+            (id, user_id, name, module, type, status, cron_schedule, config, next_run_at) \
+         VALUES ($1, $2, 'Auto-distill: Knowledge Wiki', \
+                 'distill'::trigger_module, 'cron'::trigger_type, 'active', \
+                 '*/10 * * * *', $3, NOW())"
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(serde_json::json!({ "compilationId": wiki_id.to_string() }))
+    .execute(db).await {
+        tracing::warn!(?e, %user_id, "failed to seed default Knowledge Wiki auto-distill trigger");
     }
 }

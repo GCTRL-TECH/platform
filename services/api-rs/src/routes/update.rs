@@ -1,10 +1,14 @@
 use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
-    Router,
+    Json, Router,
 };
-use serde_json::json;
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use serde_json::{json, Value};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 
 // Images to pull + their container names (api last — it hosts this endpoint)
@@ -16,9 +20,213 @@ const SERVICES: &[(&str, &str)] = &[
     ("gctrl-api",   "ghcr.io/gctrl-tech/api:latest"),
 ];
 
+/// Server version. Defaults to the crate version, overridable at build/run time
+/// via the `GCTRL_VERSION` environment variable (build-time `env!` is preferred,
+/// runtime fallback below in [`current_version`]).
+const CARGO_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Default update channel: a tiny JSON document exposing the latest version.
+/// Overridable via the `GCTRL_UPDATE_CHANNEL_URL` env var.
+const DEFAULT_CHANNEL_URL: &str = "https://gctrl.tech/version.json";
+
+/// How long a successful (or gracefully-degraded) check is cached in-memory,
+/// so the bell can poll cheaply.
+const CHECK_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// Returns the running server version. Prefers the build-time `GCTRL_VERSION`
+/// override (compiled in if present), then a runtime env override, then the
+/// crate version.
+pub(crate) fn current_version() -> String {
+    if let Some(v) = option_env!("GCTRL_VERSION") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    if let Ok(v) = std::env::var("GCTRL_VERSION") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    CARGO_VERSION.to_string()
+}
+
 pub fn router() -> Router<Arc<crate::models::AppState>> {
-    // GET — EventSource-compatible SSE stream used by LicenseBanner
-    Router::new().route("/", get(trigger_update))
+    Router::new()
+        // GET — EventSource-compatible SSE stream used by LicenseBanner / bell
+        .route("/", get(trigger_update))
+        // GET — lightweight version/update-available check (bell polling)
+        .route("/check", get(check_update))
+}
+
+// ─── Version / update-available check ─────────────────────────────────────────
+
+#[derive(Clone)]
+struct CachedCheck {
+    payload: Value,
+    fetched_at: Instant,
+}
+
+fn check_cache() -> &'static Mutex<Option<CachedCheck>> {
+    static CACHE: OnceLock<Mutex<Option<CachedCheck>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// `GET /api/update/check` → `{ current, latest, updateAvailable }`.
+///
+/// Determines `latest` from a configurable update channel (`GCTRL_UPDATE_CHANNEL_URL`,
+/// default [`DEFAULT_CHANNEL_URL`]). Degrades gracefully: any failure to reach or
+/// parse the channel yields `{ current, latest: current, updateAvailable: false }`
+/// — never a false positive, never an error surfaced to the UI. Results are cached
+/// in-memory for [`CHECK_CACHE_TTL`] so bell polling stays cheap.
+async fn check_update() -> Json<Value> {
+    let current = current_version();
+
+    // Serve from cache if fresh.
+    if let Ok(guard) = check_cache().lock() {
+        if let Some(c) = guard.as_ref() {
+            if c.fetched_at.elapsed() < CHECK_CACHE_TTL {
+                return Json(c.payload.clone());
+            }
+        }
+    }
+
+    let latest = fetch_latest_version().await.unwrap_or_else(|| current.clone());
+    let update_available = version_gt(&latest, &current);
+
+    let payload = json!({
+        "current": current,
+        "latest": latest,
+        "updateAvailable": update_available,
+    });
+
+    if let Ok(mut guard) = check_cache().lock() {
+        *guard = Some(CachedCheck { payload: payload.clone(), fetched_at: Instant::now() });
+    }
+
+    Json(payload)
+}
+
+/// Fetch the latest version. Tries the configured version channel first, then
+/// falls back to the GitHub releases API so a future GitHub release is caught
+/// even if the channel endpoint is down/unmaintained. `None` on total failure.
+async fn fetch_latest_version() -> Option<String> {
+    if let Some(v) = fetch_from_channel().await {
+        return Some(v);
+    }
+    fetch_from_github_releases().await
+}
+
+/// Parse the latest version string from the configured update channel
+/// (`GCTRL_UPDATE_CHANNEL_URL`, default `gctrl.tech/version.json`).
+async fn fetch_from_channel() -> Option<String> {
+    let url = std::env::var("GCTRL_UPDATE_CHANNEL_URL")
+        .unwrap_or_else(|_| DEFAULT_CHANNEL_URL.to_string());
+    if url.trim().is_empty() {
+        return None;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .ok()?;
+
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    // Prefer JSON; accept a few common shapes, then fall back to a bare string.
+    let text = resp.text().await.ok()?;
+    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+        for key in ["version", "latest", "latestVersion", "tag", "tag_name"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        if let Some(s) = v.as_str() {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        return None;
+    }
+
+    // Plain-text body containing just a version.
+    let s = text.trim();
+    if !s.is_empty() && s.len() < 64 && !s.contains('<') {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Fallback: the latest release tag from the GitHub releases API. Repo via
+/// `GCTRL_UPDATE_GITHUB_REPO` (default `gctrl-tech/gctrl`). Unauthenticated
+/// (60 req/h is plenty given the hourly cache); a `User-Agent` is required.
+async fn fetch_from_github_releases() -> Option<String> {
+    let repo = std::env::var("GCTRL_UPDATE_GITHUB_REPO")
+        .unwrap_or_else(|_| "gctrl-tech/gctrl".to_string());
+    let repo = repo.trim();
+    if repo.is_empty() || !repo.contains('/') {
+        return None;
+    }
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "gctrl-update-check")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v = resp.json::<Value>().await.ok()?;
+    // `tag_name` (e.g. "v1.2.3") is the canonical release version.
+    v.get("tag_name")
+        .or_else(|| v.get("name"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Loose semver comparison: returns true if `a > b`. Strips a leading `v`,
+/// drops any pre-release/build suffix, compares numeric components left-to-right.
+/// Any unparseable input compares as not-greater (conservative — no false positives).
+fn version_gt(a: &str, b: &str) -> bool {
+    match (parse_version(a), parse_version(b)) {
+        // Fixed-width [major, minor, patch] tuples so 1.2 == 1.2.0 (no false positives).
+        (Some(va), Some(vb)) => va > vb,
+        _ => false,
+    }
+}
+
+fn parse_version(s: &str) -> Option<[u64; 3]> {
+    let s = s.trim().trim_start_matches(['v', 'V']);
+    // Drop pre-release / build metadata.
+    let core = s.split(['-', '+']).next().unwrap_or(s);
+    let nums: Vec<u64> = core
+        .split('.')
+        .map(|p| p.trim().parse::<u64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if nums.is_empty() {
+        return None;
+    }
+    Some([
+        nums.first().copied().unwrap_or(0),
+        nums.get(1).copied().unwrap_or(0),
+        nums.get(2).copied().unwrap_or(0),
+    ])
 }
 
 async fn trigger_update() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
@@ -57,7 +265,7 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
     }
 
     // Step 1: Pull all images
-    for (container, image) in SERVICES {
+    for (_container, image) in SERVICES {
         send("progress", json!({ "step": "pull", "image": image, "message": format!("Pulling {}…", image) }));
 
         let img = image.to_string();

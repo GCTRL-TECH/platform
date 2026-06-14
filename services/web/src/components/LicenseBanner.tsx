@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { X, RefreshCw, Copy, Check } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, agentHealthUrl } from '@/lib/utils'
 
 interface AgentStatus {
   activated: boolean
@@ -147,7 +147,7 @@ export function LicenseBanner() {
   const [showModal, setShowModal] = useState(false)
 
   const fetchStatus = useCallback(() => {
-    fetch('http://localhost:7070/status')
+    fetch(`${agentHealthUrl()}/status`)
       .then((r) => r.json())
       .then((d) => setStatus(d as AgentStatus))
       .catch(() => setStatus(null))
@@ -215,7 +215,7 @@ export function useLicenseStatus() {
   const [loading, setLoading] = useState(true)
 
   const fetchStatus = useCallback(() => {
-    fetch('http://localhost:7070/status')
+    fetch(`${agentHealthUrl()}/status`)
       .then((r) => r.json())
       .then((d) => {
         setStatus(d as AgentStatus)

@@ -133,7 +133,7 @@ async fn update_role(
         _         => "PUBLIC".into(),
     });
     sqlx::query(
-        "UPDATE users SET role = $1::user_role, clearance = $2::user_clearance, updated_at = NOW() WHERE id = $3"
+        "UPDATE users SET role = $1, clearance = $2, updated_at = NOW() WHERE id = $3"
     )
     .bind(&body.role)
     .bind(&clearance)

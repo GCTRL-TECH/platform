@@ -5,15 +5,20 @@ import {
   GitMerge,
   Database,
   BookOpen,
+  BookOpenText,
   MessageSquare,
   Settings,
-  Coins,
   Timer,
   LogOut,
   ChevronRight,
+  Shield,
+  Sparkles,
+  Wrench,
+  Terminal,
   type LucideIcon,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
+import { useUiMode } from '@/hooks/useUiMode'
 import { cn } from '@/lib/utils'
 
 interface NavItemConfig {
@@ -22,6 +27,8 @@ interface NavItemConfig {
   to: string
   disabled?: boolean
   badge?: string
+  /** Only shown in Expert mode. */
+  expert?: boolean
 }
 
 interface NavSection {
@@ -29,29 +36,31 @@ interface NavSection {
   items: NavItemConfig[]
 }
 
+// User-centric core flow: Knowledge → Access & Ask. Advanced surfaces are
+// tagged `expert` and hidden in Easy mode to keep the default UI focused.
 const NAV_SECTIONS: NavSection[] = [
   {
-    label: 'Knowledge Management',
+    label: 'Knowledge',
     items: [
+      { label: 'Knowledge Graphs', icon: Database, to: '/graphs' },
+      { label: 'Wiki', icon: BookOpenText, to: '/wiki' },
       { label: 'KEX Extract', icon: Zap, to: '/kex' },
       { label: 'FUSE Merge', icon: GitMerge, to: '/fuse' },
-      { label: 'Knowledge Graphs', icon: Database, to: '/graphs' },
-      { label: 'Ontologies', icon: BookOpen, to: '/ontologies' },
-      { label: 'Triggers', icon: Timer, to: '/triggers' },
+      { label: 'Ontologies', icon: BookOpen, to: '/ontologies', expert: true },
+      { label: 'Triggers', icon: Timer, to: '/triggers', expert: true },
     ],
   },
   {
-    label: 'Tools',
+    label: 'Access & Ask',
     items: [
+      { label: 'Access Control', icon: Shield, to: '/access' },
       { label: 'Talk to Graph', icon: MessageSquare, to: '/chat' },
+      { label: 'Agent', icon: Terminal, to: '/agent' },
     ],
   },
-  {
-    label: 'Account',
-    items: [
-      { label: 'Tokens', icon: Coins, to: '/billing' },
-    ],
-  },
+  // Enterprise surfaces (Webhooks, SSO/SCIM, API Keys) now live under Settings
+  // as deep-linkable tabs (/settings?tab=webhooks, …) rather than nav items —
+  // they are occasional setup, not daily navigation.
 ]
 
 // Dashboard is above sections, pinned top
@@ -133,12 +142,18 @@ function NavItemLink({
 
 export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
   const { user, logout } = useAuth()
+  const { isExpert, setMode } = useUiMode()
   const navigate = useNavigate()
 
   function handleLogout() {
     logout()
     navigate('/login')
   }
+
+  // In Easy mode, hide expert items and any section left empty.
+  const sections = NAV_SECTIONS
+    .map((s) => ({ ...s, items: s.items.filter((i) => isExpert || !i.expert) }))
+    .filter((s) => s.items.length > 0)
 
   return (
     <aside
@@ -163,7 +178,7 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
         </div>
 
         {/* Sectioned navigation */}
-        {NAV_SECTIONS.map((section) => (
+        {sections.map((section) => (
           <div key={section.label}>
             {/* Section label — hidden when collapsed */}
             {!collapsed && (
@@ -193,6 +208,34 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
               <p className="truncate text-xs text-slate-500">{user?.email ?? ''}</p>
             </div>
           </div>
+        )}
+
+        {/* Easy / Expert mode toggle */}
+        {!collapsed ? (
+          <div className="mb-2 flex items-center gap-1 rounded-lg border border-slate-800 bg-slate-900/60 p-1">
+            <button
+              onClick={() => setMode('easy')}
+              className={cn('flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                !isExpert ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300')}
+            >
+              <Sparkles size={12} /> Easy
+            </button>
+            <button
+              onClick={() => setMode('expert')}
+              className={cn('flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                isExpert ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300')}
+            >
+              <Wrench size={12} /> Expert
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setMode(isExpert ? 'easy' : 'expert')}
+            title={isExpert ? 'Expert mode (click for Easy)' : 'Easy mode (click for Expert)'}
+            className="mb-1 flex w-full items-center justify-center rounded-md p-2 text-slate-500 hover:text-slate-300"
+          >
+            {isExpert ? <Wrench size={14} /> : <Sparkles size={14} />}
+          </button>
         )}
 
         <div className="mb-1">

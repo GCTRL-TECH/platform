@@ -1,45 +1,46 @@
-import { Bell, Coins } from 'lucide-react'
-import { useAuth } from '@/hooks/useAuth'
-import { useApiQuery } from '@/hooks/useApi'
-import { cn } from '@/lib/utils'
+import { useEffect, useRef, useState } from 'react'
+import { Bell, RefreshCw } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { apiGet } from '@/lib/api'
+import { UpdateModal } from '@/components/LicenseBanner'
 
 interface HeaderProps {
   title: string
 }
 
-const TIER_COLORS: Record<string, string> = {
-  free: 'badge-slate',
-  starter: 'badge-blue',
-  pro: 'badge-green',
-  enterprise: 'badge-yellow',
-}
-
-interface BalanceResponse {
-  balance: number
-  tier: string
-  tierLimit: number
+interface UpdateCheck {
+  current: string
+  latest: string
+  updateAvailable: boolean
 }
 
 export function Header({ title }: HeaderProps) {
-  const { user } = useAuth()
+  const [open, setOpen] = useState(false)
+  const [showUpdateModal, setShowUpdateModal] = useState(false)
+  const popoverRef = useRef<HTMLDivElement>(null)
 
-  // Live balance: refetches every 10s and on window focus.
-  // Auth context's user.tokensBalance is set once at login; without this
-  // the header keeps stale numbers after extractions/merges deduct tokens.
-  const { data: balanceData } = useApiQuery<BalanceResponse>(
-    ['billing', 'balance'],
-    '/billing/balance',
-    {
-      enabled: !!user,
-      refetchInterval: 10_000,
-      refetchOnWindowFocus: true,
-      staleTime: 5_000,
+  const { data } = useQuery<UpdateCheck>({
+    queryKey: ['update', 'check'],
+    queryFn: () => apiGet<UpdateCheck>('/update/check'),
+    refetchInterval: 60 * 60 * 1000, // hourly
+    refetchOnWindowFocus: false,
+    staleTime: 55 * 60 * 1000,
+    retry: false,
+  })
+
+  const updateAvailable = data?.updateAvailable === true
+
+  // Close popover on outside click
+  useEffect(() => {
+    if (!open) return
+    function onClick(e: MouseEvent) {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
     }
-  )
-
-  const liveBalance = balanceData?.balance ?? user?.tokensBalance ?? 0
-  const liveTier = balanceData?.tier ?? user?.tier ?? 'free'
-  const tierBadgeClass = TIER_COLORS[liveTier] ?? 'badge-slate'
+    document.addEventListener('mousedown', onClick)
+    return () => document.removeEventListener('mousedown', onClick)
+  }, [open])
 
   return (
     <header className="flex h-16 items-center justify-between border-b border-slate-800 bg-slate-950/80 px-6 backdrop-blur-sm">
@@ -48,29 +49,68 @@ export function Header({ title }: HeaderProps) {
 
       {/* Right section */}
       <div className="flex items-center gap-3">
-        {/* Token balance — live, refetched every 10s */}
-        {user && (
-          <div className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900 px-3 py-1.5">
-            <Coins size={14} className="text-amber-400" />
-            <span className="text-sm font-medium text-slate-200">
-              {liveBalance.toLocaleString()}
-            </span>
-            <span className="text-xs text-slate-500">tokens</span>
-            {liveTier && (
-              <span className={cn(tierBadgeClass, 'ml-1 text-[10px]')}>
-                {liveTier}
-              </span>
-            )}
-          </div>
-        )}
-
         {/* Notification bell */}
-        <button className="relative flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-800 hover:text-slate-300 transition-colors">
-          <Bell size={16} />
-          {/* Notification dot placeholder */}
-          <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-blue-500" />
-        </button>
+        <div className="relative" ref={popoverRef}>
+          <button
+            onClick={() => setOpen((v) => !v)}
+            aria-label="Notifications"
+            className="relative flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-800 hover:text-slate-300 transition-colors"
+          >
+            <Bell size={16} />
+            {/* Dot lights only when a new version is available */}
+            {updateAvailable && (
+              <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-blue-500" />
+            )}
+          </button>
+
+          {open && (
+            <div className="absolute right-0 z-50 mt-2 w-72 rounded-lg border border-slate-700 bg-slate-900 shadow-2xl">
+              <div className="border-b border-slate-800 px-4 py-3">
+                <p className="text-sm font-semibold text-slate-200">Notifications</p>
+              </div>
+
+              <div className="px-4 py-3">
+                {updateAvailable ? (
+                  <div className="space-y-3">
+                    <div>
+                      <p className="text-sm font-medium text-blue-400">New version available</p>
+                      <p className="text-xs text-slate-400">
+                        v{data?.latest}
+                        {data?.current && (
+                          <span className="text-slate-600"> (current v{data.current})</span>
+                        )}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setOpen(false)
+                        setShowUpdateModal(true)
+                      }}
+                      className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500"
+                    >
+                      <RefreshCw size={14} />
+                      Update now
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    <p className="text-sm text-slate-300">No new versions</p>
+                    <p className="text-xs text-slate-500">
+                      {data?.current
+                        ? `You're on v${data.current} — up to date.`
+                        : 'Checking for updates…'}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
+
+      {showUpdateModal && (
+        <UpdateModal onClose={() => setShowUpdateModal(false)} />
+      )}
     </header>
   )
 }

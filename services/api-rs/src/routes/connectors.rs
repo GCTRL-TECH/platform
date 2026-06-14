@@ -17,6 +17,69 @@ use crate::{
     services::redis::lpush,
 };
 
+// ─── SSRF guard for Obsidian vault URLs ──────────────────────────────────────
+
+/// Parse `raw_url` and reject anything whose hostname is not a loopback address.
+/// Obsidian Local REST API is always local; allowing non-loopback URLs would
+/// enable SSRF against internal cloud metadata endpoints or private networks.
+fn require_loopback_url(raw_url: &str) -> Result<(url::Url, bool)> {
+    let parsed = url::Url::parse(raw_url)
+        .map_err(|_| AppError::BadRequest("vault_url is not a valid URL".into()))?;
+    let host = parsed.host_str()
+        .ok_or_else(|| AppError::BadRequest("vault_url must include a host".into()))?;
+    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    if !is_loopback {
+        return Err(AppError::BadRequest(
+            "vault_url must point to a loopback address (localhost / 127.0.0.1)".into()
+        ));
+    }
+    Ok((parsed, is_loopback))
+}
+
+/// Build a reqwest client for Obsidian vault requests.
+/// TLS verification is disabled only when the vault host is loopback (self-signed cert),
+/// never for non-loopback hosts (which are already rejected by `require_loopback_url`).
+fn obsidian_http_client(is_loopback: bool) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(is_loopback)
+        .build()
+        .map_err(|e| AppError::Internal(format!("HTTP client build failed: {e}")))
+}
+
+// ─── Path-traversal guard for server-side folder vaults ─────────────────────
+
+/// Resolve `requested` against `root`, canonicalize both, and verify the result
+/// stays inside `root`. Blocks `..` traversal and symlink escape. The path must
+/// exist (canonicalize fails otherwise → rejected).
+///
+/// `requested` may be an absolute path (e.g. `/vaults/my-vault`) or relative; in
+/// both cases the canonical form must be a descendant of (or equal to) the
+/// canonical root, otherwise we refuse to touch it.
+fn resolve_vault_path(root: &str, requested: &str) -> Result<std::path::PathBuf> {
+    use std::path::Path;
+
+    let root_canon = std::fs::canonicalize(root).map_err(|_| {
+        AppError::Internal(format!("vault root '{root}' does not exist on the server"))
+    })?;
+
+    let req_path = Path::new(requested);
+    // Join relative paths onto root; absolute paths are taken as-is (still checked
+    // against root below, so an absolute path outside root is rejected).
+    let joined = if req_path.is_absolute() {
+        req_path.to_path_buf()
+    } else {
+        root_canon.join(req_path)
+    };
+
+    let canon = std::fs::canonicalize(&joined)
+        .map_err(|_| AppError::BadRequest("path does not exist".into()))?;
+
+    if !canon.starts_with(&root_canon) {
+        return Err(AppError::BadRequest("path must be inside the vault root".into()));
+    }
+    Ok(canon)
+}
+
 // ─── Credential resolution ───────────────────────────────────────────────────
 
 /// Resolve `(client_id, client_secret)` for `provider` by checking the
@@ -108,6 +171,7 @@ struct DriveFilesQuery {
 struct SyncSelectedReq {
     #[serde(rename = "connectorId")] connector_id: Uuid,
     #[serde(rename = "fileIds")]     file_ids:     Vec<String>,
+    #[serde(flatten)]                opts:         DriveExtractReqOpts,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +179,50 @@ struct SyncFolderReq {
     #[serde(rename = "connectorId")] connector_id: Uuid,
     #[serde(rename = "folderId")]    folder_id:    String,
     #[serde(rename = "maxDepth")]    max_depth:    Option<u32>,
+    #[serde(flatten)]                opts:         DriveExtractReqOpts,
+}
+
+/// Extraction options sent alongside a Drive sync (mirrors the KEX upload form):
+/// which ontology to use, discovery mode, target compilation for auto-fuse, and
+/// the classification to stamp. All optional — absent fields fall back to defaults.
+#[derive(Deserialize, Default)]
+struct DriveExtractReqOpts {
+    #[serde(rename = "ontologyId")]            ontology_id:             Option<Uuid>,
+    #[serde(rename = "discoveryMode")]         discovery_mode:          Option<String>,
+    #[serde(rename = "compilationId")]         compilation_id:          Option<Uuid>,
+    #[serde(rename = "forceSingleGraphs")]     force_single_graphs:     Option<bool>,
+    #[serde(rename = "classificationLevelId")] classification_level_id: Option<Uuid>,
+}
+
+/// Resolved extraction options (ontology labels + classification name looked up)
+/// passed into `enqueue_drive_file`.
+struct DriveExtractResolved {
+    ontology_id:             Option<Uuid>,
+    entity_types:            Option<Vec<String>>,
+    discovery_mode:          Option<String>,
+    compilation_id:          Option<Uuid>,
+    classification_level_id: Option<Uuid>,
+    classification_name:     Option<String>,
+}
+
+impl DriveExtractResolved {
+    /// Adapt resolved KEX options into the shared Obsidian re-ingest options.
+    fn to_reingest_opts(
+        &self,
+        mode: crate::services::obsidian::ReingestMode,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> crate::services::obsidian::ReingestOpts {
+        crate::services::obsidian::ReingestOpts {
+            ontology_id: self.ontology_id,
+            entity_types: self.entity_types.clone(),
+            discovery_mode: self.discovery_mode.clone(),
+            compilation_id: self.compilation_id,
+            classification_level_id: self.classification_level_id,
+            classification_name: self.classification_name.clone(),
+            mode,
+            since,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -196,6 +304,21 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         // JSON-style OAuth start: returns `{ authUrl }` for any supported
         // provider. The Settings UI pops this in a small window.
         .route("/auth/:provider",          get(oauth_auth_url))
+        // ── SharePoint ───────────────────────────────────────────────────────
+        .route("/microsoft/sharepoint/tenants",  get(list_sharepoint_tenants).post(add_sharepoint_tenant))
+        .route("/microsoft/sharepoint/sites",    get(list_sharepoint_sites))
+        .route("/microsoft/sharepoint/files",    get(list_sharepoint_files))
+        .route("/microsoft/sharepoint/sync",     post(sync_sharepoint))
+        // ── Obsidian ─────────────────────────────────────────────────────────
+        .route("/obsidian/vaults",               get(list_obsidian_vaults).post(create_obsidian_vault))
+        .route("/obsidian/vaults/:id",           delete(delete_obsidian_vault))
+        .route("/obsidian/probe",                post(probe_obsidian))
+        .route("/obsidian/files",                get(list_obsidian_files))
+        .route("/obsidian/sync",                 post(sync_obsidian))
+        // ── Obsidian (server-side mounted folder vaults) ─────────────────────
+        .route("/obsidian/folder-vaults",        post(create_obsidian_folder_vault))
+        .route("/obsidian/folder-vaults/:id/files", get(list_obsidian_folder_files))
+        .route("/obsidian/folder-vaults/:id/sync",  post(sync_obsidian_folder))
 }
 
 /// Public routes — no JWT required (OAuth callback arrives from Google with no auth header).
@@ -220,7 +343,7 @@ async fn ensure_valid_token(
     });
 
     if !expired {
-        return Ok(connector.access_token.clone());
+        return Ok(crate::services::crypto::open(&connector.access_token));
     }
 
     // Re-read the connector row from DB before attempting a refresh.
@@ -228,7 +351,7 @@ async fn ensure_valid_token(
     // we can return the fresh token without hitting Google's endpoint again.
     // This minimises — though does not fully eliminate — the refresh race window.
     let fresh = sqlx::query_as::<_, ConnectorRow>(
-        "SELECT id, provider, label, access_token, refresh_token, token_expires_at,
+        "SELECT id, provider::text, label, access_token, refresh_token, token_expires_at,
                 provider_email, is_active
          FROM oauth_connectors
          WHERE id = $1",
@@ -242,7 +365,7 @@ async fn ensure_valid_token(
             exp <= Utc::now() + chrono::Duration::seconds(60)
         });
         if !still_expired {
-            return Ok(fresh_row.access_token.clone());
+            return Ok(crate::services::crypto::open(&fresh_row.access_token));
         }
     }
 
@@ -252,7 +375,9 @@ async fn ensure_valid_token(
     let refresh_token = connector
         .refresh_token
         .as_deref()
+        .map(crate::services::crypto::open)
         .ok_or_else(|| AppError::BadRequest("No refresh token stored; please reconnect Google".into()))?;
+    let refresh_token = refresh_token.as_str();
 
     // Pull the live OAuth client credentials — the admin may have rotated them
     // since this connector was created, so we re-resolve on every refresh.
@@ -289,7 +414,7 @@ async fn ensure_valid_token(
          SET access_token = $1, token_expires_at = $2, updated_at = NOW()
          WHERE id = $3",
     )
-    .bind(&tok.access_token)
+    .bind(crate::services::crypto::seal(&tok.access_token))
     .bind(new_expiry)
     .bind(connector.id)
     .execute(db)
@@ -306,7 +431,7 @@ async fn list_connectors(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
     let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, bool)>(
-        "SELECT id, provider, label, provider_email, is_active
+        "SELECT id, provider::text, label, provider_email, is_active
          FROM oauth_connectors
          WHERE user_id = $1
          ORDER BY created_at DESC",
@@ -488,6 +613,10 @@ async fn google_callback(
 
     let expiry = tok.expires_in.map(|s| Utc::now() + chrono::Duration::seconds(s));
 
+    // Encrypt tokens at rest before they ever touch the DB.
+    let access_token_sealed  = crate::services::crypto::seal(&tok.access_token);
+    let refresh_token_sealed = tok.refresh_token.as_deref().map(crate::services::crypto::seal);
+
     // Fetch email via userinfo
     let userinfo_resp = http
         .get("https://www.googleapis.com/oauth2/v3/userinfo")
@@ -535,8 +664,8 @@ async fn google_callback(
                  updated_at       = NOW()
              WHERE id = $6",
         )
-        .bind(&tok.access_token)
-        .bind(&tok.refresh_token)
+        .bind(&access_token_sealed)
+        .bind(&refresh_token_sealed)
         .bind(expiry)
         .bind(&label)
         .bind(&provider_email)
@@ -554,8 +683,8 @@ async fn google_callback(
         )
         .bind(user_id)
         .bind(&label)
-        .bind(&tok.access_token)
-        .bind(&tok.refresh_token)
+        .bind(&access_token_sealed)
+        .bind(&refresh_token_sealed)
         .bind(expiry)
         .bind(&provider_account_id)
         .bind(&provider_email)
@@ -655,16 +784,21 @@ async fn sync_selected(
 
     let mut results: Vec<Value> = Vec::new();
 
+    let resolved = resolve_drive_opts(&state.db, claims.sub, &req.opts).await;
+
     for file_id in &req.file_ids {
         let name = meta_map.get(file_id).cloned().unwrap_or_else(|| file_id.clone());
 
         match enqueue_drive_file(
             &state.db,
             &state.redis,
+            &http,
+            &token,
             claims.sub,
             connector.id,
             file_id,
             &name,
+            &resolved,
         )
         .await
         {
@@ -712,14 +846,19 @@ async fn sync_folder(
     let mut failed = 0u32;
     let mut results: Vec<Value> = Vec::new();
 
+    let resolved = resolve_drive_opts(&state.db, claims.sub, &req.opts).await;
+
     for (file_id, name) in &all_files {
         match enqueue_drive_file(
             &state.db,
             &state.redis,
+            &http,
+            &token,
             claims.sub,
             connector.id,
             file_id,
             name,
+            &resolved,
         )
         .await
         {
@@ -752,7 +891,7 @@ async fn fetch_connector(
     user_id: Uuid,
 ) -> Result<ConnectorRow> {
     sqlx::query_as::<_, ConnectorRow>(
-        "SELECT id, provider, label, access_token, refresh_token, token_expires_at,
+        "SELECT id, provider::text, label, access_token, refresh_token, token_expires_at,
                 provider_email, is_active
          FROM oauth_connectors
          WHERE id = $1 AND user_id = $2 AND is_active = true",
@@ -902,39 +1041,1179 @@ async fn collect_folder_files(
     }
 }
 
+// ─── SharePoint structs ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AddSharepointTenantReq {
+    #[serde(rename = "tenantId")]          tenant_id:           String,
+    #[serde(rename = "tenantName")]        tenant_name:         String,
+    #[serde(rename = "clientId")]          client_id:           String,
+    #[serde(rename = "clientSecret")]      client_secret:       String,
+    #[serde(rename = "sharepointRootUrl")] sharepoint_root_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SharepointTenantQuery {
+    #[serde(rename = "tenantConfigId")] tenant_config_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct SharepointFilesQuery {
+    #[serde(rename = "tenantConfigId")] tenant_config_id: Uuid,
+    #[serde(rename = "siteId")]         site_id:          String,
+    #[serde(rename = "driveId")]        drive_id:         String,
+    #[serde(rename = "folderId")]       folder_id:        Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SyncSharepointReq {
+    #[serde(rename = "tenantConfigId")]       tenant_config_id:        Uuid,
+    #[serde(rename = "siteId")]               site_id:                 String,
+    #[serde(rename = "driveId")]              drive_id:                String,
+    #[serde(rename = "fileIds")]              file_ids:                Vec<String>,
+    #[serde(rename = "classificationLevelId")] classification_level_id: Option<Uuid>,
+}
+
+// ─── SharePoint DB row ────────────────────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct SharepointTenantRow {
+    id:                  Uuid,
+    tenant_id:           String,
+    tenant_name:         String,
+    client_id:           String,
+    client_secret:       String,
+    sharepoint_root_url: Option<String>,
+}
+
+// ─── SharePoint token helper ──────────────────────────────────────────────────
+
+/// Exchange client_credentials against Microsoft identity platform.
+/// Returns an access token valid for Microsoft Graph.
+async fn sharepoint_access_token(
+    http:          &reqwest::Client,
+    tenant_id:     &str,
+    client_id:     &str,
+    client_secret: &str,
+) -> Result<String> {
+    let url = format!(
+        "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct MsTokenResp { access_token: String }
+
+    let resp = http
+        .post(&url)
+        .form(&[
+            ("grant_type",    "client_credentials"),
+            ("client_id",     client_id),
+            ("client_secret", client_secret),
+            ("scope",         "https://graph.microsoft.com/.default"),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("MS token request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("MS token error: {body}")));
+    }
+
+    let tok: MsTokenResp = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("MS token parse error: {e}")))?;
+
+    Ok(tok.access_token)
+}
+
+// ─── Obsidian structs ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateObsidianVaultReq {
+    label:      String,
+    #[serde(rename = "vaultUrl")] vault_url:  String,
+    #[serde(rename = "apiToken")] api_token:  String,
+}
+
+#[derive(Deserialize)]
+struct ProbeObsidianReq {
+    #[serde(rename = "vaultId")] vault_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct ObsidianFilesQuery {
+    #[serde(rename = "vaultId")] vault_id: Uuid,
+    folder:                                Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SyncObsidianReq {
+    #[serde(rename = "vaultId")] vault_id: Uuid,
+    /// Note paths to extract. Accepts `paths` (preferred, matches folder sync) or
+    /// the legacy `notePaths` alias.
+    #[serde(default, alias = "notePaths")] paths: Vec<String>,
+    #[serde(flatten)] opts: DriveExtractReqOpts,
+}
+
+// ─── Obsidian DB row ──────────────────────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct ObsidianVaultRow {
+    id:          Uuid,
+    label:       String,
+    vault_url:   Option<String>,
+    api_token:   Option<String>,
+    kind:        String,
+    folder_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateObsidianFolderVaultReq {
+    label:                          String,
+    #[serde(rename = "folderPath")] folder_path: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SyncObsidianFolderReq {
+    paths:            Option<Vec<String>>,
+    #[serde(flatten)] opts: DriveExtractReqOpts,
+}
+
+// ─── SharePoint handlers ──────────────────────────────────────────────────────
+
+/// GET /api/connectors/microsoft/sharepoint/tenants
+async fn list_sharepoint_tenants(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>)>(
+        "SELECT id, tenant_id, tenant_name, sharepoint_root_url
+         FROM sharepoint_tenant_configs
+         WHERE user_id = $1
+         ORDER BY created_at DESC",
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db)
+    .await?;
+
+    let tenants: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, tenant_id, tenant_name, root_url)| {
+            json!({
+                "id":                 id,
+                "tenantId":           tenant_id,
+                "tenantName":         tenant_name,
+                "sharepointRootUrl":  root_url,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "tenants": tenants })))
+}
+
+/// POST /api/connectors/microsoft/sharepoint/tenants
+async fn add_sharepoint_tenant(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<AddSharepointTenantReq>,
+) -> Result<Json<Value>> {
+    let id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO sharepoint_tenant_configs
+             (id, user_id, tenant_id, tenant_name, client_id, client_secret, sharepoint_root_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(claims.sub)
+    .bind(&req.tenant_id)
+    .bind(&req.tenant_name)
+    .bind(&req.client_id)
+    .bind(crate::services::crypto::seal(&req.client_secret))
+    .bind(&req.sharepoint_root_url)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "id": id, "ok": true })))
+}
+
+/// GET /api/connectors/microsoft/sharepoint/sites?tenantConfigId=...
+async fn list_sharepoint_sites(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<SharepointTenantQuery>,
+) -> Result<Json<Value>> {
+    let tenant = fetch_sharepoint_tenant(&state.db, q.tenant_config_id, claims.sub).await?;
+    let http   = reqwest::Client::new();
+    let token  = sharepoint_access_token(
+        &http,
+        &tenant.tenant_id,
+        &tenant.client_id,
+        &tenant.client_secret,
+    )
+    .await?;
+
+    let resp = http
+        .get("https://graph.microsoft.com/v1.0/sites")
+        .bearer_auth(&token)
+        .query(&[
+            ("search", "*"),
+            ("$select", "id,name,displayName,webUrl"),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph API request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body   = resp.text().await.unwrap_or_default();
+        tracing::warn!("Graph sites error {status}: {body}");
+        return Err(AppError::Internal(format!("Graph API error: {status}")));
+    }
+
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph sites parse error: {e}")))?;
+
+    let sites: Vec<Value> = data
+        .get("value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id":          s.get("id")         .and_then(|v| v.as_str()).unwrap_or_default(),
+                "name":        s.get("name")        .and_then(|v| v.as_str()).unwrap_or_default(),
+                "displayName": s.get("displayName") .and_then(|v| v.as_str()).unwrap_or_default(),
+                "webUrl":      s.get("webUrl")      .and_then(|v| v.as_str()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "sites": sites })))
+}
+
+/// GET /api/connectors/microsoft/sharepoint/files?tenantConfigId=...&siteId=...&driveId=...&folderId=...
+async fn list_sharepoint_files(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<SharepointFilesQuery>,
+) -> Result<Json<Value>> {
+    let tenant = fetch_sharepoint_tenant(&state.db, q.tenant_config_id, claims.sub).await?;
+    let http   = reqwest::Client::new();
+    let token  = sharepoint_access_token(
+        &http,
+        &tenant.tenant_id,
+        &tenant.client_id,
+        &tenant.client_secret,
+    )
+    .await?;
+
+    let select = "$select=id,name,size,file,folder,lastModifiedDateTime";
+    let url = match q.folder_id.as_deref() {
+        None | Some("root") => format!(
+            "https://graph.microsoft.com/v1.0/sites/{}/drives/{}/root/children?{select}",
+            q.site_id, q.drive_id
+        ),
+        Some(fid) => format!(
+            "https://graph.microsoft.com/v1.0/sites/{}/drives/{}/items/{}/children?{select}",
+            q.site_id, q.drive_id, fid
+        ),
+    };
+
+    let resp = http
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph files request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body   = resp.text().await.unwrap_or_default();
+        tracing::warn!("Graph files error {status}: {body}");
+        return Err(AppError::Internal(format!("Graph API error: {status}")));
+    }
+
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph files parse error: {e}")))?;
+
+    let items: Vec<Value> = data
+        .get("value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| {
+            let is_folder  = item.get("folder").is_some();
+            let last_mod   = item
+                .get("lastModifiedDateTime")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let size       = item
+                .get("size")
+                .and_then(|v| v.as_i64());
+            json!({
+                "id":           item.get("id")  .and_then(|v| v.as_str()).unwrap_or_default(),
+                "name":         item.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                "isFolder":     is_folder,
+                "size":         size,
+                "lastModified": last_mod,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "items": items })))
+}
+
+/// POST /api/connectors/microsoft/sharepoint/sync
+async fn sync_sharepoint(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<SyncSharepointReq>,
+) -> Result<Json<Value>> {
+    if req.file_ids.is_empty() {
+        return Err(AppError::BadRequest("No file IDs provided".into()));
+    }
+
+    // Verify the tenant config belongs to this user
+    fetch_sharepoint_tenant(&state.db, req.tenant_config_id, claims.sub).await?;
+
+    let mut job_ids: Vec<Uuid> = Vec::new();
+
+    for file_id in &req.file_ids {
+        let job_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, type, status, input)
+             VALUES ($1, $2, 'kex_sharepoint', 'pending', $3)",
+        )
+        .bind(job_id)
+        .bind(claims.sub)
+        .bind(json!({
+            "tenantConfigId":       req.tenant_config_id,
+            "siteId":               req.site_id,
+            "driveId":              req.drive_id,
+            "fileId":               file_id,
+            "classificationLevelId": req.classification_level_id,
+        }))
+        .execute(&state.db)
+        .await?;
+
+        crate::services::usage::record_usage(
+            &state.db,
+            claims.sub,
+            "kex_extract",
+            5,
+            Some(job_id),
+        )
+        .await;
+
+        let payload = json!({
+            "job_id":   job_id,
+            "user_id":  claims.sub,
+            "type":     "sharepoint",
+            "file_id":  file_id,
+        });
+
+        lpush(&state.redis, "kex:jobs", &payload.to_string())
+            .await
+            .map_err(|e| AppError::Internal(format!("Redis push failed: {e}")))?;
+
+        job_ids.push(job_id);
+    }
+
+    Ok(Json(json!({ "jobIds": job_ids })))
+}
+
+// ─── Obsidian handlers ────────────────────────────────────────────────────────
+
+/// GET /api/connectors/obsidian/vaults
+async fn list_obsidian_vaults(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, Option<String>)>(
+        "SELECT id, label, vault_url, kind, folder_path
+         FROM obsidian_vaults
+         WHERE user_id = $1
+         ORDER BY created_at DESC",
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db)
+    .await?;
+
+    let vaults: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, label, vault_url, kind, folder_path)| {
+            json!({
+                "id":          id,
+                "label":       label,
+                "vaultUrl":    vault_url,
+                "vault_url":   vault_url,
+                "kind":        kind,
+                "folder_path": folder_path,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "vaults": vaults })))
+}
+
+/// POST /api/connectors/obsidian/vaults
+async fn create_obsidian_vault(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<CreateObsidianVaultReq>,
+) -> Result<Json<Value>> {
+    // Reject non-loopback URLs at store time — prevents persisting SSRF gadgets.
+    require_loopback_url(&req.vault_url)?;
+
+    let id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO obsidian_vaults (id, user_id, label, vault_url, api_token)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(claims.sub)
+    .bind(&req.label)
+    .bind(&req.vault_url)
+    .bind(crate::services::crypto::seal(&req.api_token))
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "id": id, "ok": true })))
+}
+
+/// DELETE /api/connectors/obsidian/vaults/:id
+async fn delete_obsidian_vault(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let deleted = sqlx::query(
+        "DELETE FROM obsidian_vaults WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(claims.sub)
+    .execute(&state.db)
+    .await?;
+
+    if deleted.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /api/connectors/obsidian/probe  { vaultId }
+async fn probe_obsidian(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<ProbeObsidianReq>,
+) -> Result<Json<Value>> {
+    let vault = fetch_obsidian_vault(&state.db, req.vault_id, claims.sub).await?;
+
+    // Enforce loopback-only at request time (belt-and-suspenders; also checked at store time).
+    // TLS verification is disabled only for loopback self-signed certs.
+    let vault_url = vault.rest_url()?;
+    let (_parsed, is_loopback) = require_loopback_url(vault_url)?;
+    let http = obsidian_http_client(is_loopback)?;
+
+    let url = format!("{}/", vault_url.trim_end_matches('/'));
+
+    let resp = http
+        .get(&url)
+        .bearer_auth(vault.rest_token())
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            // The root endpoint returns vault metadata; try to extract vault name.
+            let vault_name = r
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("vaultName")
+                        .or_else(|| v.get("vault"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                });
+            Ok(Json(json!({ "ok": true, "vaultName": vault_name })))
+        }
+        Ok(r) => {
+            tracing::warn!("Obsidian probe returned HTTP {}", r.status());
+            Ok(Json(json!({ "ok": false })))
+        }
+        Err(e) => {
+            tracing::warn!("Obsidian probe error: {e}");
+            Ok(Json(json!({ "ok": false })))
+        }
+    }
+}
+
+/// GET /api/connectors/obsidian/files?vaultId=...&folder=...
+async fn list_obsidian_files(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<ObsidianFilesQuery>,
+) -> Result<Json<Value>> {
+    let vault = fetch_obsidian_vault(&state.db, q.vault_id, claims.sub).await?;
+
+    let vault_url = vault.rest_url()?;
+    let (_parsed, is_loopback) = require_loopback_url(vault_url)?;
+    let http = obsidian_http_client(is_loopback)?;
+
+    let url = format!("{}/vault/", vault_url.trim_end_matches('/'));
+
+    let resp = http
+        .get(&url)
+        .bearer_auth(vault.rest_token())
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Obsidian API request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body   = resp.text().await.unwrap_or_default();
+        tracing::warn!("Obsidian files error {status}: {body}");
+        return Err(AppError::Internal(format!("Obsidian API error: {status}")));
+    }
+
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Obsidian files parse error: {e}")))?;
+
+    // The Obsidian Local REST API /vault/ returns { files: ["path/to/note.md", ...] }
+    let folder_prefix = q.folder.as_deref().unwrap_or("");
+
+    let files: Vec<Value> = data
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter(|path| path.ends_with(".md"))
+        .filter(|path| folder_prefix.is_empty() || path.starts_with(folder_prefix))
+        .map(|path| {
+            let name = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path)
+                .to_string();
+            json!({ "path": path, "name": name })
+        })
+        .collect();
+
+    Ok(Json(json!({ "files": files })))
+}
+
+/// POST /api/connectors/obsidian/sync
+async fn sync_obsidian(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<SyncObsidianReq>,
+) -> Result<Json<Value>> {
+    // Verify the vault belongs to this user and is a REST vault (has url/token).
+    let vault = fetch_obsidian_vault(&state.db, req.vault_id, claims.sub).await?;
+
+    // Resolve KEX options (ontology → entity types, classification name) once.
+    let resolved = resolve_drive_opts(&state.db, claims.sub, &req.opts).await;
+
+    // No explicit note subset → re-ingest the whole vault via the shared core
+    // (lists every `.md` over the REST API). Same path the cron executor uses.
+    if req.paths.is_empty() {
+        let vault_row = crate::services::obsidian::VaultRow {
+            id: vault.id,
+            user_id: claims.sub,
+            label: vault.label.clone(),
+            kind: vault.kind.clone(),
+            folder_path: vault.folder_path.clone(),
+            vault_url: vault.vault_url.clone(),
+            api_token: vault.api_token.clone(),
+        };
+        let opts = resolved.to_reingest_opts(crate::services::obsidian::ReingestMode::Full, None);
+        let (_parsed, is_loopback) = require_loopback_url(vault.rest_url()?)?;
+        let http = obsidian_http_client(is_loopback)?;
+        let res = crate::services::obsidian::reingest_vault(
+            &state.db, &state.redis, &http, &state.cfg.vaults_root, &vault_row, &opts,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+        return Ok(Json(json!({
+            "synced": res.synced, "failed": res.failed, "jobIds": res.job_ids,
+        })));
+    }
+
+    let vault_url = vault.rest_url()?.to_string();
+    let api_token = vault.rest_token().to_string();
+
+    let mut synced = 0u32;
+    let mut failed = 0u32;
+    let mut job_ids: Vec<Uuid> = Vec::new();
+
+    for note_path in &req.paths {
+        let note_name = note_path.rsplit('/').next().unwrap_or(note_path).to_string();
+        let job_id = Uuid::new_v4();
+
+        let insert = sqlx::query(
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
+             VALUES ($1, $2, 'kex_obsidian', 'pending', $3, $4)",
+        )
+        .bind(job_id)
+        .bind(claims.sub)
+        .bind(json!({
+            "fileName":      note_name,
+            "vaultId":       req.vault_id,
+            "notePath":      note_path,
+            "ontologyId":    resolved.ontology_id,
+            "compilationId": resolved.compilation_id,
+            "discoveryMode": resolved.discovery_mode,
+        }))
+        .bind(resolved.classification_level_id)
+        .execute(&state.db)
+        .await;
+
+        if insert.is_err() {
+            failed += 1;
+            continue;
+        }
+
+        crate::services::usage::record_usage(
+            &state.db,
+            claims.sub,
+            "kex_extract",
+            5,
+            Some(job_id),
+        )
+        .await;
+
+        let payload = json!({
+            "job_id":                  job_id,
+            "user_id":                 claims.sub,
+            "type":                    "kex_obsidian",
+            "input":                   {
+                "vaultUrl": vault_url,
+                "apiToken": api_token,
+                "notePath": note_path,
+                "vaultId":  req.vault_id,
+            },
+            "entity_types":            resolved.entity_types,
+            "ontology_id":             resolved.ontology_id,
+            "classification":          resolved.classification_name,
+            "classification_level_id": resolved.classification_level_id,
+        });
+
+        if lpush(&state.redis, "kex:jobs", &payload.to_string()).await.is_err() {
+            failed += 1;
+            continue;
+        }
+
+        synced += 1;
+        job_ids.push(job_id);
+    }
+
+    Ok(Json(json!({ "synced": synced, "failed": failed, "jobIds": job_ids })))
+}
+
+// ─── Obsidian folder-vault handlers (server-side mounted directory) ──────────
+
+/// Recursively collect `.md` files under `dir`, returning paths relative to
+/// `base`. Skips `.obsidian/` and `.trash/` subdirectories. Does not follow into
+/// directories whose canonical path escapes `base` (defence in depth).
+fn collect_md_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    acc: &mut Vec<std::path::PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_type.is_dir() {
+            if name == ".obsidian" || name == ".trash" {
+                continue;
+            }
+            collect_md_files(base, &path, acc);
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("md")).unwrap_or(false)
+        {
+            if let Ok(rel) = path.strip_prefix(base) {
+                acc.push(rel.to_path_buf());
+            }
+        }
+    }
+}
+
+/// POST /api/connectors/obsidian/folder-vaults  { label, folderPath }
+async fn create_obsidian_folder_vault(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<CreateObsidianFolderVaultReq>,
+) -> Result<Json<Value>> {
+    if req.label.trim().is_empty() {
+        return Err(AppError::BadRequest("label is required".into()));
+    }
+
+    // Validate the path against the configured vault root. Must exist & be inside.
+    let canon = resolve_vault_path(&state.cfg.vaults_root, &req.folder_path)?;
+    if !canon.is_dir() {
+        return Err(AppError::BadRequest("path is not a directory".into()));
+    }
+    let stored_path = canon.to_string_lossy().to_string();
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO obsidian_vaults (id, user_id, label, vault_url, api_token, kind, folder_path)
+         VALUES ($1, $2, $3, NULL, NULL, 'folder', $4)",
+    )
+    .bind(id)
+    .bind(claims.sub)
+    .bind(req.label.trim())
+    .bind(&stored_path)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "id":          id,
+        "label":       req.label.trim(),
+        "kind":        "folder",
+        "folder_path": stored_path,
+        "ok":          true,
+    })))
+}
+
+/// GET /api/connectors/obsidian/folder-vaults/:id/files
+async fn list_obsidian_folder_files(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let vault = fetch_obsidian_vault(&state.db, id, claims.sub).await?;
+    if vault.kind != "folder" {
+        return Err(AppError::BadRequest("not a folder vault".into()));
+    }
+    let folder_path = vault
+        .folder_path
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("vault has no folder_path".into()))?;
+
+    // Re-validate the stored path against root before reading.
+    let base = resolve_vault_path(&state.cfg.vaults_root, folder_path)?;
+
+    let mut rels: Vec<std::path::PathBuf> = Vec::new();
+    collect_md_files(&base, &base, &mut rels);
+
+    let mut files: Vec<Value> = Vec::new();
+    for rel in rels {
+        let abs = base.join(&rel);
+        // Per-file guard: canonical path must still be inside the vault folder.
+        let canon = match std::fs::canonicalize(&abs) {
+            Ok(c) if c.starts_with(&base) => c,
+            _ => continue,
+        };
+        let meta = match std::fs::metadata(&canon) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let basename = rel
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel_str.clone());
+        files.push(json!({
+            "path":     rel_str,
+            "basename": basename,
+            "size":     meta.len(),
+            "mtimeMs":  mtime_ms,
+        }));
+    }
+
+    Ok(Json(json!({ "files": files })))
+}
+
+/// POST /api/connectors/obsidian/folder-vaults/:id/sync
+async fn sync_obsidian_folder(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SyncObsidianFolderReq>,
+) -> Result<Json<Value>> {
+    use base64::Engine;
+
+    let vault = fetch_obsidian_vault(&state.db, id, claims.sub).await?;
+    if vault.kind != "folder" {
+        return Err(AppError::BadRequest("not a folder vault".into()));
+    }
+    let folder_path = vault
+        .folder_path
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("vault has no folder_path".into()))?;
+
+    let resolved = resolve_drive_opts(&state.db, claims.sub, &req.opts).await;
+
+    // No explicit note subset → re-ingest the whole vault via the shared core
+    // (same code path the cron executor uses). Keeps manual + scheduled sync
+    // behaviourally identical.
+    if req.paths.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
+        let vault_row = crate::services::obsidian::VaultRow {
+            id: vault.id,
+            user_id: claims.sub,
+            label: vault.label.clone(),
+            kind: vault.kind.clone(),
+            folder_path: vault.folder_path.clone(),
+            vault_url: vault.vault_url.clone(),
+            api_token: vault.api_token.clone(),
+        };
+        let opts = resolved.to_reingest_opts(crate::services::obsidian::ReingestMode::Full, None);
+        let http = reqwest::Client::new();
+        let res = crate::services::obsidian::reingest_vault(
+            &state.db, &state.redis, &http, &state.cfg.vaults_root, &vault_row, &opts,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+        return Ok(Json(json!({
+            "synced": res.synced, "failed": res.failed, "results": res.job_ids,
+        })));
+    }
+
+    let base = resolve_vault_path(&state.cfg.vaults_root, folder_path)?;
+
+    // Explicit note subset (manual selective sync only).
+    let rels: Vec<std::path::PathBuf> =
+        req.paths.as_ref().unwrap().iter().map(std::path::PathBuf::from).collect();
+
+    let mut synced = 0u32;
+    let mut failed = 0u32;
+    let mut results: Vec<Value> = Vec::new();
+
+    for rel in &rels {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        // Reject absolute / traversal note paths outright.
+        if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            failed += 1;
+            results.push(json!({ "path": rel_str, "error": "invalid note path" }));
+            continue;
+        }
+        let abs = base.join(rel);
+        // Per-file canonicalize + prefix check (blocks symlink escape).
+        let canon = match std::fs::canonicalize(&abs) {
+            Ok(c) if c.starts_with(&base) => c,
+            _ => {
+                failed += 1;
+                results.push(json!({ "path": rel_str, "error": "path outside vault" }));
+                continue;
+            }
+        };
+
+        let bytes = match std::fs::read(&canon) {
+            Ok(b) => b,
+            Err(e) => {
+                failed += 1;
+                results.push(json!({ "path": rel_str, "error": format!("read failed: {e}") }));
+                continue;
+            }
+        };
+
+        let note_name = canon
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel_str.clone());
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let kex_input = json!({
+            "fileBase64":       encoded,
+            "mimetype":         "text/markdown",
+            "originalFilename": note_name,
+        })
+        .to_string();
+
+        let job_id = Uuid::new_v4();
+        let insert = sqlx::query(
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
+             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
+        )
+        .bind(job_id)
+        .bind(claims.sub)
+        .bind(json!({
+            "fileName":      note_name,
+            "vaultId":       id,
+            "ontologyId":    resolved.ontology_id,
+            "compilationId": resolved.compilation_id,
+            "discoveryMode": resolved.discovery_mode,
+        }))
+        .bind(resolved.classification_level_id)
+        .execute(&state.db)
+        .await;
+
+        if let Err(e) = insert {
+            failed += 1;
+            results.push(json!({ "path": rel_str, "error": format!("db insert failed: {e}") }));
+            continue;
+        }
+
+        crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
+
+        let payload = json!({
+            "job_id":                  job_id,
+            "user_id":                 claims.sub,
+            "type":                    "file",
+            "input":                   kex_input,
+            "file_name":               note_name,
+            "entity_types":            resolved.entity_types,
+            "ontology_id":             resolved.ontology_id,
+            "classification":          resolved.classification_name,
+            "classification_level_id": resolved.classification_level_id,
+        });
+
+        if let Err(e) = lpush(&state.redis, "kex:jobs", &payload.to_string()).await {
+            failed += 1;
+            results.push(json!({ "path": rel_str, "error": format!("redis push failed: {e}") }));
+            continue;
+        }
+
+        synced += 1;
+        results.push(json!({ "path": rel_str, "name": note_name, "jobId": job_id }));
+    }
+
+    Ok(Json(json!({ "synced": synced, "failed": failed, "results": results })))
+}
+
+// ─── SharePoint / Obsidian DB helpers ────────────────────────────────────────
+
+async fn fetch_sharepoint_tenant(
+    db:               &sqlx::PgPool,
+    tenant_config_id: Uuid,
+    user_id:          Uuid,
+) -> Result<SharepointTenantRow> {
+    let mut row = sqlx::query_as::<_, SharepointTenantRow>(
+        "SELECT id, tenant_id, tenant_name, client_id, client_secret, sharepoint_root_url
+         FROM sharepoint_tenant_configs
+         WHERE id = $1 AND user_id = $2",
+    )
+    .bind(tenant_config_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    // Decrypt the client secret at rest → callers (token exchange) get plaintext.
+    row.client_secret = crate::services::crypto::open(&row.client_secret);
+    Ok(row)
+}
+
+async fn fetch_obsidian_vault(
+    db:       &sqlx::PgPool,
+    vault_id: Uuid,
+    user_id:  Uuid,
+) -> Result<ObsidianVaultRow> {
+    sqlx::query_as::<_, ObsidianVaultRow>(
+        "SELECT id, label, vault_url, api_token, kind, folder_path
+         FROM obsidian_vaults
+         WHERE id = $1 AND user_id = $2",
+    )
+    .bind(vault_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)
+}
+
+impl ObsidianVaultRow {
+    /// REST-vault accessors: a folder vault has no url/token, so the REST
+    /// handlers reject it with a clear error instead of unwrapping NULL.
+    fn rest_url(&self) -> Result<&str> {
+        self.vault_url.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+            AppError::BadRequest("This is a folder vault — use the folder-vault endpoints".into())
+        })
+    }
+    /// Decrypted REST API token for the Obsidian Local REST API. Legacy
+    /// plaintext tokens pass through `crypto::open` unchanged.
+    fn rest_token(&self) -> String {
+        crate::services::crypto::open(self.api_token.as_deref().unwrap_or(""))
+    }
+}
+
 /// Create a KEX job record in Postgres and push a message to Redis `kex:jobs`.
 /// Returns the new job UUID.
+/// Map a Google-native MIME type to the Office format we export it as (the KEX
+/// worker's `extract_text` understands docx/xlsx/pptx). Returns `None` for binary
+/// files that are downloaded directly via `?alt=media`.
+fn drive_export_mime(native_mime: &str) -> Option<&'static str> {
+    match native_mime {
+        "application/vnd.google-apps.document" =>
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "application/vnd.google-apps.spreadsheet" =>
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "application/vnd.google-apps.presentation" =>
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        _ => None,
+    }
+}
+
+/// Download a Drive file's bytes. Native Google formats are exported to Office
+/// formats; everything else is fetched directly. Returns `(bytes, mime, name)`.
+async fn download_drive_file(
+    drive_file_id: &str,
+    token: &str,
+    http: &reqwest::Client,
+) -> Result<(Vec<u8>, String, String)> {
+    // Metadata first: real name + mimeType (so we know export vs direct download).
+    let meta: Value = http
+        .get(format!("https://www.googleapis.com/drive/v3/files/{drive_file_id}"))
+        .query(&[("fields", "name,mimeType"), ("supportsAllDrives", "true")])
+        .bearer_auth(token)
+        .send().await
+        .map_err(|e| AppError::Internal(format!("Drive metadata request failed: {e}")))?
+        .json().await
+        .map_err(|e| AppError::Internal(format!("Drive metadata parse failed: {e}")))?;
+
+    let name = meta.get("name").and_then(|v| v.as_str()).unwrap_or(drive_file_id).to_string();
+    let src_mime = meta.get("mimeType").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let (resp, out_mime, out_name) = if let Some(export_mime) = drive_export_mime(&src_mime) {
+        // Google-native → export to an Office format the worker can parse.
+        let r = http
+            .get(format!("https://www.googleapis.com/drive/v3/files/{drive_file_id}/export"))
+            .query(&[("mimeType", export_mime)])
+            .bearer_auth(token)
+            .send().await
+            .map_err(|e| AppError::Internal(format!("Drive export failed: {e}")))?;
+        let ext = match export_mime {
+            m if m.ends_with("wordprocessingml.document") => "docx",
+            m if m.ends_with("spreadsheetml.sheet")       => "xlsx",
+            _                                              => "pptx",
+        };
+        (r, export_mime.to_string(), format!("{name}.{ext}"))
+    } else {
+        // Binary file (xlsx, pdf, docx, …) → direct download.
+        let r = http
+            .get(format!("https://www.googleapis.com/drive/v3/files/{drive_file_id}"))
+            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
+            .bearer_auth(token)
+            .send().await
+            .map_err(|e| AppError::Internal(format!("Drive download failed: {e}")))?;
+        (r, src_mime, name)
+    };
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("Drive download {code}: {body}")));
+    }
+    let bytes = resp.bytes().await
+        .map_err(|e| AppError::Internal(format!("Drive body read failed: {e}")))?;
+    Ok((bytes.to_vec(), out_mime, out_name))
+}
+
+/// Resolve a sync request's raw options into ontology labels + classification
+/// name, reusing the same ontology resolution as direct KEX uploads (so the
+/// shared default ontology is used + extended when none is selected).
+async fn resolve_drive_opts(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    opts: &DriveExtractReqOpts,
+) -> DriveExtractResolved {
+    let (ontology_id, entity_types) =
+        crate::routes::kex::resolve_ontology(db, user_id, opts.ontology_id).await;
+
+    let classification_name = if let Some(cid) = opts.classification_level_id {
+        sqlx::query_scalar::<_, String>("SELECT name FROM classification_levels WHERE id = $1")
+            .bind(cid).fetch_optional(db).await.ok().flatten()
+    } else {
+        None
+    };
+
+    DriveExtractResolved {
+        ontology_id,
+        entity_types,
+        discovery_mode: opts.discovery_mode.clone(),
+        compilation_id: opts.compilation_id,
+        classification_level_id: opts.classification_level_id,
+        classification_name,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_drive_file(
     db: &sqlx::PgPool,
     redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    http: &reqwest::Client,
+    token: &str,
     user_id: Uuid,
     connector_id: Uuid,
     drive_file_id: &str,
     file_name: &str,
+    opts: &DriveExtractResolved,
 ) -> Result<Uuid> {
+    use base64::Engine;
+
+    // Download + base64 the file so the worker's existing `file` handler can
+    // extract it (it does `json.loads(input)` → base64-decode → extract_text).
+    // Previously this pushed `type:"file"` with NO input, so the worker threw
+    // "Expecting value: line 1 column 1" on every Drive file.
+    let (bytes, mimetype, real_name) = download_drive_file(drive_file_id, token, http).await?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let kex_input = json!({
+        "fileBase64":       encoded,
+        "mimetype":         mimetype,
+        "originalFilename": real_name,
+    }).to_string();
+
     let job_id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input)
-         VALUES ($1, $2, 'kex_connector', 'pending', $3)",
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
+         VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
     )
     .bind(job_id)
     .bind(user_id)
     .bind(json!({
         "connectorId":   connector_id,
         "driveFileId":   drive_file_id,
-        "fileName":      file_name,
+        "fileName":      real_name,
+        "ontologyId":    opts.ontology_id,
+        "compilationId": opts.compilation_id,
+        "discoveryMode": opts.discovery_mode,
     }))
+    .bind(opts.classification_level_id)
     .execute(db)
     .await?;
 
     let payload = json!({
-        "job_id":        job_id,
-        "user_id":       user_id,
-        "type":          "file",
-        "connector_id":  connector_id,
-        "drive_file_id": drive_file_id,
-        "file_name":     file_name,
+        "job_id":                  job_id,
+        "user_id":                 user_id,
+        "type":                    "file",
+        "input":                   kex_input,
+        "file_name":               real_name,
+        "entity_types":            opts.entity_types,
+        "ontology_id":             opts.ontology_id,
+        "classification":          opts.classification_name,
+        "classification_level_id": opts.classification_level_id,
     });
 
     lpush(redis, "kex:jobs", &payload.to_string())

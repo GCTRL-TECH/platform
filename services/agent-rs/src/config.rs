@@ -4,6 +4,8 @@ pub struct Config {
     pub license_public_key: String,
     pub api_url:            String,
     pub port:               u16,
+    /// Where the verified ER tuning profile is cached + served from (/tuning).
+    pub tuning_profile_path: String,
 }
 
 impl Config {
@@ -25,6 +27,8 @@ impl Config {
             port: std::env::var("PORT").ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(7070),
+            tuning_profile_path: std::env::var("GCTRL_TUNING_PROFILE_PATH")
+                .unwrap_or_else(|_| "/app/config/tuning.json".into()),
         }
     }
 }

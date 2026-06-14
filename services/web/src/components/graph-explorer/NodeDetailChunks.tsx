@@ -105,22 +105,43 @@ export function NodeDetailChunks({
             </Suspense>
           </div>
 
-          {chunk.entityMentions && chunk.entityMentions.length > 0 && (
-            <div className="border-t border-slate-800 px-3 py-2 flex flex-wrap gap-1">
-              <span className="text-[10px] uppercase tracking-wide text-slate-600 mr-1 self-center">
-                Mentions:
-              </span>
-              {chunk.entityMentions.map((name) => (
-                <button
-                  key={name}
-                  onClick={() => onNavigateToEntity(name)}
-                  className="inline-flex rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-300 hover:border-indigo-500/40 hover:text-indigo-200 transition-colors"
-                >
-                  {name}
-                </button>
-              ))}
-            </div>
-          )}
+          {(() => {
+            // entity_mentions comes back as objects ({text,label,type,…}) — NOT
+            // strings. Rendering an object as a React child throws and blanks the
+            // whole panel, so normalize each mention to its display name and dedupe.
+            const names = Array.from(
+              new Set(
+                (chunk.entityMentions ?? [])
+                  .map((m) =>
+                    typeof m === 'string'
+                      ? m
+                      : (m as { text?: string; name?: string; label?: string })?.text ??
+                        (m as { name?: string })?.name ??
+                        (m as { label?: string })?.label ??
+                        '',
+                  )
+                  .map((s) => s.trim())
+                  .filter(Boolean),
+              ),
+            )
+            if (names.length === 0) return null
+            return (
+              <div className="border-t border-slate-800 px-3 py-2 flex flex-wrap gap-1">
+                <span className="text-[10px] uppercase tracking-wide text-slate-600 mr-1 self-center">
+                  Mentions:
+                </span>
+                {names.map((name) => (
+                  <button
+                    key={name}
+                    onClick={() => onNavigateToEntity(name)}
+                    className="inline-flex rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-300 hover:border-indigo-500/40 hover:text-indigo-200 transition-colors"
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            )
+          })()}
         </article>
       ))}
     </div>

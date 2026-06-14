@@ -1,7 +1,24 @@
 """
-Relation Extraction for KEX Service
-Uses local Ollama LLM to extract typed relations between entities.
-Gracefully degrades to empty list when Ollama is unavailable.
+Relation Extraction for KEX Service.
+
+Uses a local Ollama LLM to extract DIRECTED, typed relations between entities,
+then runs a deterministic validation layer. Designed for trustworthy output:
+  * CLOSED relation vocabulary (relvocab.RELATIONS) — the LLM may only pick from
+    ~32 canonical relations, killing free-form garbage like
+    `is_used_as_second_brain_for`.
+  * Direction-enforced prompt with few-shot examples — fixes the inversion bug
+    (e.g. "Bigerl is CEO of Tentris" -> (Bigerl, ceo_of, Tentris), not the flip).
+  * Deterministic post-LLM validation — both ends must be known entities, no
+    self-loops, relation normalized to canonical (out-of-vocab dropped), coarse
+    type-compatibility check that REPAIRS obvious direction inversions or drops
+    them, and dedupe.
+
+Fully LOCAL: talks only to Ollama at config.OLLAMA_BASE. Gracefully degrades to
+an empty list when Ollama is unavailable or the response can't be parsed.
+
+The winning recipe (model + prompt + validation) was selected via the offline
+eval harness in bench/kex/ against a hand-labeled gold set. See bench/kex/REPORT.md.
+Relation F1 on the gold set: ~0.45 (old free-form llama3.2) -> ~0.86 (this).
 """
 
 import json
@@ -12,40 +29,73 @@ from typing import Optional
 import requests
 
 from . import config
+from . import relvocab
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters of text to send to Ollama (keep prompt manageable)
-_MAX_TEXT_CHARS = 3000
+# Maximum characters of text to send to Ollama (keep prompt manageable).
+# Raised from 3000 → 6000: a 3000-char cut decapitates a multi-page document
+# (e.g. a CV's Experience/Education sections sit past char 3000), so the relation
+# extractor never saw the facts that matter. 6000 still fits qwen2.5:7b's context
+# comfortably and roughly doubles structured-document recall.
+_MAX_TEXT_CHARS = 6000
 
-_PROMPT_TEMPLATE = """\
-You are a relation extraction system. Given a text and a list of named entities, \
-extract all semantic relationships between the entities.
+# Cap the entity list fed to the LLM. A document can produce hundreds of NER
+# entities (a CV yielded 416); dumping all of them bloats the prompt and buries
+# the few that actually participate in relations, so the model returns almost
+# nothing. The KG builder still stores ALL entities — this cap only bounds the
+# relation-extraction prompt.
+_MAX_ENTITIES = 80
+
+
+def _build_prompt(text: str, entity_lines: str) -> str:
+    """Direction-enforced, closed-vocabulary, thorough prompt (variant 'v4')."""
+    vocab_block = relvocab.vocab_prompt_block()
+    return f"""You extract directed relationships from text. The HEAD is the subject (the doer); the TAIL is the object. Direction matters — who performs or holds the relation is the HEAD.
+
+Allowed relations (pick ONLY from this list, HEAD then TAIL):
+{vocab_block}
+
+Direction examples (study these carefully):
+- "Alice is the CEO of Acme"   -> {{"head":"Alice","relation":"ceo_of","tail":"Acme"}}
+- "Acme was founded by Alice"  -> {{"head":"Alice","relation":"founded","tail":"Acme"}}  (person is head)
+- "Bob founded Acme"           -> {{"head":"Bob","relation":"founded","tail":"Acme"}}
+- "Beta is a module of Gamma"  -> {{"head":"Beta","relation":"part_of","tail":"Gamma"}}
+- "Gamma uses Redis"           -> {{"head":"Gamma","relation":"uses","tail":"Redis"}}
+- "Carol uses a tool"          -> {{"head":"Carol","relation":"uses","tail":"tool"}}
+- "Delta calls a service"      -> {{"head":"Delta","relation":"calls","tail":"service"}}
+
+CV / résumé / profile examples (a document describing ONE person's facts — pull
+out the person's employment, education, role, languages, skills, origin):
+- "Experience: Senior Developer at Acme (2020–2023)" -> [{{"head":"Eve","relation":"worked_at","tail":"Acme"}}, {{"head":"Eve","relation":"has_role","tail":"Senior Developer"}}]
+- "Education: BSc Computer Science, TU Berlin"        -> [{{"head":"Eve","relation":"studied_at","tail":"TU Berlin"}}, {{"head":"Eve","relation":"has_degree","tail":"BSc Computer Science"}}]
+- "Languages: German, English, Spanish"              -> [{{"head":"Eve","relation":"speaks","tail":"German"}}, {{"head":"Eve","relation":"speaks","tail":"English"}}, {{"head":"Eve","relation":"speaks","tail":"Spanish"}}]
+- "Skills: Python, Kubernetes, leadership"           -> [{{"head":"Eve","relation":"has_skill","tail":"Python"}}, {{"head":"Eve","relation":"has_skill","tail":"Kubernetes"}}, {{"head":"Eve","relation":"has_skill","tail":"leadership"}}]
+- "Place of birth: Wiesbaden, Germany"               -> {{"head":"Eve","relation":"born_in","tail":"Wiesbaden"}}
+(In a CV the person is almost always the HEAD. When a section lists items under
+the person — languages, skills, employers, schools, degrees — emit ONE relation
+per item, all with that person as head.)
 
 Text:
 \"\"\"
 {text}
 \"\"\"
 
-Named entities found in the text:
-{entity_list}
-
-Return ONLY a valid JSON array. Each element must have exactly these fields:
-  "head"  - the subject entity (use the exact surface form from the entity list)
-  "type"  - a short, lowercase relation label (e.g. "works_for", "located_in", "founded_by", "part_of", "born_in")
-  "tail"  - the object entity (use the exact surface form from the entity list)
+Entities (use these EXACT surface forms for head and tail):
+{entity_lines}
 
 Rules:
-- Only extract relations where both head and tail appear in the entity list.
-- Use snake_case for relation types.
-- If no relations can be found, return an empty array: []
-- Return NOTHING except the JSON array.
+- Be THOROUGH: extract EVERY relationship explicitly stated in the text, including simple "X uses Y", "X develops Y", "X is part of Y" facts. Do not skip obvious ones.
+- head and tail must both be in the entity list, and must be different.
+- Use ONLY a relation from the allowed list; if none fits a pair, skip that pair (never invent a name).
+- Keep direction correct.
+- Return ONLY a JSON array of objects with keys "head", "relation", "tail". No prose.
 
 JSON array:"""
 
 
 class RelationExtractor:
-    """Ollama-backed relation extractor."""
+    """Ollama-backed relation extractor with closed vocab + validation."""
 
     def extract_relations(
         self,
@@ -55,30 +105,64 @@ class RelationExtractor:
         """
         Extract relations from text given a list of entity dicts.
 
-        Returns list of dicts: { head: str, type: str, tail: str }
+        Each output dict: { head: str, type: str, tail: str, confidence: float }
+        where `type` is a CANONICAL relation from relvocab.RELATIONS (`type` key
+        kept for backward compatibility with the KG builder which reads
+        `relation["type"]`). `confidence` is the per-triple trust score (0..1)
+        the memory layer (A4 heat/trust) reads: ~0.9 for a clean, in-vocab,
+        type-checked triple; lower (~0.6) when validation had to repair the
+        direction or normalize the relation surface form.
+
         Returns empty list on any failure (graceful degradation).
         """
         if not entities or len(entities) < 2:
             return []
 
-        # Truncate text to keep prompt size manageable
         truncated_text = text[:_MAX_TEXT_CHARS]
         if len(text) > _MAX_TEXT_CHARS:
             truncated_text += " ..."
 
-        entity_list_str = self._format_entity_list(entities)
-        prompt = _PROMPT_TEMPLATE.format(
-            text=truncated_text,
-            entity_list=entity_list_str,
-        )
+        # Prefer entities that actually appear in the (truncated) text window we
+        # send, then cap the list. This keeps the prompt focused on entities the
+        # model can relate, instead of burying them under hundreds of stray NER
+        # hits. Validation still runs against the FULL entity set, so a relation
+        # whose surface form is in the doc is never dropped for being off-list.
+        prompt_entities = self._select_prompt_entities(entities, truncated_text)
+        entity_lines = self._format_entity_list(prompt_entities)
+        prompt = _build_prompt(truncated_text, entity_lines)
 
         raw_response = self._call_ollama(prompt)
         if raw_response is None:
             return []
 
-        return self._parse_relations(raw_response, entities)
+        parsed = self._parse_json_array(raw_response)
+        return self._validate(parsed, entities)
 
     # ── internal helpers ──────────────────────────────────────────────
+
+    def _select_prompt_entities(self, entities: list[dict], text: str) -> list[dict]:
+        """Pick the most relation-relevant entities to put in the prompt.
+
+        Entities whose surface form occurs in the text window go first (they can
+        actually be related to something the model is reading), then the rest,
+        capped at _MAX_ENTITIES. Order within each group is preserved (NER order
+        ≈ document order). Validation still runs against the full entity set.
+        """
+        if len(entities) <= _MAX_ENTITIES:
+            return entities
+        low_text = text.lower()
+        in_text: list[dict] = []
+        rest: list[dict] = []
+        for ent in entities:
+            surf = (ent.get("text") or "").strip()
+            if surf and surf.lower() in low_text:
+                in_text.append(ent)
+            else:
+                rest.append(ent)
+        selected = in_text[:_MAX_ENTITIES]
+        if len(selected) < _MAX_ENTITIES:
+            selected += rest[: _MAX_ENTITIES - len(selected)]
+        return selected
 
     def _format_entity_list(self, entities: list[dict]) -> str:
         lines: list[str] = []
@@ -86,9 +170,9 @@ class RelationExtractor:
         for ent in entities:
             surface = ent.get("text", "").strip()
             label = ent.get("label", "entity")
-            if surface and surface not in seen:
+            if surface and surface.lower() not in seen:
                 lines.append(f"  - {surface} ({label})")
-                seen.add(surface)
+                seen.add(surface.lower())
         return "\n".join(lines)
 
     def _call_ollama(self, prompt: str) -> Optional[str]:
@@ -101,11 +185,11 @@ class RelationExtractor:
                     "prompt": prompt,
                     "stream": False,
                     "options": {
-                        "temperature": 0.1,
+                        "temperature": 0.0,
                         "num_predict": 1024,
                     },
                 },
-                timeout=120,
+                timeout=180,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -120,62 +204,114 @@ class RelationExtractor:
             logger.error(f"Ollama call failed: {exc}")
             return None
 
-    def _parse_relations(
-        self,
-        response_text: str,
-        entities: list[dict],
-    ) -> list[dict]:
-        """
-        Parse JSON array from Ollama response.
-        Uses regex fallback if the response has surrounding prose.
-        Validates that head/tail reference known entity surfaces.
-        """
-        known_surfaces: set[str] = {
-            e.get("text", "").strip().lower() for e in entities
-        }
+    def _parse_json_array(self, response_text: str) -> list[dict]:
+        """Parse a JSON array of relation objects from the model response.
+        Tolerates code fences and surrounding prose."""
+        if not response_text:
+            return []
+        raw = response_text.strip()
+        raw = re.sub(r"^```(?:json)?", "", raw).strip()
+        raw = re.sub(r"```$", "", raw).strip()
 
-        # Try direct parse first
-        json_array: Optional[list] = None
         try:
-            json_array = json.loads(response_text.strip())
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [d for d in data if isinstance(d, dict)]
         except json.JSONDecodeError:
             pass
 
-        # Regex fallback: find first [...] block
-        if json_array is None:
-            match = re.search(r"\[.*?\]", response_text, re.DOTALL)
-            if match:
-                try:
-                    json_array = json.loads(match.group())
-                except json.JSONDecodeError:
-                    logger.warning("Could not parse relations JSON from Ollama response")
-                    return []
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                if isinstance(data, list):
+                    return [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                logger.warning("Could not parse relations JSON from Ollama response")
+        return []
 
-        if not json_array or not isinstance(json_array, list):
-            return []
+    def _validate(
+        self,
+        triples: list[dict],
+        entities: list[dict],
+    ) -> list[dict]:
+        """
+        Deterministic post-LLM validation:
+          * both head and tail must be known entity surface forms
+          * no self-loops / circular relations (head != tail)
+          * relation normalized to a CANONICAL relation; out-of-vocab dropped
+          * coarse type-compatibility: if the head/tail types violate the
+            relation's allowed types, try the FLIP (repairs inverted direction);
+            if neither orientation is valid, drop the triple
+          * dedupe
+        """
+        # Map normalized surface -> (canonical surface, coarse_type) for lookup.
+        surface_map: dict[str, tuple[str, str]] = {}
+        for e in entities:
+            surf = (e.get("text") or "").strip()
+            if not surf:
+                continue
+            coarse = e.get("coarse_type") or config.coarse_for(
+                e.get("gliner_label", ""), e.get("label", "")
+            )
+            surface_map.setdefault(surf.lower(), (surf, coarse))
 
         relations: list[dict] = []
-        for item in json_array:
-            if not isinstance(item, dict):
-                continue
-            head = str(item.get("head", "")).strip()
-            rel_type = str(item.get("type", "")).strip()
-            tail = str(item.get("tail", "")).strip()
+        seen: set[tuple[str, str, str]] = set()
 
-            # Only accept relations where both ends are known entities
-            if (
-                head
-                and rel_type
-                and tail
-                and head.lower() in known_surfaces
-                and tail.lower() in known_surfaces
-                and head.lower() != tail.lower()
-            ):
-                relations.append({
-                    "head": head,
-                    "type": rel_type,
-                    "tail": tail,
-                })
+        for item in triples:
+            head_raw = str(item.get("head", "")).strip()
+            tail_raw = str(item.get("tail", "")).strip()
+            rel_raw = str(item.get("relation") or item.get("type") or "").strip()
+
+            if not head_raw or not tail_raw or not rel_raw:
+                continue
+
+            head_entry = surface_map.get(head_raw.lower())
+            tail_entry = surface_map.get(tail_raw.lower())
+            if head_entry is None or tail_entry is None:
+                continue  # both ends must be known entities
+
+            head, head_coarse = head_entry
+            tail, tail_coarse = tail_entry
+            if head.lower() == tail.lower():
+                continue  # no self/circular
+
+            canon = relvocab.normalize_relation(rel_raw)
+            if canon is None:
+                continue  # drop out-of-vocab garbage
+
+            # Confidence starts high for a clean triple and is penalised by each
+            # repair the deterministic validation has to apply. The memory layer
+            # (A4 heat/trust, A3 ground-truth ranking) reads this per edge.
+            confidence = 0.9
+
+            # The LLM emitted a relation surface form that wasn't already the
+            # canonical token (e.g. "is_ceo_of" -> "ceo_of"): a small penalty,
+            # the meaning is still in-vocab but needed normalization.
+            if canon != rel_raw.strip().lower():
+                confidence -= 0.1
+
+            # Coarse type-compatibility, with direction-flip repair. A flip is a
+            # bigger trust hit than a surface normalization: the model got the
+            # direction wrong and we corrected it.
+            if not relvocab.type_ok(canon, head_coarse, tail_coarse):
+                if relvocab.type_ok(canon, tail_coarse, head_coarse):
+                    head, tail = tail, head
+                    head_coarse, tail_coarse = tail_coarse, head_coarse
+                    confidence -= 0.2
+                else:
+                    continue  # neither orientation valid -> drop
+
+            confidence = round(max(0.0, min(1.0, confidence)), 3)
+
+            key = (head.lower(), canon, tail.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            relations.append(
+                {"head": head, "type": canon, "tail": tail, "confidence": confidence}
+            )
 
         return relations
 

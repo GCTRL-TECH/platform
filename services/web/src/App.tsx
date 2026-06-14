@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
 import { api } from '@/lib/api'
+import { agentHealthUrl } from '@/lib/utils'
 import ActivationWizard from '@/pages/onboarding/ActivationWizard'
 import { AppShell } from '@/components/layout/AppShell'
 import { LoginPage } from '@/pages/auth/LoginPage'
@@ -15,15 +16,29 @@ import { FusePage } from '@/pages/fuse/FusePage'
 import { FuseJobDetail } from '@/pages/fuse/FuseJobDetail'
 import { KGListPage } from '@/pages/kg/KGListPage'
 import { KGDetailPage } from '@/pages/kg/KGDetailPage'
+import { GraphWorkspace } from '@/pages/workspace/GraphWorkspace'
+import LineagePage from '@/pages/kg/LineagePage'
 import { OntologyListPage } from '@/pages/ontologies/OntologyListPage'
 import { OntologyDetailPage } from '@/pages/ontologies/OntologyDetailPage'
 import { TalkToGraphPage } from '@/pages/rag/TalkToGraphPage'
+import { WikiPage } from '@/pages/wiki/WikiPage'
+import { AgentPage } from '@/pages/agent/AgentPage'
 import { SettingsPage } from '@/pages/settings/SettingsPage'
 import TokenDashboard from '@/pages/billing/TokenDashboard'
 import AdminPanel from '@/pages/admin/AdminPanel'
 import TriggersPage from '@/pages/triggers/TriggersPage'
 import OnboardingWizard from '@/pages/onboarding/OnboardingWizard'
+import FirstRunSetup from '@/pages/onboarding/FirstRunSetup'
+import { useSetupRequired } from '@/hooks/usePublicConfig'
 import GoogleDrivePage from '@/pages/connectors/GoogleDrivePage'
+import SharePointPage from '@/pages/connectors/SharePointPage'
+import ObsidianPage from '@/pages/connectors/ObsidianPage'
+import ClassificationPage from '@/pages/admin/ClassificationPage'
+import AccessControlPage from '@/pages/access/AccessControlPage'
+import ApiKeysPage from '@/pages/settings/ApiKeysPage'
+import SSOPage from '@/pages/settings/SSOPage'
+import { AgentProvider } from '@/components/agent/AgentProvider'
+import { PiConsole } from '@/components/agent/PiConsole'
 
 /**
  * Returns true if we're running on localhost / 127.x / a Vite dev server.
@@ -54,7 +69,7 @@ function ActivationGate({ children }: { children: React.ReactNode }) {
       return
     }
 
-    fetch('http://localhost:7070/status')
+    fetch(`${agentHealthUrl()}/status`)
       .then((r) => r.json())
       .then((d: { activated?: boolean }) => setActivated(d.activated ?? true))
       .catch(() => {
@@ -79,6 +94,37 @@ function ActivationGate({ children }: { children: React.ReactNode }) {
 
   if (!activated) {
     return <ActivationWizard onActivated={() => setActivated(true)} />
+  }
+
+  return <>{children}</>
+}
+
+/**
+ * Fresh-install gate. When the backend reports `setupRequired` (zero users) and
+ * nobody is logged in yet, every route is funneled to `/setup` so the operator
+ * creates the initial admin account instead of seeing a login form for an
+ * account that doesn't exist.
+ *
+ * Once the admin registers, `useAuth` flips to authenticated and this gate stops
+ * redirecting — the new admin flows into `/onboarding` (LLM setup) via
+ * ProtectedRoute. Configured installs (users exist) get `setupRequired: false`
+ * and never see the setup screen.
+ */
+function SetupGate({ children }: { children: React.ReactNode }) {
+  const { setupRequired, isLoading } = useSetupRequired()
+  const { isAuthenticated } = useAuth()
+  const location = useLocation()
+
+  // While the public config resolves, render children (which show their own
+  // loading spinners). We only act once we have a definitive setupRequired.
+  if (isLoading) return <>{children}</>
+
+  // Already configured, or someone is logged in → no setup needed.
+  if (!setupRequired || isAuthenticated) return <>{children}</>
+
+  // Fresh install, unauthenticated: force the first-run setup screen.
+  if (location.pathname !== '/setup') {
+    return <Navigate to="/setup" replace />
   }
 
   return <>{children}</>
@@ -148,39 +194,60 @@ function PublicRoute() {
 export function App() {
   return (
     <ActivationGate>
-      <Routes>
-        {/* Public routes */}
-        <Route element={<PublicRoute />}>
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/register" element={<RegisterPage />} />
-          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-          <Route path="/reset-password" element={<ResetPasswordPage />} />
-        </Route>
+      <AgentProvider>
+       <SetupGate>
+        <Routes>
+          {/* First-run setup (fresh install, no users yet). SetupGate redirects
+              here automatically; it self-clears once the admin is created. */}
+          <Route path="/setup" element={<FirstRunSetup />} />
 
-        {/* Protected routes */}
-        <Route element={<ProtectedRoute />}>
-          <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/kex" element={<KexPage />} />
-          <Route path="/kex/:id" element={<KexJobDetail />} />
-          <Route path="/fuse" element={<FusePage />} />
-          <Route path="/fuse/:id" element={<FuseJobDetail />} />
-          <Route path="/graphs" element={<KGListPage />} />
-          <Route path="/graphs/:id" element={<KGDetailPage />} />
-          <Route path="/ontologies" element={<OntologyListPage />} />
-          <Route path="/ontologies/:id" element={<OntologyDetailPage />} />
-          <Route path="/chat" element={<TalkToGraphPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/billing" element={<TokenDashboard />} />
-          <Route path="/admin" element={<AdminPanel />} />
-          <Route path="/triggers" element={<TriggersPage />} />
-          <Route path="/onboarding" element={<OnboardingWizard />} />
-          <Route path="/drive" element={<GoogleDrivePage />} />
-        </Route>
+          {/* Public routes */}
+          <Route element={<PublicRoute />}>
+            <Route path="/login" element={<LoginPage />} />
+            <Route path="/register" element={<RegisterPage />} />
+            <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
+          </Route>
 
-        {/* Root and catch-all: unauthenticated → /login via ProtectedRoute, authenticated → /dashboard */}
-        <Route path="/" element={<Navigate to="/dashboard" replace />} />
-        <Route path="*" element={<Navigate to="/dashboard" replace />} />
-      </Routes>
+          {/* Protected routes */}
+          <Route element={<ProtectedRoute />}>
+            <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/kex" element={<KexPage />} />
+            <Route path="/kex/:id" element={<KexJobDetail />} />
+            <Route path="/fuse" element={<FusePage />} />
+            <Route path="/fuse/:id" element={<FuseJobDetail />} />
+            <Route path="/graphs" element={<KGListPage />} />
+            <Route path="/wiki" element={<WikiPage />} />
+            <Route path="/graphs/:id" element={<KGDetailPage />} />
+            <Route path="/graphs/:id/workspace" element={<GraphWorkspace />} />
+            <Route path="/graphs/:id/lineage" element={<LineagePage />} />
+            <Route path="/ontologies" element={<OntologyListPage />} />
+            <Route path="/ontologies/:id" element={<OntologyDetailPage />} />
+            <Route path="/chat" element={<TalkToGraphPage />} />
+            <Route path="/agent" element={<AgentPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/billing" element={<TokenDashboard />} />
+            <Route path="/admin" element={<AdminPanel />} />
+            <Route path="/triggers" element={<TriggersPage />} />
+            <Route path="/onboarding" element={<OnboardingWizard />} />
+            <Route path="/drive" element={<GoogleDrivePage />} />
+            <Route path="/sharepoint" element={<SharePointPage />} />
+            <Route path="/obsidian" element={<ObsidianPage />} />
+            <Route path="/admin/classification" element={<ClassificationPage />} />
+            <Route path="/access" element={<AccessControlPage />} />
+            {/* Webhooks moved into Settings as a tab; keep the old link working. */}
+            <Route path="/settings/webhooks" element={<Navigate to="/settings?tab=webhooks" replace />} />
+            <Route path="/settings/api-keys" element={<ApiKeysPage />} />
+            <Route path="/settings/sso" element={<SSOPage />} />
+          </Route>
+
+          {/* Root and catch-all: unauthenticated → /login via ProtectedRoute, authenticated → /dashboard */}
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Routes>
+        <PiConsole />
+       </SetupGate>
+      </AgentProvider>
     </ActivationGate>
   )
 }

@@ -116,16 +116,25 @@ async fn balance(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
-    // Prefer active license if one exists for this user
-    let license = sqlx::query_as::<_, (i32, i32, String)>(
-        "SELECT credits_allocated, credits_used, tier FROM licenses
-         WHERE user_id = $1 AND status = 'active'
-         ORDER BY activated_at DESC LIMIT 1"
+    // Prefer active license if one exists for this user.
+    // Subtract unsynced token_usage rows so balance reflects spend immediately
+    // without waiting for the 60-second heartbeat round-trip to license-api.
+    let license = sqlx::query_as::<_, (i32, i32, i64, String)>(
+        "SELECT l.credits_allocated, l.credits_used,
+                COALESCE(SUM(tu.tokens_spent), 0)::bigint AS unsynced_spent,
+                l.tier
+         FROM licenses l
+         LEFT JOIN token_usage tu
+           ON tu.user_id = l.user_id AND tu.synced_to_license_api = false
+         WHERE l.user_id = $1 AND l.status = 'active'
+         GROUP BY l.id, l.credits_allocated, l.credits_used, l.tier
+         ORDER BY l.activated_at DESC LIMIT 1"
     ).bind(claims.sub).fetch_optional(&state.db).await?;
 
-    if let Some((allocated, used, tier)) = license {
+    if let Some((allocated, used, unsynced, tier)) = license {
+        let balance = (allocated - used - unsynced as i32).max(0);
         return Ok(Json(json!({
-            "balance": allocated - used,
+            "balance": balance,
             "tier": tier,
             "tierLimit": allocated,
         })));

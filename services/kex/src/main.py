@@ -24,17 +24,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import (
+    Filter, FieldCondition, MatchValue, Range, IsEmptyCondition, PayloadField,
+)
 
 from . import config
 from .chunking import get_chunker
+from .classification import resolve_classification
+from .code_parser import parse_python_repo
 from .embedding import get_embedding_client
 from .kg_builder import get_kg_builder
 from .middleware.license_check import check_credits, report_usage
 from .ner import get_ner_pipeline
+from .pii_detector import detect_pii, redact_pii
 from .relex import get_extractor
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url
+from .sources.sharepoint_handler import fetch_sharepoint_file
+from .sources.obsidian_handler import fetch_note
 from .vector_store import get_vector_store
 
 logging.basicConfig(
@@ -83,6 +90,38 @@ def get_qdrant_client() -> Optional[QdrantClient]:
     return _qdrant_client
 
 
+# ── PostgreSQL client (module-level, re-used by lexical /search) ─────
+# Separate, autocommit, read-only connection so the lexical (BM25) channel of
+# hybrid retrieval never contends with the dual-write store's transactional conn.
+
+import psycopg2 as _psycopg2  # noqa: E402  (kept local to the search subsystem)
+
+_pg_search_conn = None
+
+
+def get_search_pg():
+    """Lazy autocommit psycopg2 connection used only for lexical chunk search.
+    Returns None if Postgres is unreachable (lexical channel degrades to empty,
+    dense still answers)."""
+    global _pg_search_conn
+    if _pg_search_conn is not None:
+        try:
+            with _pg_search_conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return _pg_search_conn
+        except Exception:
+            _pg_search_conn = None
+    try:
+        conn = _psycopg2.connect(config.PG_URL, connect_timeout=5)
+        conn.autocommit = True
+        _pg_search_conn = conn
+        logger.info("Lexical search: PostgreSQL connected")
+    except Exception as exc:
+        logger.warning(f"Lexical search: PostgreSQL unavailable: {exc}")
+        _pg_search_conn = None
+    return _pg_search_conn
+
+
 # ── Core extraction pipeline ─────────────────────────────────────────
 
 def run_pipeline(
@@ -90,12 +129,37 @@ def run_pipeline(
     job_id: str,
     user_id: str,
     entity_types: list[str] | None = None,
+    auto_redact: bool = False,
+    classification_level_id: str | None = None,
+    classification_name: str | None = None,
+    origin: str | None = None,
 ) -> dict:
     """
     Full extraction pipeline: NER -> RelEx -> KG Builder -> Chunking -> Embedding -> Vector Store.
     Returns a result dict suitable for direct HTTP response or Redis publish.
+
+    `classification_*` carry the ISO 27001 level chosen at ingest; every graph
+    element and chunk is tagged with it for per-element access control.
     """
     logger.info(f"[{job_id}] Pipeline start — {len(text)} chars")
+
+    # Resolve the ingest classification once ({id, name, rank}); defaults PUBLIC.
+    classification = resolve_classification(classification_level_id, classification_name)
+    logger.info(f"[{job_id}] Classification: {classification['name']} (rank {classification['rank']})")
+
+    # 0. PII detection / redaction — runs before NER so sensitive values are never extracted
+    pii_findings: dict = {}
+    try:
+        if auto_redact:
+            text, pii_findings = redact_pii(text)
+            if pii_findings.get("has_pii"):
+                logger.info(f"[{job_id}] PII redacted: {pii_findings['total_count']} occurrences")
+        else:
+            pii_findings = detect_pii(text)
+            if pii_findings.get("has_pii"):
+                logger.info(f"[{job_id}] PII detected (not redacted): {pii_findings['total_count']} occurrences")
+    except Exception as exc:
+        logger.warning(f"[{job_id}] PII detection failed (non-fatal): {exc}")
 
     # 1. Named Entity Recognition (GLiNER zero-shot) — GPU-bound, needs lock
     ner = get_ner_pipeline()
@@ -109,8 +173,17 @@ def run_pipeline(
     logger.info(f"[{job_id}] RelEx: {len(relations)} relations")
 
     # 3. Write to Knowledge Graph
+    # Origin provenance for A2 dossiers: prefer the caller-supplied source (file
+    # name / note path); fall back to a short preview of the extracted text so a
+    # dossier can always cite where a fact came from.
+    if not origin:
+        preview = " ".join(text[:120].split())
+        origin = (preview + "…") if len(text) > 120 else preview
     kg = get_kg_builder()
-    stats = kg.build_graph(job_id, user_id, entities, relations)
+    stats = kg.build_graph(
+        job_id, user_id, entities, relations,
+        classification=classification, origin=origin,
+    )
     logger.info(f"[{job_id}] KG: {stats}")
 
     # 4. Chunk text for vector store
@@ -154,6 +227,7 @@ def run_pipeline(
             user_id,
             compilation_id=None,  # set later by API result handler
             entity_mentions=chunk_entities,
+            classification=classification,
         )
         logger.info(f"[{job_id}] Vector store: {chunks_stored} chunks stored")
     except Exception as exc:
@@ -170,6 +244,7 @@ def run_pipeline(
             "chunks_embedded": successful_embeddings,
             "chunks_stored": chunks_stored,
         },
+        "pii_findings": pii_findings,
     }
 
 
@@ -226,6 +301,10 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             job_type = payload.get("type", "text")
             job_input = payload.get("input", "")
             entity_types = payload.get("entity_types")  # from ontology, or None for defaults
+            ontology_id = payload.get("ontology_id")  # write-back target: extend it with newly-seen types
+            auto_redact = bool(payload.get("auto_redact", False))
+            classification_name = payload.get("classification")            # level name (legacy field)
+            classification_level_id = payload.get("classification_level_id")  # level UUID (preferred)
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -235,9 +314,13 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             except Exception:
                 pass  # non-fatal
 
-            # Resolve text content based on job type
+            # Resolve text content based on job type. `origin` is the human-readable
+            # source signal (file name / note path / URL) recorded on every node so
+            # A2 dossiers can cite where a fact came from.
+            origin: str | None = None
             if job_type == "url":
                 text = extract_from_url(job_input)
+                origin = job_input if isinstance(job_input, str) else None
             elif job_type == "text":
                 text = job_input
             elif job_type == "file":
@@ -247,13 +330,42 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 file_bytes = base64.b64decode(file_data["fileBase64"])
                 mimetype = file_data.get("mimetype", "application/octet-stream")
                 text = extract_text(file_bytes, mimetype)
+                origin = file_data.get("originalFilename") or file_data.get("fileName")
                 logger.info(f"[{job_id}] Extracted {len(text)} chars from file ({mimetype})")
+            elif job_type == "kex_sharepoint":
+                inp = payload.get("input", {})
+                file_bytes, mimetype = fetch_sharepoint_file(
+                    tenant_id=inp["tenantId"],
+                    client_id=inp["clientId"],
+                    client_secret=inp["clientSecret"],
+                    drive_id=inp["driveId"],
+                    item_id=inp["itemId"],
+                )
+                text = extract_text(file_bytes, mimetype)
+                origin = inp.get("fileName")
+                logger.info(f"[{job_id}] SharePoint: extracted {len(text)} chars from {inp.get('fileName','<unknown>')} ({mimetype})")
+            elif job_type == "kex_obsidian":
+                inp = payload.get("input", {})
+                text = fetch_note(
+                    vault_url=inp["vaultUrl"],
+                    api_token=inp.get("apiToken"),
+                    note_path=inp["notePath"],
+                )
+                origin = inp.get("notePath")
+                logger.info(f"[{job_id}] Obsidian: extracted {len(text)} chars from {inp.get('notePath','<unknown>')}")
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
             check_result = check_credits("kex_extract", len(text))
-            result = run_pipeline(text, job_id, user_id, entity_types=entity_types)
+            result = run_pipeline(
+                text, job_id, user_id,
+                entity_types=entity_types, auto_redact=auto_redact,
+                classification_level_id=classification_level_id,
+                classification_name=classification_name,
+                origin=origin,
+            )
             report_usage("kex_extract", len(text), check_result["credits_spent"])
+            _extend_ontology(ontology_id, result)
             _publish_result(r, job_id, result)
 
         except Exception as exc:
@@ -290,6 +402,53 @@ def _update_job_status(job_id: str, status: str, result: dict | None = None, err
         conn.close()
     except Exception as exc:
         logger.warning(f"Failed to update jobs.status for {job_id}: {exc}")
+
+
+def _extend_ontology(ontology_id: str | None, result: dict) -> None:
+    """Extend the resolved ontology in place with any newly-discovered entity types.
+
+    Additive only: each distinct entity type found in this extraction is inserted
+    if not already present (ON CONFLICT DO NOTHING) — existing types are never
+    removed or renamed. This is how the shared default "General Knowledge" ontology
+    grows as more documents are ingested, instead of a new ontology being created
+    per run. No-op when there is no ontology target (e.g. anonymous extraction).
+    """
+    if not ontology_id:
+        return
+
+    # Distinct (name, qid) pairs from the extracted entities.
+    seen: dict[str, str | None] = {}
+    for ent in result.get("entities", []) or []:
+        name = (ent.get("label") or "").strip()
+        if not name:
+            continue
+        # First-seen QID wins; keep it stable.
+        seen.setdefault(name, ent.get("type"))
+    if not seen:
+        return
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn:
+            with conn.cursor() as cur:
+                for name, qid in seen.items():
+                    cur.execute(
+                        "INSERT INTO ontology_entity_types (ontology_id, qid, name, confidence_threshold) "
+                        "VALUES (%s, %s, %s, 0.3) "
+                        "ON CONFLICT (ontology_id, name) DO NOTHING",
+                        (ontology_id, qid, name),
+                    )
+                # Keep the denormalized count + updated_at in sync.
+                cur.execute(
+                    "UPDATE ontologies SET "
+                    "entity_type_count = (SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = %s), "
+                    "updated_at = NOW() WHERE id = %s",
+                    (ontology_id, ontology_id),
+                )
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"Failed to extend ontology {ontology_id}: {exc}")
 
 
 def _publish_result(r: redis_lib.Redis, job_id: str, result: dict) -> None:
@@ -407,6 +566,19 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"GLiNER model pre-load failed: {exc}")
 
+    # Ensure the Qdrant collection exists at startup (create-if-missing). This is
+    # what makes a fresh install / post-purge work turnkey: without it the first
+    # KEX extraction's vector upsert silently no-ops against a non-existent
+    # collection and the RAG has nothing to retrieve. Idempotent + non-fatal.
+    try:
+        vs = get_vector_store()
+        if vs._get_qdrant() is not None:
+            logger.info(f"KEX: Qdrant collection '{config.QDRANT_COLLECTION}' ready")
+        else:
+            logger.warning("KEX: Qdrant unavailable at startup (collection deferred to first upsert)")
+    except Exception as exc:
+        logger.warning(f"KEX: Qdrant collection ensure failed at startup: {exc}")
+
     # Probe Redis and start background worker
     get_redis()
     start_worker()
@@ -464,10 +636,30 @@ class ExtractResponse(BaseModel):
     vector_stats: dict = {}
 
 
+class RepoRequest(BaseModel):
+    """B1 code/repo ingest: a list of Python source files -> a structure graph.
+
+    Mirrors ExtractRequest's style. `classification_level_id` is the ISO 27001
+    level UUID (resolved to {id, name, rank} exactly like text ingest) so code
+    entities are classified identically to text. `repo_name` is the provenance
+    origin recorded on every node (defaults to "repo")."""
+    files: list[dict]
+    job_id: str
+    user_id: str
+    classification_level_id: Optional[str] = None
+    repo_name: Optional[str] = None
+
+
 class SearchReq(BaseModel):
     query: str
     limit: int = 5
     compilation_id: Optional[str] = None
+    # Scope retrieval to one owner. REQUIRED for grounded, non-leaking search —
+    # the chunk collection is shared across all users.
+    user_id: Optional[str] = None
+    # Most-permissive classification rank the caller may retrieve. Chunks with a
+    # higher min_rank are filtered out of vector search. None = no clearance cap.
+    max_rank: Optional[int] = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────
@@ -495,6 +687,72 @@ async def extract_endpoint(req: ExtractRequest):
         logger.error(f"/extract error: {exc}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail={
             "error": "pipeline_failed",
+            "message": str(exc),
+        })
+
+
+@app.post("/repo")
+async def repo_endpoint(req: RepoRequest):
+    """
+    B1 — ingest a Python codebase into a governed structure graph.
+
+    Parses the supplied .py files into entities (file/class/function/module) and
+    relations (CONTAINS / IMPORTS / CALLS / INHERITS) with the stdlib `ast`
+    module — fully LOCAL, deterministic, ZERO LLM calls — then writes them via
+    the SAME KGBuilder.build_graph() the text pipeline uses, so the code graph
+    inherits identical classification (_min_rank / _class_labels), provenance
+    (_source_job / _origin / _owner), and idempotent MERGE behaviour.
+
+    Bypasses NER / RelEx / chunking / embedding entirely: code structure is
+    syntactic, not natural language.
+
+    Synchronous (like /extract): blocks until the graph write completes.
+    """
+    files = req.files or []
+    if not files:
+        raise HTTPException(status_code=400, detail={
+            "error": "empty_input",
+            "message": "files list is empty",
+        })
+
+    try:
+        # Parse to the exact dict shapes KGBuilder expects (deterministic, local).
+        entities, relations = parse_python_repo(files)
+
+        # Resolve the ingest classification once ({id, name, rank}) — identical
+        # path to the text worker so code is classified the same as text.
+        classification = resolve_classification(req.classification_level_id, None)
+        logger.info(
+            f"[{req.job_id}] /repo classification: {classification['name']} "
+            f"(rank {classification['rank']})"
+        )
+
+        # Count parsed vs skipped from the input for the response contract.
+        py_total = sum(
+            1 for f in files
+            if isinstance(f, dict) and (f.get("path") or "").endswith(".py")
+        )
+        files_parsed = len({e["text"] for e in entities if e.get("type") == "file"})
+        files_skipped = max(0, py_total - files_parsed)
+
+        kg = get_kg_builder()
+        stats = kg.build_graph(
+            req.job_id, req.user_id, entities, relations,
+            classification=classification, origin=req.repo_name or "repo",
+        )
+        logger.info(f"[{req.job_id}] /repo KG: {stats}")
+
+        return {
+            "entities_created": stats["entities_created"],
+            "relations_created": stats["relations_created"],
+            "nodes_total": stats["nodes_total"],
+            "files_parsed": files_parsed,
+            "files_skipped": files_skipped,
+        }
+    except Exception as exc:
+        logger.error(f"/repo error: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail={
+            "error": "repo_parse_failed",
             "message": str(exc),
         })
 
@@ -668,14 +926,278 @@ async def search_health_endpoint():
     return {"ok": True}
 
 
+def _dense_search(vector, req: "SearchReq") -> list[dict]:
+    """Dense (vector) channel of hybrid retrieval. Owner + clearance are ALWAYS
+    enforced; the compilation scope is a SOFT, droppable filter with an owner-
+    corpus fallback. Returns normalized chunk dicts in rank order (best first).
+    Raises HTTPException only when Qdrant is genuinely unavailable.
+    """
+    def _owner_clearance_conditions() -> list:
+        conds: list = []
+        if req.user_id:
+            conds.append(FieldCondition(key="user_id", match=MatchValue(value=req.user_id)))
+        # Null-tolerant clearance: a missing min_rank is treated as public (rank 0).
+        if req.max_rank is not None:
+            conds.append(Filter(should=[
+                FieldCondition(key="min_rank", range=Range(lte=float(req.max_rank))),
+                IsEmptyCondition(is_empty=PayloadField(key="min_rank")),
+            ]))
+        return conds
+
+    must_conditions = _owner_clearance_conditions()
+    if req.compilation_id:
+        must_conditions.append(Filter(should=[
+            FieldCondition(key="compilation_id", match=MatchValue(value=req.compilation_id)),
+            IsEmptyCondition(is_empty=PayloadField(key="compilation_id")),
+        ]))
+    qdrant_filter: Optional[Filter] = Filter(must=must_conditions) if must_conditions else None
+
+    qc = get_qdrant_client()
+    if qc is None:
+        raise HTTPException(status_code=503, detail={"error": "Vector search unavailable"})
+
+    def _run(qfilter: Optional[Filter]):
+        if hasattr(qc, "query_points"):
+            return qc.query_points(
+                collection_name=config.QDRANT_COLLECTION,
+                query=vector, limit=max(1, req.limit),
+                query_filter=qfilter, with_payload=True,
+            ).points
+        return qc.search(
+            collection_name=config.QDRANT_COLLECTION,
+            query_vector=vector, limit=max(1, req.limit),
+            query_filter=qfilter, with_payload=True,
+        )
+
+    try:
+        hits = _run(qdrant_filter)
+        if not hits and req.compilation_id:
+            logger.info("/search dense: 0 hits scoped to compilation %s — owner-corpus fallback", req.compilation_id)
+            hits = _run(Filter(must=_owner_clearance_conditions()) if (req.user_id or req.max_rank is not None) else None)
+    except UnexpectedResponse as exc:
+        if exc.status_code == 404:
+            logger.warning(f"/search dense: collection '{config.QDRANT_COLLECTION}' not found")
+            return []
+        logger.error(f"/search dense Qdrant error: {exc}")
+        return []
+    except Exception as exc:
+        logger.error(f"/search dense Qdrant error: {exc}")
+        return []
+
+    out: list[dict] = []
+    for hit in hits:
+        payload = hit.payload or {}
+        names: list[str] = []
+        seen: set[str] = set()
+        for m in (payload.get("entity_mentions") or []):
+            nm = (m.get("name") or m.get("text") or "") if isinstance(m, dict) else str(m)
+            nm = nm.strip()
+            if nm and nm not in seen:
+                seen.add(nm)
+                names.append(nm)
+        out.append({
+            "text": payload.get("text", ""),
+            "score": float(hit.score),         # cosine similarity (0..1) — used for confidence
+            "dense_score": float(hit.score),   # preserved through fusion for a meaningful confidence
+            "entity_mentions": names,
+            "source": payload.get("source_document_id", "") or "",
+            "chunk_id": str(hit.id),
+        })
+    return out
+
+
+def _lexical_search(req: "SearchReq") -> list[dict]:
+    """Lexical (BM25-style) channel of hybrid retrieval, over text_chunks.content_tsv.
+
+    Mirrors the dense path's security/scoping EXACTLY:
+      * owner: user_id = req.user_id (when provided)
+      * clearance: min_rank IS NULL OR min_rank <= req.max_rank (null-tolerant)
+      * soft compilation: compilation_id = req.compilation_id OR compilation_id IS NULL,
+        with an owner-corpus fallback when the scoped query returns nothing.
+
+    Ranking: ts_rank_cd over websearch_to_tsquery('simple', q). Additionally UNIONs
+    a raw ILIKE substring match so punctuated exact tokens (filenames, hyphenated
+    IDs like "GCTRL-XR-7741") that 'simple' splits on punctuation are still caught —
+    these get a fixed high lexical rank because an exact substring hit is a strong
+    signal. Returns normalized chunk dicts in rank order (best first).
+    """
+    q = req.query.strip()
+    if not q:
+        return []
+    conn = get_search_pg()
+    if conn is None:
+        return []
+
+    limit = max(1, req.limit)
+
+    def _scope_sql(include_comp: bool) -> tuple[str, dict]:
+        # archived = false: A5 dedup soft-archives near-duplicate chunks; retrieval
+        # must skip them so a merged duplicate never resurfaces as a hit.
+        clauses = ["tc.archived = false",
+                   "tc.content_tsv @@ websearch_to_tsquery('simple', %(q)s)"]
+        params: dict = {"q": q, "limit": limit}
+        if req.user_id:
+            clauses.append("tc.user_id = %(uid)s")
+            params["uid"] = req.user_id
+        if req.max_rank is not None:
+            clauses.append("(tc.min_rank IS NULL OR tc.min_rank <= %(rank)s)")
+            params["rank"] = req.max_rank
+        if include_comp and req.compilation_id:
+            clauses.append("(tc.compilation_id = %(comp)s OR tc.compilation_id IS NULL)")
+            params["comp"] = req.compilation_id
+        sql = (
+            "SELECT tc.id::text, tc.content, tc.entity_mentions, "
+            "       ts_rank_cd(tc.content_tsv, websearch_to_tsquery('simple', %(q)s)) AS rank "
+            "FROM text_chunks tc "
+            "WHERE " + " AND ".join(clauses) + " "
+            "ORDER BY rank DESC LIMIT %(limit)s"
+        )
+        return sql, params
+
+    def _ilike_sql(include_comp: bool) -> tuple[str, dict]:
+        # Exact-substring fallback for punctuated tokens tsquery splits apart.
+        # archived = false mirrors _scope_sql (skip A5-deduped duplicates).
+        clauses = ["tc.archived = false", "tc.content ILIKE %(like)s"]
+        params: dict = {"like": f"%{q}%", "limit": limit}
+        if req.user_id:
+            clauses.append("tc.user_id = %(uid)s"); params["uid"] = req.user_id
+        if req.max_rank is not None:
+            clauses.append("(tc.min_rank IS NULL OR tc.min_rank <= %(rank)s)"); params["rank"] = req.max_rank
+        if include_comp and req.compilation_id:
+            clauses.append("(tc.compilation_id = %(comp)s OR tc.compilation_id IS NULL)"); params["comp"] = req.compilation_id
+        sql = (
+            "SELECT tc.id::text, tc.content, tc.entity_mentions "
+            "FROM text_chunks tc WHERE " + " AND ".join(clauses) + " LIMIT %(limit)s"
+        )
+        return sql, params
+
+    def _normalize(row_id: str, content: str, mentions) -> dict:
+        names: list[str] = []
+        seen: set[str] = set()
+        items = mentions if isinstance(mentions, list) else []
+        for m in items:
+            nm = (m.get("name") or m.get("text") or "") if isinstance(m, dict) else str(m)
+            nm = nm.strip()
+            if nm and nm not in seen:
+                seen.add(nm); names.append(nm)
+        return {"text": content or "", "entity_mentions": names, "source": "", "chunk_id": row_id}
+
+    def _query(include_comp: bool) -> list[dict]:
+        results: dict[str, dict] = {}
+        order: list[str] = []
+        try:
+            with conn.cursor() as cur:
+                sql, params = _scope_sql(include_comp)
+                cur.execute(sql, params)
+                for rid, content, mentions, rank in cur.fetchall():
+                    if rid not in results:
+                        results[rid] = _normalize(rid, content, mentions)
+                        results[rid]["score"] = float(rank or 0.0)
+                        order.append(rid)
+            # ILIKE fallback for exact substrings (punctuated IDs/filenames). These
+            # rank at the FRONT — an exact literal hit is the strongest lexical
+            # signal and is precisely what BM25-over-tsvector can miss.
+            with conn.cursor() as cur:
+                sql, params = _ilike_sql(include_comp)
+                cur.execute(sql, params)
+                ilike_ids = [r[0] for r in cur.fetchall()]
+            if ilike_ids:
+                # Re-order so exact-substring hits lead, preserving their content.
+                lead = []
+                for rid in ilike_ids:
+                    if rid in results:
+                        lead.append(rid)
+                    else:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT id::text, content, entity_mentions FROM text_chunks WHERE id = %s", (rid,))
+                            row = cur.fetchone()
+                        if row:
+                            results[rid] = _normalize(row[0], row[1], row[2])
+                            results[rid]["score"] = 0.0
+                            lead.append(rid)
+                order = lead + [r for r in order if r not in set(lead)]
+        except Exception as exc:
+            logger.warning(f"/search lexical query failed: {exc}")
+            return []
+        return [results[r] for r in order][:limit]
+
+    hits = _query(include_comp=True)
+    if not hits and req.compilation_id:
+        logger.info("/search lexical: 0 hits scoped to compilation %s — owner-corpus fallback", req.compilation_id)
+        hits = _query(include_comp=False)
+    return hits
+
+
+def _rrf_fuse(channels: list[list[dict]], limit: int, k: int = 60) -> list[dict]:
+    """Reciprocal-rank fusion of multiple ranked chunk lists into one.
+
+    score(chunk) = Σ_channels 1 / (k + rank_in_channel)   (rank is 1-based)
+
+    Chunks are identified by chunk_id (falling back to text). k≈60 is the standard
+    RRF constant — it damps the contribution of low-ranked items so a chunk that is
+    top-1 in EITHER channel surfaces, which is exactly what makes the union of dense
+    (semantic) and lexical (exact-token) retrieval strictly better than either
+    alone. Carries each chunk's richest payload (entity_mentions from whichever
+    channel had them) for downstream graph-expand.
+    """
+    # Lexical-only hits have no cosine similarity; give them a modest positive
+    # confidence floor so a chunk recalled purely by exact-token match still
+    # reports confidence > 0 downstream (rag.rs averages chunk.score) instead of
+    # tanking the answer's confidence to ~0.
+    LEXICAL_CONFIDENCE_FLOOR = 0.35
+
+    fused: dict[str, dict] = {}
+    for channel in channels:
+        for rank, ch in enumerate(channel, start=1):
+            key = ch.get("chunk_id") or ch.get("text", "")
+            if not key:
+                continue
+            contrib = 1.0 / (k + rank)
+            if key not in fused:
+                entry = dict(ch)
+                entry["_rrf"] = contrib
+                fused[key] = entry
+            else:
+                fused[key]["_rrf"] += contrib
+                # Carry the dense cosine score if THIS channel is the one that had it.
+                if ch.get("dense_score") is not None and fused[key].get("dense_score") is None:
+                    fused[key]["dense_score"] = ch["dense_score"]
+                # Prefer the entity_mentions from whichever channel actually has them.
+                if not fused[key].get("entity_mentions") and ch.get("entity_mentions"):
+                    fused[key]["entity_mentions"] = ch["entity_mentions"]
+                if not fused[key].get("text") and ch.get("text"):
+                    fused[key]["text"] = ch["text"]
+
+    # Order by the RRF score (the fusion's job), but REPORT an interpretable
+    # per-chunk `score`: the dense cosine similarity when the chunk was retrieved
+    # semantically, else a lexical floor. This keeps rag.rs's confidence (mean of
+    # chunk.score) meaningful instead of collapsing it to the tiny 1/(k+rank) band.
+    ordered = sorted(fused.values(), key=lambda c: c["_rrf"], reverse=True)
+    out: list[dict] = []
+    for c in ordered[:limit]:
+        ds = c.get("dense_score")
+        c["score"] = float(ds) if ds is not None else LEXICAL_CONFIDENCE_FLOOR
+        c.pop("_rrf", None)
+        c.pop("dense_score", None)
+        out.append(c)
+    return out
+
+
 @app.post("/search")
 async def search_endpoint(req: SearchReq):
     """
-    Semantic search over stored chunks in Qdrant.
+    HYBRID retrieval over stored chunks: dense (Qdrant vector) ∪ lexical
+    (Postgres BM25-style full-text + exact-substring), fused by reciprocal-rank
+    fusion. This is the anchor retrieval for the graph RAG in rag.rs — making it
+    hybrid here means BOTH the fast path and the agentic deep path (which call
+    this same endpoint) gain exact-keyword / filename / ID recall that pure dense
+    vector search misses.
 
-    Embeds the query, then performs an approximate nearest-neighbour search
-    against the configured Qdrant collection.  An optional compilation_id
-    filter narrows results to a specific KG compilation.
+    Cascade:
+      1. dense channel  (semantic, owner+clearance+soft-compilation scoped)
+      2. lexical channel (exact tokens, SAME scoping, with ILIKE substring rescue)
+      3. RRF fusion of the two into one ranked list
+      4. fallback: if fusion is empty, lexical-only over the whole owner corpus
     """
     query = req.query.strip()
     if not query:
@@ -683,84 +1205,75 @@ async def search_endpoint(req: SearchReq):
     if len(query) > 2000:
         raise HTTPException(status_code=400, detail={"error": "query exceeds 2000 character limit"})
 
-    # Embed the query
+    # Dense channel — embed the query; embedding failure degrades to lexical-only
+    # rather than 503, so exact-token retrieval still works if Ollama is down.
+    dense_hits: list[dict] = []
     vector = get_embedding_client().embed(query)
     if vector is None:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "Embedding service unavailable"},
-        )
+        logger.warning("/search: embedding unavailable — dense channel skipped, lexical-only")
+    else:
+        dense_hits = _dense_search(vector, req)
 
-    # Build optional compilation_id filter
-    qdrant_filter: Optional[Filter] = None
-    if req.compilation_id:
-        qdrant_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="compilation_id",
-                    match=MatchValue(value=req.compilation_id),
-                )
-            ]
-        )
+    # Lexical channel — Postgres full-text + exact-substring (BM25-style).
+    lexical_hits = _lexical_search(req)
 
-    # Query Qdrant
+    # RRF fusion of dense ∪ lexical into a single ranked list.
+    fused = _rrf_fuse([dense_hits, lexical_hits], limit=max(1, req.limit))
+
+    # Final fallback: nothing fused (e.g. compilation scope hid everything and the
+    # dense fallback also empty) → lexical-only over the WHOLE owner corpus.
+    if not fused:
+        corpus_req = SearchReq(query=req.query, limit=req.limit, compilation_id=None,
+                               user_id=req.user_id, max_rank=req.max_rank)
+        corpus_lex = _lexical_search(corpus_req)
+        fused = _rrf_fuse([corpus_lex], limit=max(1, req.limit))
+
+    logger.info(
+        "/search hybrid: dense=%d lexical=%d fused=%d (comp=%s)",
+        len(dense_hits), len(lexical_hits), len(fused), req.compilation_id,
+    )
+    return {"chunks": fused}
+
+
+# ── A5: semantic dedup-merge ──────────────────────────────────────────
+
+
+class DedupReq(BaseModel):
+    """Scope + tunables for the dedup governance pass. All fields optional; an
+    empty body sweeps the whole corpus (still per-user safe) at the default τ."""
+    tau: Optional[float] = None
+    user_id: Optional[str] = None
+    compilation_id: Optional[str] = None
+    dry_run: bool = False
+
+
+@app.post("/dedup")
+async def dedup_endpoint(req: DedupReq):
+    """
+    A5 — find near-duplicate chunks (embedding cosine > τ) and merge each cluster
+    into one canonical chunk: union provenance, keep the most-restrictive clearance,
+    soft-archive the duplicates. Conservative + per-user + clearance-preserving.
+
+    Called by the api-rs memory-maintenance cycle (and usable standalone / after an
+    ingest). Returns {scanned, clusters, merged, tau, dry_run, examples}.
+    """
+    from .dedup import run_dedup, DEFAULT_TAU
+    from starlette.concurrency import run_in_threadpool
+    tau = req.tau if (req.tau is not None and 0.5 <= req.tau <= 1.0) else DEFAULT_TAU
     qc = get_qdrant_client()
-    if qc is None:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "Vector search unavailable"},
-        )
-
-    try:
-        # qdrant-client 1.7+ replaces .search() with .query_points()
-        if hasattr(qc, "query_points"):
-            resp = qc.query_points(
-                collection_name=config.QDRANT_COLLECTION,
-                query=vector,
-                limit=max(1, req.limit),
-                query_filter=qdrant_filter,
-                with_payload=True,
-            )
-            hits = resp.points
-        else:
-            hits = qc.search(
-                collection_name=config.QDRANT_COLLECTION,
-                query_vector=vector,
-                limit=max(1, req.limit),
-                query_filter=qdrant_filter,
-                with_payload=True,
-            )
-    except UnexpectedResponse as exc:
-        if exc.status_code == 404:
-            # Collection does not exist yet — return empty results, not an error
-            logger.warning(
-                f"/search: collection '{config.QDRANT_COLLECTION}' not found in Qdrant"
-            )
-            return {"chunks": []}
-        logger.error(f"/search Qdrant error: {exc}")
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "Vector search unavailable"},
-        )
-    except Exception as exc:
-        logger.error(f"/search Qdrant error: {exc}")
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "Vector search unavailable"},
-        )
-
-    chunks = []
-    for hit in hits:
-        payload = hit.payload or {}
-        chunks.append({
-            "text": payload.get("text", ""),
-            "score": hit.score,
-            "entity_mentions": payload.get("entity_mentions", []),
-            "source": payload.get("source_document_id", ""),
-            "chunk_id": str(hit.id),
-        })
-
-    return {"chunks": chunks}
+    # run_dedup is synchronous (blocking psycopg2 + Qdrant I/O). Offload it to a
+    # threadpool so a corpus sweep never blocks the uvicorn event loop (which also
+    # serves /search and the GLiNER-bound /extract on the same worker).
+    return await run_in_threadpool(
+        run_dedup,
+        qc=qc,
+        pg_url=config.PG_URL,
+        collection=config.QDRANT_COLLECTION,
+        tau=tau,
+        user_id=req.user_id,
+        compilation_id=req.compilation_id,
+        dry_run=req.dry_run,
+    )
 
 
 # ── Local dev entry point ─────────────────────────────────────────────

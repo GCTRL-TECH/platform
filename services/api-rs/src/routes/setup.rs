@@ -358,9 +358,18 @@ async fn probe_http(url: &str) -> Option<u128> {
 }
 
 async fn status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value> {
-    let qdrant = state.cfg.qdrant_url.clone();
-    let ollama =
-        std::env::var("OLLAMA_BASE").unwrap_or_else(|_| "http://localhost:11434".into());
+    // Which swappable services currently point at an external override vs the
+    // bundled onboard default — drives the status "source" chips in the UI.
+    let override_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT service, url FROM service_overrides",
+    ).fetch_all(&state.db).await.unwrap_or_default();
+    let has_override = |svc: &str| override_rows.iter()
+        .any(|(s, u)| s == svc && u.as_deref().map(|x| !x.trim().is_empty()).unwrap_or(false));
+
+    // Probe the EFFECTIVE endpoint (override if set, else bundled default) for the
+    // HTTP services, so swapping a target shows that target's health right away.
+    let qdrant = crate::routes::infra::effective_service_url(&state.db, &state.cfg, "qdrant").await;
+    let ollama = crate::routes::infra::effective_service_url(&state.db, &state.cfg, "ollama").await;
     let neo4j_uri = state.cfg.neo4j_uri.clone();
     let redis_url = state.cfg.redis_url.clone();
 
@@ -404,13 +413,14 @@ async fn status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value
         },
     );
 
+    let src = |svc: &str| if has_override(svc) { "override" } else { "default" };
     Json(json!({
         "services": {
-            "neo4j":    { "url": neo4j_uri,        "connected": neo4j_res["connected"],  "latencyMs": neo4j_res["latencyMs"] },
-            "qdrant":   { "url": qdrant,            "connected": qdrant_res["connected"], "latencyMs": qdrant_res["latencyMs"] },
-            "ollama":   { "url": ollama,            "connected": ollama_res["connected"], "latencyMs": ollama_res["latencyMs"] },
-            "postgres": { "url": "(configured)",   "connected": pg_res["connected"],     "latencyMs": pg_res["latencyMs"] },
-            "redis":    { "url": "(configured)",   "connected": redis_res["connected"],  "latencyMs": redis_res["latencyMs"] },
+            "neo4j":    { "url": neo4j_uri, "connected": neo4j_res["connected"],  "latencyMs": neo4j_res["latencyMs"],  "source": src("neo4j"),   "swappable": true },
+            "qdrant":   { "url": qdrant,    "connected": qdrant_res["connected"], "latencyMs": qdrant_res["latencyMs"], "source": src("qdrant"),  "swappable": true },
+            "ollama":   { "url": ollama,    "connected": ollama_res["connected"], "latencyMs": ollama_res["latencyMs"], "source": src("ollama"),  "swappable": true },
+            "postgres": { "url": "postgres (bundled)", "connected": pg_res["connected"], "latencyMs": pg_res["latencyMs"], "source": src("postgres"), "swappable": true },
+            "redis":    { "url": "redis (bundled)",    "connected": redis_res["connected"], "latencyMs": redis_res["latencyMs"], "source": "default", "swappable": false },
         }
     }))
 }

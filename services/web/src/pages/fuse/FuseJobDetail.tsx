@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { format } from 'date-fns'
 import { useApiQuery } from '@/hooks/useApi'
+import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
@@ -96,6 +97,7 @@ export function FuseJobDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { neo4jBrowser } = usePublicConfig()
 
   const { data: jobResponse, isLoading, error } = useApiQuery<FuseJobResponse>(
     ['fuse', 'jobs', id],
@@ -186,7 +188,7 @@ export function FuseJobDetail() {
               View Compilation
             </button>
           )}
-          <a href="http://localhost:7474" target="_blank" rel="noopener noreferrer" className="btn-secondary">
+          <a href={neo4jBrowser} target="_blank" rel="noopener noreferrer" className="btn-secondary">
             <ExternalLink size={14} />
             Neo4j
           </a>

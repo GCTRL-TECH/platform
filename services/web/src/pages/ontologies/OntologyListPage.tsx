@@ -22,6 +22,10 @@ import { cn } from '@/lib/utils'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
 import { apiPost, apiDelete } from '@/lib/api'
 
+/** The shared canonical "General Knowledge" ontology (migration 036). Always
+ * present from install, default for every user, and not deletable. */
+export const DEFAULT_ONTOLOGY_ID = '00000000-0000-0000-0000-0000000000a1'
+
 type OntologyScope = 'private' | 'shared' | 'public'
 
 interface Ontology {
@@ -205,6 +209,7 @@ function OntologyCard({
 }) {
   const scopeStyle = SCOPE_STYLES[ontology.scope] || SCOPE_STYLES.private
   const ScopeIcon = scopeStyle.icon
+  const isDefault = ontology.id === DEFAULT_ONTOLOGY_ID
 
   return (
     <button
@@ -214,18 +219,27 @@ function OntologyCard({
         scopeStyle.border
       )}
     >
-      {/* Delete button */}
-      <div
-        className="absolute right-2 top-2 opacity-0 transition-opacity group-hover:opacity-100"
-        onClick={(e) => {
-          e.stopPropagation()
-          onDelete(ontology.id, ontology.name)
-        }}
-        role="button"
-        title="Delete ontology"
-      >
-        <Trash2 size={14} className="text-slate-600 transition-colors hover:text-red-400" />
-      </div>
+      {/* Delete button — the shared default ontology is permanent and not deletable */}
+      {isDefault ? (
+        <div
+          className="absolute right-2 top-2 rounded bg-slate-800 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-slate-400"
+          title="The default ontology is always present and cannot be deleted"
+        >
+          Default
+        </div>
+      ) : (
+        <div
+          className="absolute right-2 top-2 opacity-0 transition-opacity group-hover:opacity-100"
+          onClick={(e) => {
+            e.stopPropagation()
+            onDelete(ontology.id, ontology.name)
+          }}
+          role="button"
+          title="Delete ontology"
+        >
+          <Trash2 size={14} className="text-slate-600 transition-colors hover:text-red-400" />
+        </div>
+      )}
 
       {/* Header row */}
       <div className="mb-3 flex items-start justify-between gap-2">

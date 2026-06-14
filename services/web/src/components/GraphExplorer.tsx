@@ -57,7 +57,12 @@ const ForceGraph3D = lazy(() =>
   import('react-force-graph-3d').then((m) => ({ default: m.default })),
 )
 
-const MAX_DISPLAY_NODES = 500
+// Render every node up to a perf ceiling (the force sim, not drawing, is the
+// cost); the viewport bounds visible density via the zoom clamp below, so the
+// user pans to reach the rest rather than seeing a hard "first 500" truncation.
+const MAX_DISPLAY_NODES = 4000
+const MIN_ZOOM = 0.35
+const MAX_ZOOM = 8
 const LINK_COLOR_BASE = '#475569'
 const LINK_OPACITY_FOCUS = 0.5
 const LINK_OPACITY_FADE = 0.08
@@ -181,32 +186,75 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
   const focusId = hoveredId ?? clickFocusId
   const focus = useFocusMode(displayedEdges, focusId)
 
-  // ── colour cache keyed on (focusId, colorBy)
-  const colorCacheKey = `${focusId ?? '∅'}::${colorBy}`
-  const colorCache = useMemo(
-    () => new Map<string, string>(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [colorCacheKey],
+  // ── Animated focus fade ───────────────────────────────────────────────
+  // Each node has an animated "focusedness" in [NODE_OPACITY_FADE..1] that eases
+  // toward its target (1 if in the focused set, faded otherwise) instead of
+  // snapping. A short rAF loop lerps the values and bumps `animTick`, whose new
+  // identity makes the ForceGraph re-read the colour accessors each frame — so
+  // both 2D and 3D fade smoothly rather than flickering.
+  const focusAlphaRef = useRef<Map<string, number>>(new Map())
+  const [animTick, setAnimTick] = useState(0)
+  const animRafRef = useRef<number | null>(null)
+  // Latest focus + node set for the rAF closure (avoids stale captures).
+  const focusRef = useRef(focus)
+  focusRef.current = focus
+  const focusNodesRef = useRef(displayedNodes)
+  focusNodesRef.current = displayedNodes
+
+  useEffect(() => {
+    const step = () => {
+      const m = focusAlphaRef.current
+      const f = focusRef.current
+      let moving = false
+      for (const n of focusNodesRef.current) {
+        const target = f.isFaded(n) ? NODE_OPACITY_FADE : 1
+        const cur = m.get(n.id)
+        if (cur === undefined) {
+          m.set(n.id, target)
+          continue
+        }
+        const next = cur + (target - cur) * 0.18
+        if (Math.abs(target - next) > 0.012) {
+          m.set(n.id, next)
+          moving = true
+        } else {
+          m.set(n.id, target)
+        }
+      }
+      setAnimTick((t) => (t + 1) & 0xffff)
+      animRafRef.current = moving ? requestAnimationFrame(step) : null
+    }
+    if (animRafRef.current) cancelAnimationFrame(animRafRef.current)
+    animRafRef.current = requestAnimationFrame(step)
+    return () => {
+      if (animRafRef.current) cancelAnimationFrame(animRafRef.current)
+    }
+  }, [focusId])
+
+  const nodeFocusAlpha = useCallback(
+    (id: string) => focusAlphaRef.current.get(id) ?? 1,
+    [],
   )
+
   const computeNodeColor = useCallback(
-    (n: GraphNode) => {
-      const cached = colorCache.get(n.id)
-      if (cached) return cached
-      const base = getNodeColor(n, colorBy)
-      const alpha = focus.isFaded(n) ? NODE_OPACITY_FADE : 1
-      const out = withAlpha(base, alpha)
-      colorCache.set(n.id, out)
-      return out
-    },
-    [colorBy, colorCache, focus],
+    (n: GraphNode) => withAlpha(getNodeColor(n, colorBy), nodeFocusAlpha(n.id)),
+    // animTick intentionally in deps: a fresh identity each frame makes the
+    // ForceGraph re-evaluate node colours so the fade animates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [colorBy, nodeFocusAlpha, animTick],
   )
   const computeLinkColor = useCallback(
-    (e: GraphEdge) =>
-      withAlpha(
-        LINK_COLOR_BASE,
-        focus.edgeIsFaded(e) ? LINK_OPACITY_FADE : LINK_OPACITY_FOCUS,
-      ),
-    [focus],
+    (e: GraphEdge) => {
+      const sId = typeof e.source === 'string' ? e.source : (e.source as { id: string }).id
+      const tId = typeof e.target === 'string' ? e.target : (e.target as { id: string }).id
+      // A link is as visible as its least-focused endpoint.
+      const f = Math.min(nodeFocusAlpha(sId), nodeFocusAlpha(tId))
+      const t = (f - NODE_OPACITY_FADE) / (1 - NODE_OPACITY_FADE) // 0..1
+      const op = LINK_OPACITY_FADE + (LINK_OPACITY_FOCUS - LINK_OPACITY_FADE) * t
+      return withAlpha(LINK_COLOR_BASE, op)
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [nodeFocusAlpha, animTick],
   )
 
   const computeNodeVal = useCallback(
@@ -371,6 +419,8 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
             nodeLabel={(n: object) => resolveTypeLabel(n as GraphNode)}
             linkColor={computeLinkColor as never}
             linkWidth={0.8}
+            minZoom={MIN_ZOOM}
+            maxZoom={MAX_ZOOM}
             linkDirectionalArrowLength={3}
             linkDirectionalArrowRelPos={0.95}
             onNodeHover={handleNodeHover as never}
@@ -387,9 +437,10 @@ export function GraphExplorer({ compilationId, className }: GraphExplorerProps) 
                     if (!label) return
                     const fontSize = 4
                     ctx.font = `${fontSize}px sans-serif`
-                    ctx.fillStyle = focus.isFaded(n)
-                      ? 'rgba(148, 163, 184, 0.25)'
-                      : 'rgba(226, 232, 240, 0.95)'
+                    // Animated label opacity tracks the node's focus fade.
+                    const a = nodeFocusAlpha(n.id)
+                    const t = (a - NODE_OPACITY_FADE) / (1 - NODE_OPACITY_FADE)
+                    ctx.fillStyle = `rgba(214, 222, 236, ${(0.25 + 0.7 * t).toFixed(3)})`
                     ctx.textAlign = 'center'
                     ctx.textBaseline = 'top'
                     ctx.fillText(label, n.x, n.y + 6)

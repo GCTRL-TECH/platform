@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
 } from 'react'
 import { useDropzone } from 'react-dropzone'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   MessageSquare,
   Send,
@@ -36,10 +37,22 @@ import {
   MicOff,
 } from 'lucide-react'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
+import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { getToken } from '@/lib/auth'
+import { pickDefaultChatModel, isValidChatSelection } from '@/lib/models'
 import { formatDistanceToNow } from 'date-fns'
+
+/// Safe relative-time formatter. `formatDistanceToNow(new Date(undefined))` throws
+/// "Invalid time value" — which the app error boundary turns into a blank screen.
+/// Returns '' for missing/invalid timestamps so a bad date never crashes the page.
+function timeAgo(value?: string | null): string {
+  if (!value) return ''
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return ''
+  return formatDistanceToNow(d, { addSuffix: true })
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -53,6 +66,8 @@ interface Source {
   label?: string
   url?: string
   imageUrl?: string
+  entityMentions?: string[]
+  chunkId?: string
 }
 
 interface ChatMessage {
@@ -76,7 +91,9 @@ interface ChatMessage {
 interface Conversation {
   id: string
   title: string
-  createdAt: string
+  // The list endpoint returns `updatedAt`; `createdAt` may be absent.
+  updatedAt?: string
+  createdAt?: string
   model?: string
   compilationName?: string
 }
@@ -135,6 +152,7 @@ interface KexFromChatResponse {
 }
 
 type Mode = 'standard' | 'incognito'
+type Depth = 'fast' | 'deep'
 
 // ─── Utility: nano-id ────────────────────────────────────────────────────────
 
@@ -475,12 +493,16 @@ function GraphVisualization({
 function TracePanel({
   message,
   onClose,
+  onTraceSource,
 }: {
   message: ChatMessage
   onClose: () => void
+  /** Open the graph viewer focused on this source's entity (trace provenance). */
+  onTraceSource: (src: Source) => void
 }) {
   const [cypherCopied, setCypherCopied] = useState(false)
   const [cypherExpanded, setCypherExpanded] = useState(false)
+  const { neo4jBrowser } = usePublicConfig()
 
   function copyQuery() {
     if (!message.cypher) return
@@ -523,7 +545,10 @@ function TracePanel({
               {message.sources.map((src, i) => (
                 <div
                   key={i}
-                  className="group rounded-xl border border-white/5 bg-white/[0.03] p-3 transition-all duration-150 hover:border-blue-500/20 hover:bg-blue-500/5"
+                  onClick={() => onTraceSource(src)}
+                  role="button"
+                  title="Open in the graph viewer to trace where this came from"
+                  className="group cursor-pointer rounded-xl border border-white/5 bg-white/[0.03] p-3 transition-all duration-150 hover:border-blue-500/30 hover:bg-blue-500/5"
                 >
                   <div className="flex items-start gap-2.5">
                     {/* Type icon */}
@@ -599,9 +624,14 @@ function TracePanel({
                           />
                         </div>
                         <span className="shrink-0 text-[10px] font-medium text-slate-500">
-                          {Math.round(src.relevance * 100)}%
+                          {Math.round((src.relevance ?? 0) * 100)}%
                         </span>
                       </div>
+
+                      {/* Click-to-trace cue (revealed on hover) */}
+                      <p className="mt-1.5 text-[10px] text-blue-400/0 group-hover:text-blue-400/90 transition-colors">
+                        → Open in graph viewer to trace this source
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -658,7 +688,7 @@ function TracePanel({
                     {cypherCopied ? 'Copied' : 'Copy'}
                   </button>
                   <a
-                    href="http://localhost:7474/browser/"
+                    href={`${(neo4jBrowser || `http://${window.location.hostname}:7474`).replace(/\/$/, '')}/browser/`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="btn-ghost h-6 px-2 text-[10px] gap-1"
@@ -721,7 +751,7 @@ const MessageItem = memo(function MessageItem({
         <div className="max-w-[72%] rounded-2xl rounded-br-sm bg-blue-500/20 backdrop-blur-sm border border-blue-500/10 px-4 py-2.5 text-sm text-slate-100 shadow-lg shadow-blue-500/5 leading-relaxed">
           {message.content}
           <div className="mt-1 text-right text-[10px] text-slate-600">
-            {formatDistanceToNow(new Date(message.createdAt), { addSuffix: true })}
+            {timeAgo(message.createdAt)}
           </div>
         </div>
         <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/10 backdrop-blur-sm">
@@ -781,7 +811,7 @@ const MessageItem = memo(function MessageItem({
 
           {/* Timestamp */}
           <span className="text-[10px] text-slate-700">
-            {formatDistanceToNow(new Date(message.createdAt), { addSuffix: true })}
+            {timeAgo(message.createdAt)}
           </span>
 
           {/* Hover actions */}
@@ -968,7 +998,7 @@ function ConversationItem({
       </div>
       <div className="flex items-center gap-1.5">
         <span className="text-[10px] text-slate-600">
-          {formatDistanceToNow(new Date(conv.createdAt), { addSuffix: true })}
+          {timeAgo(conv.updatedAt ?? conv.createdAt)}
         </span>
         {conv.model && (
           <span className="badge badge-slate text-[9px] px-1 py-0">{conv.model}</span>
@@ -986,9 +1016,17 @@ function ConversationItem({
 export function TalkToGraphPage() {
   // Mode
   const [mode, setMode] = useState<Mode>('standard')
+  // Retrieval depth: fast single-pass RAG (default) vs agentic deep multi-hop
+  const [depth, setDepth] = useState<Depth>('fast')
 
   // Conversation state (standard: from API; incognito: local only)
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
+  // Initialize the active conversation from the URL (`/chat?c=<id>`) so hitting
+  // Back from the graph viewer (or reloading) restores the thread the user was in
+  // instead of dropping them on an empty chat.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(
+    () => searchParams.get('c')
+  )
   const [incognitoMessages, setIncognitoMessages] = useState<ChatMessage[]>([])
   const [standardMessages, setStandardMessages] = useState<ChatMessage[]>([])
 
@@ -1000,18 +1038,55 @@ export function TalkToGraphPage() {
   const [droppedFile, setDroppedFile] = useState<File | null>(null)
   const [isExtracting, setIsExtracting] = useState(false)
   const [extractionResult, setExtractionResult] = useState<string | null>(null)
-  // Per-message feedback (Phase C will wire to API)
+  // Per-message feedback. A4: a 👍/👎 adjusts the referenced dossier's TRUST via
+  // POST /rag/feedback (down → trust 0, up → raise toward 1). UI state is the
+  // instant optimistic part; the API call is best-effort (never blocks the UI).
   const [feedbackMap, setFeedbackMap] = useState<Record<string, 'up' | 'down'>>({})
 
   function handleFeedback(msgId: string, vote: 'up' | 'down') {
+    let isToggleOff = false
     setFeedbackMap((prev) => {
       // Toggle off if same vote
       if (prev[msgId] === vote) {
+        isToggleOff = true
         const next = { ...prev }
         delete next[msgId]
         return next
       }
       return { ...prev, [msgId]: vote }
+    })
+    if (isToggleOff) return
+
+    // Resolve the entity this feedback targets: prefer the answer's graph-trace
+    // node (the entity the answer was actually about), else fall back to the
+    // longest capitalised run in the preceding question.
+    const msgs = mode === 'incognito' ? incognitoMessages : standardMessages
+    const idx = msgs.findIndex((m) => m.id === msgId)
+    const aiMsg = idx >= 0 ? msgs[idx] : undefined
+    let entity: string | undefined = aiMsg?.graphTrace?.nodes?.[0]?.name
+    if (!entity) {
+      // Walk back to the human turn that prompted this answer.
+      for (let i = idx - 1; i >= 0; i--) {
+        if (msgs[i].role === 'human') {
+          const caps = msgs[i].content.match(/\b([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)*)/g)
+          if (caps && caps.length) entity = caps.sort((a, b) => b.length - a.length)[0]
+          break
+        }
+      }
+    }
+
+    const BASE_URL =
+      (import.meta.env as Record<string, string | undefined>)['VITE_API_URL'] || '/api'
+    const token = getToken()
+    void fetch(`${BASE_URL}/rag/feedback`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ messageId: msgId, entity, vote }),
+    }).catch(() => {
+      /* best-effort: feedback failing never disrupts the chat */
     })
   }
 
@@ -1040,8 +1115,8 @@ export function TalkToGraphPage() {
   )
 
   const { data: modelsData } = useApiQuery<ModelsResponse>(
-    ['rag', 'models'],
-    '/rag/models',
+    ['llm', 'models'],
+    '/llm/models',
     { retry: false, staleTime: 60_000 }
   )
 
@@ -1069,6 +1144,21 @@ export function TalkToGraphPage() {
   const models = modelsData?.models ?? []
   const compilations = compilationsData?.compilations ?? []
 
+  const navigate = useNavigate()
+  // Open the graph viewer to trace a cited source. Target the selected graph (or
+  // the first available); pass ALL of the chunk's entity mentions as focus
+  // candidates (newline-separated) so the workspace selects the first one that is
+  // a real node — `entityMentions[0]` alone is often a generic term (e.g. a
+  // language or date) that isn't in the graph, which left the click unselected.
+  // Preserve the current conversation in the URL so Back returns to this thread.
+  function handleTraceSource(src: Source) {
+    const target = selectedCompilation || compilations[0]?.id
+    if (!target) { navigate('/graphs'); return }
+    const candidates = (src.entityMentions ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 12)
+    const focus = candidates.length ? `?focus=${encodeURIComponent(candidates.join('\n'))}` : ''
+    navigate(`/graphs/${target}/workspace${focus}`)
+  }
+
   const currentMessages = mode === 'incognito' ? incognitoMessages : standardMessages
 
   const selectedModelOption = models.find((m) => m.model === selectedModel)
@@ -1080,11 +1170,27 @@ export function TalkToGraphPage() {
     }
   }, [conversationDetail])
 
-  // Default model when data arrives
+  // Mirror the active conversation into the URL (`?c=<id>`) so Back/refresh and
+  // the graph-viewer round-trip return to the same thread. `replace` avoids
+  // polluting history with one entry per message.
   useEffect(() => {
-    if (models.length > 0 && !selectedModel) {
-      const available = models.find((m) => m.available)
-      if (available) setSelectedModel(available.model)
+    if (mode !== 'standard') return
+    const current = searchParams.get('c')
+    if (activeConversationId && current !== activeConversationId) {
+      setSearchParams((p) => { const n = new URLSearchParams(p); n.set('c', activeConversationId); return n }, { replace: true })
+    } else if (!activeConversationId && current) {
+      setSearchParams((p) => { const n = new URLSearchParams(p); n.delete('c'); return n }, { replace: true })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversationId, mode])
+
+  // Default model when data arrives — prefer a known-good chat model, and
+  // repair any stale/invalid (e.g. embedding) selection so chat never breaks.
+  useEffect(() => {
+    if (models.length === 0) return
+    if (!selectedModel || !isValidChatSelection(selectedModel, models)) {
+      const def = pickDefaultChatModel(models)
+      if (def) setSelectedModel(def)
     }
   }, [models, selectedModel])
 
@@ -1215,6 +1321,7 @@ export function TalkToGraphPage() {
       const body: Record<string, unknown> = {
         message,
         mode,
+        agentic: depth === 'deep',
         ...(selectedCompilation ? { compilationId: selectedCompilation } : {}),
         ...(activeConversationId && mode === 'standard' ? { conversationId: activeConversationId } : {}),
         llmConfig: {
@@ -1247,14 +1354,53 @@ export function TalkToGraphPage() {
 
       const data = (await res.json()) as RagQueryResponse
 
+      // The API returns chunk sources as { text, score, source, chunkId,
+      // entityMentions }. Map them onto the Source shape the UI renders
+      // (relevance ← score, a readable name, etc.) so cards aren't blank.
+      const mappedSources: Source[] = (
+        (data.sources ?? []) as unknown as Array<Record<string, unknown>>
+      ).map((s) => {
+        const mentions = Array.isArray(s.entityMentions) ? (s.entityMentions as string[]) : []
+        const score = typeof s.score === 'number' ? (s.score as number) : (s.relevance as number) ?? 0
+        return {
+          name: (s.source as string) || mentions[0] || 'Knowledge chunk',
+          type: (s.type as string) || 'semantic',
+          relevance: score,
+          text: (s.text as string) ?? (s.excerpt as string),
+          entityMentions: mentions,
+          chunkId: s.chunkId as string | undefined,
+        }
+      })
+
+      // The API returns graphTrace as an ARRAY of {from,relation,to}; the UI
+      // renders {nodes,edges}. Normalize so the trace panel never crashes (the
+      // old code did `.nodes.length` on an array → white screen).
+      const normalizeGraphTrace = (raw: unknown): ChatMessage['graphTrace'] => {
+        if (!raw) return undefined
+        if (Array.isArray(raw)) {
+          const nodeMap = new Map<string, { id: string; name: string; type: string }>()
+          const edges: Array<{ source: string; target: string; type: string }> = []
+          for (const t of raw as Array<{ from?: string; relation?: string; to?: string }>) {
+            if (!t.from || !t.to) continue
+            if (!nodeMap.has(t.from)) nodeMap.set(t.from, { id: t.from, name: t.from, type: 'entity' })
+            if (!nodeMap.has(t.to)) nodeMap.set(t.to, { id: t.to, name: t.to, type: 'entity' })
+            edges.push({ source: t.from, target: t.to, type: t.relation ?? '' })
+          }
+          return { nodes: [...nodeMap.values()], edges }
+        }
+        const o = raw as { nodes?: unknown; edges?: unknown }
+        if (Array.isArray(o.nodes) && Array.isArray(o.edges)) return raw as ChatMessage['graphTrace']
+        return undefined
+      }
+
       const aiMsg: ChatMessage = {
         id: nanoid(),
         role: 'ai',
         content: data.answer,
-        sources: data.sources,
+        sources: mappedSources,
         cypher: data.cypher,
         confidence: data.confidence,
-        graphTrace: data.graphTrace,
+        graphTrace: normalizeGraphTrace(data.graphTrace as unknown),
         tokensUsed: data.tokensUsed,
         model: data.model,
         imageUrl: (data as unknown as Record<string, unknown>).imageUrl as string | undefined,
@@ -1644,6 +1790,42 @@ export function TalkToGraphPage() {
                 <ChevronDown size={10} className="absolute right-2 text-slate-500 pointer-events-none" />
               </div>
 
+              {/* Fast / Deep depth toggle */}
+              <div
+                className="flex items-center rounded-md border border-slate-700/50 bg-slate-950/60 p-0.5"
+                title="Deep uses the agent for multi-hop reasoning (slower, better answers)"
+              >
+                <button
+                  onClick={() => setDepth('fast')}
+                  className={cn(
+                    'rounded px-2.5 py-1 text-[11px] font-medium transition-all duration-150',
+                    depth === 'fast'
+                      ? 'bg-white/10 text-slate-100 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
+                  )}
+                >
+                  Fast
+                </button>
+                <button
+                  onClick={() => setDepth('deep')}
+                  className={cn(
+                    'rounded px-2.5 py-1 text-[11px] font-medium transition-all duration-150',
+                    depth === 'deep'
+                      ? 'bg-blue-500/20 text-blue-300 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
+                  )}
+                >
+                  Deep
+                </button>
+              </div>
+
+              {/* Depth hint */}
+              <span className="text-[10px] text-slate-600">
+                {depth === 'deep'
+                  ? 'Deep uses the agent for multi-hop reasoning (slower, better answers)'
+                  : ''}
+              </span>
+
               {/* API key toggle for cloud models */}
               {selectedModelOption?.requiresKey && (
                 <button
@@ -1709,6 +1891,7 @@ export function TalkToGraphPage() {
           <TracePanel
             message={traceMessage}
             onClose={() => setTraceMessage(null)}
+            onTraceSource={handleTraceSource}
           />
         </div>
       )}

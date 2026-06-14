@@ -174,10 +174,168 @@
   .animate-ring-3 { animation: ring-pulse 4s ease-in-out infinite 2.6s; }
   .animate-float  { animation: float-slow 6s ease-in-out infinite; }
 
+  /* ─── Twinkling starfield ────────────────────────────────────
+     Each layer is split into 3 sub-groups + a shine group, each with
+     its own keyframe and cadence, so the field feels alive instead of
+     pulsing in sync. Durations are intentionally long — real stars
+     drift slowly. The shine variant briefly flares with a soft glow
+     so one star in the field "catches the eye" every cycle. */
+  @keyframes twinkle-a {
+    0%, 100% { opacity: 0.80; }
+    50%      { opacity: 0.35; }
+  }
+  @keyframes twinkle-b {
+    0%, 100% { opacity: 0.70; }
+    40%      { opacity: 0.20; }
+    75%      { opacity: 0.55; }
+  }
+  @keyframes twinkle-c {
+    0%, 100% { opacity: 0.65; }
+    35%      { opacity: 0.90; }
+    70%      { opacity: 0.30; }
+  }
+  /* Shine: stacked box-shadow halos around the dot itself. Box-shadow is
+     painted at the element's own box (not clipped to a filter region), so
+     every shine star gets a real glow. Two variants — cool (white/blue)
+     and warm (white/amber) — give the field colour variety. */
+  @keyframes twinkle-shine {
+    0%, 100% {
+      opacity: 0.45;
+      box-shadow:
+        0 0 2px 0 rgba(255,255,255,0.35);
+    }
+    35% {
+      opacity: 0.20;
+      box-shadow:
+        0 0 1px 0 rgba(255,255,255,0.15);
+    }
+    /* Bright sustained flare — a tight white core, a medium-radius white
+       halo, and a wide cool-tinted bloom. Easily catches the eye. */
+    55% {
+      opacity: 1.00;
+      box-shadow:
+        0 0 4px 0  rgba(255,255,255,1.00),
+        0 0 12px 0 rgba(255,255,255,0.90),
+        0 0 26px 0 rgba(255,255,255,0.55),
+        0 0 48px 0 rgba(180,200,255,0.35);
+    }
+    65% {
+      opacity: 1.00;
+      box-shadow:
+        0 0 5px 0  rgba(255,255,255,1.00),
+        0 0 16px 0 rgba(255,255,255,0.80),
+        0 0 34px 0 rgba(255,255,255,0.45),
+        0 0 60px 0 rgba(180,200,255,0.28);
+    }
+    78% {
+      opacity: 0.70;
+      box-shadow:
+        0 0 3px 0  rgba(255,255,255,0.70),
+        0 0 8px 0  rgba(255,255,255,0.40);
+    }
+  }
+
+  @keyframes twinkle-shine-warm {
+    0%, 100% {
+      opacity: 0.45;
+      box-shadow:
+        0 0 2px 0 rgba(255,235,200,0.35);
+    }
+    35% {
+      opacity: 0.20;
+      box-shadow:
+        0 0 1px 0 rgba(255,235,200,0.15);
+    }
+    55% {
+      opacity: 1.00;
+      box-shadow:
+        0 0 4px 0  rgba(255,255,255,1.00),
+        0 0 12px 0 rgba(255,240,210,0.90),
+        0 0 26px 0 rgba(255,220,170,0.55),
+        0 0 48px 0 rgba(255,200,140,0.30);
+    }
+    65% {
+      opacity: 1.00;
+      box-shadow:
+        0 0 5px 0  rgba(255,255,255,1.00),
+        0 0 16px 0 rgba(255,240,210,0.80),
+        0 0 34px 0 rgba(255,220,170,0.45),
+        0 0 60px 0 rgba(255,200,140,0.25);
+    }
+    78% {
+      opacity: 0.70;
+      box-shadow:
+        0 0 3px 0  rgba(255,240,210,0.70),
+        0 0 8px 0  rgba(255,220,170,0.40);
+    }
+  }
+
+  .animate-twinkle-a          { animation: twinkle-a          12s ease-in-out infinite; }
+  .animate-twinkle-b          { animation: twinkle-b          14s ease-in-out infinite; }
+  .animate-twinkle-c          { animation: twinkle-c          10s ease-in-out infinite; }
+  .animate-twinkle-shine      { animation: twinkle-shine      11s ease-in-out infinite; }
+  .animate-twinkle-shine-warm { animation: twinkle-shine-warm 13s ease-in-out infinite; }
+
+  /* Shooting star — a bright streak with a fading trail. CSS variables
+     `--ss-angle` and `--ss-distance` are set inline per-instance for
+     per-star randomisation. transform-origin sits at the leading tip so
+     the rotation point matches the visual head of the streak. */
+  .shooting-star {
+    width: 170px;
+    height: 2.5px;
+    background: linear-gradient(to right,
+      rgba(255,255,255,0) 0%,
+      rgba(255,255,255,0.35) 50%,
+      rgba(255,255,255,0.85) 85%,
+      rgba(255,255,255,1) 100%);
+    border-radius: 999px;
+    box-shadow:
+      0 0 6px  rgba(255,255,255,0.95),
+      0 0 14px rgba(255,255,255,0.65),
+      0 0 28px rgba(180,200,255,0.4);
+    transform-origin: right center;
+    will-change: transform, opacity;
+    pointer-events: none;
+  }
+
+  @keyframes shoot {
+    0% {
+      opacity: 0;
+      transform: rotate(var(--ss-angle)) translateX(0);
+    }
+    10% { opacity: 1; }
+    85% { opacity: 1; }
+    100% {
+      opacity: 0;
+      transform: rotate(var(--ss-angle)) translateX(var(--ss-distance));
+    }
+  }
+
+  /* Header baseline — declares the bottom border as transparent so the
+     scroll transition can interpolate to the scrolled colour cleanly. */
+  .landing-nav {
+    border-bottom: 1px solid transparent;
+  }
   .landing-nav-scrolled {
     background: rgba(2,6,23,0.85);
     backdrop-filter: blur(12px);
     border-bottom: 1px solid rgba(99,102,241,0.15);
+  }
+
+  /* ─── Iced-glass pill — used for hero trust signals ────────────
+     Slight bg tint + blur + soft border + inner ring give the “frosted
+     glass” feel without dominating the layout. */
+  .glass-pill {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur-md;
+    box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.10), 0 1px 2px 0 rgba(0,0,0,0.25);
+  }
+
+  /* Soft black drop-shadow for hero text on top of busy imagery. */
+  .text-shadow-hero {
+    text-shadow:
+      0 1px 2px rgba(0,0,0,0.55),
+      0 2px 8px rgba(0,0,0,0.45),
+      0 4px 24px rgba(0,0,0,0.35);
   }
 
   /* Grid background for hero */
@@ -197,7 +355,9 @@
     }
 
     .animate-ring-1, .animate-ring-2, .animate-ring-3,
-    .animate-float, .animate-bounce {
+    .animate-float, .animate-bounce,
+    .animate-twinkle-a, .animate-twinkle-b, .animate-twinkle-c,
+    .animate-twinkle-shine, .animate-twinkle-shine-warm {
       animation: none;
     }
   }

@@ -166,3 +166,92 @@ Package: `n8n-nodes-gctrl` (at borghive/n8n-nodes-gctrl/)
 - Base64 file encoding through Redis (Docker cross-container)
 - Port offsets from Hasura (5433, 6380, 3001)
 - Browser-only RAG sessions (GDPR by design)
+
+---
+
+## Enterprise Feature Push (June 2026)
+
+### New Source Connectors
+- **Microsoft SharePoint** (multi-tenant): OAuth via Azure AD client_credentials, site/library/file picker UI
+- **Obsidian Vault**: REST API integration with loopback-only SSRF guard, note picker with wikilink stripping
+- `sharepoint_handler.py`, `obsidian_handler.py` added to KEX worker
+
+### Real-Time Token Balance
+- Billing endpoint now subtracts unsynced `token_usage` rows (not yet heartbeat-synced) from balance inline
+- Balance is accurate within milliseconds, not 60s heartbeat intervals
+
+### ISO 27001 Data Classification
+- `classification_levels` table replaces hardcoded enum — system levels + user-custom levels
+- 4 system levels: PUBLIC(0), INTERNAL(100), CONFIDENTIAL(200), STRICTLY_CONFIDENTIAL(300)
+- All compilation/entity queries clearance-filtered: `WHERE cl.rank <= user_clearance_rank`
+- Auto-classifier via Ollama suggests classification when not specified
+
+### API Keys with Clearance Scoping
+- `ApiKey <raw>` auth path alongside JWT Bearer
+- `max_clearance_rank` on each key — physically caps data visibility at middleware
+- Use case: give untrusted automation a `max_clearance_rank=0` key, it can ONLY see PUBLIC data
+
+### PII Detection
+- `presidio-analyzer` scans extracted text pre-NER
+- Detects: PERSON, EMAIL, PHONE, IBAN, NRP (German ID), LOCATION
+- Only type+count in DB (no actual values — GDPR)
+- PII shield badge on job detail page with one-click re-ingest with redaction
+
+### Pi Console Agent
+- Floating SSE-streaming agent panel (bottom-right FAB)
+- `POST /api/agent/chat` — Ollama, streamed tokens via Server-Sent Events
+- GCTRL tools: list_graphs, search_entities, check_balance, list_sources
+- Also accessible as `gctrl agent` interactive REPL in CLI
+
+### Data Lineage
+- `GET /api/kg/compilations/:id/lineage` — SVG DAG of jobs → compilation
+- `GET /api/graph/entity/:name/lineage` — entity → compilations provenance
+- `LineagePage.tsx` with inline SVG renderer (no third-party graph lib dependency)
+
+### Retention Policies
+- `retention_policies` table with per-classification-level rules
+- PL/pgSQL trigger auto-sets `expires_at` on compilation classification assignment
+- Nightly background task: deletes expired Neo4j nodes + Postgres records, writes audit log
+- Admin can set user-specific overrides per level via `PUT /api/classification/levels/:id/retention`
+
+### Enterprise SSO / SCIM
+- OIDC: authorize + callback endpoints for Okta, Azure AD, Keycloak, Google Workspace
+- SCIM v2: full `GET/POST/PUT/PATCH/DELETE /api/scim/v2/Users` for automated provisioning
+- `sso_configs` table + `scim_tokens` table with SHA-256 hashed bearer tokens
+
+### Webhooks
+- CRUD: `GET/POST/PUT/DELETE /api/webhooks`
+- HMAC-SHA256 signed delivery (`X-GCTRL-Signature: sha256=...`)
+- Auto-disable after 3 consecutive delivery failures
+- Fires on: `job.completed` (more events can be added)
+- Delivery history: `GET /api/webhooks/:id/deliveries`
+
+### KG Export Standards
+- `GET /api/kg/compilations/:id/export?format=jsonld` — JSON-LD
+- `?format=rdf-turtle` — Turtle/RDF
+- `?format=graphml` — GraphML
+- Clearance-gated: can only export compilations you have clearance for
+
+### CLI — `gctrl`
+```bash
+gctrl auth login|status|logout
+gctrl kex extract --file|--url|--text [--classification INTERNAL] [--wait]
+gctrl kex jobs
+gctrl graph list|get
+gctrl source list
+gctrl classify levels|set
+gctrl agent         # interactive REPL
+```
+Authentication: `ApiKey` header, key stored in `~/.gctrl/config.json`
+
+### Migrations Added
+`021` — job type constraint expansion  
+`022` — SharePoint multi-tenant config  
+`023` — Obsidian vault connections  
+`024` — classification levels table (replaces enum)  
+`025` — enhanced audit log  
+`026` — API key clearance scoping  
+`027` — PII findings table  
+`028` — retention policies + auto-expiry trigger  
+`029` — SSO configs + SCIM tokens  
+`030` — webhooks + webhook deliveries

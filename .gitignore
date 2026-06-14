@@ -10,7 +10,16 @@ __pycache__/
 *.pem
 *.key
 config/license.jwt
+# Tuned ER benchmarks live in the PRIVATE gctrl-bench repo — never ship the
+# tuned recipe / gold sets in the droppable public repo.
+bench/
+# License-delivered + dev-local ER tuning profiles (never the public recipe).
+config/tuning.json
+*tuning.local.json
+# The canonical tuned recipe is a PRIVATE license-api deploy asset, never committed.
+tuning-profile.json
 .previous-images
 coverage/
 .pytest_cache/
 e2e-output.txt
+.gstack/

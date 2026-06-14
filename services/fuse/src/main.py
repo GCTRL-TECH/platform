@@ -22,6 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from . import config
+from . import communities
+from . import distiller
+from . import dossier
+from . import user_profile
 from .merger import get_merger
 from .middleware.license_check import check_credits, report_usage
 
@@ -57,13 +61,55 @@ def run_merge(
     user_id: str,
     classification: str = "PUBLIC",
     enable_conex: bool = False,
+    enable_smart_match: bool = True,
+    enable_canonical_link: bool = True,
+    enable_embedding_match: bool = True,
     match_rules: list[dict] | None = None,
+    threshold_accept: float | None = None,
+    threshold_review: float | None = None,
+    metric_overrides: dict | None = None,
+    field_mode_config: dict | None = None,
 ) -> dict:
-    """Full three-stage merge pipeline."""
+    """Full three-stage merge pipeline.
+
+    The optional ``threshold_accept`` / ``threshold_review`` / ``enable_conex`` /
+    ``metric_overrides`` knobs let the benchmark harness A/B linking quality via
+    the synchronous ``/merge`` path. All are optional → existing callers are
+    unaffected (defaults preserve prior behaviour)."""
     rules_info = f", {len(match_rules)} match rules" if match_rules else ""
     logger.info(f"[{compilation_id}] Merge start — {len(source_job_ids)} sources{rules_info}")
 
     merger = get_merger()
+
+    # ── Tuning seam ───────────────────────────────────────────────────────────
+    # Resolve the ACTIVE entity-resolution profile (license-delivered tuned values
+    # if present, else bundled generic defaults — never raises). Apply it as the
+    # baseline; explicit run_merge params (the benchmark A/B knobs) still win below.
+    from . import tuning as _tuning
+    from . import config_builder as _cfg, embedding_match as _emb
+    _profile = _tuning.load_tuning()
+    # Per-type LIMES presets (mutate the in-place dict stage-2 reads).
+    _cfg.DEFAULT_METRICS.update(_profile.get("default_metrics") or {})
+    # Embedding-match cutoffs (runtime globals).
+    _emb.apply_embedding_overrides(_profile.get("embedding_overrides"))
+    # Accept/review floors + per-type metric overrides from the profile.
+    merger.threshold_accept = float(_profile["threshold_accept"])
+    merger.threshold_review = float(_profile["threshold_review"])
+    merger.metric_overrides = dict(_profile.get("metric_overrides") or {})
+    # Profile field-mode config is the default when the caller didn't pass one.
+    if field_mode_config is None:
+        field_mode_config = _profile.get("field_mode_config") or None
+
+    # Explicit threshold overrides take precedence (the benchmark A/B knobs). They
+    # are applied before match_rules so a rule can still ratchet acceptance up.
+    if threshold_accept is not None:
+        merger.threshold_accept = float(threshold_accept)
+    if threshold_review is not None:
+        merger.threshold_review = float(threshold_review)
+    # Per-type LIMES metric overrides ({entity_type: "trigrams(x.name,y.name)|0.7"}).
+    # Explicit request overrides win over the profile's; absent → keep the profile's.
+    if metric_overrides is not None:
+        merger.metric_overrides = metric_overrides
 
     # Apply ontology match rules to merger config
     if match_rules:
@@ -73,7 +119,18 @@ def run_merge(
                 merger.threshold_accept = max(merger.threshold_accept, float(threshold))
                 merger.threshold_review = min(merger.threshold_review, float(threshold) - 0.15)
 
-    stats = merger.merge(compilation_id, source_job_ids, user_id, classification, enable_conex=enable_conex)
+    stats = merger.merge(
+        compilation_id, source_job_ids, user_id, classification,
+        enable_conex=enable_conex, enable_smart_match=enable_smart_match,
+        enable_canonical_link=enable_canonical_link,
+        enable_embedding_match=enable_embedding_match,
+        field_mode_config=field_mode_config,
+    )
+
+    # Persist classification conflicts (don't ship the bulky list in the result).
+    conflicts = stats.pop("_conflicts", [])
+    if conflicts:
+        _write_conflicts(compilation_id, conflicts)
 
     logger.info(f"[{compilation_id}] Merge complete: {stats}")
     return {
@@ -81,6 +138,35 @@ def run_merge(
         "status": "completed",
         **stats,
     }
+
+
+def _write_conflicts(compilation_id: str, conflicts: list[dict]) -> None:
+    """Upsert merge-surfaced classification conflicts into Postgres for review.
+
+    Best-effort: a write failure must never fail the merge — the labels are
+    already correct in Neo4j; this table only drives the human review queue.
+    """
+    try:
+        import json as _json
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            for c in conflicts:
+                cur.execute(
+                    """
+                    INSERT INTO classification_conflicts
+                        (compilation_id, element_kind, element_key, labels, status)
+                    VALUES (%s, %s, %s, %s::jsonb, 'open')
+                    ON CONFLICT (compilation_id, element_kind, element_key)
+                    DO UPDATE SET labels = EXCLUDED.labels, status = 'open'
+                    """,
+                    (compilation_id, c["element_kind"], c["element_key"],
+                     _json.dumps(c.get("labels", []))),
+                )
+        conn.close()
+        logger.info(f"[{compilation_id}] Recorded {len(conflicts)} classification conflict(s)")
+    except Exception as exc:
+        logger.warning(f"[{compilation_id}] Failed to record conflicts: {exc}")
 
 
 # ── Redis background worker ──────────────────────────────────────────
@@ -101,7 +187,9 @@ def _worker_loop() -> None:
             continue
 
         try:
-            item = r.blpop("fuse:jobs", timeout=2)
+            # Watch BOTH queues in one blocking pop. Redis returns the queue name
+            # that produced the item, so we branch on it below (fuse vs distill).
+            item = r.blpop(["fuse:jobs", "distill:jobs"], timeout=2)
         except redis_lib.exceptions.ConnectionError:
             logger.warning("Worker: Redis connection lost, retrying in 5s")
             global _redis_client
@@ -116,7 +204,12 @@ def _worker_loop() -> None:
         if item is None:
             continue
 
-        _queue_name, raw_payload = item
+        queue_name, raw_payload = item
+
+        if queue_name == "distill:jobs":
+            _handle_distill_job(r, raw_payload)
+            continue
+
         logger.info("Worker: received fuse job from queue")
 
         job_id = "unknown"
@@ -137,6 +230,9 @@ def _worker_loop() -> None:
             result = run_merge(
                 compilation_id, source_job_ids, user_id, classification,
                 match_rules=match_rules,
+                enable_smart_match=bool(payload.get("enable_smart_match", True)),
+                enable_canonical_link=bool(payload.get("enable_canonical_link", True)),
+                enable_embedding_match=bool(payload.get("enable_embedding_match", True)),
             )
             report_usage("fuse_merge", 0, check_result["credits_spent"])
             _publish_result(r, job_id, compilation_id, result)
@@ -146,6 +242,50 @@ def _worker_loop() -> None:
                 f"Worker: job {job_id} failed: {exc}\n{traceback.format_exc()}"
             )
             _publish_error(r, job_id, str(exc))
+
+
+def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
+    """Process a `distill:jobs` item and publish to `distill:results`.
+
+    Payload: {job_id?, compilation_id, user_id, limit?}. The sync HTTP path
+    (`POST /distill`) is the primary M1 entry point; this async consumer mirrors
+    the fuse worker so scheduled/queued distillation works the same way."""
+    job_id = "unknown"
+    try:
+        payload = json.loads(raw_payload)
+        job_id = payload.get("job_id", "unknown")
+        compilation_id = payload.get("compilation_id")
+        user_id = payload.get("user_id", "system")
+        limit = int(payload.get("limit", 15))
+        logger.info(f"Worker: received distill job for {compilation_id}")
+
+        if job_id != "unknown":
+            _update_job_status(job_id, "processing")
+
+        result = distiller.distill(compilation_id, user_id, limit=limit)
+
+        if job_id != "unknown":
+            _update_job_status(job_id, "completed", result=result)
+        try:
+            r.publish("distill:results", json.dumps({
+                "job_id": job_id,
+                "compilation_id": compilation_id,
+                "status": "completed",
+                "result": result,
+            }))
+        except Exception as exc:
+            logger.error(f"Failed to publish distill result for {job_id}: {exc}")
+
+    except Exception as exc:
+        logger.error(f"Worker: distill job {job_id} failed: {exc}\n{traceback.format_exc()}")
+        if job_id != "unknown":
+            _update_job_status(job_id, "failed", error=str(exc))
+        try:
+            r.publish("distill:results", json.dumps({
+                "job_id": job_id, "status": "failed", "error": str(exc),
+            }))
+        except Exception:
+            pass
 
     logger.info("FUSE worker thread stopped")
 
@@ -288,6 +428,28 @@ class MergeRequest(BaseModel):
     source_job_ids: list[str]
     user_id: str
     classification: str = "PUBLIC"
+    # Optional benchmark A/B knobs (backward compatible — all default to None so
+    # existing callers behave exactly as before).
+    threshold_accept: Optional[float] = None
+    threshold_review: Optional[float] = None
+    enable_conex: bool = False
+    enable_smart_match: bool = False
+    enable_canonical_link: bool = False
+    # Embedding best-buddy + model-number pass for NOISY general-name data (the
+    # dirty-text quality lever). OFF by default → clean/field-mode paths unchanged.
+    enable_embedding_match: bool = False
+    metric_overrides: Optional[dict] = None
+    # Field-mode precision-recovery knobs (blocking key + authors post-filter).
+    # Only consulted when Stage-2 enters attribute-aware field mode; ignored by
+    # the general/name-only path. {blocking_key, authors_prop, authors_threshold,
+    # authors_min_both}.
+    field_mode_config: Optional[dict] = None
+
+
+class DistillRequest(BaseModel):
+    compilation_id: str
+    user_id: str
+    limit: int = 15
 
 
 class MergeResponse(BaseModel):
@@ -313,11 +475,116 @@ async def merge_endpoint(req: MergeRequest):
             req.source_job_ids,
             req.user_id,
             req.classification,
+            enable_conex=req.enable_conex,
+            enable_smart_match=req.enable_smart_match,
+            enable_canonical_link=req.enable_canonical_link,
+            enable_embedding_match=req.enable_embedding_match,
+            threshold_accept=req.threshold_accept,
+            threshold_review=req.threshold_review,
+            metric_overrides=req.metric_overrides,
+            field_mode_config=req.field_mode_config,
         )
         report_usage("fuse_merge", 0, check_result["credits_spent"])
         return MergeResponse(**result)
     except Exception as exc:
         logger.error(f"/merge error: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/distill")
+async def distill_endpoint(req: DistillRequest):
+    """Distil a WIKI compilation into wiki pages synchronously (M1 sync path)."""
+    try:
+        return distiller.distill(req.compilation_id, req.user_id, limit=req.limit)
+    except ValueError as exc:
+        # Bad request: not a WIKI comp / missing source / unknown comp.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"/distill error: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class DossierRequest(BaseModel):
+    user_id: str
+    # Single-entity on-demand build (the api-rs GET /dossier?name=X path).
+    entity_name: Optional[str] = None
+    # OR: refresh dossiers for the top-degree entities of a compilation.
+    compilation_id: Optional[str] = None
+    source_job_ids: Optional[list[str]] = None
+    top_n: int = 10
+
+
+@app.post("/dossier/build")
+async def dossier_build_endpoint(req: DossierRequest):
+    """Build/refresh entity dossier(s) — the HOT memory tier.
+
+    Two modes:
+      • entity_name set → compile/refresh ONE dossier on-demand (returns it, or
+        404 when the user owns no node with that name).
+      • compilation_id + source_job_ids set → refresh the top-N god-node dossiers.
+    """
+    try:
+        if req.entity_name:
+            result = dossier.build_dossier_for_name(req.user_id, req.entity_name)
+            if result is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No owned entity named '{req.entity_name}'",
+                )
+            return result
+        if req.compilation_id is not None:
+            return dossier.build_top_dossiers(
+                req.compilation_id, req.user_id,
+                req.source_job_ids or [], top_n=req.top_n,
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Provide entity_name, or compilation_id + source_job_ids",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"/dossier/build error: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class ProfileBuildRequest(BaseModel):
+    user_id: str
+
+
+@app.post("/profile/build")
+async def profile_build_endpoint(req: ProfileBuildRequest):
+    """A6 — distil the user's USER-PROFILE memory from STANDARD-mode history.
+
+    OPT-IN: refuses (403) unless `user_profile.enabled` is true for the user.
+    Incognito content is never persisted, so it can never be a source here.
+    """
+    try:
+        return user_profile.build_profile(req.user_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"/profile/build error: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class CommunitiesRequest(BaseModel):
+    compilation_id: str
+    user_id: str
+    source_job_ids: Optional[list[str]] = None
+
+
+@app.post("/communities")
+async def communities_endpoint(req: CommunitiesRequest):
+    """B2 — detect communities + centrality ("god nodes") for a compilation and
+    write `_community`/`_centrality`/`_god_node` back onto its Neo4j nodes.
+    Fully local (label propagation, no extra deps). Returns a cluster summary."""
+    try:
+        return communities.detect_communities(
+            req.compilation_id, req.user_id, req.source_job_ids or [],
+        )
+    except Exception as exc:
+        logger.error(f"/communities error: {exc}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

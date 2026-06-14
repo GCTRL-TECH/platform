@@ -32,7 +32,7 @@ export function ProblemSection() {
           {PROBLEMS.map((p, i) => (
             <div
               key={p.title}
-              className={`reveal reveal-delay-${i + 1} rounded-2xl border border-red-500/10 bg-red-950/10 p-8 backdrop-blur-sm`}
+              className={`feature-card-landing reveal reveal-delay-${i + 1} p-8`}
             >
               <div className="mb-4 text-3xl">{p.icon}</div>
               <h3 className="mb-2 text-lg font-semibold text-white">{p.title}</h3>

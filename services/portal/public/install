@@ -316,10 +316,25 @@ start_stack() {
   if probe_tcp 11434; then
     echo "  Ollama    : connected at ${OLLAMA_BASE}"
   else
-    echo "  Ollama    : bundled — pull a model: docker exec gctrl-ollama ollama pull qwen2.5:7b"
+    # Bundled Ollama: pull the models KEX needs so extraction works out of the
+    # box, fully local at zero token cost.
+    #   qwen2.5:7b       — relation extraction (RELEX_MODEL). ~4.7 GB.
+    #   nomic-embed-text — chunk embeddings (EMBEDDING_MODEL). ~0.3 GB.
+    pull_ollama_models
   fi
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# Pull the local models KEX requires into the bundled Ollama container. Idempotent
+# (Ollama skips already-present models). Keeps the platform zero-cost-local.
+pull_ollama_models() {
+  echo "  Ollama    : bundled — pulling required local models (one-time)..."
+  for model in qwen2.5:7b nomic-embed-text; do
+    echo "              pulling ${model} ..."
+    docker exec gctrl-ollama ollama pull "${model}" \
+      || echo "              WARN: failed to pull ${model} — pull manually: docker exec gctrl-ollama ollama pull ${model}"
+  done
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────

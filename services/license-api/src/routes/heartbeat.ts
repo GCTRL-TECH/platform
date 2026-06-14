@@ -4,6 +4,7 @@ import { licenses, users, tokenUsage } from '../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 import { verifyLicenseJWT, signLicenseJWT } from '../lib/jwt.js';
 import { getCurrentVersion } from '../lib/version.js';
+import { tuningDeltaFor } from '../lib/tuning.js';
 
 const router = Router();
 
@@ -22,7 +23,7 @@ router.post('/v1/heartbeat', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const { usage_report } = req.body;
+  const { usage_report, tuning_version } = req.body;
 
   if (Array.isArray(usage_report) && usage_report.length > 0) {
     const records = usage_report.map((u: { action: string; chars_processed: number; credits_spent: number; timestamp: string }) => ({
@@ -62,6 +63,13 @@ router.post('/v1/heartbeat', async (req: Request, res: Response): Promise<void> 
     updateRequired,
   });
 
+  // ER tuning delta (version-delta): only carried when the agent's cached version
+  // is stale, so steady-state heartbeats add zero extra bytes. Signed with the
+  // license key; the agent verifies + caches it and serves it to FUSE locally.
+  const tuning = await tuningDeltaFor(
+    typeof tuning_version === 'number' ? tuning_version : null,
+  );
+
   res.json({
     license_jwt: newJwt,
     credits_balance: user.creditsBalance,
@@ -69,6 +77,7 @@ router.post('/v1/heartbeat', async (req: Request, res: Response): Promise<void> 
     latest_version: version,
     update_available: updateAvailable,
     update_required: updateRequired,
+    ...(tuning ? { tuning } : {}),
   });
 });
 
