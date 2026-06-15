@@ -569,17 +569,31 @@ function IntegrationsTab() {
   useEffect(() => { void loadConnectors(); void loadProviderConfigs() }, [loadConnectors, loadProviderConfigs])
 
   const handleConnect = async (provider: string) => {
+    const callerIsAdmin = user?.role === 'admin'
+    // When OAuth isn't configured yet, don't dead-end: for an admin, open the
+    // inline credentials form right here (that's the thing they need to fill in,
+    // and it lives on this very page) instead of an alert telling them to "go to
+    // Settings" — where they already are.
+    const openSetup = () => {
+      setExpandedRow(provider)
+      setConfigForm({ clientId: '', clientSecret: '' })
+    }
     setConnecting(provider)
     try {
       const { data } = await api.get(`/connectors/auth/${provider}`)
       if (data.authUrl) {
         window.open(data.authUrl, '_blank', 'width=600,height=700')
       } else if (data.error) {
-        alert(data.error)
+        if (callerIsAdmin) openSetup()
+        else alert(data.error)
       }
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Connection failed'
-      alert(msg)
+      // 400 "not configured" → guide the admin into the setup form; surface other
+      // (network/server) errors so they aren't silently swallowed.
+      const notConfigured = /not configured|client id|client secret|Settings/i.test(msg)
+      if (callerIsAdmin && notConfigured) openSetup()
+      else alert(msg)
     } finally {
       setConnecting(null)
       setTimeout(() => void loadConnectors(), 3000)
