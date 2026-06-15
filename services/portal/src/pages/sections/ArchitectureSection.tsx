@@ -21,37 +21,63 @@ function useCanRender3D() {
   return ok
 }
 
-function StaticArchitecture() {
-  const Row = ({ items, accent }: { items: string[]; accent: string }) => (
-    <div className="flex flex-wrap items-center justify-center gap-2">
-      {items.map((it) => (
-        <span key={it} className={`rounded-lg border px-2.5 py-1 text-xs font-medium ${accent}`}>
-          {it}
-        </span>
-      ))}
+function Pill({ children, accent }: { children: string; accent: string }) {
+  return <span className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${accent}`}>{children}</span>
+}
+
+function Layer({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="w-full rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+      <p className="mb-2 text-center text-[9px] font-semibold uppercase tracking-[0.18em] text-slate-500">{label}</p>
+      {children}
     </div>
   )
+}
+
+function StaticArchitecture() {
   return (
-    <div className="flex h-full w-full flex-col items-center justify-center gap-4 p-6">
-      <span className="text-[10px] uppercase tracking-[0.2em] text-violet-300">your agents · via MCP</span>
-      <Row items={['Claude', 'Cursor', 'Hermes']} accent="border-violet-400/30 bg-violet-500/10 text-violet-200" />
-      <div className="text-slate-600">↓</div>
-      <div className="rounded-2xl border border-indigo-400/40 bg-indigo-500/10 px-6 py-4 text-center backdrop-blur-sm">
-        <div className="bg-gradient-to-r from-indigo-300 via-violet-300 to-cyan-300 bg-clip-text text-lg font-bold text-transparent">
-          GCTRL
+    <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-4">
+      {/* Sources & Agents */}
+      <Layer label="Sources & Agents">
+        <div className="grid grid-cols-2 gap-3">
+          <div className="flex flex-wrap justify-center gap-1.5">
+            {['SharePoint', 'Google Drive', 'Other Silo'].map((s) => (
+              <Pill key={s} accent="border-cyan-400/30 bg-cyan-500/10 text-cyan-200">{s}</Pill>
+            ))}
+          </div>
+          <div className="flex flex-wrap justify-center gap-1.5">
+            {['Hermes', 'Claude', 'Codex'].map((s) => (
+              <Pill key={s} accent="border-violet-400/30 bg-violet-500/10 text-violet-200">{s}</Pill>
+            ))}
+          </div>
         </div>
-        <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300">middleware</div>
+      </Layer>
+      <span className="text-xs text-slate-600">↓ &nbsp;&nbsp; ↑↓</span>
+      <Layer label="Access Control">
+        <div className="flex flex-wrap justify-center gap-1.5">
+          <Pill accent="border-amber-400/30 bg-amber-500/10 text-amber-200">Ingestion · classify</Pill>
+          <Pill accent="border-amber-400/30 bg-amber-500/10 text-amber-200">Access rights · clearance</Pill>
+        </div>
+      </Layer>
+      <span className="text-xs text-slate-600">↕</span>
+      <div className="w-full rounded-xl border border-indigo-400/40 bg-indigo-500/10 p-3 text-center">
+        <div className="bg-gradient-to-r from-indigo-300 via-violet-300 to-cyan-300 bg-clip-text text-sm font-bold text-transparent">
+          GCTRL · Middleware
+        </div>
         <div className="mt-2 flex flex-wrap justify-center gap-1.5">
           {['Hot', 'Warm', 'Cold', 'Wiki'].map((m) => (
-            <span key={m} className="rounded border border-white/10 bg-slate-950/50 px-1.5 py-0.5 text-[10px] text-slate-300">
-              {m}
-            </span>
+            <Pill key={m} accent="border-white/10 bg-slate-950/50 text-slate-300">{m}</Pill>
           ))}
         </div>
       </div>
-      <div className="text-slate-600">↓</div>
-      <Row items={['Neo4j', 'Qdrant', 'Postgres', 'Redis']} accent="border-cyan-400/30 bg-cyan-500/10 text-cyan-200" />
-      <span className="text-[10px] uppercase tracking-[0.2em] text-cyan-300">your storage · swappable</span>
+      <span className="text-xs text-slate-600">↕</span>
+      <Layer label="Your Infrastructure">
+        <div className="flex flex-wrap justify-center gap-1.5">
+          {['Neo4j', 'Postgres', 'Qdrant', 'Wiki'].map((s) => (
+            <Pill key={s} accent="border-sky-400/30 bg-sky-500/10 text-sky-200">{s}</Pill>
+          ))}
+        </div>
+      </Layer>
     </div>
   )
 }
@@ -64,7 +90,7 @@ export function ArchitectureSection() {
       <div className="pointer-events-none absolute left-1/2 top-1/2 -z-0 h-[36rem] w-[36rem] -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-600/10 blur-[120px]" />
       <div className="relative mx-auto grid max-w-6xl items-center gap-12 lg:grid-cols-2">
         {/* 3D visual */}
-        <div className="reveal-left order-2 h-[26rem] w-full lg:order-1 lg:h-[32rem]">
+        <div className="reveal-left order-2 h-[30rem] w-full lg:order-1 lg:h-[34rem]">
           {can3D ? (
             <Suspense fallback={<StaticArchitecture />}>
               <ArchitectureScene />
@@ -84,18 +110,17 @@ export function ArchitectureSection() {
             </span>
           </h2>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
-            GCTRL is a stateless orchestration layer over your graph and vector stores. It bundles Neo4j,
-            Qdrant, Postgres and Redis for a one-line install — but every one of them is{' '}
-            <span className="font-medium text-slate-200">swappable</span>. Point GCTRL at your own managed
-            stores and own your data end to end. No lock-in.
+            Sources flow in, agents plug in, and access control governs both — while GCTRL organises everything into
+            layered memory on top of <span className="font-medium text-slate-200">swappable</span> storage. Bundled for
+            a one-line install; point it at your own Neo4j, Qdrant and Postgres anytime. No lock-in.
           </p>
 
           <ul className="mt-7 space-y-4">
             {[
-              ['Ingestion layer + memory organiser', 'GCTRL ingests at scale, builds a knowledge graph, and keeps it clean — the part other "agent memory" tools skip.'],
-              ['Raw storage for deterministic context', 'Authoritative, queryable facts — not a fuzzy embedding blob. Ground your agents on truth.'],
-              ['Parallel memory layers', 'Hot dossiers, warm chunks, the cold graph, and a curated Wiki-LLM of company knowledge — all at once.'],
-              ['Your agents plug in over MCP', 'Claude, Cursor, Hermes and more gain durable, access-controlled memory as a team member.'],
+              ['Ingest from any source', 'SharePoint, Google Drive, and other silos stream in through a governed ingestion layer.'],
+              ['Access control on both sides', 'Classification on the way in; clearance-gated access on the way out — enforced for every query.'],
+              ['Parallel memory layers', 'Hot dossiers, warm chunks, the cold graph, and a curated Wiki — organised on a high-performance core.'],
+              ['Your agents plug in over MCP', 'Claude, Codex, Hermes and more gain durable, access-controlled memory as a team member.'],
             ].map(([title, body]) => (
               <li key={title} className="flex gap-3">
                 <span className="mt-1.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-gradient-to-r from-indigo-400 to-cyan-400" />

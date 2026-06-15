@@ -32,7 +32,7 @@ The script is interactive on first run: it detects your environment, lets you pi
 2. **Detects GPU.** On Linux, an NVIDIA GPU triggers CUDA image selection automatically.
 3. **Interactive model picker.** Choose the local model to pull and run for extraction and RAG.
 4. **Brings up the stack.** Starts all platform services via docker compose.
-5. **Deploys LIMES** — the entity-resolution engine behind FUSE — **automatically**.
+5. **Deploys the FUSE resolution engine automatically.**
 
 ## Ports
 

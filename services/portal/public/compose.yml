@@ -63,10 +63,10 @@ services:
     networks:
       - gctrl
 
-  # LIMES link-discovery resolver — ALWAYS deployed (GCTRL's own engine, not
-  # something a host would already be running). FUSE's high-precision entity-
-  # resolution stage talks to it; without it FUSE degrades to the slower Python
-  # matcher. Multi-arch image (native on Apple Silicon).
+  # FUSE resolution engine — ALWAYS deployed (GCTRL's own engine, not something a
+  # host would already be running). FUSE's high-precision entity-resolution stage
+  # talks to it; without it FUSE degrades to a slower fallback matcher. Multi-arch
+  # image (native on Apple Silicon).
   gctrl-resolver:
     image: ghcr.io/gctrl-tech/fusion-engine:latest
     container_name: gctrl-resolver

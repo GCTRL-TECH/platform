@@ -35,7 +35,7 @@ GCTRL starts earlier: it **ingests at scale** and **builds the knowledge graph**
 - **Agent-memory tools:** organise what the agent already saw.
 - **GCTRL:** ingests the corpus, builds the graph, and *then* serves memory over it.
 
-The entity-resolution engine (**LIMES**) that powers FUSE is what lets large, messy ingests collapse into one clean graph instead of a pile of duplicates.
+FUSE's entity-resolution engine is what lets large, messy ingests collapse into one clean graph instead of a pile of duplicates.
 
 ## On-prem and GDPR-ready by design
 
