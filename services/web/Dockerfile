@@ -1,3 +1,5 @@
+# GCTRL dashboard (React + nginx). Built multi-arch (amd64 + arm64) in CI so it
+# runs natively on Apple Silicon — no platform-mismatch warning on a Mac install.
 # Stage 1: Build
 FROM node:20-alpine AS build
 
