@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react'
 import { Routes, Route, Navigate, Outlet } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
 import { AppShell } from '@/components/layout/AppShell'
@@ -10,6 +11,10 @@ import { LicensesPage } from '@/pages/LicensesPage'
 import { LicenseDetailPage } from '@/pages/LicenseDetailPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { AdminPage } from '@/pages/AdminPage'
+// Marketing content pages are lazy-loaded so react-markdown + doc content stay
+// out of the main (landing) bundle.
+const DocsPage = lazy(() => import('@/pages/docs/DocsPage').then((m) => ({ default: m.DocsPage })))
+const UseCasesPage = lazy(() => import('@/pages/UseCasesPage').then((m) => ({ default: m.UseCasesPage })))
 
 function Spinner() {
   return (
@@ -50,6 +55,7 @@ function LandingRoute() {
 
 export function App() {
   return (
+    <Suspense fallback={<Spinner />}>
     <Routes>
       <Route element={<PublicRoute />}>
         <Route path="/login" element={<LoginPage />} />
@@ -69,7 +75,14 @@ export function App() {
       </Route>
 
       <Route path="/" element={<LandingRoute />} />
+
+      {/* Public marketing pages — viewable regardless of auth */}
+      <Route path="/docs" element={<DocsPage />} />
+      <Route path="/docs/:slug" element={<DocsPage />} />
+      <Route path="/use-cases" element={<UseCasesPage />} />
+
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
+    </Suspense>
   )
 }
