@@ -77,6 +77,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/chunks",          get(list_chunks))
         .route("/chunks/:id",      axum::routing::delete(delete_chunk))
         .route("/queue",           get(queue_depth))
+        .route("/threads",         axum::routing::put(set_threads))
 }
 
 async fn extract(
@@ -442,10 +443,39 @@ async fn delete_job(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Redis key the KEX worker's config-watcher polls to scale its thread pool.
+const KEX_THREADS_KEY: &str = "kex:config:threads";
+
 async fn queue_depth(State(state): State<Arc<crate::models::AppState>>) -> Result<Json<Value>> {
     let depth = crate::services::redis::llen(&state.redis, "kex:jobs").await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(json!({ "depth": depth })))
+    // Current desired worker-thread count (what the KEX pool scales to). Defaults
+    // to 1 when unset. The frontend's "N threads" selector reads this back, so it
+    // must survive a poll — that's why the PUT below persists it in Redis.
+    let threads = crate::services::redis::get(&state.redis, KEX_THREADS_KEY).await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 10);
+    Ok(Json(json!({ "depth": depth, "threads": threads })))
+}
+
+#[derive(Deserialize)]
+struct ThreadsReq { threads: i64 }
+
+/// PUT /api/kex/threads — set how many KEX extraction worker threads run in
+/// parallel. Persisted in Redis (`kex:config:threads`); the worker's config-
+/// watcher picks the change up within ~1s and scales its pool up/down. Clamped
+/// to 1..=10 to match the worker's own bound.
+async fn set_threads(
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<ThreadsReq>,
+) -> Result<Json<Value>> {
+    let threads = req.threads.clamp(1, 10);
+    crate::services::redis::set(&state.redis, KEX_THREADS_KEY, &threads.to_string()).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "threads": threads })))
 }
 
 // ── Chunks lookup (powers the Node Detail drawer's "Chunks" tab) ──────────────

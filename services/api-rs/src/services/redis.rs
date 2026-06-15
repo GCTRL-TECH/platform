@@ -19,3 +19,13 @@ pub async fn llen(conn: &Arc<Mutex<MultiplexedConnection>>, key: &str) -> redis:
     let mut c = conn.lock().await;
     redis::cmd("LLEN").arg(key).query_async(&mut *c).await
 }
+
+pub async fn set(conn: &Arc<Mutex<MultiplexedConnection>>, key: &str, value: &str) -> redis::RedisResult<()> {
+    let mut c = conn.lock().await;
+    redis::cmd("SET").arg(key).arg(value).query_async(&mut *c).await
+}
+
+pub async fn get(conn: &Arc<Mutex<MultiplexedConnection>>, key: &str) -> redis::RedisResult<Option<String>> {
+    let mut c = conn.lock().await;
+    redis::cmd("GET").arg(key).query_async(&mut *c).await
+}
