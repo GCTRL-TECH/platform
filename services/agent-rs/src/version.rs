@@ -3,7 +3,8 @@
 //! The agent tracks which RELEASE this instance is running ("current_version"),
 //! decoupled from individual image builds. The version is persisted in the agent
 //! config dir so it survives restarts. It is:
-//!   - reported upstream each heartbeat (`instance_version`),
+//!   - reported upstream only when it CHANGES (`instance_version`), tracked
+//!     against a `reported_version` marker so steady-state heartbeats stay quiet,
 //!   - seeded on a fresh install from the license's `latest_version`,
 //!   - exposed on `/status` as `currentVersion`,
 //!   - set by the API update executor via `POST /version` after a successful update.

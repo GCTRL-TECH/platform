@@ -43,14 +43,23 @@ pub async fn beat(
     let records    = queue.lock().await.flush();
     // Tell the server our cached tuning version so it only re-sends on a bump.
     let tuning_version = crate::tuning::read_cache(&cfg.tuning_profile_path).await.map(|t| t.version);
-    // Report the RELEASE this instance is on so the server can see version drift.
-    let instance_version = crate::version::read_current(&cfg.version_path).await;
+    // Report the RELEASE this instance is on — but ONLY when it changed since the
+    // cloud last acknowledged it. Steady-state heartbeats carry nothing; we signal
+    // a version exactly on change (fresh install / after an update), then go quiet.
+    // If the change-triggered report fails, the next heartbeat re-sends it (still
+    // unacknowledged) — never routine chatter.
+    let current_version  = crate::version::read_current(&cfg.version_path).await;
+    let reported_version = crate::version::read_current(&cfg.reported_version_path).await;
+    let instance_version = current_version
+        .clone()
+        .filter(|c| reported_version.as_deref() != Some(c.as_str()));
     let payload    = HeartbeatPayload { usage_report: records.clone(), tuning_version, instance_version: instance_version.clone() };
     let jwt        = tokio::fs::read_to_string(&cfg.license_jwt_path).await.unwrap_or_default();
     let license_jwt_path = cfg.license_jwt_path.clone();
     let license_public_key = cfg.license_public_key.clone();
     let tuning_profile_path = cfg.tuning_profile_path.clone();
     let version_path = cfg.version_path.clone();
+    let reported_version_path = cfg.reported_version_path.clone();
     let api_url    = cfg.api_url.clone();
 
     let client = reqwest::Client::new();
@@ -93,12 +102,23 @@ pub async fn beat(
                     }
                 }
 
+                // We sent a changed version this beat → mark it acknowledged so
+                // subsequent steady-state heartbeats stay quiet (only re-sends on
+                // the next genuine change). On failure the marker stays behind, so
+                // the next heartbeat retries automatically.
+                if let Some(sent) = instance_version.as_ref() {
+                    if let Err(e) = crate::version::write_current(&reported_version_path, sent).await {
+                        tracing::warn!("reported_version marker write failed: {e}");
+                    }
+                }
+
                 // Seed current_version on a fresh install. A fresh install just pulled
                 // `:latest`, so it IS on the latest release — but the local version file
                 // doesn't exist yet. If it's still unset, seed it from the license's
                 // latest_version so updateAvailable computes as false out of the box.
+                // (It reports on the next beat via the change-detection above.)
                 // Never overwrite an existing current_version here (updates own that).
-                if instance_version.is_none() {
+                if current_version.is_none() {
                     let latest = cache.read().await.latest_version().to_string();
                     if !latest.is_empty() {
                         match crate::version::write_current(&version_path, &latest).await {

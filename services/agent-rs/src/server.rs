@@ -246,6 +246,16 @@ async fn handle_set_version(
     match crate::version::write_current(&state.cfg.version_path, &req.version).await {
         Ok(()) => {
             tracing::info!("current_version set to {}", req.version.trim());
+            // Signal the new version to the cloud immediately (don't wait up to a
+            // full heartbeat interval). Best-effort + non-blocking: the change-
+            // detection in beat() reports it once and marks it acknowledged; if
+            // this fire fails, the next heartbeat re-sends it.
+            let cache = state.cache.clone();
+            let queue = state.queue.clone();
+            let cfg   = state.cfg.clone();
+            tokio::spawn(async move {
+                crate::heartbeat::beat(cache, queue, &cfg).await;
+            });
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {

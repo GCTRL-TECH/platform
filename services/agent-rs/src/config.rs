@@ -8,6 +8,11 @@ pub struct Config {
     pub tuning_profile_path: String,
     /// File-backed current instance RELEASE version (decoupled from the image build).
     pub version_path: String,
+    /// Marker for the version the cloud has already acknowledged. The heartbeat
+    /// only re-sends `instance_version` when `version_path` differs from this, so
+    /// steady-state heartbeats carry nothing — we signal a version only when it
+    /// actually changes (fresh install / after an update).
+    pub reported_version_path: String,
 }
 
 impl Config {
@@ -33,6 +38,8 @@ impl Config {
                 .unwrap_or_else(|_| "/app/config/tuning.json".into()),
             version_path: std::env::var("GCTRL_VERSION_PATH")
                 .unwrap_or_else(|_| "/app/config/current_version".into()),
+            reported_version_path: std::env::var("GCTRL_REPORTED_VERSION_PATH")
+                .unwrap_or_else(|_| "/app/config/reported_version".into()),
         }
     }
 }
