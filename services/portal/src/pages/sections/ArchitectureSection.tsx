@@ -31,9 +31,15 @@ export function ArchitectureSection() {
     <div className="relative overflow-hidden border-y border-slate-900 bg-[#020617] px-6 py-24">
       <div className="pointer-events-none absolute left-1/2 top-1/2 -z-0 h-[36rem] w-[36rem] -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-600/10 blur-[120px]" />
       <div className="relative mx-auto grid max-w-6xl items-center gap-12 lg:grid-cols-2">
-        {/* Visual: galaxy background + readable iced-glass diagram */}
-        <div className="reveal-left relative order-2 h-[38rem] w-full overflow-hidden rounded-3xl border border-white/5 lg:order-1 lg:h-[44rem]">
-          <div className="absolute inset-0">
+        {/* Visual: dim galaxy (faded edgelessly into the bg) + readable glass diagram */}
+        <div className="reveal-left relative order-2 h-[38rem] w-full lg:order-1 lg:h-[44rem]">
+          <div
+            className="pointer-events-none absolute inset-0"
+            style={{
+              WebkitMaskImage: 'radial-gradient(ellipse 72% 64% at 50% 42%, #000 24%, transparent 82%)',
+              maskImage: 'radial-gradient(ellipse 72% 64% at 50% 42%, #000 24%, transparent 82%)',
+            }}
+          >
             {can3D ? (
               <Suspense fallback={<div className={STATIC_BG} />}>
                 <ArchitectureScene />

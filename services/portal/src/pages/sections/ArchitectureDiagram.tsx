@@ -1,7 +1,7 @@
-// The readable foreground for the architecture visual: iced-glass panels laid
-// out in three layers over the galaxy background. Pure DOM — no 3D label drift.
-// Memory tiers connect DIRECTLY to their backing store (Hot↔Postgres,
-// Warm↔Qdrant, Cold↔Neo4j, Wiki↔Wiki).
+// Readable foreground for the architecture visual: iced-glass panels over the
+// (dim) galaxy. Prominent, animated data lanes connect specific elements:
+// Sources → Ingestion, Agents ↔ Access rights, and each memory tier ↔ its own
+// store (Hot↔Postgres, Warm↔Qdrant, Cold↔Neo4j, Wiki↔Wiki).
 
 const CI = {
   cyan: '#22d3ee',
@@ -11,12 +11,12 @@ const CI = {
   sky: '#38bdf8',
 }
 
-function Lane({ color, dir = 'down' }: { color: string; dir?: 'down' | 'up' | 'both' }) {
+function Lane({ color, dir = 'down', h = 'h-10' }: { color: string; dir?: 'down' | 'up' | 'both'; h?: string }) {
   const Dot = ({ cls }: { cls: string }) => (
-    <span className={`absolute left-1/2 h-1.5 w-1.5 -translate-x-1/2 rounded-full ${cls}`} style={{ background: color, boxShadow: `0 0 6px ${color}` }} />
+    <span className={`absolute left-1/2 h-2 w-2 -translate-x-1/2 rounded-full ${cls}`} style={{ background: color, boxShadow: `0 0 9px ${color}, 0 0 3px #fff` }} />
   )
   return (
-    <div className="relative mx-auto h-9 w-px" style={{ background: `linear-gradient(to bottom, transparent, ${color}66, transparent)` }}>
+    <div className={`relative mx-auto ${h} w-[2px] rounded-full`} style={{ background: `linear-gradient(to bottom, transparent, ${color}, transparent)`, boxShadow: `0 0 9px ${color}66` }}>
       {(dir === 'down' || dir === 'both') && <Dot cls="arch-flow-down" />}
       {(dir === 'up' || dir === 'both') && <Dot cls="arch-flow-up" />}
     </div>
@@ -26,8 +26,8 @@ function Lane({ color, dir = 'down' }: { color: string; dir?: 'down' | 'up' | 'b
 function Panel({ caption, children, emphasized = false }: { caption: string; children: React.ReactNode; emphasized?: boolean }) {
   return (
     <div
-      className={`rounded-2xl border ${emphasized ? 'border-indigo-400/30' : 'border-white/10'} bg-slate-950/55 p-3.5 backdrop-blur-md`}
-      style={{ boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 30px rgba(2,6,23,0.4)' }}
+      className={`rounded-2xl border ${emphasized ? 'border-indigo-400/30' : 'border-white/10'} bg-slate-950/60 p-3.5 backdrop-blur-md`}
+      style={{ boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 30px rgba(2,6,23,0.45)' }}
     >
       <p className="mb-2.5 text-center text-[9px] font-semibold uppercase tracking-[0.2em] text-slate-500">{caption}</p>
       {children}
@@ -74,24 +74,32 @@ export function ArchitectureDiagram() {
           </div>
         </Panel>
 
-        {/* connector: sources → ingestion (down) · agents ↔ rights (both) */}
-        <div className="flex justify-around px-10 py-0.5">
+        {/* direct: Sources → Ingestion (down) · Agents ↔ Access rights (both) */}
+        <div className="grid grid-cols-2 gap-3 px-3.5 py-0.5">
           <Lane color={CI.cyan} dir="down" />
           <Lane color={CI.violet} dir="both" />
         </div>
 
-        {/* Layer 2 — GCTRL Middleware (access control + core + memory, one layer) */}
+        {/* Layer 2 — GCTRL Middleware (access control + core + memory) */}
         <Panel caption="GCTRL · Middleware" emphasized>
-          <div className="grid grid-cols-3 items-center gap-2">
+          <div className="grid grid-cols-2 gap-3">
             <Chip label="Ingestion" sub="classify" accent={CI.indigo} />
+            <Chip label="Access rights" sub="clearance" accent={CI.indigo} />
+          </div>
+
+          {/* core — centered, with a slow, subtle pulse behind it */}
+          <div className="relative mx-auto mt-3 w-2/5">
             <div
-              className="rounded-xl border border-indigo-400/50 bg-indigo-500/15 px-2 py-2 text-center"
-              style={{ boxShadow: '0 0 24px rgba(99,102,241,0.35), inset 0 1px 0 rgba(255,255,255,0.1)' }}
+              className="arch-glow-pulse pointer-events-none absolute -inset-6 rounded-full"
+              style={{ background: 'radial-gradient(circle, rgba(129,140,248,0.45), transparent 70%)', filter: 'blur(10px)' }}
+            />
+            <div
+              className="relative rounded-xl border border-indigo-400/50 bg-indigo-500/15 px-2 py-2 text-center backdrop-blur-sm"
+              style={{ boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.12)' }}
             >
               <p className="bg-gradient-to-r from-indigo-300 via-violet-300 to-cyan-300 bg-clip-text text-sm font-bold text-transparent">GCTRL</p>
               <p className="text-[8px] uppercase tracking-[0.15em] text-slate-300">core</p>
             </div>
-            <Chip label="Access rights" sub="clearance" accent={CI.indigo} />
           </div>
 
           <p className="mb-1.5 mt-3 text-center text-[9px] uppercase tracking-wider text-slate-500">Memory layers</p>
@@ -105,7 +113,7 @@ export function ArchitectureDiagram() {
           </div>
         </Panel>
 
-        {/* connector: each memory tier ↔ its own store, directly */}
+        {/* direct: each memory tier ↔ its own store */}
         <div className="grid grid-cols-4 gap-1.5 px-3.5 py-0.5">
           {MEM.map((m) => <Lane key={m.label} color={m.color} dir="both" />)}
         </div>

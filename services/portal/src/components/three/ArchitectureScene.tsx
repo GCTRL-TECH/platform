@@ -52,11 +52,11 @@ function Galaxy() {
         <bufferAttribute attach="attributes-color" args={[colors, 3]} />
       </bufferGeometry>
       <pointsMaterial
-        size={0.055}
+        size={0.05}
         sizeAttenuation
         vertexColors
         transparent
-        opacity={0.9}
+        opacity={0.38}
         depthWrite={false}
         blending={THREE.AdditiveBlending}
       />
@@ -74,7 +74,7 @@ export default function ArchitectureScene() {
     >
       <Galaxy />
       <EffectComposer>
-        <Bloom luminanceThreshold={0.0} luminanceSmoothing={0.9} intensity={0.85} mipmapBlur radius={0.8} />
+        <Bloom luminanceThreshold={0.15} luminanceSmoothing={0.9} intensity={0.5} mipmapBlur radius={0.75} />
       </EffectComposer>
     </Canvas>
   )
