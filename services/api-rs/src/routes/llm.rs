@@ -230,29 +230,59 @@ async fn test_provider(
     let client = reqwest::Client::new();
 
     if provider == "ollama" {
+        // The base URL actually persisted for this user (Settings → LLM / Infra).
+        // Surfaced back so the UI can confirm "Connected — using <this exact URL>",
+        // proving the value the user typed is what we stored and tested.
+        let persisted_base: Option<String> = sqlx::query_scalar(
+            "SELECT base_url FROM user_llm_providers WHERE user_id = $1 AND provider = 'ollama'",
+        )
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .filter(|s: &String| !s.trim().is_empty());
+
         // Re-validate the stored base at request time (SEC-1); fall back to the
-        // default if a bad row slipped through write-time validation.
-        let base = crate::services::llm::validate_llm_base("ollama", target.base_url.as_deref())
+        // default if a bad row slipped through write-time validation. This is the
+        // base we ACTUALLY hit (host.docker.internal / LAN / loopback all allowed
+        // for ollama; only cloud providers are pinned to their official host).
+        let resolved_base = crate::services::llm::validate_llm_base("ollama", target.base_url.as_deref())
             .map(|u| u.as_str().trim_end_matches('/').to_string())
             .unwrap_or_else(|_| crate::services::llm::ollama_default_base());
         let mut rb = client
-            .get(format!("{}/api/tags", base.trim_end_matches('/')))
+            .get(format!("{}/api/tags", resolved_base.trim_end_matches('/')))
             .timeout(Duration::from_secs(5));
         // Optional bearer for a remote/cloud Ollama.
         if let Some(k) = target.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
             rb = rb.bearer_auth(k);
         }
         // A 2xx from /api/tags means the endpoint (and key, if any) is valid.
-        // Surface how many models the connection exposes for a clearer result.
+        // Surface the persisted + resolved base and the model count so the UI can
+        // render "Connected — using <resolvedBase>, N models".
         return Ok(Json(match rb.send().await {
             Ok(r) if r.status().is_success() => {
                 let count = r.json::<Value>().await.ok()
                     .and_then(|v| v["models"].as_array().map(|a| a.len()))
                     .unwrap_or(0);
-                json!({ "ok": true, "provider": provider, "models": count })
+                json!({
+                    "ok": true,
+                    "provider": provider,
+                    "models": count,
+                    "baseUrl": persisted_base,
+                    "resolvedBase": resolved_base,
+                })
             }
-            Ok(r)  => json!({ "ok": false, "provider": provider, "error": format!("Ollama returned {}", r.status()) }),
-            Err(e) => json!({ "ok": false, "provider": provider, "error": format!("unreachable: {e}") }),
+            Ok(r)  => json!({
+                "ok": false, "provider": provider,
+                "error": format!("Ollama returned {}", r.status()),
+                "baseUrl": persisted_base, "resolvedBase": resolved_base,
+            }),
+            Err(e) => json!({
+                "ok": false, "provider": provider,
+                "error": format!("unreachable: {e}"),
+                "baseUrl": persisted_base, "resolvedBase": resolved_base,
+            }),
         }));
     }
 

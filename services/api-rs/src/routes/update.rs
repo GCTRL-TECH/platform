@@ -93,9 +93,16 @@ async fn check_update() -> Json<Value> {
     let latest = fetch_latest_version().await.unwrap_or_else(|| current.clone());
     let update_available = version_gt(&latest, &current);
 
+    // Both naming conventions are emitted so every consumer is satisfied:
+    // Header.tsx / SettingsPage.tsx read `current`/`latest`; other clients (and the
+    // license banner) read `currentVersion`/`latestVersion`. `updateAvailable` is
+    // always present and false on any upstream failure (never a 5xx, never a false
+    // positive) so the UI can truthfully say "up to date" when the channel is down.
     let payload = json!({
         "current": current,
         "latest": latest,
+        "currentVersion": current,
+        "latestVersion": latest,
         "updateAvailable": update_available,
     });
 

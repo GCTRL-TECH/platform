@@ -39,7 +39,7 @@ from .ner import get_ner_pipeline
 from .pii_detector import detect_pii, redact_pii
 from .relex import get_extractor
 from .sources.file_handler import extract_text
-from .sources.url_handler import extract_from_url
+from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
 from .sources.obsidian_handler import fetch_note
 from .vector_store import get_vector_store
@@ -177,8 +177,24 @@ def run_pipeline(
     logger.info(f"[{job_id}] NER: {len(entities)} entities")
 
     # 2. Relation Extraction (Ollama HTTP — can run in parallel)
+    # Resilient: a failure of the LLM (Ollama down / crash / timeout / 5xx) MUST
+    # NOT fail the whole job. We keep the entities already extracted by NER and
+    # complete the extraction as a successful-but-degraded result (no relations),
+    # surfacing a concise human-readable warning the dashboard can show.
+    warnings: list[str] = []
     relex = get_extractor()
-    relations = relex.extract_relations(text, entities, ollama_base=ollama_base)
+    try:
+        relations = relex.extract_relations(text, entities, ollama_base=ollama_base)
+        if getattr(relex, "last_degraded", False) and relex.last_degraded_reason:
+            warnings.append(relex.last_degraded_reason)
+            logger.warning(f"[{job_id}] RelEx degraded: {relex.last_degraded_reason}")
+    except Exception as exc:
+        logger.warning(f"[{job_id}] RelEx failed (non-fatal, continuing with entities only): {exc}")
+        relations = []
+        warnings.append(
+            "Relation extraction skipped — LLM unavailable. Connect a working "
+            "Ollama in Settings → Infrastructure to enable relation extraction."
+        )
     logger.info(f"[{job_id}] RelEx: {len(relations)} relations")
 
     # 3. Write to Knowledge Graph
@@ -246,7 +262,17 @@ def run_pipeline(
     except Exception as exc:
         logger.warning(f"[{job_id}] Vector store failed (non-fatal): {exc}")
 
-    return {
+    # A concise human-readable note for the dashboard when the extraction
+    # completed but a step degraded (e.g. relation extraction skipped because the
+    # LLM was unavailable). The job is still 'completed'/'success', not 'failed'.
+    degraded = len(warnings) > 0
+    warning_msg = None
+    if degraded:
+        warning_msg = (
+            f"Extracted {len(entities)} entities; " + " ".join(warnings)
+        )
+
+    result = {
         "job_id": job_id,
         "status": "completed",
         "entities": entities,
@@ -259,6 +285,10 @@ def run_pipeline(
         },
         "pii_findings": pii_findings,
     }
+    if degraded:
+        result["degraded"] = True
+        result["warning"] = warning_msg
+    return result
 
 
 # ── Redis background worker ──────────────────────────────────────────
@@ -337,9 +367,31 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             # source signal (file name / note path / URL) recorded on every node so
             # A2 dossiers can cite where a fact came from.
             origin: str | None = None
+            crawled_urls: list[str] | None = None
             if job_type == "url":
                 text = extract_from_url(job_input)
                 origin = job_input if isinstance(job_input, str) else None
+            elif job_type in ("crawl", "url_crawl"):
+                # Website-crawl job: BOUNDED, same-domain BFS. `input` is the seed
+                # URL (string) or a dict carrying url + crawl params. The Rust API
+                # mirrors the text/url extract payload, so url/max_pages/max_depth
+                # may live either at top level or inside `input`.
+                inp = job_input if isinstance(job_input, dict) else {}
+                seed_url = (inp.get("url") if isinstance(inp, dict) else None) or \
+                    payload.get("url") or (job_input if isinstance(job_input, str) else "")
+                max_pages = int(inp.get("max_pages") or payload.get("max_pages") or 1)
+                max_depth = int(inp.get("max_depth") or payload.get("max_depth") or 2)
+                logger.info(f"[{job_id}] Crawl start: {seed_url} (max_pages={max_pages}, max_depth={max_depth})")
+                text, crawled_urls = crawl_website(seed_url, max_pages=max_pages, max_depth=max_depth)
+                # Provenance: cite the crawled pages. Single page → that URL;
+                # multi-page → seed plus a count so a dossier can attribute facts.
+                if crawled_urls:
+                    origin = crawled_urls[0] if len(crawled_urls) == 1 else \
+                        f"{seed_url} (+{len(crawled_urls) - 1} more pages)"
+                else:
+                    origin = seed_url
+                if not text or not text.strip():
+                    logger.warning(f"[{job_id}] Crawl found no extractable content for {seed_url}")
             elif job_type == "text":
                 text = job_input
             elif job_type == "file":
@@ -348,7 +400,8 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 file_data = json.loads(job_input)
                 file_bytes = base64.b64decode(file_data["fileBase64"])
                 mimetype = file_data.get("mimetype", "application/octet-stream")
-                text = extract_text(file_bytes, mimetype)
+                _fname = file_data.get("originalFilename") or file_data.get("fileName") or "document"
+                text = extract_text(file_bytes, mimetype, filename=_fname)
                 origin = file_data.get("originalFilename") or file_data.get("fileName")
                 logger.info(f"[{job_id}] Extracted {len(text)} chars from file ({mimetype})")
             elif job_type == "kex_sharepoint":
@@ -360,7 +413,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                     drive_id=inp["driveId"],
                     item_id=inp["itemId"],
                 )
-                text = extract_text(file_bytes, mimetype)
+                text = extract_text(file_bytes, mimetype, filename=inp.get("fileName") or "document")
                 origin = inp.get("fileName")
                 logger.info(f"[{job_id}] SharePoint: extracted {len(text)} chars from {inp.get('fileName','<unknown>')} ({mimetype})")
             elif job_type == "kex_obsidian":
@@ -375,6 +428,24 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
+            # A crawl (or any source) that found nothing extractable completes as
+            # a clear, successful "no content" result — NOT a hard failure.
+            if job_type in ("crawl", "url_crawl") and (not text or not text.strip()):
+                empty_result = {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "entities": [],
+                    "relations": [],
+                    "graph_stats": {},
+                    "vector_stats": {"chunks_created": 0, "chunks_embedded": 0, "chunks_stored": 0},
+                    "pii_findings": {},
+                    "degraded": True,
+                    "warning": "Crawl found no extractable content (no readable pages on this domain).",
+                    "crawled_urls": crawled_urls or [],
+                }
+                _publish_result(r, job_id, empty_result)
+                continue
+
             check_result = check_credits("kex_extract", len(text))
             result = run_pipeline(
                 text, job_id, user_id,
@@ -386,6 +457,9 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 embedding_base_url=embedding_base_url,
                 embedding_provider=embedding_provider,
             )
+            # Record crawl provenance on the result for the dashboard.
+            if crawled_urls:
+                result["crawled_urls"] = crawled_urls
             report_usage("kex_extract", len(text), check_result["credits_spent"])
             _extend_ontology(ontology_id, result)
             _publish_result(r, job_id, result)
@@ -656,6 +730,12 @@ class ExtractResponse(BaseModel):
     relations: list[dict]
     graph_stats: dict
     vector_stats: dict = {}
+    # Set when the extraction completed but a step degraded (e.g. relation
+    # extraction skipped because the LLM was unavailable). Job is still success.
+    degraded: bool = False
+    warning: Optional[str] = None
+    # Provenance: URLs crawled (website-crawl jobs) so the dashboard can show them.
+    crawled_urls: Optional[list[str]] = None
 
 
 class RepoRequest(BaseModel):
@@ -805,7 +885,7 @@ async def upload_endpoint(
     content_type = file.content_type or "application/octet-stream"
 
     try:
-        text = extract_text(file_bytes, content_type)
+        text = extract_text(file_bytes, content_type, filename=file.filename or "document")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={
             "error": "unsupported_format",

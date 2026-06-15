@@ -19,7 +19,7 @@ export function Header({ title }: HeaderProps) {
   const [showUpdateModal, setShowUpdateModal] = useState(false)
   const popoverRef = useRef<HTMLDivElement>(null)
 
-  const { data } = useQuery<UpdateCheck>({
+  const { data, isError, isLoading } = useQuery<UpdateCheck>({
     queryKey: ['update', 'check'],
     queryFn: () => apiGet<UpdateCheck>('/update/check'),
     refetchInterval: 60 * 60 * 1000, // hourly
@@ -28,6 +28,9 @@ export function Header({ title }: HeaderProps) {
     retry: false,
   })
 
+  // A failed update check means "we couldn't confirm a newer version" — treat that
+  // as up-to-date rather than surfacing a scary error. Only an explicit
+  // updateAvailable:true response lights the badge.
   const updateAvailable = data?.updateAvailable === true
 
   // Close popover on outside click
@@ -94,11 +97,17 @@ export function Header({ title }: HeaderProps) {
                   </div>
                 ) : (
                   <div className="space-y-1">
-                    <p className="text-sm text-slate-300">No new versions</p>
+                    <p className="text-sm text-slate-300">
+                      {isLoading ? 'Checking for updates…' : "You're up to date"}
+                    </p>
                     <p className="text-xs text-slate-500">
                       {data?.current
                         ? `You're on v${data.current} — up to date.`
-                        : 'Checking for updates…'}
+                        : isLoading
+                          ? 'Checking for updates…'
+                          : isError
+                            ? 'No new version available.'
+                            : 'No new version available.'}
                     </p>
                   </div>
                 )}

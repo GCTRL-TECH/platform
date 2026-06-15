@@ -343,18 +343,39 @@ async fn probe_tcp(host: &str, port: u16) -> Option<u128> {
     Some(start.elapsed().as_millis())
 }
 
-async fn probe_http(url: &str) -> Option<u128> {
-    let start = std::time::Instant::now();
+/// Reachability probe for an HTTP service (ollama / qdrant). Tries a list of
+/// candidate paths in order and succeeds on the FIRST that responds at all —
+/// reachability is what "online" means here, so any HTTP reply (even a 404 on a
+/// path the service doesn't expose) proves the service is up. Falls back to a raw
+/// TCP connect on the URL's host:port so a service that answers no GET (or only
+/// answers on an endpoint we didn't list) still reads as online when its port is
+/// open. `base` is the service root, e.g. `http://gctrl-ollama:11434`.
+async fn probe_service_http(base: &str, paths: &[&str]) -> Option<u128> {
+    let root = base.trim_end_matches('/');
     let client = reqwest::Client::new();
-    let resp = timeout(Duration::from_millis(3000), client.get(url).send())
-        .await
-        .ok()?
-        .ok()?;
-    if resp.status().as_u16() < 500 {
-        Some(start.elapsed().as_millis())
-    } else {
-        None
+    for path in paths {
+        let url = format!("{root}{path}");
+        let start = std::time::Instant::now();
+        if let Ok(Ok(_resp)) = timeout(Duration::from_millis(3000), client.get(&url).send()).await {
+            // Any response (any status) means the service is reachable & serving.
+            return Some(start.elapsed().as_millis());
+        }
     }
+    // Last resort: the port is open even if no listed HTTP path answered.
+    if let Some((host, port)) = http_host_port(base) {
+        return probe_tcp(&host, port).await;
+    }
+    None
+}
+
+/// Extract host + port from an `http(s)://host:port/...` URL, defaulting the port
+/// to the scheme default (80 / 443) when absent. Used for the TCP reachability
+/// fallback in [`probe_service_http`].
+fn http_host_port(url: &str) -> Option<(String, u16)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Some((host, port))
 }
 
 async fn status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value> {
@@ -382,13 +403,15 @@ async fn status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value
             }
         },
         async {
-            match probe_http(&format!("{}/", &qdrant)).await {
+            // Qdrant: `/healthz` (newer) → `/` (version banner) → TCP fallback.
+            match probe_service_http(&qdrant, &["/healthz", "/"]).await {
                 Some(ms) => json!({ "connected": true,  "latencyMs": ms as i64 }),
                 None     => json!({ "connected": false, "latencyMs": null }),
             }
         },
         async {
-            match probe_http(&format!("{}/", &ollama)).await {
+            // Ollama: `/api/tags` (always served) → `/` ("Ollama is running") → TCP.
+            match probe_service_http(&ollama, &["/api/tags", "/"]).await {
                 Some(ms) => json!({ "connected": true,  "latencyMs": ms as i64 }),
                 None     => json!({ "connected": false, "latencyMs": null }),
             }

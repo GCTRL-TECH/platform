@@ -97,6 +97,14 @@ JSON array:"""
 class RelationExtractor:
     """Ollama-backed relation extractor with closed vocab + validation."""
 
+    def __init__(self) -> None:
+        # Set by the most recent extract_relations() call so the pipeline can
+        # tell "the LLM was unavailable" apart from "the LLM ran but found no
+        # relations". When degraded, `last_degraded_reason` carries a concise,
+        # human-readable message for the job/dashboard.
+        self.last_degraded: bool = False
+        self.last_degraded_reason: Optional[str] = None
+
     def extract_relations(
         self,
         text: str,
@@ -119,8 +127,17 @@ class RelationExtractor:
         type-checked triple; lower (~0.6) when validation had to repair the
         direction or normalize the relation surface form.
 
-        Returns empty list on any failure (graceful degradation).
+        Returns empty list on any failure (graceful degradation). When the
+        failure is the LLM being UNAVAILABLE (connection error / timeout / 5xx),
+        `self.last_degraded` is set True with a human-readable
+        `self.last_degraded_reason` so the pipeline can mark the job as a
+        successful-but-degraded extraction (entities only, no relations) instead
+        of failing the whole job.
         """
+        # Reset degradation state for this run.
+        self.last_degraded = False
+        self.last_degraded_reason = None
+
         if not entities or len(entities) < 2:
             return []
 
@@ -139,10 +156,20 @@ class RelationExtractor:
 
         raw_response = self._call_ollama(prompt, ollama_base=ollama_base)
         if raw_response is None:
+            # _call_ollama already recorded the reason on self.last_degraded_*.
             return []
 
-        parsed = self._parse_json_array(raw_response)
-        return self._validate(parsed, entities)
+        try:
+            parsed = self._parse_json_array(raw_response)
+            return self._validate(parsed, entities)
+        except Exception as exc:
+            # A parsing / validation defect must never fail the whole job.
+            logger.warning(f"Relation parse/validation failed (non-fatal): {exc}")
+            self.last_degraded = True
+            self.last_degraded_reason = (
+                "Relation extraction skipped (LLM response could not be parsed)."
+            )
+            return []
 
     # ── internal helpers ──────────────────────────────────────────────
 
@@ -187,6 +214,10 @@ class RelationExtractor:
         `ollama_base` overrides `config.OLLAMA_BASE` for this call when provided
         (per-job endpoint from the API); otherwise the env-configured default."""
         base = (ollama_base or "").strip() or config.OLLAMA_BASE
+        _unavailable = (
+            "Relation extraction skipped — LLM unavailable. Connect a working "
+            "Ollama in Settings → Infrastructure to enable relation extraction."
+        )
         try:
             resp = requests.post(
                 f"{base.rstrip('/')}/api/generate",
@@ -206,12 +237,24 @@ class RelationExtractor:
             return data.get("response", "")
         except requests.exceptions.ConnectionError:
             logger.warning("Ollama not reachable - skipping relation extraction")
+            self.last_degraded = True
+            self.last_degraded_reason = _unavailable
             return None
         except requests.exceptions.Timeout:
             logger.warning("Ollama timed out during relation extraction")
+            self.last_degraded = True
+            self.last_degraded_reason = _unavailable
+            return None
+        except requests.exceptions.HTTPError as exc:
+            # 5xx / model crash (e.g. "llama runner process has terminated").
+            logger.warning(f"Ollama returned an error - skipping relation extraction: {exc}")
+            self.last_degraded = True
+            self.last_degraded_reason = _unavailable
             return None
         except Exception as exc:
             logger.error(f"Ollama call failed: {exc}")
+            self.last_degraded = True
+            self.last_degraded_reason = _unavailable
             return None
 
     def _parse_json_array(self, response_text: str) -> list[dict]:

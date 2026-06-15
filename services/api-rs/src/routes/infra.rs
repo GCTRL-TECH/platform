@@ -61,7 +61,11 @@ pub(crate) fn default_service_url(cfg: &crate::config::Config, service: &str) ->
         "neo4j" => cfg.neo4j_uri.clone(),
         "qdrant" => cfg.qdrant_url.clone(),
         "postgres" => "postgres (bundled)".to_string(), // creds in DATABASE_URL — never surfaced
-        "ollama" => std::env::var("OLLAMA_BASE").unwrap_or_else(|_| "http://localhost:11434".into()),
+        // Bundled Ollama lives on the compose network as `gctrl-ollama`. Prefer the
+        // explicit OLLAMA_BASE env (compose sets it), then fall back to the compose
+        // service name — NOT `localhost`, which from inside the api container points
+        // at the api container itself and always reads as "offline".
+        "ollama" => std::env::var("OLLAMA_BASE").unwrap_or_else(|_| "http://gctrl-ollama:11434".into()),
         _ => String::new(),
     }
 }

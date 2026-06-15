@@ -9,26 +9,119 @@ import io
 import json
 import logging
 import re
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Legacy binary OLE formats (Office 97-2003) we cannot parse with pure-python
+# libraries. We return a friendly message instead of crashing the worker.
+_LEGACY_OLE_EXTENSIONS = {
+    ".doc": ".docx",
+    ".xls": ".xlsx",
+    ".ppt": ".pptx",
+}
+
+
+def _ext_of(filename: str) -> str:
+    """Lowercase file extension (including the dot), or '' when none."""
+    if not filename or "." not in filename:
+        return ""
+    return "." + filename.rsplit(".", 1)[-1].lower()
+
+
+def _route_by_extension(ext: str, file_bytes: bytes) -> "Optional[str]":
+    """Route a file to the right pure-python parser by lowercase extension.
+
+    Returns the extracted text, or None if the extension is not one we route
+    by extension (caller then falls back to mimetype routing). Each branch is
+    self-contained; the per-parser functions already wrap their own errors.
+    """
+    if ext == ".pdf":
+        return _extract_pdf(file_bytes)
+    if ext == ".docx":
+        return _extract_docx(file_bytes)
+    if ext == ".pptx":
+        return _extract_pptx(file_bytes)
+    if ext in (".xlsx", ".xlsm"):
+        return _extract_xlsx(file_bytes)
+    if ext in (".odt", ".odp", ".ods"):
+        return _extract_odf(file_bytes)
+    if ext == ".csv":
+        return _extract_csv(file_bytes)
+    if ext in (".md", ".markdown"):
+        return _extract_plaintext(file_bytes)
+    if ext in (".html", ".htm"):
+        return _extract_html(file_bytes)
+    if ext == ".json":
+        return _extract_json(file_bytes)
+    if ext in (".txt", ".text", ".log"):
+        return _extract_plaintext(file_bytes)
+    if ext in (".xml",):
+        return _extract_xml(file_bytes)
+    if ext in (".yaml", ".yml"):
+        return _extract_yaml(file_bytes)
+    if ext == ".toml":
+        return _extract_toml(file_bytes)
+    if ext == ".rtf":
+        return _extract_rtf(file_bytes)
+    if ext == ".epub":
+        return _extract_epub(file_bytes)
+    if ext == ".eml":
+        return _extract_eml(file_bytes)
+    if ext == ".msg":
+        return _extract_msg(file_bytes)
+    return None
 
 
 def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -> str:
     """
     Extract textual content from file bytes.
 
+    Routing strategy:
+      1. Lowercase EXTENSION first (most reliable: base64 uploads often arrive
+         with a generic 'application/octet-stream' mimetype, so we cannot trust
+         the mimetype alone). A clear friendly error is returned for legacy
+         binary OLE formats (.doc/.xls/.ppt) instead of crashing.
+      2. unstructured.io for enhanced formats (OCR, images) when available.
+      3. MIME-type routing as the fallback.
+
     Args:
         file_bytes: Raw file content.
         mimetype:   MIME type string (e.g. "application/pdf").
-        filename:   Original filename (used for format detection).
+        filename:   Original filename (used for extension-based detection).
 
     Returns:
         Extracted text as a single string.
 
     Raises:
-        ValueError: If the mimetype is unsupported or extraction fails.
+        ValueError: If the format is unsupported or extraction fails.
     """
-    # Try unstructured.io first for enhanced formats (OCR, images, etc.)
+    ext = _ext_of(filename)
+
+    # 0. Legacy binary OLE formats — friendly error, never crash the worker.
+    if ext in _LEGACY_OLE_EXTENSIONS:
+        modern = _LEGACY_OLE_EXTENSIONS[ext]
+        raise ValueError(
+            f"Legacy binary format '{ext}' is not supported. "
+            f"Please convert to the modern format ({modern}) and re-upload "
+            f"(also supported: .docx/.xlsx/.pptx/.pdf/.csv/.html/.md/.json/.txt)."
+        )
+
+    # 1. Route by lowercase extension first — most reliable for uploads.
+    if ext:
+        try:
+            routed = _route_by_extension(ext, file_bytes)
+            if routed is not None:
+                return routed
+        except ValueError:
+            raise
+        except Exception as exc:
+            # A parser raised something unexpected; surface a clean error rather
+            # than letting an unhandled exception bubble up and kill the worker.
+            raise ValueError(f"Failed to parse '{ext}' file: {exc}")
+
+    # 2. Try unstructured.io for enhanced formats (OCR, images, etc.)
     try:
         from .unstructured_handler import should_use_unstructured, extract_text as unstructured_extract
         if should_use_unstructured(mimetype):
@@ -37,8 +130,17 @@ def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -
     except Exception as exc:
         logger.warning(f"Unstructured.io fallback: {exc}, using built-in extractor")
 
-    # Normalise mimetype (strip parameters like charset)
+    # 3. Normalise mimetype (strip parameters like charset) and route by MIME.
     base_mime = mimetype.split(";")[0].strip().lower()
+
+    # Friendly error for legacy OLE mimetypes when no extension was given.
+    if base_mime in ("application/msword", "application/vnd.ms-powerpoint") or (
+        base_mime == "application/vnd.ms-excel" and not ext
+    ):
+        raise ValueError(
+            "Legacy binary Office format is not supported. "
+            "Please convert to the modern format (.docx/.xlsx/.pptx) and re-upload."
+        )
 
     if base_mime == "application/pdf":
         return _extract_pdf(file_bytes)
@@ -601,6 +703,78 @@ def _extract_odt(data: bytes) -> str:
     if not paragraphs:
         raise ValueError("ODT contained no extractable text")
     return "\n\n".join(paragraphs)
+
+
+# ── ODF (OpenDocument text / presentation / spreadsheet) ───────────
+
+
+def _extract_odf(data: bytes) -> str:
+    """Extract text from any OpenDocument file (.odt / .odp / .ods).
+
+    odfpy exposes every text-bearing node as <text:p> / <text:span>, regardless
+    of whether the document is a text doc, a presentation or a spreadsheet, so a
+    single getElementsByType(P) sweep harvests readable content from all three.
+    """
+    try:
+        from odf.opendocument import load as odf_load  # type: ignore
+        from odf.text import P  # type: ignore
+    except ImportError:
+        raise ValueError("odfpy is not installed")
+
+    doc = odf_load(io.BytesIO(data))
+    paragraphs: list[str] = []
+    for p in doc.getElementsByType(P):
+        # teletype.extractText would be ideal, but a recursive childNode walk is
+        # dependency-free and handles nested spans the same way.
+        text = _odf_node_text(p)
+        if text.strip():
+            paragraphs.append(text.strip())
+
+    if not paragraphs:
+        raise ValueError("OpenDocument file contained no extractable text")
+    return "\n\n".join(paragraphs)
+
+
+def _odf_node_text(node) -> str:
+    """Recursively collect text from an odfpy node and its children."""
+    out = ""
+    for child in getattr(node, "childNodes", []) or []:
+        if getattr(child, "nodeType", None) == 3 and hasattr(child, "data"):  # TEXT_NODE
+            out += child.data
+        else:
+            out += _odf_node_text(child)
+    return out
+
+
+# ── HTML ───────────────────────────────────────────────────────────
+
+
+def _extract_html(data: bytes) -> str:
+    """Extract readable text from an HTML document, stripping script/style."""
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            html = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        html = data.decode("utf-8", errors="replace")
+
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n")
+    except ImportError:
+        # Fallback: crude tag stripping without bs4.
+        text = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+        text = re.sub(r"<[^>]+>", " ", text)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("HTML contained no extractable text")
+    return "\n".join(lines)
 
 
 # ── YAML ───────────────────────────────────────────────────────────

@@ -36,6 +36,8 @@ import {
   Sparkles,
   Trash2,
   Plus,
+  AlertTriangle,
+  ShieldAlert,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
@@ -353,6 +355,8 @@ function ModelsTab() {
   const [ollamaSaved, setOllamaSaved] = useState(false)
   const [ollamaTesting, setOllamaTesting] = useState(false)
   const [ollamaTest, setOllamaTest] = useState<{ ok: boolean; msg: string } | null>(null)
+  // The base URL the server currently has persisted (for the status chip).
+  const [ollamaSavedBase, setOllamaSavedBase] = useState<string | null>(null)
 
   const loadProviders = useCallback(async () => {
     try {
@@ -361,6 +365,7 @@ function ModelsTab() {
       setProviders(list)
       const ollama = list.find((p) => p.provider === 'ollama')
       if (ollama?.baseUrl) setOllamaBase(ollama.baseUrl)
+      setOllamaSavedBase(ollama?.baseUrl ?? null)
       setOllamaHasKey(Boolean(ollama?.hasKey))
     } catch { /* non-fatal */ }
   }, [])
@@ -398,12 +403,20 @@ function ModelsTab() {
       if (ollamaKey.trim()) body.apiKey = ollamaKey.trim()
       await api.put('/llm/providers', body)
       if (ollamaKey.trim()) setOllamaKey('')
-      const { data } = await api.post('/llm/providers/ollama/test')
+      const { data } = await api.post('/llm/providers/ollama/test') as {
+        data: { ok?: boolean; baseUrl?: string; resolvedBase?: string; models?: unknown; error?: string }
+      }
+      // Backend returns { ok, baseUrl, resolvedBase, models }. `models` may be an
+      // array of model names or a numeric count depending on the build — handle both.
+      const modelCount = Array.isArray(data.models)
+        ? data.models.length
+        : (typeof data.models === 'number' ? data.models : undefined)
+      const target = data.resolvedBase || data.baseUrl || ollamaBase.trim() || 'Ollama'
       setOllamaTest({
         ok: !!data.ok,
         msg: data.ok
-          ? (data.models ? `Connection OK — ${data.models} model(s) reachable` : 'Connection OK')
-          : (data.error ?? 'Test failed'),
+          ? `Connected to ${target}${modelCount !== undefined ? ` — ${modelCount} model${modelCount === 1 ? '' : 's'} available` : ''}`
+          : (data.error ?? 'Test failed — is the URL reachable?'),
       })
       void loadProviders()
     } catch {
@@ -431,11 +444,15 @@ function ModelsTab() {
 
       <section>
         <div className="rounded-lg border border-slate-800 bg-slate-900/30 px-4 py-3">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <div className="h-2 w-2 rounded-full bg-emerald-400" />
             <span className="text-sm font-medium text-slate-300">Local Ollama</span>
             <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
               Connected / local
+            </span>
+            {/* Status chip: shows the base URL the server currently has persisted. */}
+            <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-400">
+              {ollamaSavedBase ? `Saved base: ${ollamaSavedBase}` : 'Saved base: bundled (http://localhost:11434)'}
             </span>
           </div>
           <p className="mt-1.5 text-xs text-slate-500">
@@ -476,14 +493,20 @@ function ModelsTab() {
                 disabled={ollamaTesting}
                 className="flex items-center gap-1.5 rounded-md bg-slate-800 px-3 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700 disabled:opacity-50 whitespace-nowrap"
               >
-                {ollamaTesting ? <Loader2 size={14} className="animate-spin" /> : null}
-                Test
+                {ollamaTesting ? <Loader2 size={14} className="animate-spin" /> : <Wifi size={14} />}
+                Test connection
               </button>
             </div>
             {ollamaTest && (
-              <p className={cn('text-[11px]', ollamaTest.ok ? 'text-emerald-400' : 'text-red-400')}>
-                {ollamaTest.msg}
-              </p>
+              <div className={cn(
+                'flex items-start gap-2 rounded-md border px-3 py-2 text-[11px]',
+                ollamaTest.ok
+                  ? 'border-emerald-900/40 bg-emerald-950/20 text-emerald-300'
+                  : 'border-red-900/40 bg-red-950/20 text-red-400'
+              )}>
+                {ollamaTest.ok ? <Check size={13} className="mt-0.5 shrink-0" /> : <AlertTriangle size={13} className="mt-0.5 shrink-0" />}
+                <span>{ollamaTest.msg}</span>
+              </div>
             )}
           </div>
         </div>
@@ -674,6 +697,11 @@ function IntegrationsTab() {
                       ? p.live.map((c) => c.providerEmail || c.label).join(', ')
                       : p.description}
                   </p>
+                  {!p.isConnected && !p.isConfigured && !isAdmin && (
+                    <p className="mt-0.5 text-[10px] text-amber-500/80">
+                      Ask an administrator to add {p.name} OAuth credentials before connecting.
+                    </p>
+                  )}
                 </div>
 
                 {/* Action buttons (all inline) */}
@@ -700,18 +728,23 @@ function IntegrationsTab() {
                     >
                       Disconnect
                     </button>
+                  ) : !p.isConfigured && isAdmin ? (
+                    // Admin can configure credentials → guide them into the inline Setup form
+                    // instead of a dead, greyed-out Connect button.
+                    <button
+                      onClick={() => void handleToggleExpand(p.id)}
+                      className="rounded bg-amber-600/90 px-2.5 py-1 text-[10px] font-medium text-white hover:bg-amber-500 transition-colors"
+                    >
+                      Set up &amp; Connect
+                    </button>
                   ) : (
+                    // Credentials may come from server env vars even when `configured` is
+                    // false in the DB, so always let the user attempt the connection. The
+                    // backend returns a clear, actionable error if OAuth truly isn't set up.
                     <button
                       onClick={() => handleConnect(p.id)}
-                      disabled={connecting === p.id || !p.isConfigured}
-                      title={!p.isConfigured ? 'Configure credentials first' : undefined}
-                      className={cn(
-                        'rounded px-2.5 py-1 text-[10px] font-medium transition-colors',
-                        p.isConfigured
-                          ? 'bg-indigo-600 text-white hover:bg-indigo-500'
-                          : 'bg-slate-800 text-slate-600 cursor-not-allowed',
-                        'disabled:opacity-50'
-                      )}
+                      disabled={connecting === p.id}
+                      className="rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-medium text-white hover:bg-indigo-500 transition-colors disabled:opacity-50"
                     >
                       {connecting === p.id ? 'Connecting...' : 'Connect'}
                     </button>
@@ -2544,7 +2577,7 @@ function InfrastructureTab() {
   const [error, setError] = useState('')
   const [showUpdateModal, setShowUpdateModal] = useState(false)
   const { status: agentStatus } = useLicenseStatus()
-  const { data: updateCheck } = useQuery<{ current: string; latest: string; updateAvailable: boolean }>({
+  const { data: updateCheck, isError: updateCheckError } = useQuery<{ current: string; latest: string; updateAvailable: boolean }>({
     queryKey: ['update', 'check'],
     queryFn: () => apiGet('/update/check'),
     refetchInterval: 60 * 60 * 1000,
@@ -2593,7 +2626,7 @@ function InfrastructureTab() {
             className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors disabled:opacity-50"
           >
             <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
-            Refresh
+            Re-check
           </button>
         </div>
         <p className="mb-4 text-xs text-slate-500">
@@ -2702,9 +2735,9 @@ function InfrastructureTab() {
                   </p>
                 ) : (
                   <p className="text-sm text-slate-400">
-                    {agentStatus || updateCheck
-                      ? 'Your installation is up to date.'
-                      : 'Agent unreachable — status unknown.'}
+                    {agentStatus || updateCheck || updateCheckError
+                      ? "You're up to date — no new version available."
+                      : 'Checking for updates…'}
                   </p>
                 )
               )}
@@ -3105,6 +3138,10 @@ function LicenseTab() {
   }
 
   const displayKey = revealedFull ?? license?.licenseKey ?? ''
+  // Only treat the install as registered when a license is present AND active.
+  // A non-null-but-inactive license (or no license at all) is a GRACE PERIOD, and
+  // we must never render a key-like string that implies it's already registered.
+  const isActivated = license?.status === 'active'
 
   return (
     <div className="space-y-6 max-w-xl">
@@ -3117,7 +3154,7 @@ function LicenseTab() {
               <Loader2 size={14} className="animate-spin" />
               Loading license…
             </div>
-          ) : license ? (
+          ) : isActivated && license ? (
             <>
               <div className="flex items-center gap-2">
                 <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400">
@@ -3184,9 +3221,26 @@ function LicenseTab() {
               </p>
             </>
           ) : (
-            <div className="flex items-start gap-2 text-sm text-slate-400">
-              <Shield size={14} className="mt-0.5 shrink-0 text-slate-500" />
-              <span>No active license linked to this account. Enter a key below to activate.</span>
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="flex items-center gap-1 rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-400">
+                  <AlertTriangle size={11} /> Not activated
+                </span>
+                <span className="rounded-full bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-400">
+                  Grace period
+                </span>
+              </div>
+              <div className="flex items-start gap-2.5 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2.5">
+                <ShieldAlert size={15} className="mt-0.5 shrink-0 text-amber-400" />
+                <div className="text-xs text-amber-200/90">
+                  <p className="font-medium text-amber-300">This installation is running in a grace period.</p>
+                  <p className="mt-1 text-amber-200/70">
+                    Performance is throttled and capacity is limited until a license is
+                    activated. Activate a license below to unlock full extraction, fusion,
+                    and query throughput.
+                  </p>
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -3194,11 +3248,11 @@ function LicenseTab() {
 
       {/* Activate / replace license */}
       <section>
-        <SectionHeader>{license ? 'Replace License Key' : 'Activate License Key'}</SectionHeader>
+        <SectionHeader>{isActivated ? 'Replace License Key' : 'Activate License Key'}</SectionHeader>
         <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4 space-y-4">
           <div>
             <label className="mb-1.5 block text-xs font-medium text-slate-400">
-              {license ? 'New License Key' : 'License Key'}
+              {isActivated ? 'New License Key' : 'License Key'}
             </label>
             <div className="flex gap-2">
               <input
@@ -3229,7 +3283,7 @@ function LicenseTab() {
             className="flex items-center gap-2 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white transition-colors"
           >
             {activating ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
-            {activating ? 'Activating…' : license ? 'Replace License Key' : 'Activate License Key'}
+            {activating ? 'Activating…' : isActivated ? 'Replace License Key' : 'Activate License Key'}
           </button>
         </div>
       </section>

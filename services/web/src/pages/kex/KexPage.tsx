@@ -22,6 +22,7 @@ import {
   Search,
   CheckSquare,
   Square,
+  Check,
   Loader2,
   Home,
   Timer,
@@ -65,14 +66,24 @@ interface OntologiesResponse { ontologies: OntologyOption[] }
 
 type Tab = 'sources' | 'upload' | 'text' | 'url'
 
+// Popular document formats KEX now supports. Keep this list in sync with the
+// `accept` string used by plain <input type="file"> pickers and the helper text.
 const ACCEPTED_TYPES: Record<string, string[]> = {
   'application/pdf': ['.pdf'],
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+  'text/plain': ['.txt'],
+  'text/markdown': ['.md', '.markdown'],
   'text/csv': ['.csv'],
   'application/json': ['.json'],
+  'text/html': ['.html', '.htm'],
   'application/xml': ['.xml'],
   'text/xml': ['.xml'],
-  'text/plain': ['.txt'],
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+  'application/vnd.ms-excel.sheet.macroEnabled.12': ['.xlsm'],
+  'application/vnd.oasis.opendocument.text': ['.odt'],
+  'application/vnd.oasis.opendocument.presentation': ['.odp'],
+  'application/vnd.oasis.opendocument.spreadsheet': ['.ods'],
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -84,7 +95,11 @@ export function KexPage() {
   const [activeTab, setActiveTab] = useState<Tab>('sources')
   const [url, setUrl] = useState('')
   const [text, setText] = useState('')
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([])
+  // Per-file upload progress/status, keyed by a stable index within selectedFiles.
+  type FileUploadStatus = 'pending' | 'uploading' | 'done' | 'error'
+  const [fileStatuses, setFileStatuses] = useState<Record<number, { status: FileUploadStatus; error?: string }>>({})
+  const [uploadingFiles, setUploadingFiles] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [statusInfo, setStatusInfo] = useState<string | null>(null)
   const [selectedOntologyId, setSelectedOntologyId] = useState<string | null>(null)
@@ -229,8 +244,11 @@ export function KexPage() {
   const queryClient = useQueryClient()
   const refreshBalance = () => queryClient.invalidateQueries({ queryKey: ['billing', 'balance'] })
 
+  // Retained for type-compat / potential single-file callers; multi-file uploads go
+  // through handleMultiUpload (per-file status). uploadMutation.isPending still feeds
+  // isSubmitting for any path that uses it.
   const uploadMutation = useUploadMutation<ExtractResponse>('/kex/upload', {
-    onSuccess: () => { setRefetchKey((k) => k + 1); setSelectedFile(null); setSubmitError(null); refreshBalance() },
+    onSuccess: () => { setRefetchKey((k) => k + 1); setSelectedFiles([]); setSubmitError(null); refreshBalance() },
     onError: (err) => { setSubmitError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Upload failed') },
   })
   const extractMutation = useApiMutation<ExtractResponse>('/kex/extract', 'POST', {
@@ -403,21 +421,69 @@ export function KexPage() {
     } finally { setDriveSyncing(false) }
   }
 
-  // Dropzone
-  const onDrop = useCallback((accepted: File[]) => { if (accepted[0]) setSelectedFile(accepted[0]) }, [])
-  const { getRootProps, getInputProps, isDragActive, fileRejections } = useDropzone({ onDrop, accept: ACCEPTED_TYPES, maxFiles: 1 })
+  // Dropzone — accepts multiple files (drag-drop or click). Appends to any already
+  // selected, de-duplicating by name+size, and clears stale per-file statuses.
+  const onDrop = useCallback((accepted: File[]) => {
+    if (!accepted.length) return
+    setSelectedFiles((prev) => {
+      const seen = new Set(prev.map((f) => `${f.name}:${f.size}`))
+      const merged = [...prev]
+      for (const f of accepted) {
+        const key = `${f.name}:${f.size}`
+        if (!seen.has(key)) { merged.push(f); seen.add(key) }
+      }
+      return merged
+    })
+    setFileStatuses({})
+  }, [])
+  const { getRootProps, getInputProps, isDragActive, fileRejections } = useDropzone({ onDrop, accept: ACCEPTED_TYPES, multiple: true })
 
   // Submit
-  const isSubmitting = uploadMutation.isPending || extractMutation.isPending || driveSyncing
+  const isSubmitting = uploadMutation.isPending || uploadingFiles || extractMutation.isPending || driveSyncing
+
+  // Upload each selected file independently, tracking per-file status so the user
+  // sees which succeeded/failed. One bad file doesn't abort the rest.
+  async function handleMultiUpload(files: File[]) {
+    setUploadingFiles(true)
+    setSubmitError(null)
+    setFileStatuses(Object.fromEntries(files.map((_, i) => [i, { status: 'pending' as const }])))
+    let anySuccess = false
+    let firstError: string | null = null
+    const failedIdx: number[] = []
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]!
+      setFileStatuses((prev) => ({ ...prev, [i]: { status: 'uploading' } }))
+      try {
+        const fd = new FormData()
+        fd.append('file', file)
+        if (selectedOntologyId) { fd.append('ontologyId', selectedOntologyId); fd.append('discoveryMode', discoveryMode) }
+        if (classificationLevelId) fd.append('classificationLevelId', classificationLevelId)
+        await api.post('/kex/upload', fd, { headers: { 'Content-Type': undefined } })
+        anySuccess = true
+        setFileStatuses((prev) => ({ ...prev, [i]: { status: 'done' } }))
+      } catch (err: unknown) {
+        const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Upload failed'
+        firstError ??= msg
+        failedIdx.push(i)
+        setFileStatuses((prev) => ({ ...prev, [i]: { status: 'error', error: msg } }))
+      }
+    }
+    setUploadingFiles(false)
+    if (anySuccess) {
+      setRefetchKey((k) => k + 1)
+      refreshBalance()
+      // Keep only the files that failed (so the user can retry); drop successes.
+      setSelectedFiles((prev) => prev.filter((_, i) => failedIdx.includes(i)))
+      setFileStatuses({})
+    }
+    if (firstError && !anySuccess) setSubmitError(firstError)
+  }
 
   function handleSubmit() {
     setSubmitError(null)
     setStatusInfo(null)
-    if (activeTab === 'upload' && selectedFile) {
-      const fd = new FormData(); fd.append('file', selectedFile)
-      if (selectedOntologyId) { fd.append('ontologyId', selectedOntologyId); fd.append('discoveryMode', discoveryMode) }
-      if (classificationLevelId) fd.append('classificationLevelId', classificationLevelId)
-      uploadMutation.mutate(fd)
+    if (activeTab === 'upload' && selectedFiles.length > 0) {
+      void handleMultiUpload(selectedFiles)
     } else if (activeTab === 'url' && url) {
       extractMutation.mutate({ data: { text: url, ontologyId: selectedOntologyId || undefined, discoveryMode, classificationLevelId: classificationLevelId || undefined } })
     } else if (activeTab === 'text' && text) {
@@ -466,14 +532,17 @@ export function KexPage() {
       if (currentDriveFolderId !== 'root') return 'Extract Knowledge from Folder'
       return 'Select a source'
     }
-    if (activeTab === 'upload') return 'Extract Knowledge from File'
+    if (activeTab === 'upload') {
+      if (selectedFiles.length > 1) return `Extract Knowledge from ${selectedFiles.length} Files`
+      return 'Extract Knowledge from File'
+    }
     if (activeTab === 'text') return 'Extract Knowledge from Text'
     if (activeTab === 'url') return 'Extract Knowledge from URL'
     return 'Extract Knowledge'
   }
 
   const canSubmit =
-    (activeTab === 'upload' && !!selectedFile) ||
+    (activeTab === 'upload' && selectedFiles.length > 0) ||
     (activeTab === 'url' && !!url.trim()) ||
     (activeTab === 'text' && !!text.trim()) ||
     (activeTab === 'sources' && selectedProvider === 'obsidian' && obsidianSelected.size > 0) ||
@@ -529,15 +598,55 @@ export function KexPage() {
             <div {...getRootProps()} className={cn('flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-8 transition-colors', isDragActive ? 'border-blue-500 bg-blue-500/5' : 'border-slate-700 bg-slate-800/30 hover:border-slate-600')}>
               <input {...getInputProps()} />
               <Upload size={20} className={isDragActive ? 'text-blue-400' : 'text-slate-400'} />
-              <p className="text-xs text-slate-400">{isDragActive ? 'Drop here' : 'Drag & drop or click — PDF, DOCX, CSV, JSON, XML, TXT'}</p>
+              <p className="text-xs text-slate-400">{isDragActive ? 'Drop files here' : 'Drag & drop or click — add one or more files'}</p>
+              <p className="text-[10px] text-slate-600">PDF, TXT, MD, CSV, JSON, HTML, DOCX, PPTX, XLSX, XLSM, ODT, ODP, ODS</p>
             </div>
-            {fileRejections.length > 0 && <p className="text-xs text-red-400">{fileRejections[0]?.errors[0]?.message}</p>}
-            {selectedFile && (
-              <div className="flex items-center gap-3 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2">
-                <File size={14} className="text-blue-400" />
-                <span className="min-w-0 flex-1 truncate text-xs text-slate-200">{selectedFile.name}</span>
-                <span className="text-[10px] text-slate-500">{(selectedFile.size / 1024).toFixed(1)} KB</span>
-                <button onClick={() => setSelectedFile(null)} className="text-slate-600 hover:text-slate-400"><X size={13} /></button>
+            {fileRejections.length > 0 && (
+              <p className="text-xs text-red-400">
+                {fileRejections[0]?.errors[0]?.message}
+                {fileRejections.length > 1 ? ` (+${fileRejections.length - 1} more rejected)` : ''}
+              </p>
+            )}
+            {selectedFiles.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-slate-500">{selectedFiles.length} file{selectedFiles.length > 1 ? 's' : ''} selected</span>
+                  {!uploadingFiles && (
+                    <button onClick={() => { setSelectedFiles([]); setFileStatuses({}) }} className="text-[10px] text-slate-500 hover:text-slate-300">Clear all</button>
+                  )}
+                </div>
+                {selectedFiles.map((file, i) => {
+                  const st = fileStatuses[i]?.status
+                  return (
+                    <div key={`${file.name}:${file.size}:${i}`} className="flex items-center gap-3 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2">
+                      {st === 'uploading' ? (
+                        <Loader2 size={14} className="shrink-0 animate-spin text-blue-400" />
+                      ) : st === 'done' ? (
+                        <Check size={14} className="shrink-0 text-emerald-400" />
+                      ) : st === 'error' ? (
+                        <AlertCircle size={14} className="shrink-0 text-red-400" />
+                      ) : (
+                        <File size={14} className="shrink-0 text-blue-400" />
+                      )}
+                      <span className="min-w-0 flex-1 truncate text-xs text-slate-200">{file.name}</span>
+                      {st === 'error' && fileStatuses[i]?.error && (
+                        <span className="max-w-[40%] truncate text-[10px] text-red-400" title={fileStatuses[i]?.error}>{fileStatuses[i]?.error}</span>
+                      )}
+                      <span className="text-[10px] text-slate-500">{(file.size / 1024).toFixed(1)} KB</span>
+                      {!uploadingFiles && (
+                        <button
+                          onClick={() => {
+                            setSelectedFiles((prev) => prev.filter((_, idx) => idx !== i))
+                            setFileStatuses({})
+                          }}
+                          className="text-slate-600 hover:text-slate-400"
+                        >
+                          <X size={13} />
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             )}
           </div>

@@ -52,6 +52,7 @@ fn build_router(state: Arc<models::AppState>) -> Router {
     let protected = Router::new()
         .nest("/api/users",       routes::users::router().merge(routes::api_keys::router()))
         .nest("/api/kex",         routes::kex::router())
+        .nest("/api/crawler",     routes::crawler::router())
         .nest("/api/fuse",        routes::fuse::router())
         .nest("/api/kg",          routes::kg::router())
         .nest("/api/billing",     routes::billing::router())

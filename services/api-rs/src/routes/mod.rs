@@ -3,6 +3,7 @@ pub mod config;
 pub mod auth;
 pub mod users;
 pub mod kex;
+pub mod crawler;
 pub mod fuse;
 pub mod kg;
 pub mod llm;
