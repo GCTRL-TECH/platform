@@ -157,3 +157,35 @@ def get_embedding_client() -> EmbeddingClient:
             api_key=config.EMBEDDING_API_KEY,
         )
     return _client
+
+
+def build_embedding_client(
+    embedding_base_url: Optional[str] = None,
+    embedding_provider: Optional[str] = None,
+    ollama_base: Optional[str] = None,
+) -> EmbeddingClient:
+    """Build an EmbeddingClient honoring optional per-job overrides.
+
+    Used by the extraction pipeline so a job can target the owner's runtime
+    Ollama endpoint (Settings → Infrastructure) instead of the container's env
+    defaults. Any override left None/empty falls back to the env-based config,
+    so with no overrides this is equivalent to `get_embedding_client()` — keeping
+    the default install unchanged.
+
+    Resolution mirrors the singleton: an Ollama embedding client's base comes from
+    `embedding_base_url` → `ollama_base` → `config.EMBEDDING_BASE_URL` →
+    `config.OLLAMA_BASE`, so passing just `ollama_base` (the common case) redirects
+    embeddings to the same Ollama the relation extractor uses.
+    """
+    base_override = (embedding_base_url or "").strip() or (ollama_base or "").strip()
+    provider = (embedding_provider or "").strip() or config.EMBEDDING_PROVIDER
+    # No override at all → reuse the cached singleton (identical behaviour to today).
+    if not base_override and not (embedding_provider or "").strip():
+        return get_embedding_client()
+    base_url = base_override or config.EMBEDDING_BASE_URL or config.OLLAMA_BASE
+    return EmbeddingClient(
+        provider=provider,
+        base_url=base_url,
+        model=config.EMBEDDING_MODEL,
+        api_key=config.EMBEDDING_API_KEY,
+    )

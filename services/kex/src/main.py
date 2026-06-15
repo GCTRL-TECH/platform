@@ -32,7 +32,7 @@ from . import config
 from .chunking import get_chunker
 from .classification import resolve_classification
 from .code_parser import parse_python_repo
-from .embedding import get_embedding_client
+from .embedding import get_embedding_client, build_embedding_client
 from .kg_builder import get_kg_builder
 from .middleware.license_check import check_credits, report_usage
 from .ner import get_ner_pipeline
@@ -133,6 +133,9 @@ def run_pipeline(
     classification_level_id: str | None = None,
     classification_name: str | None = None,
     origin: str | None = None,
+    ollama_base: str | None = None,
+    embedding_base_url: str | None = None,
+    embedding_provider: str | None = None,
 ) -> dict:
     """
     Full extraction pipeline: NER -> RelEx -> KG Builder -> Chunking -> Embedding -> Vector Store.
@@ -140,6 +143,12 @@ def run_pipeline(
 
     `classification_*` carry the ISO 27001 level chosen at ingest; every graph
     element and chunk is tagged with it for per-element access control.
+
+    `ollama_base` / `embedding_base_url` / `embedding_provider` are optional
+    per-job overrides for the LLM + embedding endpoints (the owner's runtime
+    Settings → Infrastructure base URL, passed through by the API). When absent
+    the env-based `config.*` defaults are used, so the default install is
+    unchanged and KEX never crashes on a missing/empty value.
     """
     logger.info(f"[{job_id}] Pipeline start — {len(text)} chars")
 
@@ -169,7 +178,7 @@ def run_pipeline(
 
     # 2. Relation Extraction (Ollama HTTP — can run in parallel)
     relex = get_extractor()
-    relations = relex.extract_relations(text, entities)
+    relations = relex.extract_relations(text, entities, ollama_base=ollama_base)
     logger.info(f"[{job_id}] RelEx: {len(relations)} relations")
 
     # 3. Write to Knowledge Graph
@@ -197,7 +206,11 @@ def run_pipeline(
     logger.info(f"[{job_id}] Chunked: {len(chunks)} chunks")
 
     # 5. Embed chunks (graceful degradation: failed embeddings become None)
-    embedder = get_embedding_client()
+    embedder = build_embedding_client(
+        embedding_base_url=embedding_base_url,
+        embedding_provider=embedding_provider,
+        ollama_base=ollama_base,
+    )
     embeddings = embedder.embed_batch([c["content"] for c in chunks])
     successful_embeddings = sum(1 for v in embeddings if v is not None)
     logger.info(f"[{job_id}] Embedded: {successful_embeddings}/{len(embeddings)} vectors")
@@ -305,6 +318,12 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             auto_redact = bool(payload.get("auto_redact", False))
             classification_name = payload.get("classification")            # level name (legacy field)
             classification_level_id = payload.get("classification_level_id")  # level UUID (preferred)
+            # Optional per-job LLM/embedding endpoint overrides resolved by the API
+            # from the owner's Settings → Infrastructure config. Absent/empty →
+            # fall back to env-based config (default install unchanged).
+            ollama_base = payload.get("ollama_base")
+            embedding_base_url = payload.get("embedding_base_url")
+            embedding_provider = payload.get("embedding_provider")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -363,6 +382,9 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 classification_level_id=classification_level_id,
                 classification_name=classification_name,
                 origin=origin,
+                ollama_base=ollama_base,
+                embedding_base_url=embedding_base_url,
+                embedding_provider=embedding_provider,
             )
             report_usage("kex_extract", len(text), check_result["credits_spent"])
             _extend_ontology(ontology_id, result)

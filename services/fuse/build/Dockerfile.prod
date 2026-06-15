@@ -29,7 +29,15 @@ COPY requirements.txt .
 #   CPU  (default): https://download.pytorch.org/whl/cpu        → ~700 MB
 #   CUDA:           https://download.pytorch.org/whl/cu121      → ~3 GB
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir torch==2.4.0 --index-url ${TORCH_INDEX_URL}
+# buildx sets TARGETARCH. arm64 (Apple Silicon) → the aarch64 CPU wheel from
+# PyPI (the pytorch CPU/cu121 indexes are x86_64-only). amd64 → the matrix index
+# (cpu or cu121). The CUDA variant is amd64-only, so it never hits the arm branch.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      pip install --no-cache-dir torch==2.4.0; \
+    else \
+      pip install --no-cache-dir torch==2.4.0 --index-url ${TORCH_INDEX_URL}; \
+    fi
 RUN pip install --no-cache-dir -r requirements.txt
 # Compiled engine (.so) + the thin .py entrypoint/__init__ only — no engine source.
 COPY --from=compiler /build/src ./src

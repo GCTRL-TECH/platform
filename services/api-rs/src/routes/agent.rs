@@ -452,10 +452,11 @@ pub(crate) async fn execute_tool(
             let clf_name: Option<String> = if let Some(c) = clf {
                 sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1").bind(c).fetch_optional(&state.db).await.ok().flatten()
             } else { None };
-            let payload = json!({
+            let mut payload = json!({
                 "job_id": job_id, "user_id": claims.sub, "type": "text",
                 "input": text, "classification": clf_name, "classification_level_id": clf
             });
+            crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
             let _ = crate::services::redis::lpush(&state.redis, "kex:jobs", &payload.to_string()).await;
             json!({ "jobId": job_id, "status": "pending" })
         }

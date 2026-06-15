@@ -224,7 +224,7 @@ async fn reingest_folder_vault(
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
             .await;
 
-        let payload = json!({
+        let mut payload = json!({
             "job_id":                  job_id,
             "user_id":                 vault.user_id,
             "type":                    "file",
@@ -235,6 +235,7 @@ async fn reingest_folder_vault(
             "classification":          opts.classification_name,
             "classification_level_id": opts.classification_level_id,
         });
+        crate::services::llm::inject_ollama_overrides(db, vault.user_id, &mut payload).await;
 
         if lpush(redis, "kex:jobs", &payload.to_string()).await.is_err() {
             out.failed += 1;
@@ -324,7 +325,7 @@ async fn reingest_rest_vault(
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
             .await;
 
-        let payload = json!({
+        let mut payload = json!({
             "job_id":                  job_id,
             "user_id":                 vault.user_id,
             "type":                    "kex_obsidian",
@@ -339,6 +340,7 @@ async fn reingest_rest_vault(
             "classification":          opts.classification_name,
             "classification_level_id": opts.classification_level_id,
         });
+        crate::services::llm::inject_ollama_overrides(db, vault.user_id, &mut payload).await;
 
         if lpush(redis, "kex:jobs", &payload.to_string()).await.is_err() {
             out.failed += 1;

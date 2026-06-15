@@ -101,9 +101,15 @@ class RelationExtractor:
         self,
         text: str,
         entities: list[dict],
+        ollama_base: Optional[str] = None,
     ) -> list[dict]:
         """
         Extract relations from text given a list of entity dicts.
+
+        `ollama_base` is an optional per-job override for the Ollama endpoint
+        (the owner's Settings → Infrastructure base URL, passed through by the
+        API). When None/empty the module-wide `config.OLLAMA_BASE` is used, so the
+        default install is unchanged.
 
         Each output dict: { head: str, type: str, tail: str, confidence: float }
         where `type` is a CANONICAL relation from relvocab.RELATIONS (`type` key
@@ -131,7 +137,7 @@ class RelationExtractor:
         entity_lines = self._format_entity_list(prompt_entities)
         prompt = _build_prompt(truncated_text, entity_lines)
 
-        raw_response = self._call_ollama(prompt)
+        raw_response = self._call_ollama(prompt, ollama_base=ollama_base)
         if raw_response is None:
             return []
 
@@ -175,11 +181,15 @@ class RelationExtractor:
                 seen.add(surface.lower())
         return "\n".join(lines)
 
-    def _call_ollama(self, prompt: str) -> Optional[str]:
-        """Call Ollama /api/generate; return response text or None on error."""
+    def _call_ollama(self, prompt: str, ollama_base: Optional[str] = None) -> Optional[str]:
+        """Call Ollama /api/generate; return response text or None on error.
+
+        `ollama_base` overrides `config.OLLAMA_BASE` for this call when provided
+        (per-job endpoint from the API); otherwise the env-configured default."""
+        base = (ollama_base or "").strip() or config.OLLAMA_BASE
         try:
             resp = requests.post(
-                f"{config.OLLAMA_BASE}/api/generate",
+                f"{base.rstrip('/')}/api/generate",
                 json={
                     "model": config.RELEX_MODEL,
                     "prompt": prompt,

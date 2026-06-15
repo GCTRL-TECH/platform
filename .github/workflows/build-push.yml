@@ -27,6 +27,7 @@ jobs:
       web:        ${{ steps.filter.outputs.web }}
       portal:     ${{ steps.filter.outputs.portal }}
       license-api: ${{ steps.filter.outputs.license-api }}
+      fusion:     ${{ steps.filter.outputs.fusion }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -47,6 +48,8 @@ jobs:
               - 'services/portal/**'
             license-api:
               - 'services/license-api/**'
+            fusion:
+              - 'services/fusion-engine/**'
 
   # ── Build jobs — each only runs when its source changed ────────────────────
   # workflow_dispatch (manual trigger) always builds everything.
@@ -55,12 +58,27 @@ jobs:
     needs: changes
     if: needs.changes.outputs.kex == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          # Default kex:latest — CPU, multi-arch (native on Apple Silicon).
+          - variant: cpu
+            file: services/kex/build/Dockerfile.prod.cpu
+            platforms: linux/amd64,linux/arm64
+            tag_suffix: ""
+          # kex:latest-cuda — NVIDIA GPU hosts only (amd64).
+          - variant: cuda
+            file: services/kex/build/Dockerfile.prod
+            platforms: linux/amd64
+            tag_suffix: "-cuda"
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -69,31 +87,38 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: services/kex
-          file: services/kex/build/Dockerfile.prod
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platforms }}
           push: true
           tags: |
-            ghcr.io/gctrl-tech/kex:latest
-            ghcr.io/gctrl-tech/kex:${{ github.sha }}
+            ghcr.io/gctrl-tech/kex:latest${{ matrix.tag_suffix }}
+            ghcr.io/gctrl-tech/kex:${{ github.sha }}${{ matrix.tag_suffix }}
 
   build-fuse:
     needs: changes
     if: needs.changes.outputs.fuse == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
     strategy:
       matrix:
         include:
+          # Default fuse:latest — CPU, multi-arch (native on Apple Silicon).
           - variant: cpu
             torch_index: https://download.pytorch.org/whl/cpu
+            platforms: linux/amd64,linux/arm64
             tag_suffix: ""
+          # fuse:latest-cuda — NVIDIA GPU hosts only (amd64).
           - variant: cuda
             torch_index: https://download.pytorch.org/whl/cu121
+            platforms: linux/amd64
             tag_suffix: "-cuda"
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -103,6 +128,7 @@ jobs:
         with:
           context: services/fuse
           file: services/fuse/build/Dockerfile.prod
+          platforms: ${{ matrix.platforms }}
           build-args: TORCH_INDEX_URL=${{ matrix.torch_index }}
           push: true
           tags: |
@@ -197,6 +223,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -205,10 +233,39 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: services/web
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ghcr.io/gctrl-tech/web:latest
             ghcr.io/gctrl-tech/web:${{ github.sha }}
+
+  # ── Fusion Engine (LIMES resolver) — multi-arch off the committed jar ───────
+  build-fusion-engine:
+    needs: changes
+    if: needs.changes.outputs.fusion == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true   # pull the real limes.jar (LFS), not the pointer
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/fusion-engine
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/gctrl-tech/fusion-engine:latest
+            ghcr.io/gctrl-tech/fusion-engine:${{ github.sha }}
 
   build-portal:
     needs: changes
@@ -253,7 +310,7 @@ jobs:
           script: |
             set -e
             cd /docker/gctrl
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin || echo "ghcr login skipped (images are public)"
 
             sed -i 's|image: ghcr.io/gctrl-tech/web:latest|image: ghcr.io/gctrl-tech/portal:latest|' docker-compose.yml
 
@@ -282,7 +339,7 @@ jobs:
           envs: GHCR_TOKEN,DATABASE_URL,JWT_SECRET,JWT_REFRESH_SECRET
           script: |
             set -e
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin || echo "ghcr login skipped (images are public)"
 
             docker pull ghcr.io/gctrl-tech/api:latest
             GCTRL_NET=$(docker inspect gctrl-db --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)

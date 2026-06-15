@@ -1,0 +1,52 @@
+# KEX prod image — CPU / multi-arch (linux/amd64 + linux/arm64).
+# This is the DEFAULT kex:latest. It runs NATIVELY on Apple Silicon (Mac Studio)
+# — no QEMU emulation, no CUDA. The GPU/CUDA variant is built separately as
+# kex:latest-cuda from Dockerfile.prod (amd64-only, NVIDIA hosts).
+#
+# The IP-heavy engine is compiled to native .so via Cython (source stripped);
+# main.py + __init__.py stay as .py for FastAPI route introspection.
+
+# ── Stage 1: compile engine to .so. Shares the runtime base (python:3.11-slim),
+# and under buildx each target arch builds its own stage, so the .so ABI always
+# matches the arch it will run on. ───────────────────────────────────────────
+FROM python:3.11-slim AS compiler
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir cython==3.0.11 setuptools
+COPY src/ ./src/
+RUN set -e; \
+    find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -print0 \
+      | xargs -0 python -m Cython.Build.Cythonize -3 -i -j 4; \
+    find src -name '*.py' ! -name 'main.py' ! -name '__init__.py' -delete; \
+    find src -name '*.c' -delete; \
+    rm -rf build; \
+    echo "=== shipped modules ===" && find src -name '*.so' -o -name '*.py' | sort
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM python:3.11-slim
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc g++ libc6-dev \
+      tesseract-ocr tesseract-ocr-deu tesseract-ocr-fra tesseract-ocr-spa libtesseract-dev \
+      ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+# CPU-only torch. buildx sets TARGETARCH automatically:
+#   amd64 → the slim CPU wheel from the pytorch CPU index (no bundled CUDA).
+#   arm64 → the aarch64 wheel from PyPI (CPU-only; no CUDA exists on arm).
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      pip install --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu; \
+    else \
+      pip install --no-cache-dir torch==2.4.0; \
+    fi
+RUN pip install --no-cache-dir -r requirements.txt lxml_html_clean
+
+# Compiled engine (.so) + thin .py entrypoint/__init__ only — no engine source.
+COPY --from=compiler /build/src ./src
+
+ENV TRANSFORMERS_CACHE=/app/models
+EXPOSE 4010
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4010"]

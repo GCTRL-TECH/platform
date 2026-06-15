@@ -126,13 +126,14 @@ async fn extract(
         None
     };
 
-    let payload = json!({
+    let mut payload = json!({
         "job_id": job_id, "user_id": claims.sub, "type": "text",
         "input": req.text, "entity_types": entity_types,
         "ontology_id": ontology_id,
         "classification": classification_name,
         "classification_level_id": req.classification_level_id,
     });
+    crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -341,13 +342,14 @@ async fn upload(
         "originalFilename": file_name,
     }).to_string();
 
-    let payload = json!({
+    let mut payload = json!({
         "job_id": job_id, "user_id": claims.sub, "type": "file",
         "input": kex_input, "file_name": file_name, "entity_types": entity_types,
         "ontology_id": resolved_ontology_id,
         "classification": classification_name,
         "classification_level_id": classification_level_id,
     });
+    crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

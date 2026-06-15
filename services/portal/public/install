@@ -65,6 +65,7 @@ QDRANT_URL=""
 OLLAMA_BASE=""
 GPU_ENABLED=false
 GPU_TYPE="none"   # none | nvidia | amd
+CHAT_MODEL=""     # generation model chosen by choose_model() ("" = skip / pick later)
 
 # ── GPU Detection ─────────────────────────────────────────────────────────────
 # Detection strategy:
@@ -168,6 +169,69 @@ detect_services() {
   echo ""
 }
 
+# ── Model Picker ──────────────────────────────────────────────────────────────
+# Choose the local generation model KEX/RAG use. Default is small/fast so the
+# bundled (CPU) Ollama path works out of the box; upgrade later by pointing GCTRL
+# at a native Ollama (Metal/CUDA GPU) in Settings → Infrastructure and pulling a
+# bigger model. Honors GCTRL_MODEL for non-interactive installs; never hangs when
+# there's no terminal.
+choose_model() {
+  if [ -n "${GCTRL_MODEL:-}" ]; then
+    CHAT_MODEL="$GCTRL_MODEL"
+    info "Model (from GCTRL_MODEL): ${CHAT_MODEL}"
+    return
+  fi
+
+  # Total RAM in GB — for a sensible recommendation (best-effort, 0 if unknown).
+  local ram_gb=0
+  if [ "$(uname)" = "Darwin" ]; then
+    ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+  elif [ -r /proc/meminfo ]; then
+    ram_gb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0) / 1048576 ))
+  fi
+
+  local default_choice="llama3.2:3b"
+
+  # No interactive terminal (piped/non-interactive) → take the default silently.
+  if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    CHAT_MODEL="$default_choice"
+    info "Non-interactive — default model ${CHAT_MODEL} (override with GCTRL_MODEL=...)"
+    return
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  [ "$ram_gb" -gt 0 ] && info "Detected RAM: ${ram_gb} GB"
+  echo "  Choose the local model GCTRL uses for extraction & RAG:"
+  echo "    1) llama3.2:3b   — lightweight, fast         (~2 GB)   [default]"
+  echo "    2) qwen2.5:7b    — best extraction quality   (~5 GB)"
+  echo "    3) qwen2.5:14b   — higher quality            (~9 GB,  16 GB+ RAM)"
+  echo "    4) qwen2.5:32b   — max quality               (~20 GB, 32 GB+ RAM)"
+  echo "    5) custom        — enter any Ollama tag"
+  echo "    6) skip          — choose later in the dashboard"
+  echo "  (Tip: the bundled Ollama runs on CPU. For GPU speed, point GCTRL at a"
+  echo "   native Ollama in Settings → Infrastructure, then pick a bigger model.)"
+  local choice=""
+  read -rp "  Choice [1]: " choice </dev/tty || choice=""
+  case "${choice:-1}" in
+    1) CHAT_MODEL="llama3.2:3b" ;;
+    2) CHAT_MODEL="qwen2.5:7b" ;;
+    3) CHAT_MODEL="qwen2.5:14b" ;;
+    4) CHAT_MODEL="qwen2.5:32b" ;;
+    5) read -rp "  Ollama model tag: " CHAT_MODEL </dev/tty || CHAT_MODEL=""
+       CHAT_MODEL="${CHAT_MODEL:-$default_choice}" ;;
+    6) CHAT_MODEL="" ;;
+    *) CHAT_MODEL="$default_choice" ;;
+  esac
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ -n "$CHAT_MODEL" ]; then
+    info "Model: ${CHAT_MODEL}"
+  else
+    info "Skipping model download — pick one later in Settings → Models"
+  fi
+  echo ""
+}
+
 # ── Generate Config ───────────────────────────────────────────────────────────
 generate_config() {
   info "Creating ${INSTALL_DIR}..."
@@ -191,6 +255,8 @@ NEO4J_USER=${NEO4J_USER}
 NEO4J_PASSWORD=${NEO4J_PASSWORD}
 QDRANT_URL=${QDRANT_URL}
 OLLAMA_BASE=${OLLAMA_BASE}
+RELEX_MODEL=${CHAT_MODEL:-qwen2.5:7b}
+AUTO_CLASSIFY_MODEL=${CHAT_MODEL:-llama3.2}
 POSTGRES_PASSWORD=gctrl-postgres-password
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
@@ -222,6 +288,7 @@ services:
               count: all
               capabilities: [gpu]
   gctrl-kex:
+    image: ghcr.io/gctrl-tech/kex:latest-cuda
     deploy:
       resources:
         reservations:
@@ -330,7 +397,9 @@ start_stack() {
 # (Ollama skips already-present models). Keeps the platform zero-cost-local.
 pull_ollama_models() {
   echo "  Ollama    : bundled — pulling required local models (one-time)..."
-  for model in qwen2.5:7b nomic-embed-text; do
+  local models=("nomic-embed-text")
+  [ -n "${CHAT_MODEL}" ] && models=("${CHAT_MODEL}" "${models[@]}")
+  for model in "${models[@]}"; do
     echo "              pulling ${model} ..."
     docker exec gctrl-ollama ollama pull "${model}" \
       || echo "              WARN: failed to pull ${model} — pull manually: docker exec gctrl-ollama ollama pull ${model}"
@@ -342,6 +411,7 @@ main() {
   check_prereqs
   detect_gpu
   detect_services
+  choose_model
   generate_config
   start_stack
 }

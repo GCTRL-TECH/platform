@@ -6,6 +6,9 @@
 services:
   gctrl-agent:
     image: ghcr.io/gctrl-tech/agent:latest
+    # Rust service — amd64 image; runs natively on amd64 and via Rosetta 2 on
+    # Apple Silicon. Pinned so Docker doesn't warn about a missing arm64 variant.
+    platform: linux/amd64
     container_name: gctrl-agent
     restart: unless-stopped
     ports:
@@ -45,6 +48,9 @@ services:
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - QDRANT_COLLECTION=gctrl_chunks
       - EMBEDDING_MODEL=nomic-embed-text
+      # Generation model the installer's model-picker selected (pulled into Ollama).
+      - RELEX_MODEL=${RELEX_MODEL:-qwen2.5:7b}
+      - AUTO_CLASSIFY_MODEL=${AUTO_CLASSIFY_MODEL:-llama3.2}
       - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - PORT=4010
     volumes:
@@ -57,11 +63,14 @@ services:
     networks:
       - gctrl
 
+  # LIMES link-discovery resolver — ALWAYS deployed (GCTRL's own engine, not
+  # something a host would already be running). FUSE's high-precision entity-
+  # resolution stage talks to it; without it FUSE degrades to the slower Python
+  # matcher. Multi-arch image (native on Apple Silicon).
   gctrl-resolver:
     image: ghcr.io/gctrl-tech/fusion-engine:latest
     container_name: gctrl-resolver
     restart: unless-stopped
-    profiles: [bundled-fusion]
     environment:
       - JAVA_OPTS=-Xmx2G
     command: ["-s"]
@@ -92,6 +101,8 @@ services:
 
   gctrl-api:
     image: ghcr.io/gctrl-tech/api:latest
+    # Rust service — amd64 image; native on amd64, Rosetta 2 on Apple Silicon.
+    platform: linux/amd64
     container_name: gctrl-api
     restart: unless-stopped
     ports:

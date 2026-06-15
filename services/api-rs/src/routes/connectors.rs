@@ -1415,12 +1415,13 @@ async fn sync_sharepoint(
         )
         .await;
 
-        let payload = json!({
+        let mut payload = json!({
             "job_id":   job_id,
             "user_id":  claims.sub,
             "type":     "sharepoint",
             "file_id":  file_id,
         });
+        crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
 
         lpush(&state.redis, "kex:jobs", &payload.to_string())
             .await
@@ -1698,7 +1699,7 @@ async fn sync_obsidian(
         )
         .await;
 
-        let payload = json!({
+        let mut payload = json!({
             "job_id":                  job_id,
             "user_id":                 claims.sub,
             "type":                    "kex_obsidian",
@@ -1713,6 +1714,7 @@ async fn sync_obsidian(
             "classification":          resolved.classification_name,
             "classification_level_id": resolved.classification_level_id,
         });
+        crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
 
         if lpush(&state.redis, "kex:jobs", &payload.to_string()).await.is_err() {
             failed += 1;
@@ -1978,7 +1980,7 @@ async fn sync_obsidian_folder(
 
         crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
-        let payload = json!({
+        let mut payload = json!({
             "job_id":                  job_id,
             "user_id":                 claims.sub,
             "type":                    "file",
@@ -1989,6 +1991,7 @@ async fn sync_obsidian_folder(
             "classification":          resolved.classification_name,
             "classification_level_id": resolved.classification_level_id,
         });
+        crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
 
         if let Err(e) = lpush(&state.redis, "kex:jobs", &payload.to_string()).await {
             failed += 1;
@@ -2204,7 +2207,7 @@ async fn enqueue_drive_file(
     .execute(db)
     .await?;
 
-    let payload = json!({
+    let mut payload = json!({
         "job_id":                  job_id,
         "user_id":                 user_id,
         "type":                    "file",
@@ -2215,6 +2218,7 @@ async fn enqueue_drive_file(
         "classification":          opts.classification_name,
         "classification_level_id": opts.classification_level_id,
     });
+    crate::services::llm::inject_ollama_overrides(db, user_id, &mut payload).await;
 
     lpush(redis, "kex:jobs", &payload.to_string())
         .await

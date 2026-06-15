@@ -275,6 +275,61 @@ pub async fn resolve_for_user(
     }
 }
 
+/// Resolve the owner's runtime-configured Ollama base URL (Settings →
+/// Infrastructure writes it into `user_llm_providers.base_url` for
+/// `provider='ollama'`). Returns the validated base only when the user has
+/// actually set a non-empty override; `None` otherwise (so callers fall back to
+/// the worker's env defaults — keeping the default install unchanged).
+///
+/// The value is run through [`validate_llm_base`] so a malformed / unsafe base in
+/// the DB is rejected here rather than handed to the KEX worker.
+pub async fn resolve_ollama_base_for_user(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> Option<String> {
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT base_url FROM user_llm_providers
+         WHERE user_id = $1 AND provider = 'ollama'",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+
+    let raw = stored.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    match validate_llm_base("ollama", Some(&raw)) {
+        Ok(u) => Some(u.as_str().trim_end_matches('/').to_string()),
+        Err(_) => None,
+    }
+}
+
+/// Inject the owner's runtime Ollama endpoint into a KEX `kex:jobs` payload so the
+/// extraction worker honors the Settings → Infrastructure base URL for THIS job
+/// (relation extraction + embedding) instead of its container-baked env defaults.
+///
+/// Adds `ollama_base` AND `embedding_base_url` (both point at the same Ollama
+/// instance — KEX's embedding default is also Ollama) ONLY when a non-empty
+/// configured value exists. Backward compatible: with no override configured the
+/// payload is untouched, so the worker uses its env-based config exactly as today.
+pub async fn inject_ollama_overrides(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    payload: &mut Value,
+) {
+    if let Some(base) = resolve_ollama_base_for_user(db, user_id).await {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("ollama_base".into(), json!(base));
+            // KEX's embedding provider defaults to Ollama and falls back to
+            // OLLAMA_BASE; point its embedding endpoint at the same instance so a
+            // native-Ollama switch covers embeddings too. `embedding_provider`
+            // is intentionally omitted — we only redirect the base, not change
+            // the provider, so non-Ollama embedding setups are left alone.
+            map.insert("embedding_base_url".into(), json!(base));
+        }
+    }
+}
+
 // ── Request building ──────────────────────────────────────────────────────────
 
 /// A single chat turn. Anthropic splits `system` out of the messages array, so we
