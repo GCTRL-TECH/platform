@@ -90,7 +90,7 @@ export function ArchitectureSection() {
       <div className="pointer-events-none absolute left-1/2 top-1/2 -z-0 h-[36rem] w-[36rem] -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-600/10 blur-[120px]" />
       <div className="relative mx-auto grid max-w-6xl items-center gap-12 lg:grid-cols-2">
         {/* 3D visual */}
-        <div className="reveal-left order-2 h-[30rem] w-full lg:order-1 lg:h-[34rem]">
+        <div className="reveal-left order-2 h-[38rem] w-full lg:order-1 lg:h-[44rem]">
           {can3D ? (
             <Suspense fallback={<StaticArchitecture />}>
               <ArchitectureScene />

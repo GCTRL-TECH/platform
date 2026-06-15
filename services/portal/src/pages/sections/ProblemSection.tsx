@@ -1,18 +1,18 @@
 const PROBLEMS = [
   {
-    icon: '🪪',
-    title: "You can't prove who saw what",
-    body: 'The moment AI touches sensitive data, you owe an answer to the CISO, the DPO, and the auditor: who accessed which fact, at what clearance, and why. Most stacks bolt access control on as an afterthought — or skip it and hope.',
-  },
-  {
     icon: '🗄️',
-    title: 'Your best knowledge is locked away',
-    body: 'The data your AI needs most is trapped in decade-old SharePoint, legacy SQL, email archives and orphaned file shares — fragmented, duplicated, contradictory, and impossible to use at scale. So it stays dark.',
+    title: 'Locked in silos & legacy systems',
+    body: 'The knowledge your AI needs is scattered across SharePoint, old mailservers, legacy SQL, and orphaned file shares. Before anything is useful, you have to reach it — and just reaching it is a project of its own.',
   },
   {
-    icon: '⚠️',
-    title: 'One confident wrong answer is a breach',
-    body: 'Vector similarity cannot enforce truth — or clearance. In a regulated room, an unsourced answer or an over-shared fact isn’t a glitch. It’s a liability with your name on it.',
+    icon: '🔁',
+    title: 'Messy, duplicated, contradictory',
+    body: 'Garbage in, garbage out. Point an LLM at raw, unresolved data and it learns from noise: the same entity under ten names, stale records, conflicting versions. The answers look confident and are quietly wrong.',
+  },
+  {
+    icon: '🔐',
+    title: 'Governance is overwhelming',
+    body: 'Even once you can reach the data — who is allowed to see what? Classification, clearance, and an audit trail across every source is a task most teams start, dread, and never finish.',
   },
 ]
 
@@ -23,14 +23,15 @@ export function ProblemSection() {
         <div className="mb-16 text-center reveal">
           <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-indigo-400">The real problem</p>
           <h2 className="mx-auto max-w-3xl text-4xl font-bold text-white md:text-5xl">
-            Enterprise AI doesn’t fail on intelligence.{' '}
+            Your AI is only as good as your data —{' '}
             <span className="bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent">
-              It fails on trust.
+              and most data isn’t ready.
             </span>
           </h2>
           <p className="mx-auto mt-5 max-w-2xl text-slate-400">
-            The model was never the hard part. Safely connecting it to your real, sensitive, scattered data —
-            and keeping control of who sees what — is where every enterprise rollout stalls.
+            Garbage in, garbage out. Before AI can deliver, your knowledge has to be{' '}
+            <span className="text-slate-200">accessible</span>, <span className="text-slate-200">clean</span>, and{' '}
+            <span className="text-slate-200">governed</span> — and in most enterprises it’s none of the three.
           </p>
         </div>
 
@@ -45,8 +46,8 @@ export function ProblemSection() {
         </div>
 
         <p className="mx-auto mt-12 max-w-2xl text-center text-base text-slate-500 reveal">
-          Solve those three, and AI stops being a risk you defend and becomes an advantage you compound. That’s the
-          whole point of GCTRL.
+          GCTRL exists to fix exactly this: it makes the messy, scattered, sensitive data your AI needs{' '}
+          <span className="text-slate-300">accessible, clean, and governed</span> — so what goes in is worth what comes out.
         </p>
       </div>
     </section>
