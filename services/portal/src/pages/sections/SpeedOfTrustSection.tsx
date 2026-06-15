@@ -1,23 +1,35 @@
+import { SlidersHorizontal, KeyRound, ScrollText, Network, type LucideIcon } from 'lucide-react'
+
 const STANDARDS = ['GDPR', 'ISO 27001', 'SOC 2', 'TISAX', 'NIS2']
 
-const PILLARS = [
+const ICON_CLS: Record<string, string> = {
+  indigo: 'border-indigo-500/20 bg-indigo-500/10 text-indigo-300',
+  violet: 'border-violet-500/20 bg-violet-500/10 text-violet-300',
+  cyan: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300',
+}
+
+const PILLARS: { Icon: LucideIcon; color: keyof typeof ICON_CLS; title: string; body: string }[] = [
   {
-    icon: '🎚️',
+    Icon: SlidersHorizontal,
+    color: 'indigo',
     title: 'Per-element classification',
     body: 'Nodes, edges, and chunks each carry their own clearance markings. Sensitivity travels with the data, not the schema — so it survives every merge, query, and export.',
   },
   {
-    icon: '🔐',
+    Icon: KeyRound,
+    color: 'violet',
     title: 'Scoped tokens for users AND agents',
     body: 'Issue narrow, time-bound, revocable capabilities to a person or an AI agent. Every retrieval is filtered server-side against the caller’s scope — never a client-side hint that can be ignored.',
   },
   {
-    icon: '📜',
+    Icon: ScrollText,
+    color: 'cyan',
     title: 'Forensic audit trail',
     body: 'Every access, every denial, every scope grant — captured with the caller, the context, and the verdict. The receipts your CISO, auditors, and DPO accept before procurement signs.',
   },
   {
-    icon: '🛰️',
+    Icon: Network,
+    color: 'indigo',
     title: 'Granular orchestration',
     body: 'Merge the whole organisation’s knowledge into one graph — and classification still holds. Two people of different clearance query the same data and each sees only what they’re cleared for.',
   },
@@ -60,7 +72,9 @@ export function SpeedOfTrustSection() {
         <div className="grid gap-6 md:grid-cols-2">
           {PILLARS.map((p, i) => (
             <div key={p.title} className={`feature-card-landing reveal reveal-delay-${(i % 4) + 1} flex gap-4 p-6`}>
-              <div className="text-3xl">{p.icon}</div>
+              <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border ${ICON_CLS[p.color]}`}>
+                <p.Icon className="h-5 w-5" strokeWidth={1.75} />
+              </div>
               <div>
                 <h3 className="mb-1.5 font-semibold text-white">{p.title}</h3>
                 <p className="text-sm leading-relaxed text-slate-400">{p.body}</p>

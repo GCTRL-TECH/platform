@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Users, KeyRound, BarChart3, Tag, AlertTriangle, KeySquare, type LucideIcon } from 'lucide-react'
+import { Users, KeyRound, BarChart3, Tag, AlertTriangle, KeySquare, X, type LucideIcon } from 'lucide-react'
 import { apiGet, apiPost, apiPatch } from '@/lib/api'
 import { formatDistanceToNow } from 'date-fns'
 
@@ -165,10 +165,11 @@ function UsersTab() {
                         Set
                       </button>
                       <button
-                        className="text-xs text-slate-500 hover:text-slate-300"
+                        className="text-slate-500 hover:text-slate-300"
+                        aria-label="Cancel"
                         onClick={() => setPwdOpen((p) => ({ ...p, [u.id]: false }))}
                       >
-                        ✕
+                        <X className="h-3.5 w-3.5" />
                       </button>
                     </div>
                   ) : (
