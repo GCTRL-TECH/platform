@@ -1,31 +1,54 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 
-// Top-level nav. Section anchors use `/#id` so they work from any page
-// (docs / use-cases navigate back to the landing page and scroll). Page links
-// (Documentation, Use cases) are real routes.
+// Section anchors use `/#id` so they work from any page (docs / use-cases
+// navigate back to the landing page and scroll). Page links are real routes.
 const NAV: [label: string, href: string][] = [
-  ['Platform', '/#features'],
   ['Architecture', '/#architecture'],
+  ['Trust', '/#trust'],
   ['Benchmarks', '/#benchmarks'],
   ['Documentation', '/docs'],
-  ['Use cases', '/use-cases'],
 ]
+
+const USE_CASES: [label: string, href: string, desc: string][] = [
+  ['Agentic Team Memory', '/use-cases#agentic-team-memory', 'Shared, access-controlled memory for your AI team'],
+  ['Activate Your Legacy Data', '/use-cases#legacy-revival', 'Turn old mailservers, SharePoint & SQL into a clean graph'],
+]
+
+function ChevronDown() {
+  return (
+    <svg className="h-3.5 w-3.5 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+    </svg>
+  )
+}
 
 function NavLink({ label, href, onClick }: { label: string; href: string; onClick?: () => void }) {
   const cls = 'text-sm text-slate-400 transition-colors hover:text-white'
-  // Route links (no hash) use react-router; anchor links use a plain <a>.
   if (href.startsWith('/') && !href.includes('#')) {
-    return (
-      <Link to={href} className={cls} onClick={onClick}>
-        {label}
-      </Link>
-    )
+    return <Link to={href} className={cls} onClick={onClick}>{label}</Link>
   }
+  return <a href={href} className={cls} onClick={onClick}>{label}</a>
+}
+
+function UseCasesDropdown() {
   return (
-    <a href={href} className={cls} onClick={onClick}>
-      {label}
-    </a>
+    <div className="group relative">
+      <Link to="/use-cases" className="flex items-center gap-1 text-sm text-slate-400 transition-colors hover:text-white">
+        Use cases <ChevronDown />
+      </Link>
+      {/* pt-3 bridges the gap so the panel doesn't close while moving onto it */}
+      <div className="invisible absolute left-1/2 top-full z-50 -translate-x-1/2 pt-3 opacity-0 transition-all duration-150 group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100">
+        <div className="w-72 rounded-xl border border-slate-800 bg-slate-950/95 p-1.5 shadow-2xl backdrop-blur">
+          {USE_CASES.map(([label, href, desc]) => (
+            <Link key={href} to={href} className="block rounded-lg px-3 py-2 transition-colors hover:bg-slate-800/80">
+              <p className="text-sm font-medium text-slate-100">{label}</p>
+              <p className="mt-0.5 text-xs leading-snug text-slate-500">{desc}</p>
+            </Link>
+          ))}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -55,6 +78,7 @@ export function SiteHeader() {
           {NAV.map(([label, href]) => (
             <NavLink key={label} label={label} href={href} />
           ))}
+          <UseCasesDropdown />
         </nav>
 
         <div className="hidden items-center gap-3 md:flex">
@@ -90,6 +114,18 @@ export function SiteHeader() {
             {NAV.map(([label, href]) => (
               <NavLink key={label} label={label} href={href} onClick={() => setMenuOpen(false)} />
             ))}
+            <div>
+              <Link to="/use-cases" className="text-sm text-slate-300" onClick={() => setMenuOpen(false)}>
+                Use cases
+              </Link>
+              <div className="mt-2 flex flex-col gap-2 border-l border-slate-800 pl-3">
+                {USE_CASES.map(([label, href]) => (
+                  <Link key={href} to={href} className="text-sm text-slate-400 hover:text-white" onClick={() => setMenuOpen(false)}>
+                    {label}
+                  </Link>
+                ))}
+              </div>
+            </div>
             <hr className="border-slate-800" />
             <Link to="/login" className="text-sm text-slate-300" onClick={() => setMenuOpen(false)}>
               Sign In

@@ -7,13 +7,14 @@ const CDN = 'https://cdn.simpleicons.org'
 const WHITE = 'FFFFFF'
 
 const INTEGRATIONS = [
-  { name: 'Neo4j',         logo: `${CDN}/neo4j/${WHITE}`,        desc: 'Native KG storage'     },
-  { name: 'Qdrant',        logo: `${CDN}/qdrant/${WHITE}`,       desc: 'Vector RAG backend'    },
+  { name: 'SharePoint',    logo: `${CDN}/microsoftsharepoint/${WHITE}`, desc: 'Enterprise docs'  },
   { name: 'Google Drive',  logo: `${CDN}/googledrive/${WHITE}`,  desc: 'Cloud document source' },
-  { name: 'Notion',        logo: `${CDN}/notion/${WHITE}`,      desc: 'Workspace & docs'      },
   { name: 'Confluence',    logo: `${CDN}/confluence/${WHITE}`,   desc: 'Wiki & documentation'  },
+  { name: 'Notion',        logo: `${CDN}/notion/${WHITE}`,      desc: 'Workspace & docs'      },
   { name: 'GitHub',        logo: `${CDN}/github/${WHITE}`,       desc: 'Code & docs'           },
   { name: 'Obsidian',      logo: `${CDN}/obsidian/${WHITE}`,     desc: 'Knowledge vault'       },
+  { name: 'Neo4j',         logo: `${CDN}/neo4j/${WHITE}`,        desc: 'Swappable KG store'    },
+  { name: 'Qdrant',        logo: `${CDN}/qdrant/${WHITE}`,       desc: 'Swappable vector store'},
   { name: 'REST API',      logo: null,                            desc: 'Any custom source'     },
 ]
 

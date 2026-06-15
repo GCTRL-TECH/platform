@@ -117,8 +117,8 @@ export function ArchitectureSection() {
 
           <ul className="mt-7 space-y-4">
             {[
-              ['Ingest from any source', 'SharePoint, Google Drive, and other silos stream in through a governed ingestion layer.'],
-              ['Access control on both sides', 'Classification on the way in; clearance-gated access on the way out — enforced for every query.'],
+              ['Ingest from any source', 'SharePoint, Google Drive, email archives and other silos stream in through a governed ingestion layer.'],
+              ['Full classification control', 'Per-element clearance on nodes, edges and chunks. Scoped tokens for every user and agent. Merge everyone’s knowledge into one graph and classification still holds — each person sees only what they’re cleared for. Granular, auditable, on every read and write.'],
               ['Parallel memory layers', 'Hot dossiers, warm chunks, the cold graph, and a curated Wiki — organised on a high-performance core.'],
               ['Your agents plug in over MCP', 'Claude, Codex, Hermes and more gain durable, access-controlled memory as a team member.'],
             ].map(([title, body]) => (

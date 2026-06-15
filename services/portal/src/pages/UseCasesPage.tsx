@@ -1,4 +1,5 @@
-import { Link } from 'react-router-dom'
+import { useEffect } from 'react'
+import { Link, useLocation } from 'react-router-dom'
 import { useScrollReveal } from '@/hooks/useScrollReveal'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
@@ -47,8 +48,62 @@ function TeamMemoryDiagram() {
   )
 }
 
+function LegacyRevivalDiagram() {
+  const Source = ({ name, kind }: { name: string; kind: string }) => (
+    <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-center">
+      <p className="text-sm font-semibold text-slate-100">{name}</p>
+      <p className="text-[10px] uppercase tracking-wider text-slate-400">{kind}</p>
+    </div>
+  )
+  return (
+    <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-6 backdrop-blur-sm sm:p-8">
+      {/* Legacy sources */}
+      <p className="mb-3 text-center text-[11px] uppercase tracking-[0.2em] text-slate-500">Locked-away legacy data</p>
+      <div className="grid grid-cols-2 gap-3">
+        <Source name="Mailserver" kind="email archive" />
+        <Source name="SharePoint" kind="decade-old archive" />
+        <Source name="Legacy SQL" kind="old databases" />
+        <Source name="File shares" kind="orphaned drives" />
+      </div>
+
+      <div className="my-4 text-center text-slate-600">↓ &nbsp; ingest at scale &nbsp; ↓</div>
+
+      {/* Central GCTRL */}
+      <div className="rounded-2xl border border-cyan-400/40 bg-cyan-500/10 px-6 py-5 text-center">
+        <div className="bg-gradient-to-r from-amber-300 via-orange-300 to-cyan-300 bg-clip-text text-xl font-bold text-transparent">
+          GCTRL
+        </div>
+        <p className="text-[11px] uppercase tracking-[0.2em] text-slate-300">ingest · FUSE resolve · canonical</p>
+      </div>
+
+      <div className="my-4 text-center text-slate-600">↓</div>
+
+      {/* Output */}
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-center">
+          <p className="text-sm font-semibold text-slate-200">Clean canonical KG + Wiki</p>
+          <p className="text-xs text-slate-500">queryable by your AI agents</p>
+        </div>
+        <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-center">
+          <p className="text-sm font-semibold text-slate-200">Provenance + clearance intact</p>
+          <p className="text-xs text-slate-500">lineage & retention preserved</p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function UseCasesPage() {
   useScrollReveal()
+  const location = useLocation()
+
+  useEffect(() => {
+    if (location.hash) {
+      document
+        .getElementById(location.hash.slice(1))
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [location.hash])
 
   return (
     <div className="min-h-screen bg-[#020617]">
@@ -66,13 +121,28 @@ export function UseCasesPage() {
             </span>
           </h1>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
-            How organizations use GCTRL as the shared, access-controlled memory layer for their entire AI workforce.
+            Two ways organizations put GCTRL to work as the shared, access-controlled memory layer for their
+            entire AI workforce — from live team knowledge to decades of locked-away legacy data.
           </p>
+          <div className="mt-8 flex flex-wrap justify-center gap-3">
+            <Link
+              to="#agentic-team-memory"
+              className="rounded-xl border border-indigo-400/30 bg-indigo-500/10 px-3 py-2 text-sm font-medium text-indigo-200 transition hover:border-indigo-400/60 hover:text-white"
+            >
+              Agentic Team Memory
+            </Link>
+            <Link
+              to="#legacy-revival"
+              className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-sm font-medium text-amber-100 transition hover:border-amber-400/60 hover:text-white"
+            >
+              Activate Your Legacy Data
+            </Link>
+          </div>
         </div>
       </section>
 
       {/* Agentic Team Memory */}
-      <section className="px-6 pb-24">
+      <section id="agentic-team-memory" className="scroll-mt-24 px-6 pb-24">
         <div className="mx-auto max-w-6xl">
           <div className="grid items-center gap-12 lg:grid-cols-2">
             <div className="reveal-left">
@@ -139,6 +209,87 @@ export function UseCasesPage() {
                 <li>1. <Link to="/docs/installation" className="text-indigo-400 hover:text-indigo-300">Install GCTRL</Link> on a central machine</li>
                 <li>2. Create <Link to="/docs/access-control" className="text-indigo-400 hover:text-indigo-300">scoped tokens</Link> per colleague</li>
                 <li>3. <Link to="/docs/agents-mcp" className="text-indigo-400 hover:text-indigo-300">Connect each agent over MCP</Link></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Activate Your Legacy Data */}
+      <section id="legacy-revival" className="scroll-mt-24 px-6 pb-24">
+        <div className="mx-auto max-w-6xl">
+          <div className="grid items-center gap-12 lg:grid-cols-2">
+            <div className="reveal-left">
+              <p className="text-xs font-semibold uppercase tracking-wider text-indigo-400">Enterprise use case</p>
+              <h2 className="mt-2 text-3xl font-bold text-white sm:text-4xl">
+                Activate Your{' '}
+                <span className="bg-gradient-to-r from-amber-400 via-orange-400 to-cyan-400 bg-clip-text text-transparent">
+                  Legacy Data
+                </span>
+              </h2>
+              <p className="mt-5 text-lg leading-relaxed text-slate-400">
+                Every enterprise sits on decades of locked-away knowledge —{' '}
+                <span className="font-medium text-slate-200">old mailservers and email archives</span>, a decade-old
+                SharePoint, <span className="font-medium text-slate-200">legacy SQL databases</span>, orphaned file
+                shares and network drives. It's exactly the data your AI needs, and exactly the data nobody can use.
+              </p>
+              <p className="mt-4 text-lg leading-relaxed text-slate-400">
+                GCTRL ingests that mess <span className="font-medium text-slate-200">at scale</span>.{' '}
+                <span className="font-medium text-slate-200">FUSE</span> resolves the duplicates and contradictions —
+                matching records that describe the same entity across systems and reconciling them — into{' '}
+                <span className="font-medium text-slate-200">one clean, canonical knowledge graph</span>, and serves it
+                to your agents with <span className="font-medium text-slate-200">provenance, lineage and retention
+                preserved</span>, and clearance enforced at query time.
+              </p>
+            </div>
+            <div className="reveal-right">
+              <LegacyRevivalDiagram />
+            </div>
+          </div>
+
+          {/* Why GCTRL is unique here */}
+          <div className="reveal mt-16 rounded-2xl border border-slate-800 bg-slate-900/40 p-8">
+            <h3 className="text-xl font-semibold text-white">Why nothing else does this</h3>
+            <p className="mt-3 max-w-3xl leading-relaxed text-slate-400">
+              Most “chat with your data” tools <span className="font-medium text-slate-200">choke on messy legacy at
+              volume</span> — they index a handful of clean docs and call it done. GCTRL is built to ingest the{' '}
+              <em>mess</em> and resolve it <span className="font-medium text-slate-200">deterministically</span> into
+              structured, queryable knowledge — turning a liability into a moat, without breaking compliance.
+            </p>
+            <div className="mt-7 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+              {[
+                ['Ingest at volume', 'Decades of mailservers, SharePoint, SQL and file shares — pulled in at scale, not a sample.'],
+                ['Deterministic entity resolution', 'FUSE matches records describing the same entity across systems and merges them, repeatably.'],
+                ['Contradictions reconciled', 'Conflicting and duplicate facts collapse into one canonical, trustworthy version.'],
+                ['Provenance & lineage', 'Every fact traces back to its source system and document — nothing is a black box.'],
+                ['Retention preserved', 'Original retention and deletion rules carry through, so compliance stays intact.'],
+                ['Clearance enforced', 'The resulting graph is queried under the same classification rules as the rest of GCTRL.'],
+              ].map(([title, body]) => (
+                <div key={title}>
+                  <p className="font-semibold text-slate-100">{title}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-slate-400">{body}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Ideal for + setup */}
+          <div className="reveal mt-8 grid gap-4 sm:grid-cols-2">
+            <div className="feature-card-landing">
+              <h4 className="font-semibold text-slate-100">Ideal for</h4>
+              <ul className="mt-3 space-y-1.5 text-sm text-slate-400">
+                <li>• Migrating or decommissioning legacy systems without losing the knowledge inside</li>
+                <li>• M&A data consolidation across two organizations' overlapping systems</li>
+                <li>• Making 10+ years of archives finally AI-usable</li>
+                <li>• Regulated orgs needing provenance + retention preserved end-to-end</li>
+              </ul>
+            </div>
+            <div className="feature-card-landing">
+              <h4 className="font-semibold text-slate-100">How to set it up</h4>
+              <ul className="mt-3 space-y-1.5 text-sm text-slate-400">
+                <li>1. <Link to="/docs/installation" className="text-indigo-400 hover:text-indigo-300">Install GCTRL</Link> and point it at your legacy sources</li>
+                <li>2. Run <Link to="/docs/modules" className="text-indigo-400 hover:text-indigo-300">KEX &amp; FUSE</Link> to ingest and resolve at scale</li>
+                <li>3. Serve the graph under <Link to="/docs/access-control" className="text-indigo-400 hover:text-indigo-300">access control</Link> to your agents</li>
               </ul>
             </div>
           </div>
