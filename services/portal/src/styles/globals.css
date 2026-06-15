@@ -346,6 +346,22 @@
     background-size: 60px 60px;
   }
 
+  /* ─── Architecture diagram — flowing signal dots along connector lanes ─── */
+  @keyframes arch-flow-down {
+    0%   { top: -15%; opacity: 0; }
+    15%  { opacity: 1; }
+    85%  { opacity: 1; }
+    100% { top: 115%; opacity: 0; }
+  }
+  @keyframes arch-flow-up {
+    0%   { top: 115%; opacity: 0; }
+    15%  { opacity: 1; }
+    85%  { opacity: 1; }
+    100% { top: -15%; opacity: 0; }
+  }
+  .arch-flow-down { animation: arch-flow-down 2.6s linear infinite; }
+  .arch-flow-up   { animation: arch-flow-up 2.9s linear infinite; }
+
   /* ─── Reduced motion ─────────────────────────────────────────── */
   @media (prefers-reduced-motion: reduce) {
     .reveal, .reveal-left, .reveal-right, .reveal-scale {
@@ -357,7 +373,8 @@
     .animate-ring-1, .animate-ring-2, .animate-ring-3,
     .animate-float, .animate-bounce,
     .animate-twinkle-a, .animate-twinkle-b, .animate-twinkle-c,
-    .animate-twinkle-shine, .animate-twinkle-shine-warm {
+    .animate-twinkle-shine, .animate-twinkle-shine-warm,
+    .arch-flow-down, .arch-flow-up {
       animation: none;
     }
   }
