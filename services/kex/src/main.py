@@ -170,10 +170,12 @@ def run_pipeline(
     except Exception as exc:
         logger.warning(f"[{job_id}] PII detection failed (non-fatal): {exc}")
 
-    # 1. Named Entity Recognition (GLiNER zero-shot) — GPU-bound, needs lock
+    # 1. Named Entity Recognition (GLiNER zero-shot). The GPU/CPU-bound inference
+    # is serialized INSIDE the NER pipeline at chunk granularity, so a large
+    # document yields the lock between chunks instead of blocking the whole
+    # worker pool for minutes (no doc-level lock held here anymore).
     ner = get_ner_pipeline()
-    with _pipeline_lock:
-        entities = ner.extract_entities(text, entity_types=entity_types)
+    entities = ner.extract_entities(text, entity_types=entity_types)
     logger.info(f"[{job_id}] NER: {len(entities)} entities")
 
     # 2. Relation Extraction (Ollama HTTP — can run in parallel)
@@ -295,7 +297,8 @@ def run_pipeline(
 
 _worker_running = False
 _worker_threads: list[tuple[threading.Thread, threading.Event]] = []
-_pipeline_lock = threading.Lock()  # serialize GPU-bound NER
+# NER inference is serialized inside src/ner.py (per-chunk), not here — so a
+# single huge document can't hold a doc-level lock and stall the whole pool.
 
 
 def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:

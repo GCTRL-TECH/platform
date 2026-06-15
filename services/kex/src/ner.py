@@ -6,6 +6,7 @@ Uses Wikidata QID mapping for structured knowledge graph output.
 
 import logging
 import re
+import threading
 from typing import Optional
 
 from . import config
@@ -17,6 +18,12 @@ logger = logging.getLogger(__name__)
 _CHUNK_CHARS = 1200
 _OVERLAP_CHARS = 120
 
+# Serializes the GPU/CPU-bound GLiNER work across worker threads. Held ONLY
+# around the one-time model load and each per-chunk predict — NOT across a whole
+# document. So a huge doc's NER yields the lock between its chunks instead of
+# blocking every other worker for minutes (head-of-line stall fix).
+_model_lock = threading.Lock()
+
 
 class NERPipeline:
     """GLiNER-based zero-shot NER with Wikidata type mapping."""
@@ -25,18 +32,24 @@ class NERPipeline:
         self._model = None
 
     def _get_model(self):
+        # Double-checked locking: load exactly once even when several worker
+        # threads hit a cold model simultaneously (the lock around predict no
+        # longer wraps the whole call, so loading must guard itself).
         if self._model is None:
-            from gliner import GLiNER
-            import torch
+            with _model_lock:
+                if self._model is None:
+                    from gliner import GLiNER
+                    import torch
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Loading GLiNER model: {config.GLINER_MODEL} on {device}")
-            self._model = GLiNER.from_pretrained(config.GLINER_MODEL)
-            if device == "cuda":
-                self._model = self._model.to(device)
-            logger.info(
-                f"GLiNER loaded — {len(config.DEFAULT_ENTITY_TYPES)} default entity types"
-            )
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    logger.info(f"Loading GLiNER model: {config.GLINER_MODEL} on {device}")
+                    model = GLiNER.from_pretrained(config.GLINER_MODEL)
+                    if device == "cuda":
+                        model = model.to(device)
+                    self._model = model
+                    logger.info(
+                        f"GLiNER loaded — {len(config.DEFAULT_ENTITY_TYPES)} default entity types"
+                    )
         return self._model
 
     @property
@@ -128,11 +141,17 @@ class NERPipeline:
     def _predict(
         self, model, text: str, labels: list[str], threshold: float, offset: int
     ) -> list[dict]:
-        """Run GLiNER prediction on a single chunk."""
+        """Run GLiNER prediction on a single chunk.
+
+        The actual inference is serialized via `_model_lock` (GPU/CPU safety),
+        but the lock is released between chunks — so a large document can't hold
+        it for its whole length and starve the rest of the worker pool.
+        """
         try:
-            entities = model.predict_entities(
-                text, labels, threshold=threshold
-            )
+            with _model_lock:
+                entities = model.predict_entities(
+                    text, labels, threshold=threshold
+                )
         except Exception as exc:
             logger.warning(f"GLiNER prediction failed on chunk at offset {offset}: {exc}")
             return []
