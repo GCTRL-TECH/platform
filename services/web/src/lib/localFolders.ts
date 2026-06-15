@@ -48,15 +48,12 @@ export interface LocalFolderSettings {
   ontologyId: string | null
   compilationId: string | null
   classificationLevelId: string | null
-  // When true, the app-level sweep re-ingests changed files while GCTRL is open.
-  autoReingest: boolean
 }
 
 export const DEFAULT_SETTINGS: LocalFolderSettings = {
   ontologyId: null,
   compilationId: null,
   classificationLevelId: null,
-  autoReingest: false,
 }
 
 export interface LocalFolderMeta {
@@ -163,18 +160,16 @@ export async function deleteLocalFolder(id: string): Promise<void> {
 
 // ─── Permissions + directory walking ─────────────────────────────────────────
 
-/** Query (and optionally request) read permission on a stored handle.
- *  `silent` (used by the background sweep, which has no user gesture) only
- *  *queries* — it never prompts, returning false when not already granted. */
-async function ensurePermission(handle: FsDirectoryHandle, silent: boolean): Promise<boolean> {
+/** Query, then (if needed) request read permission on a stored handle. Must be
+ *  invoked from a user gesture for the request to be allowed to prompt. */
+async function ensurePermission(handle: FsDirectoryHandle): Promise<boolean> {
   const desc: FsHandlePermissionDescriptor = { mode: 'read' }
   try {
     if (handle.queryPermission) {
       const cur = await handle.queryPermission(desc)
       if (cur === 'granted') return true
-      if (silent) return false
     }
-    if (!silent && handle.requestPermission) {
+    if (handle.requestPermission) {
       return (await handle.requestPermission(desc)) === 'granted'
     }
   } catch {
@@ -238,21 +233,22 @@ export interface IngestProgress {
 export interface IngestOptions {
   /** Re-upload every supported file, ignoring the unchanged-skip manifest. */
   force?: boolean
-  /** No-gesture mode (background sweep): never prompt for permission. */
-  silent?: boolean
   /** Restrict to these relPaths (selective sync). Empty/undefined = whole folder. */
   subset?: string[]
   onProgress?: (p: IngestProgress) => void
 }
 
-/** Upload one file to KEX via the normal multipart upload endpoint. */
+/** Upload one file to KEX via the normal multipart upload endpoint.
+ *  `Content-Type: undefined` lets the browser/axios set multipart + boundary
+ *  (the shared api instance defaults to application/json, which would corrupt
+ *  the upload) — same trick the Upload tab's useUploadMutation uses. */
 async function uploadFile(file: File, name: string, settings: LocalFolderSettings): Promise<void> {
   const fd = new FormData()
   fd.append('file', file, name)
   if (settings.ontologyId) fd.append('ontologyId', settings.ontologyId)
   if (settings.classificationLevelId) fd.append('classificationLevelId', settings.classificationLevelId)
   if (settings.compilationId) fd.append('compilationId', settings.compilationId)
-  await api.post('/kex/upload', fd)
+  await api.post('/kex/upload', fd, { headers: { 'Content-Type': undefined } })
 }
 
 /**
@@ -266,14 +262,8 @@ export async function ingestFolder(id: string, opts: IngestOptions = {}): Promis
   const rec = await getRecord(id)
   if (!rec) throw new Error('This folder is no longer registered in this browser.')
 
-  const granted = await ensurePermission(rec.handle, opts.silent ?? false)
-  if (!granted) {
-    throw new Error(
-      opts.silent
-        ? 'permission-not-granted' // background sweep: quietly skipped by caller
-        : 'Read permission was denied for this folder.',
-    )
-  }
+  const granted = await ensurePermission(rec.handle)
+  if (!granted) throw new Error('Read permission was denied for this folder.')
 
   let files = await listFolderFiles(rec.handle)
   if (opts.subset && opts.subset.length > 0) {
@@ -321,30 +311,4 @@ export async function ingestFolder(id: string, opts: IngestOptions = {}): Promis
   await tx('readwrite', (s) => s.put(fresh))
 
   return progress
-}
-
-/**
- * Background sweep: re-ingest every folder with autoReingest=true, skipping
- * unchanged files. Silent (no permission prompts) — folders whose permission
- * isn't already granted in this session are quietly skipped until the user
- * re-opens them. Returns the number of folders that actually ran.
- */
-export async function runAutoReingestSweep(): Promise<number> {
-  if (!supportsLocalFolders()) return 0
-  let ran = 0
-  const folders = await listLocalFolders()
-  for (const f of folders) {
-    if (!f.settings.autoReingest) continue
-    try {
-      const p = await ingestFolder(f.id, { force: false, silent: true })
-      if (p.uploaded > 0) {
-        ran++
-        // eslint-disable-next-line no-console
-        console.info(`[local-folder] auto re-ingest "${f.label}": ${p.uploaded} changed file(s) sent`)
-      }
-    } catch {
-      /* permission-not-granted / handle gone — skip silently */
-    }
-  }
-  return ran
 }

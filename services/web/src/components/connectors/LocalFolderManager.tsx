@@ -11,7 +11,6 @@ import {
   Check,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { cn } from '@/lib/utils'
 import {
   supportsLocalFolders,
   addLocalFolder,
@@ -117,9 +116,6 @@ export default function LocalFolderManager({
     }
   }
 
-  const handleToggleAuto = async (id: string, next: boolean) => {
-    await updateSettings(id, { autoReingest: next }); await load()
-  }
   const handleRemove = async (id: string) => {
     if (!confirm('Remove this local folder? (Already-extracted knowledge is kept.)')) return
     await deleteLocalFolder(id); await load()
@@ -143,7 +139,9 @@ export default function LocalFolderManager({
         if (ontologyId) fd.append('ontologyId', ontologyId)
         if (classificationLevelId) fd.append('classificationLevelId', classificationLevelId)
         if (compilationId) fd.append('compilationId', compilationId)
-        await api.post('/kex/upload', fd)
+        // Content-Type undefined → browser sets multipart boundary (the api
+        // instance defaults to application/json, which corrupts the upload).
+        await api.post('/kex/upload', fd, { headers: { 'Content-Type': undefined } })
         sent++
       } catch { failed++ }
     }
@@ -208,26 +206,13 @@ export default function LocalFolderManager({
                   </div>
 
                   <button
-                    onClick={() => void handleToggleAuto(f.id, !f.settings.autoReingest)}
-                    title="Periodically re-ingest changed files while GCTRL is open"
-                    className={cn(
-                      'flex items-center gap-1.5 rounded border px-2 py-1 text-[10px] font-medium transition-colors',
-                      f.settings.autoReingest
-                        ? 'border-emerald-800/50 bg-emerald-950/30 text-emerald-400'
-                        : 'border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-300',
-                    )}
-                  >
-                    <RefreshCw size={11} />
-                    {f.settings.autoReingest ? 'Auto on' : 'Auto off'}
-                  </button>
-
-                  <button
                     onClick={() => void runIngest(f.id, false)}
                     disabled={ingesting}
+                    title="Re-ingest this folder — unchanged files (same name, date & size) are skipped"
                     className="flex items-center gap-1.5 rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-medium text-white hover:bg-indigo-500 disabled:opacity-50 transition-colors"
                   >
                     {ingesting ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-                    {ingesting ? 'Ingesting…' : 'Ingest changed'}
+                    {ingesting ? 'Ingesting…' : 'Re-ingest'}
                   </button>
 
                   <button

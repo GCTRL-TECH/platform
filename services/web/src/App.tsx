@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
-import { useLocalFolderAutoReingest } from '@/hooks/useLocalFolderAutoReingest'
 import { api } from '@/lib/api'
 import { agentHealthUrl } from '@/lib/utils'
 import ActivationWizard from '@/pages/onboarding/ActivationWizard'
@@ -134,10 +133,6 @@ function SetupGate({ children }: { children: React.ReactNode }) {
 function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useAuth()
   const location = useLocation()
-
-  // Background re-ingest for "Local Folder" KEX sources (changed files only),
-  // running across all authenticated pages while GCTRL is open in the browser.
-  useLocalFolderAutoReingest()
 
   // Auto-link license key to account on first authenticated session
   useEffect(() => {
