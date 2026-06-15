@@ -313,15 +313,28 @@ jobs:
       - build-fusion-engine
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # Never let a publish hiccup fail the overall build — it's best-effort.
+    continue-on-error: true
     steps:
       - name: Publish version to license API
+        # Pass the commit message + token through the ENV, never inline ${{ }} into
+        # the shell — a message with quotes/parens/newlines would otherwise break
+        # the script (syntax error), and inlining secrets/user text is unsafe.
+        env:
+          VERSION: 0.1.${{ github.run_number }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PUBLISH_TOKEN: ${{ secrets.VERSION_PUBLISH_TOKEN }}
         run: |
-          VER="0.1.${{ github.run_number }}"
-          MSG=$(printf '%s' "${{ github.event.head_commit.message }}" | head -1)
-          BODY=$(jq -nc --arg v "$VER" --arg c "$MSG" '{version:$v, changelog:$c, channel:"stable"}')
+          if [ -z "$PUBLISH_TOKEN" ]; then
+            echo "VERSION_PUBLISH_TOKEN not set — skipping version publish (non-fatal)"
+            exit 0
+          fi
+          MSG=$(printf '%s' "$COMMIT_MSG" | head -1)
+          BODY=$(jq -nc --arg v "$VERSION" --arg c "$MSG" '{version:$v, changelog:$c, channel:"stable"}')
           curl -fsSL -m 20 -X POST https://api.gctrl.tech/v1/versions \
-            -H "Authorization: Bearer ${{ secrets.VERSION_PUBLISH_TOKEN }}" \
-            -H "Content-Type: application/json" -d "$BODY" || echo "version publish skipped/failed (non-fatal)"
+            -H "Authorization: Bearer $PUBLISH_TOKEN" \
+            -H "Content-Type: application/json" -d "$BODY" \
+            || echo "version publish skipped/failed (non-fatal)"
 
   # ── Deploy jobs — only run if their upstream build ran ─────────────────────
 
