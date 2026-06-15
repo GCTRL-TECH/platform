@@ -23,7 +23,7 @@ router.post('/v1/heartbeat', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const { usage_report, tuning_version } = req.body;
+  const { usage_report, tuning_version, instance_version } = req.body;
 
   if (Array.isArray(usage_report) && usage_report.length > 0) {
     const records = usage_report.map((u: { action: string; chars_processed: number; credits_spent: number; timestamp: string }) => ({
@@ -45,7 +45,13 @@ router.post('/v1/heartbeat', async (req: Request, res: Response): Promise<void> 
   }
 
   await db.update(licenses)
-    .set({ lastHeartbeatAt: new Date(), status: 'active' })
+    .set({
+      lastHeartbeatAt: new Date(),
+      status: 'active',
+      ...(typeof instance_version === 'string' && instance_version.length > 0
+        ? { reportedVersion: instance_version }
+        : {}),
+    })
     .where(eq(licenses.id, claims.licenseId));
 
   const [user] = await db.select().from(users).where(eq(users.id, claims.sub)).limit(1);

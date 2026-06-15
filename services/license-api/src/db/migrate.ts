@@ -69,6 +69,7 @@ const STATEMENTS: string[] = [
   `ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_reassignment_at TIMESTAMPTZ`,
   `ALTER TABLE licenses ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ`,
   `ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ`,
+  `ALTER TABLE licenses ADD COLUMN IF NOT EXISTS reported_version TEXT`,
 
   // ── token_usage (THE drift that caused the crashloop) ───────────────────
   `CREATE TABLE IF NOT EXISTS token_usage (

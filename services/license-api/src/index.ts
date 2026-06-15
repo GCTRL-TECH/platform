@@ -3,6 +3,7 @@ import cors from 'cors';
 import { readFileSync } from 'fs';
 import activateRouter from './routes/activate.js';
 import heartbeatRouter from './routes/heartbeat.js';
+import versionsRouter from './routes/versions.js';
 import stripeRouter from './routes/stripe.js';
 import adminRouter from './routes/admin.js';
 import authRouter from './routes/auth.js';
@@ -28,6 +29,7 @@ app.get('/v1/public-key', (_req, res) => {
 
 app.use(activateRouter);
 app.use(heartbeatRouter);
+app.use(versionsRouter);
 app.use(stripeRouter);
 app.use(authRouter);
 app.use('/admin', adminRouter);

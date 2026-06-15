@@ -1,8 +1,8 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { X, RefreshCw, Copy, Check } from 'lucide-react'
 import { cn, agentHealthUrl } from '@/lib/utils'
 
-interface AgentStatus {
+export interface AgentStatus {
   activated: boolean
   valid: boolean
   tier: string
@@ -10,6 +10,7 @@ interface AgentStatus {
   updateAvailable: boolean
   updateRequired: boolean
   latestVersion: string
+  currentVersion?: string
 }
 
 interface ProgressLine {
@@ -21,18 +22,95 @@ interface ProgressLine {
 
 const MANUAL_COMMAND = 'curl -fsSL https://gctrl.tech/update | bash'
 
+// How long to wait for the first SSE event before declaring the connection stalled.
+const STALL_TIMEOUT_MS = 25_000
+
+/**
+ * UpdateModal state machine:
+ *   connecting → pulling → restarting → done
+ *                                     ↘ error  (from any prior state)
+ *
+ * - connecting: SSE opened, no progress event yet. A stall timer is armed; if no
+ *   progress/done/error arrives within STALL_TIMEOUT_MS we flip to `error`.
+ * - pulling:    at least one `pull`/`pulled` progress event seen.
+ * - restarting: a `restart`/`restarted` progress event seen.
+ * - done:       `done` event — auto-reloads after a short delay.
+ * - error:      explicit error event, transport onerror, or stall timeout. Always
+ *               offers the manual command + a Retry button. Never shown while still
+ *               legitimately connecting.
+ */
+type UpdatePhase = 'connecting' | 'pulling' | 'restarting' | 'done' | 'error'
+
+function phaseFromStep(step: string): UpdatePhase | null {
+  if (step === 'pull' || step === 'pulled') return 'pulling'
+  if (step === 'restart' || step === 'restarting' || step === 'restarted') return 'restarting'
+  return null
+}
+
+const PHASE_LABEL: Record<UpdatePhase, string> = {
+  connecting: 'Connecting to update service…',
+  pulling: 'Pulling new images…',
+  restarting: 'Restarting services…',
+  done: 'Update complete',
+  error: 'Update failed',
+}
+
 export function UpdateModal({ onClose }: { onClose: () => void }) {
   const [lines, setLines] = useState<ProgressLine[]>([])
-  const [done, setDone] = useState(false)
+  const [phase, setPhase] = useState<UpdatePhase>('connecting')
   const [error, setError] = useState('')
   const [manualCommand, setManualCommand] = useState('')
   const [copied, setCopied] = useState(false)
+  // Bumping this re-runs the SSE effect for the Retry button.
+  const [attempt, setAttempt] = useState(0)
+
+  // Live refs so async SSE callbacks read current phase without re-subscribing.
+  const phaseRef = useRef<UpdatePhase>('connecting')
+  phaseRef.current = phase
 
   useEffect(() => {
+    setLines([])
+    setError('')
+    setManualCommand('')
+    setPhase('connecting')
+    phaseRef.current = 'connecting'
+
     const es = new EventSource('/api/update', { withCredentials: true })
+    let closed = false
+
+    const fail = (message: string, cmd?: string) => {
+      if (closed) return
+      // Never override a terminal success state.
+      if (phaseRef.current === 'done') return
+      closed = true
+      window.clearTimeout(stallTimer)
+      setError(message)
+      setManualCommand(cmd ?? MANUAL_COMMAND)
+      setPhase('error')
+      es.close()
+    }
+
+    // Stall guard: no event at all within the window → treat as unreachable.
+    let stallTimer = window.setTimeout(() => {
+      fail('Update service did not respond. It may be unreachable or stalled.')
+    }, STALL_TIMEOUT_MS)
+
+    const advance = (next: UpdatePhase) => {
+      setPhase((prev) => {
+        if (prev === 'done' || prev === 'error') return prev
+        // Don't move backwards (e.g. a late pull line after restart began).
+        if (prev === 'restarting' && next === 'pulling') return prev
+        return next
+      })
+    }
 
     es.addEventListener('progress', (e) => {
+      // First byte of life — disarm the stall guard.
+      window.clearTimeout(stallTimer)
       const data = JSON.parse(e.data) as ProgressLine
+      const next = phaseFromStep(data.step)
+      if (next) advance(next)
+      else if (phaseRef.current === 'connecting') advance('pulling')
       setLines((prev) => {
         // Collapse repeated pull progress lines into the last entry for the same image
         if (data.step === 'pull' && prev.length > 0) {
@@ -46,7 +124,10 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
     })
 
     es.addEventListener('done', () => {
-      setDone(true)
+      window.clearTimeout(stallTimer)
+      closed = true
+      setPhase('done')
+      phaseRef.current = 'done'
       es.close()
       setTimeout(() => window.location.reload(), 4000)
     })
@@ -54,26 +135,24 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
     es.addEventListener('error', (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data) as { message?: string; manualCommand?: string }
-        setError(data.message ?? 'Update failed')
-        if (data.manualCommand) setManualCommand(data.manualCommand)
+        fail(data.message ?? 'Update failed', data.manualCommand)
       } catch {
-        setError('Update failed — run manually')
-        setManualCommand(MANUAL_COMMAND)
+        fail('Update failed — run manually')
       }
-      es.close()
     })
 
-    // If EventSource itself errors (e.g. 503 no socket)
+    // Transport-level failure (e.g. 503 no socket, connection dropped).
     es.onerror = () => {
-      if (!done && !error) {
-        setError('Could not reach update service')
-        setManualCommand(MANUAL_COMMAND)
-        es.close()
-      }
+      fail('Could not reach update service')
     }
 
-    return () => es.close()
-  }, [])
+    return () => {
+      closed = true
+      window.clearTimeout(stallTimer)
+      es.close()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attempt])
 
   function copyCommand() {
     void navigator.clipboard.writeText(manualCommand || MANUAL_COMMAND)
@@ -81,23 +160,34 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
     setTimeout(() => setCopied(false), 2000)
   }
 
+  const done = phase === 'done'
+  const isError = phase === 'error'
+  const closable = done || isError
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
       <div className="relative w-full max-w-lg rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
           <div className="flex items-center gap-2">
-            <RefreshCw size={15} className={cn('text-blue-400', !done && !error && 'animate-spin')} />
+            <RefreshCw size={15} className={cn('text-blue-400', !done && !isError && 'animate-spin')} />
             <span className="text-sm font-semibold text-slate-200">
-              {done ? 'Update complete' : error ? 'Update failed' : 'Updating GCTRL…'}
+              {done ? 'Update complete' : isError ? 'Update failed' : 'Updating GCTRL…'}
             </span>
           </div>
-          {(done || error) && (
-            <button onClick={onClose} className="text-slate-500 hover:text-slate-300">
+          {closable && (
+            <button onClick={onClose} aria-label="Close" className="text-slate-500 hover:text-slate-300">
               <X size={16} />
             </button>
           )}
         </div>
+
+        {/* Phase indicator (hidden once terminal) */}
+        {!closable && (
+          <div className="px-5 pt-3 text-xs font-medium text-slate-300">
+            {PHASE_LABEL[phase]}
+          </div>
+        )}
 
         {/* Progress log */}
         <div className="max-h-64 overflow-y-auto px-5 py-3 font-mono text-[11px] text-slate-400 space-y-0.5">
@@ -108,8 +198,8 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
               {line.message}
             </div>
           ))}
-          {lines.length === 0 && !error && (
-            <div className="text-slate-500">Connecting to update service…</div>
+          {lines.length === 0 && !isError && (
+            <div className="text-slate-500">{PHASE_LABEL[phase]}</div>
           )}
         </div>
 
@@ -120,7 +210,7 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
               Reloading in a moment…
             </p>
           )}
-          {error && (
+          {isError && (
             <div className="space-y-3">
               <p className="text-sm text-red-400">{error}</p>
               <p className="text-xs text-slate-500">Run this command on your server to update manually:</p>
@@ -134,6 +224,13 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
                   {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
                 </button>
               </div>
+              <button
+                onClick={() => setAttempt((n) => n + 1)}
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500"
+              >
+                <RefreshCw size={14} />
+                Retry
+              </button>
             </div>
           )}
         </div>

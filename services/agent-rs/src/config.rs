@@ -6,6 +6,8 @@ pub struct Config {
     pub port:               u16,
     /// Where the verified ER tuning profile is cached + served from (/tuning).
     pub tuning_profile_path: String,
+    /// File-backed current instance RELEASE version (decoupled from the image build).
+    pub version_path: String,
 }
 
 impl Config {
@@ -29,6 +31,8 @@ impl Config {
                 .unwrap_or(7070),
             tuning_profile_path: std::env::var("GCTRL_TUNING_PROFILE_PATH")
                 .unwrap_or_else(|_| "/app/config/tuning.json".into()),
+            version_path: std::env::var("GCTRL_VERSION_PATH")
+                .unwrap_or_else(|_| "/app/config/current_version".into()),
         }
     }
 }

@@ -58,6 +58,8 @@ struct StatusResponse {
     update_required:  bool,
     #[serde(rename = "latestVersion")]
     latest_version:   String,
+    #[serde(rename = "currentVersion")]
+    current_version:  String,
 }
 
 async fn handle_activate(
@@ -205,15 +207,56 @@ async fn handle_report(
 
 async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
     let c = state.cache.read().await;
+    let latest_version = c.latest_version().to_string();
+    // The agent is the authority on whether ITS version is behind: read the local
+    // current_version and recompute updateAvailable rather than trusting the JWT
+    // claim (which is computed server-side and may lag this instance). Forced
+    // updates (update_required) stay server-driven.
+    let current_version = crate::version::read_current(&state.cfg.version_path)
+        .await
+        .unwrap_or_default();
+    let update_available =
+        !current_version.is_empty() && crate::version::version_gt(&latest_version, &current_version);
     Json(StatusResponse {
         activated:        c.is_activated(),
         valid:            c.is_valid(),
         tier:             c.tier().into(),
         balance:          c.balance(),
-        update_available: c.is_update_available(),
+        update_available,
         update_required:  c.is_update_required(),
-        latest_version:   c.latest_version().into(),
+        latest_version,
+        current_version,
     })
+}
+
+#[derive(Deserialize)]
+struct SetVersionRequest {
+    version: String,
+}
+
+/// POST /version — set the current instance RELEASE version. Called by the API
+/// update executor over the internal docker network (`gctrl-agent:7070`) after a
+/// successful update, so the agent immediately reflects the new version and
+/// `/status` reports updateAvailable=false. Same internal trust boundary as
+/// /check — only the local stack reaches this port.
+async fn handle_set_version(
+    State(state): State<AppState>,
+    Json(req): Json<SetVersionRequest>,
+) -> impl IntoResponse {
+    match crate::version::write_current(&state.cfg.version_path, &req.version).await {
+        Ok(()) => {
+            tracing::info!("current_version set to {}", req.version.trim());
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to write current_version: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to persist version: {e}") })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// GET /tuning — serve the cached, signature-verified ER tuning profile to the
@@ -248,6 +291,7 @@ pub async fn run(
         .route("/check",    post(handle_check))
         .route("/report",   post(handle_report))
         .route("/status",   get(handle_status))
+        .route("/version",  post(handle_set_version))
         .route("/tuning",   get(handle_tuning))
         .with_state(state);
 

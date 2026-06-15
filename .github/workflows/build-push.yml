@@ -8,6 +8,9 @@ on:
 env:
   REGISTRY: ghcr.io
   ORG: gctrl-tech
+  # Release version string for this build. Tagged onto every customer image as
+  # :v<VERSION> and published to the license API by the publish-version job.
+  VERSION: 0.1.${{ github.run_number }}
 
 # Use the built-in GITHUB_TOKEN to push to GHCR (no expiring PAT). Granted at the
 # workflow level so every build job can publish packages.
@@ -93,6 +96,7 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/kex:latest${{ matrix.tag_suffix }}
             ghcr.io/gctrl-tech/kex:${{ github.sha }}${{ matrix.tag_suffix }}
+            ghcr.io/gctrl-tech/kex:v${{ env.VERSION }}${{ matrix.tag_suffix }}
 
   build-fuse:
     needs: changes
@@ -134,6 +138,7 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/fuse:latest${{ matrix.tag_suffix }}
             ghcr.io/gctrl-tech/fuse:${{ github.sha }}${{ matrix.tag_suffix }}
+            ghcr.io/gctrl-tech/fuse:v${{ env.VERSION }}${{ matrix.tag_suffix }}
 
   build-license-api:
     needs: changes
@@ -185,6 +190,7 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/agent:latest
             ghcr.io/gctrl-tech/agent:${{ github.sha }}
+            ghcr.io/gctrl-tech/agent:v${{ env.VERSION }}
 
   build-api-rs:
     needs: changes
@@ -213,6 +219,7 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/api:latest
             ghcr.io/gctrl-tech/api:${{ github.sha }}
+            ghcr.io/gctrl-tech/api:v${{ env.VERSION }}
 
   build-web:
     needs: changes
@@ -238,6 +245,7 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/web:latest
             ghcr.io/gctrl-tech/web:${{ github.sha }}
+            ghcr.io/gctrl-tech/web:v${{ env.VERSION }}
 
   # ── Fusion Engine (LIMES resolver) — multi-arch off the committed jar ───────
   build-fusion-engine:
@@ -266,6 +274,7 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/fusion-engine:latest
             ghcr.io/gctrl-tech/fusion-engine:${{ github.sha }}
+            ghcr.io/gctrl-tech/fusion-engine:v${{ env.VERSION }}
 
   build-portal:
     needs: changes
@@ -289,6 +298,30 @@ jobs:
           tags: |
             ghcr.io/gctrl-tech/portal:latest
             ghcr.io/gctrl-tech/portal:${{ github.sha }}
+
+  # ── Publish the new version to the license API (best-effort) ───────────────
+  # Runs after the customer-image builds on push to main. Best-effort: a publish
+  # hiccup must never red-X the build, so the curl is non-fatal. The version
+  # string matches the :v<VERSION> image tag (0.1.<run_number>).
+  publish-version:
+    needs:
+      - build-kex
+      - build-fuse
+      - build-agent-rs
+      - build-api-rs
+      - build-web
+      - build-fusion-engine
+    if: always() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish version to license API
+        run: |
+          VER="0.1.${{ github.run_number }}"
+          MSG=$(printf '%s' "${{ github.event.head_commit.message }}" | head -1)
+          BODY=$(jq -nc --arg v "$VER" --arg c "$MSG" '{version:$v, changelog:$c, channel:"stable"}')
+          curl -fsSL -m 20 -X POST https://api.gctrl.tech/v1/versions \
+            -H "Authorization: Bearer ${{ secrets.VERSION_PUBLISH_TOKEN }}" \
+            -H "Content-Type: application/json" -d "$BODY" || echo "version publish skipped/failed (non-fatal)"
 
   # ── Deploy jobs — only run if their upstream build ran ─────────────────────
 

@@ -15,6 +15,10 @@ struct HeartbeatPayload {
     /// a tuning blob when this is stale, so steady state carries nothing extra).
     #[serde(skip_serializing_if = "Option::is_none")]
     tuning_version: Option<i64>,
+    /// The RELEASE this instance is currently running (None on a fresh install
+    /// that hasn't been seeded yet). Lets the server see per-instance version drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -39,11 +43,14 @@ pub async fn beat(
     let records    = queue.lock().await.flush();
     // Tell the server our cached tuning version so it only re-sends on a bump.
     let tuning_version = crate::tuning::read_cache(&cfg.tuning_profile_path).await.map(|t| t.version);
-    let payload    = HeartbeatPayload { usage_report: records.clone(), tuning_version };
+    // Report the RELEASE this instance is on so the server can see version drift.
+    let instance_version = crate::version::read_current(&cfg.version_path).await;
+    let payload    = HeartbeatPayload { usage_report: records.clone(), tuning_version, instance_version: instance_version.clone() };
     let jwt        = tokio::fs::read_to_string(&cfg.license_jwt_path).await.unwrap_or_default();
     let license_jwt_path = cfg.license_jwt_path.clone();
     let license_public_key = cfg.license_public_key.clone();
     let tuning_profile_path = cfg.tuning_profile_path.clone();
+    let version_path = cfg.version_path.clone();
     let api_url    = cfg.api_url.clone();
 
     let client = reqwest::Client::new();
@@ -82,6 +89,21 @@ pub async fn beat(
                                 Err(e) => tracing::warn!("tuning cache write failed: {e}"),
                             },
                             Err(e) => tracing::warn!("tuning JWS rejected (keeping last-good): {e}"),
+                        }
+                    }
+                }
+
+                // Seed current_version on a fresh install. A fresh install just pulled
+                // `:latest`, so it IS on the latest release — but the local version file
+                // doesn't exist yet. If it's still unset, seed it from the license's
+                // latest_version so updateAvailable computes as false out of the box.
+                // Never overwrite an existing current_version here (updates own that).
+                if instance_version.is_none() {
+                    let latest = cache.read().await.latest_version().to_string();
+                    if !latest.is_empty() {
+                        match crate::version::write_current(&version_path, &latest).await {
+                            Ok(()) => tracing::info!("Seeded current_version to {latest} (fresh install)"),
+                            Err(e) => tracing::warn!("current_version seed write failed: {e}"),
                         }
                     }
                 }

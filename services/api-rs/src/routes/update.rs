@@ -275,19 +275,27 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
     for (_container, image) in SERVICES {
         send("progress", json!({ "step": "pull", "image": image, "message": format!("Pulling {}…", image) }));
 
-        let img = image.to_string();
-        match tokio::task::spawn_blocking(move || pull_image(&img)).await {
-            Ok(Ok(_)) => {
-                send("progress", json!({ "step": "pulled", "image": image, "message": format!("✓ {} ready", image) }));
+        // Pull with up to 3 attempts so a transient registry/network hiccup
+        // doesn't abort the whole update.
+        let mut ok = false;
+        let mut last_err = String::new();
+        for attempt in 1..=3 {
+            let img = image.to_string();
+            match tokio::task::spawn_blocking(move || pull_image(&img)).await {
+                Ok(Ok(_)) => { ok = true; break; }
+                Ok(Err(e)) => last_err = e,
+                Err(e) => last_err = e.to_string(),
             }
-            Ok(Err(e)) => {
-                send("error", json!({ "message": format!("Pull failed for {}: {}", image, e), "manualCommand": "curl -fsSL https://gctrl.tech/update | bash" }));
-                return;
+            if attempt < 3 {
+                send("progress", json!({ "step": "pull", "image": image, "message": format!("Retrying {} (attempt {}/3)…", image, attempt + 1) }));
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            Err(e) => {
-                send("error", json!({ "message": format!("Task error: {}", e), "manualCommand": "curl -fsSL https://gctrl.tech/update | bash" }));
-                return;
-            }
+        }
+        if ok {
+            send("progress", json!({ "step": "pulled", "image": image, "message": format!("{} ready", image) }));
+        } else {
+            send("error", json!({ "message": format!("Pull failed for {} after 3 attempts: {}", image, last_err), "manualCommand": "curl -fsSL https://gctrl.tech/update | bash" }));
+            return;
         }
     }
 
@@ -298,15 +306,20 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
         let name = container.to_string();
         match tokio::task::spawn_blocking(move || recreate_container(&name)).await {
             Ok(Ok(_)) => {
-                send("progress", json!({ "step": "restarted", "container": container, "message": format!("✓ {} running new version", container) }));
+                send("progress", json!({ "step": "restarted", "container": container, "message": format!("{} updated", container) }));
             }
             Ok(Err(e)) => {
                 tracing::warn!("Recreate {} failed: {}", container, e);
-                send("progress", json!({ "step": "restart_warn", "container": container, "message": format!("⚠ {} – {}", container, e) }));
+                send("progress", json!({ "step": "restart_warn", "container": container, "message": format!("{}: {}", container, e) }));
             }
             Err(_) => {}
         }
     }
+
+    // Step 2b: Close the loop — tell the agent what version we just installed so it
+    // flips updateAvailable=false and reports the new version on its next heartbeat.
+    // Best-effort: a failure here doesn't fail the update (the agent re-derives it).
+    notify_agent_updated().await;
 
     // Step 3: Done — client reloads on receiving this
     send("done", json!({}));
@@ -316,6 +329,72 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
     // mid-stream. The container will fully recreate on the next docker compose up.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let _ = tokio::task::spawn_blocking(|| docker_restart("gctrl-api")).await;
+}
+
+/// Tell the agent which version we just installed so it updates its instance
+/// `current_version` and stops advertising the update. We ask the agent for the
+/// `latestVersion` it knows about (its single source of truth from the license
+/// heartbeat) and write that back as the new current version. Entirely
+/// best-effort — any failure is logged and swallowed; the agent will re-derive
+/// the correct state on its next heartbeat regardless.
+async fn notify_agent_updated() {
+    let base = std::env::var("GCTRL_AGENT_INTERNAL_URL")
+        .unwrap_or_else(|_| "http://gctrl-agent:7070".to_string());
+    let base = base.trim_end_matches('/');
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("notify_agent_updated: client build failed: {e}");
+            return;
+        }
+    };
+
+    // 1. Ask the agent which version is the latest it knows about.
+    let status: Value = match client.get(format!("{base}/status")).send().await {
+        Ok(resp) => match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("notify_agent_updated: parse /status failed: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!("notify_agent_updated: GET /status failed: {e}");
+            return;
+        }
+    };
+
+    let version = status
+        .get("latestVersion")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(version) = version else {
+        tracing::warn!("notify_agent_updated: agent /status had no latestVersion; skipping");
+        return;
+    };
+
+    // 2. Write it back as the instance's new current_version.
+    match client
+        .post(format!("{base}/version"))
+        .json(&json!({ "version": version }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("notify_agent_updated: agent current_version set to {version}");
+        }
+        Ok(resp) => {
+            tracing::warn!("notify_agent_updated: POST /version returned {}", resp.status());
+        }
+        Err(e) => {
+            tracing::warn!("notify_agent_updated: POST /version failed: {e}");
+        }
+    }
 }
 
 // ─── Docker socket helpers ────────────────────────────────────────────────────

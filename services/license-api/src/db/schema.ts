@@ -30,6 +30,7 @@ export const licenses = pgTable('licenses', {
   lastReassignmentAt: timestamp('last_reassignment_at'),
   activatedAt: timestamp('activated_at'),
   lastHeartbeatAt: timestamp('last_heartbeat_at'),
+  reportedVersion: text('reported_version'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 

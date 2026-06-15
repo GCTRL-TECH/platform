@@ -6,6 +6,7 @@ mod credits;
 mod usage_queue;
 mod heartbeat;
 mod tuning;
+mod version;
 mod server;
 
 #[tokio::main]
