@@ -34,6 +34,7 @@ import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
 import { ExtractionsTable } from './components/ExtractionsTable'
+import LocalFolderManager from '@/components/connectors/LocalFolderManager'
 import {
   listLocalVaults,
   getLocalVaultHandle,
@@ -693,6 +694,15 @@ export function KexPage() {
                     <p className="text-[10px] text-slate-500">Extract from any URL recursively</p>
                   </div>
                 </button>
+                {/* Local Folder — pick folders/files from THIS computer (browser-side) */}
+                <button onClick={() => { setSelectedSource('localfolder'); setSelectedProvider('localfolder') }}
+                  className="flex items-center gap-3 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2.5 text-left hover:border-slate-600 transition-colors">
+                  <FolderOpen size={13} className="text-cyan-400" />
+                  <div>
+                    <p className="text-xs font-medium text-slate-200">Local Folder</p>
+                    <p className="text-[10px] text-slate-500">Ingest folders &amp; files from this computer</p>
+                  </div>
+                </button>
                 {/* Google Drive — configure tile if not connected */}
                 {!connectedSources.some((s) => s.provider === 'google') && (
                   <a href="/drive"
@@ -757,6 +767,15 @@ export function KexPage() {
                   </div>
                 </div>
                 <p className="text-[10px] text-slate-600">Crawls the site recursively, extracts text from each page, and creates a batch extraction.</p>
+              </div>
+            ) : selectedProvider === 'localfolder' ? (
+              /* ── Local Folder (browser File System Access API) ─────────── */
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <button onClick={() => { setSelectedSource(null); setSelectedProvider(null) }} className="rounded p-0.5 text-slate-500 hover:bg-slate-800 hover:text-slate-300"><X size={12} /></button>
+                  <span className="text-xs font-medium text-slate-200">Local Folder</span>
+                </div>
+                <LocalFolderManager onIngested={() => { setRefetchKey((k) => k + 1); refreshBalance() }} />
               </div>
             ) : selectedProvider === 'google' ? (
               <div className="space-y-2">
