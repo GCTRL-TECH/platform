@@ -775,7 +775,12 @@ export function KexPage() {
                   <button onClick={() => { setSelectedSource(null); setSelectedProvider(null) }} className="rounded p-0.5 text-slate-500 hover:bg-slate-800 hover:text-slate-300"><X size={12} /></button>
                   <span className="text-xs font-medium text-slate-200">Local Folder</span>
                 </div>
-                <LocalFolderManager onIngested={() => { setRefetchKey((k) => k + 1); refreshBalance() }} />
+                <LocalFolderManager
+                  ontologyId={selectedOntologyId}
+                  compilationId={autoFuseTarget}
+                  classificationLevelId={classificationLevelId}
+                  onIngested={() => { setRefetchKey((k) => k + 1); refreshBalance() }}
+                />
               </div>
             ) : selectedProvider === 'google' ? (
               <div className="space-y-2">
