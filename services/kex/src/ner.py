@@ -338,15 +338,24 @@ class NERPipeline:
         # 1. Tally a score-weighted vote per surface name -> coarse bucket.
         from collections import defaultdict
 
-        votes: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        # Cython-safety: the prod build is Cython-compiled, where a `dict`
+        # annotation (on a local OR a function parameter) enforces an EXACT-dict
+        # check (PyDict_CheckExact) that REJECTS subclasses like `defaultdict`
+        # ("Expected dict, got collections.defaultdict" — fails every job). So:
+        #   * `votes` is left untyped (it's only iterated, never passed as dict), and
+        #   * its INNER maps are plain dicts (defaultdict(dict)), because each inner
+        #     map is handed to `_pick_bucket(bucket_scores: dict[str, float])` — a
+        #     defaultdict there would trip the same exact-dict check.
+        votes = defaultdict(dict)  # name -> {bucket: score} (inner = plain dict)
         # Best (highest-score) fine metadata seen for each (name, bucket).
-        best_meta: dict[tuple[str, str], dict] = {}
+        best_meta = {}  # (name, bucket) -> {score, fine_qid, label}
 
         for ent in entities:
             key = ent["text"].strip().lower()
             bucket = ent.get("coarse_type") or ent.get("type") or "other"
             score = float(ent.get("score", 0.0)) or 0.0001
-            votes[key][bucket] += score
+            bucket_scores = votes[key]  # plain dict (no default factory → use .get)
+            bucket_scores[bucket] = bucket_scores.get(bucket, 0.0) + score
             mk = (key, bucket)
             prev = best_meta.get(mk)
             if prev is None or score > prev["score"]:
