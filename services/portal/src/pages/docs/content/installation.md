@@ -10,6 +10,8 @@ curl -fsSL https://gctrl.tech/install | bash
 
 The script is interactive on first run: it detects your environment, lets you pick a model, and brings the platform up.
 
+> **For full performance, run Ollama natively.** The bundled Ollama runs inside Docker, which is **CPU-only** — Docker cannot reach your GPU (Apple Metal, or NVIDIA on Windows/Linux). Install Ollama natively on the host and point GCTRL at it in **Settings → Infrastructure**. It is the single biggest performance lever — see [Infrastructure & Ollama](infrastructure.md).
+
 ## Prerequisites
 
 | Requirement | Notes |
@@ -23,8 +25,7 @@ The script is interactive on first run: it detects your environment, lets you pi
 
 - **macOS (Apple Silicon)** — images run **native arm64**.
 - **Linux (x86_64)** — an **NVIDIA GPU is auto-detected**; when present the installer selects **CUDA** images.
-
-> On Apple Silicon, Docker cannot reach the Apple GPU (Metal). For best performance run Ollama natively — see [Infrastructure](infrastructure.md).
+- **Windows** — run it via **Docker Desktop + WSL 2**. Follow the dedicated [Windows Install](windows.md) guide.
 
 ## What the installer does
 

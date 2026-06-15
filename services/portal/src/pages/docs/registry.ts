@@ -10,6 +10,7 @@ export const DOC_GROUPS: DocGroup[] = [
     pages: [
       { slug: 'introduction', title: 'Introduction' },
       { slug: 'installation', title: 'Installation' },
+      { slug: 'windows', title: 'Windows Install' },
       { slug: 'activation', title: 'Activation & Setup' },
       { slug: 'quickstart', title: 'Quickstart' },
     ],
