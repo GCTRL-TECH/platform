@@ -47,17 +47,56 @@ Read HOT/blended first → answer → **write the new conclusion back** with `st
 
 pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first.";
 
-/// Idempotently ensure the system `gctrl-memory` skill exists/upgraded so the
-/// internal Pi agent always carries the memory-discipline guidance. Single source:
-/// the manifest prompt is `MEMORY_SKILL_MD`. Not locked → users can disable it.
+/// Core agent-discipline habits folded into Pi's system prompt. Four principles
+/// (think-first, simplicity, surgical edits, goal-driven verification) that make
+/// the agent's work reliable. Seeded as a system skill so it's on by default and
+/// toggleable per user.
+pub const AGENT_DISCIPLINE_MD: &str = r#"# Agent Discipline
+
+Four habits that make your work reliable. Apply them on every task.
+
+## 1. Think before doing
+Surface assumptions, tradeoffs, and confusion BEFORE you act. Don't assume; don't hide uncertainty. When the request is ambiguous or several approaches exist, name them and choose one with a brief reason.
+
+## 2. Simplicity first
+Do the minimum that actually solves the problem. Nothing speculative — no extra features, abstractions, or handling the task doesn't need. Fewer moving parts, less to go wrong.
+
+## 3. Surgical changes
+When editing existing work, touch only what the request requires. Preserve the surrounding structure and style. Clean up only your own mess — don't refactor or "improve" unrelated parts.
+
+## 4. Goal-driven execution
+Turn the task into explicit, verifiable success criteria. Work step by step and loop until each criterion is actually met — don't stop at "looks done". State what you verified.
+"#;
+
+/// Idempotently ensure the system skills exist/upgraded so the internal Pi agent
+/// always carries the core guidance. Single source: each manifest prompt is the
+/// const above. Not locked → users can disable any of them.
 pub async fn ensure_system_skills(db: &sqlx::PgPool) {
-    let manifest = json!({ "prompt": MEMORY_SKILL_MD });
-    let _ = sqlx::query(
-        "INSERT INTO agent_skills (user_id, slug, name, description, kind, locked, enabled, manifest)
-         VALUES (NULL, 'gctrl-memory', 'GCTRL Memory', 'Use the hot/warm/cold/wiki layers and write conclusions back so memory compounds.', 'curated', false, true, $1)
-         ON CONFLICT (slug) WHERE user_id IS NULL
-         DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, manifest = EXCLUDED.manifest"
-    ).bind(&manifest).execute(db).await;
+    let upserts: &[(&str, &str, &str, &str)] = &[
+        (
+            "gctrl-memory",
+            "GCTRL Memory",
+            "Use the hot/warm/cold/wiki layers and write conclusions back so memory compounds.",
+            MEMORY_SKILL_MD,
+        ),
+        (
+            "agent-discipline",
+            "Agent Discipline",
+            "Think before doing, keep it simple, make surgical edits, and verify against explicit success criteria.",
+            AGENT_DISCIPLINE_MD,
+        ),
+    ];
+    for (slug, name, description, prompt) in upserts {
+        let manifest = json!({ "prompt": prompt });
+        let _ = sqlx::query(
+            "INSERT INTO agent_skills (user_id, slug, name, description, kind, locked, enabled, manifest)
+             VALUES (NULL, $1, $2, $3, 'curated', false, true, $4)
+             ON CONFLICT (slug) WHERE user_id IS NULL
+             DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, manifest = EXCLUDED.manifest"
+        )
+        .bind(slug).bind(name).bind(description).bind(&manifest)
+        .execute(db).await;
+    }
 }
 
 /// GET /api/agent/skill.md — the canonical GCTRL Memory skill, as markdown, so a
