@@ -36,9 +36,9 @@ services:
       - GCTRL_VAULTS_ROOT=/vaults
       # Remote MCP gateway (/api/agent/mcp) — lets external multi-agent
       # orchestrators drive the Pi harness over the network. OFF by default;
-      # every call is api-key authed, clearance-scoped and audited. Enable only
-      # when you intend to expose the harness, then restart the api service.
-      - GCTRL_AGENT_GATEWAY_ENABLED=${GCTRL_AGENT_GATEWAY_ENABLED:-false}
+      # every call is api-key authed, clearance-scoped and audited. On by default
+      # so the MCP gateway is reachable right after install; set to false to disable.
+      - GCTRL_AGENT_GATEWAY_ENABLED=${GCTRL_AGENT_GATEWAY_ENABLED:-true}
       # ── Single source of truth for user-visible endpoint URLs ──────────────
       # The UI fetches GET /api/config/public and derives EVERY displayed URL
       # (MCP/n8n setup strings, Neo4j Browser links, agent health) from one

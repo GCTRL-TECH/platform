@@ -52,7 +52,11 @@ impl Config {
             google_client_id:     opt_env("GOOGLE_CLIENT_ID",     ""),
             google_client_secret: opt_env("GOOGLE_CLIENT_SECRET", ""),
             vaults_root:          opt_env("GCTRL_VAULTS_ROOT",     "/vaults"),
-            agent_gateway_enabled: env_bool("GCTRL_AGENT_GATEWAY_ENABLED", false),
+            // On by default so a fresh install exposes the MCP-over-HTTP gateway
+            // immediately (it's still API-key authed + clearance-scoped + audited,
+            // and 403s without a valid token). Set GCTRL_AGENT_GATEWAY_ENABLED=false
+            // to turn it off.
+            agent_gateway_enabled: env_bool("GCTRL_AGENT_GATEWAY_ENABLED", true),
             neo4j_browser_url:    opt_env("GCTRL_NEO4J_BROWSER_URL", ""),
             agent_url:            opt_env("GCTRL_AGENT_URL", ""),
         }

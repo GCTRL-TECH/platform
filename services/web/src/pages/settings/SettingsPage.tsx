@@ -1329,14 +1329,37 @@ function AgentTab() {
   const activeModel = activeProvider?.defaultModel ?? null
   const enabledSkills = skills.filter((s) => s.enabled).length
 
+  const [mcpToken, setMcpToken] = useState<string | null>(null)
+  const [genBusy, setGenBusy] = useState(false)
+  const [genErr, setGenErr] = useState<string | null>(null)
+
+  // One-click full-access token for the MCP gateway: a max-rank, non-KB-scoped
+  // Access Token. Shown once (only the hash is stored), revocable on /access.
+  async function generateFullAccessToken() {
+    setGenBusy(true); setGenErr(null)
+    try {
+      const { data } = await api.post('/users/api-keys', {
+        name: 'Full Access (MCP)',
+        maxClearanceRank: 1000,
+        kbScoped: false,
+      })
+      setMcpToken(data.key as string)
+    } catch (err: unknown) {
+      setGenErr((err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Could not create token')
+    } finally {
+      setGenBusy(false)
+    }
+  }
+
   const origin = window.location.origin
   const endpoint = `${origin}/api/agent/mcp`
+  const tokenForConfig = mcpToken ?? '<your-access-token>'
 
   const mcpConfig = JSON.stringify({
     gctrl: {
       url: endpoint,
       headers: {
-        Authorization: 'ApiKey <your-access-token>',
+        Authorization: `ApiKey ${tokenForConfig}`,
       },
     },
   }, null, 2)
@@ -1395,7 +1418,7 @@ function AgentTab() {
             </span>
           ) : (
             <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-400">
-              <WifiOff size={11} /> Disabled (default)
+              <WifiOff size={11} /> Disabled
             </span>
           )}
         </div>
@@ -1412,11 +1435,12 @@ function AgentTab() {
           <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2.5">
             <Lock size={13} className="mt-0.5 shrink-0 text-amber-400" />
             <div className="text-[11px] text-amber-200/90">
-              <p className="font-medium text-amber-300">Off by default.</p>
+              <p className="font-medium text-amber-300">Currently disabled.</p>
               <p className="mt-0.5 text-amber-200/70">
-                Enabling external access requires a server-side change: set{' '}
-                <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">GCTRL_AGENT_GATEWAY_ENABLED=true</code>{' '}
-                in the API server environment and restart the service. It cannot be toggled from the UI.
+                The gateway is on by default; it was turned off via{' '}
+                <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">GCTRL_AGENT_GATEWAY_ENABLED=false</code>.
+                Remove that (or set it to <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">true</code>) in the API
+                server environment and restart to re-enable.
               </p>
             </div>
           </div>
@@ -1452,14 +1476,46 @@ function AgentTab() {
               {copied === 'config' ? 'Copied!' : 'Copy'}
             </button>
           </div>
-          <p className="mt-2 text-[11px] text-slate-600">
-            Replace <code className="text-amber-400">&lt;your-access-token&gt;</code> with a scoped
-            Access Token. Create and scope one (clearance + per-graph grants) on the{' '}
-            <a href="/access" className="inline-flex items-center gap-0.5 text-blue-400 hover:underline">
-              Access Control page <ExternalLink size={10} />
-            </a>
-            . All tool calls made through it are audited and clearance-scoped.
-          </p>
+          {/* Full-access token generator — fills the config above on success */}
+          <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+            {mcpToken ? (
+              <div>
+                <div className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400">
+                  <Check size={12} /> Full-access token created — copy it now, it won&apos;t be shown again.
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <code className="flex-1 rounded bg-slate-800 px-2.5 py-1.5 font-mono text-xs text-amber-300 break-all">{mcpToken}</code>
+                  <button onClick={() => copyText(mcpToken, 'token')} className="rounded bg-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:text-white">
+                    {copied === 'token' ? 'Copied!' : 'Copy'}
+                  </button>
+                </div>
+                <p className="mt-2 text-[10px] text-slate-500">
+                  It&apos;s now in your API keys (config above is filled in) and can be revoked anytime on the{' '}
+                  <a href="/access" className="text-blue-400 hover:underline">Access Control page</a>.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[11px] text-slate-500">
+                  Need a token fast? Generate a <span className="text-slate-300">full-access</span> one (shown once, revocable).
+                </p>
+                <button
+                  onClick={() => void generateFullAccessToken()}
+                  disabled={genBusy}
+                  className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+                >
+                  {genBusy ? <Loader2 size={12} className="animate-spin" /> : <KeyRound size={12} />}
+                  Generate full-access token
+                </button>
+              </div>
+            )}
+            {genErr && <p className="mt-2 text-[11px] text-red-400">{genErr}</p>}
+            <p className="mt-2 text-[10px] text-slate-600">
+              Or scope a narrower token (clearance + per-graph grants) on the{' '}
+              <a href="/access" className="inline-flex items-center gap-0.5 text-blue-400 hover:underline">
+                Access Control page <ExternalLink size={10} /></a>. All calls are audited and clearance-scoped.
+            </p>
+          </div>
         </div>
       </section>
     </div>
