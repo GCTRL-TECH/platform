@@ -22,6 +22,12 @@ def check_credits(action: str, chars: int) -> dict:
         data = resp.json()
         if not data.get("allowed"):
             raise PermissionError(data.get("reason", "Credits check failed"))
+        # The agent's /check returns `credits` (the cost of this action), but
+        # callers read `credits_spent`. Normalize so the key is ALWAYS present —
+        # otherwise a reachable agent (active license) makes every job fail with
+        # KeyError: 'credits_spent' (only the grace-mode path had the key).
+        if "credits_spent" not in data:
+            data["credits_spent"] = data.get("credits", 0)
         return data
     except httpx.ConnectError:
         logger.warning("gctrl-agent unreachable — operating in grace mode")
