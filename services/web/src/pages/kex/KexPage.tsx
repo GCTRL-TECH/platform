@@ -9,7 +9,6 @@ import {
   Info,
   File,
   X,
-  Coins,
   ChevronDown,
   Plug,
   Building2,
@@ -566,10 +565,6 @@ export function KexPage() {
           <div>
             <h2 className="text-base font-semibold text-slate-100">Knowledge Extraction</h2>
             <p className="mt-0.5 text-xs text-slate-500">Extract structured knowledge from any source.</p>
-          </div>
-          <div className="flex items-center gap-1.5 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2.5 py-1 text-[10px] text-amber-400">
-            <Coins size={11} />
-            <span>5 tokens/extract</span>
           </div>
         </div>
 
