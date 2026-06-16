@@ -216,6 +216,7 @@ jobs:
         with:
           context: ./services/api-rs
           push: true
+          build-args: APP_VERSION=${{ env.VERSION }}
           tags: |
             ghcr.io/gctrl-tech/api:latest
             ghcr.io/gctrl-tech/api:${{ github.sha }}
@@ -242,6 +243,7 @@ jobs:
           context: services/web
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: APP_VERSION=${{ env.VERSION }}
           tags: |
             ghcr.io/gctrl-tech/web:latest
             ghcr.io/gctrl-tech/web:${{ github.sha }}

@@ -9,8 +9,12 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --prefer-offline --legacy-peer-deps
 
-# Copy source and build
+# Copy source and build. APP_VERSION is stamped in by CI
+# (--build-arg APP_VERSION=0.1.<run_number>); Vite bakes VITE_BUILD_VERSION
+# into the bundle so the dashboard can show which build is running.
 COPY . .
+ARG APP_VERSION=dev
+ENV VITE_BUILD_VERSION=$APP_VERSION
 RUN npm run build
 
 # Stage 2: Serve with nginx
