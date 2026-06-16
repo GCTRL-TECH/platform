@@ -625,7 +625,7 @@ def distill(compilation_id: str, user_id: str, limit: int = 15) -> dict:
             }
 
         # ── 2. Concept pages (one per coarse_type cluster) ───────────────────
-        by_coarse: dict[str, list[dict]] = defaultdict(list)
+        by_coarse = defaultdict(list)  # untyped (Cython rejects defaultdict-as-dict)
         for meta in page_meta.values():
             by_coarse[meta["coarse"]].append(meta)
         concept_meta: dict[str, dict] = {}
@@ -649,7 +649,7 @@ def distill(compilation_id: str, user_id: str, limit: int = 15) -> dict:
 
         # ── 3. Backlinks: invert the [[wikilink]] graph across all pages ─────
         all_meta = {**page_meta, **concept_meta}
-        backlinks: dict[str, list[str]] = defaultdict(list)
+        backlinks = defaultdict(list)  # untyped (Cython rejects defaultdict-as-dict)
         for src_slug, meta in all_meta.items():
             for target_slug in meta["links"]:
                 if target_slug in all_meta and target_slug != src_slug:
@@ -909,7 +909,7 @@ def _build_index_body(
         lines.append("")
 
     # Entities, grouped by coarse type.
-    by_coarse: dict[str, list[dict]] = defaultdict(list)
+    by_coarse = defaultdict(list)  # untyped (Cython rejects defaultdict-as-dict)
     for m in page_meta.values():
         by_coarse[m["coarse"]].append(m)
     lines.append(f"## Entities ({len(page_meta)})\n")

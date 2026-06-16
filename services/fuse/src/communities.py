@@ -138,7 +138,9 @@ def _louvain(names: list[str], adj: dict[str, set[str]], degree: dict[str, int])
             break
 
     # Renumber to dense 0..K-1, largest community first (community 0 = biggest).
-    members: dict[str, list[str]] = defaultdict(list)
+    # Untyped: the Cython prod build rejects a defaultdict under a `dict`
+    # annotation (PyDict_CheckExact → "Expected dict, got collections.defaultdict").
+    members = defaultdict(list)
     for n, c in comm.items():
         members[c].append(n)
     ordered = sorted(members.values(), key=lambda ms: (-len(ms), min(ms)))
@@ -188,7 +190,7 @@ def detect_communities(
         god_set = set(g for g in god if degree[g] > 0)
 
         # Auto-name each community after its highest-degree member.
-        by_comm: dict[int, list[str]] = defaultdict(list)
+        by_comm = defaultdict(list)  # untyped (Cython rejects defaultdict-as-dict)
         for n in names:
             by_comm[community[n]].append(n)
         comm_summary = []
