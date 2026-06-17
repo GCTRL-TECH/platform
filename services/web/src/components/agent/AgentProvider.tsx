@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback, useRef, type ReactNode } from 'react'
+import { createContext, useContext, useState, useCallback, useRef, useEffect, type ReactNode } from 'react'
 import { getToken } from '@/lib/auth'
 
 interface AgentMessage {
@@ -82,9 +82,20 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   // null until the Agent page decides the default (admin → full access).
   const [overrideClearanceRank, setOverrideClearanceRank] = useState<number | null>(null)
   const sessionId = useRef<string>(crypto.randomUUID())
+  // Mirror of `messages` for reading the running thread inside sendMessage without
+  // a stale closure — Pi is server-stateless, so we replay this history each turn.
+  const messagesRef = useRef<AgentMessage[]>([])
+  useEffect(() => { messagesRef.current = messages }, [messages])
 
   const sendMessage = useCallback(async (text: string) => {
     if (isStreaming) return
+
+    // Capture the PRIOR turns (working memory) before we append this turn, so the
+    // agent keeps cross-turn context. Text-only, last 8 turns, bounded length.
+    const history = messagesRef.current
+      .filter((m) => m.content.trim().length > 0)
+      .slice(-8)
+      .map((m) => ({ role: m.role, content: m.content }))
 
     const userMsg: AgentMessage = {
       id: crypto.randomUUID(),
@@ -117,6 +128,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
           sessionId: sessionId.current,
           llmProvider,
           llmModel,
+          history,
           ...(overrideClearanceRank != null ? { overrideClearanceRank } : {}),
         }),
       })

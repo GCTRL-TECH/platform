@@ -151,7 +151,7 @@ export default function WebhooksPage() {
     setLoading(true)
     setListError(null)
     try {
-      const res = await api.get('/api/webhooks')
+      const res = await api.get('/webhooks')
       setWebhooks(res.data.webhooks ?? [])
     } catch {
       setListError('Failed to load webhooks.')
@@ -194,7 +194,7 @@ export default function WebhooksPage() {
     setCreating(true)
     setCreateError(null)
     try {
-      await api.post('/api/webhooks', {
+      await api.post('/webhooks', {
         name: form.name.trim(),
         url: form.url.trim(),
         secret: form.secret.trim() || undefined,
@@ -217,7 +217,7 @@ export default function WebhooksPage() {
     setTogglingId(webhook.id)
     setRowErrors((prev) => ({ ...prev, [webhook.id]: '' }))
     try {
-      await api.put(`/api/webhooks/${webhook.id}`, { is_active: !webhook.isActive })
+      await api.put(`/webhooks/${webhook.id}`, { is_active: !webhook.isActive })
       setWebhooks((prev) =>
         prev.map((w) => (w.id === webhook.id ? { ...w, isActive: !w.isActive } : w))
       )
@@ -234,7 +234,7 @@ export default function WebhooksPage() {
     setTestingId(id)
     setRowErrors((prev) => ({ ...prev, [id]: '' }))
     try {
-      await api.post(`/api/webhooks/${id}/test`, {})
+      await api.post(`/webhooks/${id}/test`, {})
       push('Test sent')
     } catch {
       setRowErrors((prev) => ({ ...prev, [id]: 'Test request failed.' }))
@@ -249,7 +249,7 @@ export default function WebhooksPage() {
     setDeletingId(id)
     setRowErrors((prev) => ({ ...prev, [id]: '' }))
     try {
-      await api.delete(`/api/webhooks/${id}`)
+      await api.delete(`/webhooks/${id}`)
       setWebhooks((prev) => prev.filter((w) => w.id !== id))
       if (openDeliveries === id) setOpenDeliveries(null)
       push('Webhook deleted')
@@ -273,7 +273,7 @@ export default function WebhooksPage() {
     setDeliveriesLoading(id)
     setDeliveriesError((prev) => ({ ...prev, [id]: '' }))
     try {
-      const res = await api.get(`/api/webhooks/${id}/deliveries`)
+      const res = await api.get(`/webhooks/${id}/deliveries`)
       setDeliveries((prev) => ({ ...prev, [id]: (res.data.deliveries ?? []).slice(0, 10) }))
     } catch {
       setDeliveriesError((prev) => ({ ...prev, [id]: 'Failed to load deliveries.' }))

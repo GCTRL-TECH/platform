@@ -3028,7 +3028,9 @@ function InfrastructureTab() {
     setLoading(true)
     setError('')
     try {
-      const res = await api.get<SetupStatus>('/api/setup/status')
+      // `api` already prefixes baseURL `/api`; the path must NOT repeat it or it
+      // resolves to /api/api/setup/status → 404, leaving every service "Offline".
+      const res = await api.get<SetupStatus>('/setup/status')
       setStatus(res.data)
     } catch (err: any) {
       setError(err?.message ?? 'Failed to reach API')

@@ -1032,6 +1032,26 @@ async fn chat(
     let mut claims_clone = claims;
     claims_clone.agent_override_rank = Some(agent_rank);
 
+    // WORKING MEMORY: normalize the client-sent recent turns into the loop's
+    // transcript shape so the agent keeps cross-turn context. Pi stays
+    // server-stateless (no DB) — the UI owns the thread and replays it each turn.
+    // Cap to the last 8 turns; bound each content to keep the prompt lean.
+    let history_seed: Vec<Value> = req.history.clone().unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            let role = m.get("role").and_then(|r| r.as_str())?;
+            let content = m.get("content").and_then(|c| c.as_str())?;
+            if content.trim().is_empty() { return None; }
+            let r = if role == "assistant" || role == "ai" { "assistant" } else { "user" };
+            let c: String = content.chars().take(2000).collect();
+            Some(json!({ "role": r, "content": c }))
+        })
+        .collect();
+    let history_seed: Vec<Value> = {
+        let start = history_seed.len().saturating_sub(8);
+        history_seed[start..].to_vec()
+    };
+
     // Clone what we need to move into the async stream
     let state_clone = state.clone();
 
@@ -1046,7 +1066,9 @@ async fn chat(
         // This is what lets Pi "fully control" GCTRL — e.g. list_graphs →
         // get_graph → correct_relationship → confirm, in one conversation turn.
         const MAX_ITERS: usize = 6;
-        let mut convo: Vec<Value> = vec![json!({"role": "user", "content": &message})];
+        // Seed with prior turns (working memory), then this turn's question.
+        let mut convo: Vec<Value> = history_seed;
+        convo.push(json!({"role": "user", "content": &message}));
         let mut iter = 0usize;
 
         loop {
