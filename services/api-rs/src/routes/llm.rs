@@ -558,9 +558,22 @@ async fn set_model_prefs(
     Json(req): Json<SetPrefsReq>,
 ) -> Result<Json<Value>> {
     let norm = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    // A cloud embedding base is rejected unless it's a valid embedding endpoint;
-    // for ollama/local we keep it NULL (uses the user's ollama base).
-    let emb_base = norm(req.embedding_base_url);
+    let emb_provider = norm(req.embedding_provider);
+    // SSRF guard: the embedding base is fetched server-side by the KEX worker, so
+    // validate it through the same defense as the Ollama base BEFORE persisting.
+    // Cloud providers (openai/anthropic/openrouter) are pinned to their official
+    // host — an arbitrary host (e.g. http://169.254.169.254 metadata) is rejected
+    // with 400. ollama/nim/local are allowed on http/https LAN but reject embedded
+    // credentials and non-http(s) schemes. Empty → NULL (use the user's Ollama).
+    let emb_base = match norm(req.embedding_base_url) {
+        Some(b) => {
+            let prov = emb_provider.as_deref().unwrap_or("ollama");
+            let validated = crate::services::llm::validate_llm_base(prov, Some(&b))
+                .map_err(|e| AppError::BadRequest(format!("Invalid embedding base URL: {e}")))?;
+            Some(validated.as_str().trim_end_matches('/').to_string())
+        }
+        None => None,
+    };
     sqlx::query(
         "INSERT INTO user_model_prefs
             (user_id, embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model, updated_at)
@@ -575,7 +588,7 @@ async fn set_model_prefs(
     )
     .bind(claims.sub)
     .bind(norm(req.embedding_model))
-    .bind(norm(req.embedding_provider))
+    .bind(emb_provider)
     .bind(emb_base)
     .bind(norm(req.relation_model))
     .bind(norm(req.distill_model))
@@ -617,7 +630,11 @@ async fn ollama_catalog(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Json<Value> {
     let (base, key) = resolve_user_ollama(&state.db, claims.sub).await;
-    let client = reqwest::Client::new();
+    // No-redirect client: a validated base must not be able to 302 onward (SSRF).
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
 
     // Which models are installed locally right now.
     let mut installed: Vec<String> = Vec::new();
@@ -676,7 +693,11 @@ async fn ollama_pull(
         return Err(AppError::BadRequest("invalid model name".into()));
     }
     let (base, key) = resolve_user_ollama(&state.db, claims.sub).await;
-    let client = reqwest::Client::new();
+    // No-redirect client: a validated base must not be able to 302 onward (SSRF).
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
     let mut rb = client
         .post(format!("{base}/api/pull"))
         .json(&json!({ "name": model, "stream": false }))

@@ -237,6 +237,8 @@ class RelationExtractor:
                     },
                 },
                 timeout=180,
+                # SSRF hardening: don't follow redirects to a metadata endpoint.
+                allow_redirects=False,
             )
             resp.raise_for_status()
             data = resp.json()

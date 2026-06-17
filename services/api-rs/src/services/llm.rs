@@ -343,8 +343,15 @@ pub async fn inject_ollama_overrides(
             map.insert("embedding_base_url".into(), json!(base));
         }
         // Explicit embedding base override (e.g. a deliberate cloud embedder).
+        // Defense in depth: re-validate before injecting so a row that somehow
+        // bypassed write-time validation can never steer the KEX worker at an
+        // SSRF target (e.g. a cloud-metadata IP). Invalid → drop the override and
+        // fall back to the (already validated) Ollama base above.
         if let Some(b) = nz(emb_base_pref) {
-            map.insert("embedding_base_url".into(), json!(b));
+            let prov = emb_provider.as_deref().unwrap_or("ollama");
+            if let Ok(u) = validate_llm_base(prov, Some(&b)) {
+                map.insert("embedding_base_url".into(), json!(u.as_str().trim_end_matches('/')));
+            }
         }
         // The actual model choices the worker should use for THIS job.
         if let Some(m) = nz(emb_model) {

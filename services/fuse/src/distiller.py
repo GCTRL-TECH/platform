@@ -364,6 +364,8 @@ def _llm_complete(
             f"{base.rstrip('/')}/api/generate",
             json={"model": distill_model, "prompt": prompt, "stream": False},
             timeout=_LLM_TIMEOUT,
+            # SSRF hardening: don't follow redirects to a metadata endpoint.
+            allow_redirects=False,
         )
         resp.raise_for_status()
         return (resp.json().get("response") or "").strip()

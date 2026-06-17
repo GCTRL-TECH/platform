@@ -77,6 +77,9 @@ class EmbeddingClient:
             self._embed_url,
             json={"model": self.model, "input": text},
             timeout=_EMBED_TIMEOUT,
+            # SSRF hardening: never follow a redirect — a validated base must not be
+            # able to 302 the request onward to e.g. a cloud-metadata endpoint.
+            allow_redirects=False,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -97,6 +100,7 @@ class EmbeddingClient:
                 self._embed_url,
                 json={"model": self.model, "input": clean},
                 timeout=_EMBED_TIMEOUT * 2,
+                allow_redirects=False,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -127,6 +131,7 @@ class EmbeddingClient:
             json=body,
             headers=headers,
             timeout=_EMBED_TIMEOUT * 2,
+            allow_redirects=False,
         )
         resp.raise_for_status()
         data = resp.json()
