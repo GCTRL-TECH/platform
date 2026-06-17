@@ -2,6 +2,22 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Native <select> dropdowns — force a dark option list app-wide. Some browsers
+   (notably Windows/Chrome) render the native <option> popup white-on-white and
+   ignore `color-scheme: dark` on the <select>, so we style options explicitly.
+   Un-layered, so it wins over Tailwind's base reset. */
+select {
+  color-scheme: dark;
+}
+select option,
+select optgroup {
+  background-color: #0f172a; /* slate-950 */
+  color: #f1f5f9;            /* slate-100 */
+}
+select option:disabled {
+  color: #64748b;            /* slate-500 */
+}
+
 @layer base {
   :root {
     --background: #0f172a;
