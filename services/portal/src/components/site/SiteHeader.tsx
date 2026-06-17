@@ -12,6 +12,7 @@ const NAV: [label: string, href: string][] = [
 
 const USE_CASES: [label: string, href: string, desc: string][] = [
   ['Agentic Team Memory', '/use-cases#agentic-team-memory', 'Shared, access-controlled memory for your AI team'],
+  ['Airtight Client Projects', '/use-cases#project-isolation', 'One source of truth, per-project isolation — nothing mixes, even by accident'],
   ['Activate Your Legacy Data', '/use-cases#legacy-revival', 'Turn old mailservers, SharePoint & SQL into a clean graph'],
 ]
 
