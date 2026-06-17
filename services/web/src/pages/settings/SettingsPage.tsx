@@ -616,7 +616,10 @@ function ModelChooser() {
                 )
               })}
             </div>
-            {sel && !selInstalled && (
+            {/* Only warn about a missing install when we can actually see the
+                installed set — if Ollama is unreachable the list is empty and
+                every model would falsely look uninstalled. */}
+            {sel && !selInstalled && data?.ollamaReachable && (
               <p className="mt-1.5 flex items-center gap-1 text-[11px] text-amber-400">
                 <AlertTriangle size={11} /> The selected model isn't installed yet — click Install so the engine can use it.
               </p>
