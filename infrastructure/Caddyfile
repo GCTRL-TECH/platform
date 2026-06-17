@@ -43,3 +43,10 @@
         }
     }
 }
+
+# ─── Cookieless analytics (self-hosted Umami) ───────────────────────────────
+# Auto-TLS via Let's Encrypt. Requires an A record analytics.gctrl.tech -> VPS IP.
+analytics.gctrl.tech {
+    reverse_proxy umami:3000
+    encode gzip zstd
+}

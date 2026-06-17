@@ -20,6 +20,7 @@ interface LlmModelsResponse {
 interface LlmProviderState {
   provider: string
   connected: boolean
+  defaultModel?: string | null
 }
 interface LlmProvidersResponse {
   providers: LlmProviderState[]
@@ -55,24 +56,32 @@ export function PiConsole() {
   )
   const models = modelsData?.models ?? []
 
-  // Repair the selected model once the list loads: if it's empty, an embedding
-  // model, or no longer in the (embedding-filtered) list, pick a known-good
-  // local chat model so the widget never sits on a non-working default.
-  useEffect(() => {
-    if (models.length === 0) return
-    if (llmProvider === 'ollama' && !isValidChatSelection(llmModel, models)) {
-      const def = pickDefaultChatModel(models)
-      if (def && def !== llmModel) setLlmModel(def)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [models])
-
   // Connected providers — drives the agent-first "connect an LLM" nudge.
   const { data: providersData, isLoading: providersLoading } = useApiQuery<LlmProvidersResponse>(
     ['llm', 'providers'],
     '/llm/providers',
     { retry: false, staleTime: 60_000, enabled: isOpen }
   )
+
+  // Repair the selected model once the list loads: if it's empty, an embedding
+  // model, or no longer in the (embedding-filtered) list, pick a known-good chat
+  // model so the widget never sits on a non-working default.
+  useEffect(() => {
+    if (models.length === 0) return
+    if (llmProvider === 'ollama' && !isValidChatSelection(llmModel, models)) {
+      // Prefer the user's configured provider default (e.g. a working cloud model)
+      // over the "biggest local" heuristic, which can pick a model that crashes.
+      const configured = (providersData?.providers ?? [])
+        .find((p) => p.connected && p.defaultModel)?.defaultModel
+      const def = pickDefaultChatModel(models, configured)
+      if (def && def !== llmModel) {
+        const match = models.find((m) => m.model === def)
+        if (match && match.provider !== llmProvider) setLlmProvider(match.provider)
+        setLlmModel(def)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [models, providersData])
   const hasProvider = (providersData?.providers ?? []).some((p) => p.connected)
   const hasModel = models.some((m) => m.available !== false)
   // First-run nudge: render a connect card instead of the chat input when no

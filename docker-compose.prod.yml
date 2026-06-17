@@ -309,6 +309,50 @@ services:
         limits:
           memory: 256M
 
+  # ─── Umami (cookieless web analytics) ───────────────────────────────
+  # Self-hosted, GDPR-by-design: no cookies, no consent banner, data stays
+  # on our infra. Served at https://analytics.gctrl.tech (Caddy → :3000).
+  # Its own Postgres keeps analytics physically isolated from the KG platform.
+  umami:
+    image: ghcr.io/umami-software/umami:postgresql-latest
+    container_name: gctrl-umami
+    restart: unless-stopped
+    environment:
+      - DATABASE_TYPE=postgresql
+      - DATABASE_URL=postgresql://umami:${UMAMI_DB_PASSWORD}@umami-db:5432/umami
+      - APP_SECRET=${UMAMI_APP_SECRET}
+    depends_on:
+      umami-db:
+        condition: service_healthy
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  umami-db:
+    image: postgres:16-alpine
+    container_name: gctrl-umami-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=umami
+      - POSTGRES_PASSWORD=${UMAMI_DB_PASSWORD}
+      - POSTGRES_DB=umami
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umami"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - umami-db-data:/var/lib/postgresql/data
+    networks:
+      - GCTRL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
 # ─── Volumes ────────────────────────────────────────────────────────
 volumes:
   caddy-data:
@@ -320,6 +364,7 @@ volumes:
   GCTRL-prometheus:
   GCTRL-grafana:
   kex-models:
+  umami-db-data:
 
 # ─── Networks ───────────────────────────────────────────────────────
 networks:

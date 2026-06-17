@@ -141,6 +141,15 @@ struct ChatReq {
     llm_provider: Option<String>,
     #[serde(rename = "llmModel")]
     llm_model: Option<String>,
+    /// Per-session clearance the agent should operate at (a classification rank, or
+    /// i32::MAX for full access). Admins default to full access when omitted; a
+    /// session may downgrade. A non-admin can never exceed their stored rank.
+    #[serde(rename = "overrideClearanceRank")]
+    override_clearance_rank: Option<i32>,
+    /// Recent conversation turns from the client. Pi is server-stateless (the UI
+    /// holds the thread), so the client sends the running history to seed the loop
+    /// — that's what gives the agent cross-turn memory. `[{role, content}]`.
+    history: Option<Vec<Value>>,
 }
 
 // ── System prompt ─────────────────────────────────────────────────────────────
@@ -1006,9 +1015,25 @@ async fn chat(
     // Build the effective system prompt: GCTRL base + the caller's enabled skills.
     let system_prompt = build_system_prompt(&state, &claims).await;
 
+    // Per-session clearance the agent runs at. The onboard CTO agent (admin)
+    // defaults to FULL access (i32::MAX) so it can operate the whole system; any
+    // session may DOWNGRADE. A non-admin can never exceed their stored rank.
+    // `agent_override_rank` on the claims flows through every tool's existing rank
+    // gate (get_user_clearance_rank / effective_rank_for_compilation) — no per-tool
+    // plumbing. It's `#[serde(skip)]`, so it can never be forged via a token.
+    let stored_rank = crate::routes::kg::get_user_clearance_rank(&state.db, &claims).await;
+    let is_admin = claims.role == "admin";
+    let agent_rank = match req.override_clearance_rank {
+        Some(r) if is_admin => r,
+        Some(r) => r.min(stored_rank),   // non-admin: downgrade only
+        None if is_admin => i32::MAX,    // admin default: full access
+        None => stored_rank,
+    };
+    let mut claims_clone = claims;
+    claims_clone.agent_override_rank = Some(agent_rank);
+
     // Clone what we need to move into the async stream
     let state_clone = state.clone();
-    let claims_clone = claims;
 
     let event_stream = async_stream::stream! {
         use crate::services::llm::{self, ChatMessages};

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Eye, EyeOff, AlertCircle, CheckCircle } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
+import { track } from '@/lib/analytics'
 
 export function RegisterPage() {
   const { register } = useAuth()
@@ -23,6 +24,7 @@ export function RegisterPage() {
     setLoading(true)
     try {
       await register(email, password)
+      track('signup')
       navigate('/dashboard', { replace: true })
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error

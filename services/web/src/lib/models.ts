@@ -28,9 +28,18 @@ export function isEmbeddingModel(model: string | null | undefined): boolean {
 // Preference order for a known-good LOCAL chat model, then any available one.
 const PREFERRED = ['qwen2.5', 'qwen2.5:7b', 'llama3.2', 'llama3.1', 'mistral']
 
-export function pickDefaultChatModel(models: LlmModel[]): string | null {
+export function pickDefaultChatModel(models: LlmModel[], preferred?: string | null): string | null {
   const usable = models.filter((m) => m.available && !isEmbeddingModel(m.model))
   if (usable.length === 0) return null
+  // Honor the user's explicitly configured default first (e.g. a provider
+  // default_model). Critical on machines where the "best local" model crashes
+  // (e.g. an Ollama runner that dies on qwen) but the user has set a working
+  // cloud model as their default — we must not snap back to the crashing local.
+  if (preferred) {
+    const want = preferred.trim()
+    const hit = usable.find((m) => m.model === want)
+    if (hit) return hit.model
+  }
   for (const pref of PREFERRED) {
     const hit = usable.find((m) => m.model === pref || m.model.startsWith(`${pref}:`))
     if (hit) return hit.model

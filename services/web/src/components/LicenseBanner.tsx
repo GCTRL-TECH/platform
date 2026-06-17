@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { X, RefreshCw, Copy, Check } from 'lucide-react'
 import { cn, agentHealthUrl } from '@/lib/utils'
+import { getToken } from '@/lib/auth'
 
 export interface AgentStatus {
   activated: boolean
@@ -75,81 +76,123 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
     setPhase('connecting')
     phaseRef.current = 'connecting'
 
-    const es = new EventSource('/api/update', { withCredentials: true })
+    // NOTE: this used to use EventSource, but `/api/update` is behind require_auth
+    // and EventSource cannot send an `Authorization: Bearer` header — so the SSE
+    // request was unauthenticated → 401 → "Could not reach update service". We
+    // stream via fetch (which CAN send the token) and parse SSE frames by hand,
+    // the same pattern AgentProvider uses for the agent chat stream.
+    const controller = new AbortController()
     let closed = false
 
     const fail = (message: string, cmd?: string) => {
       if (closed) return
-      // Never override a terminal success state.
-      if (phaseRef.current === 'done') return
+      if (phaseRef.current === 'done') return // never override terminal success
       closed = true
       window.clearTimeout(stallTimer)
       setError(message)
       setManualCommand(cmd ?? MANUAL_COMMAND)
       setPhase('error')
-      es.close()
+      controller.abort()
     }
 
     // Stall guard: no event at all within the window → treat as unreachable.
-    let stallTimer = window.setTimeout(() => {
+    const stallTimer = window.setTimeout(() => {
       fail('Update service did not respond. It may be unreachable or stalled.')
     }, STALL_TIMEOUT_MS)
 
     const advance = (next: UpdatePhase) => {
       setPhase((prev) => {
         if (prev === 'done' || prev === 'error') return prev
-        // Don't move backwards (e.g. a late pull line after restart began).
         if (prev === 'restarting' && next === 'pulling') return prev
         return next
       })
     }
 
-    es.addEventListener('progress', (e) => {
-      // First byte of life — disarm the stall guard.
-      window.clearTimeout(stallTimer)
-      const data = JSON.parse(e.data) as ProgressLine
-      const next = phaseFromStep(data.step)
-      if (next) advance(next)
-      else if (phaseRef.current === 'connecting') advance('pulling')
-      setLines((prev) => {
-        // Collapse repeated pull progress lines into the last entry for the same image
-        if (data.step === 'pull' && prev.length > 0) {
-          const last = prev[prev.length - 1]!
-          if (last.step === 'pull' && last.image === data.image) {
-            return [...prev.slice(0, -1), data]
+    const dispatch = (eventType: string, dataStr: string) => {
+      if (eventType === 'progress') {
+        window.clearTimeout(stallTimer) // first byte of life
+        let data: ProgressLine
+        try { data = JSON.parse(dataStr) as ProgressLine } catch { return }
+        const next = phaseFromStep(data.step)
+        if (next) advance(next)
+        else if (phaseRef.current === 'connecting') advance('pulling')
+        setLines((prev) => {
+          if (data.step === 'pull' && prev.length > 0) {
+            const last = prev[prev.length - 1]!
+            if (last.step === 'pull' && last.image === data.image) {
+              return [...prev.slice(0, -1), data]
+            }
+          }
+          return [...prev, data]
+        })
+      } else if (eventType === 'done') {
+        window.clearTimeout(stallTimer)
+        closed = true
+        setPhase('done')
+        phaseRef.current = 'done'
+        controller.abort()
+        setTimeout(() => window.location.reload(), 4000)
+      } else if (eventType === 'error') {
+        try {
+          const data = JSON.parse(dataStr) as { message?: string; manualCommand?: string }
+          fail(data.message ?? 'Update failed', data.manualCommand)
+        } catch {
+          fail('Update failed — run manually')
+        }
+      }
+    }
+
+    void (async () => {
+      try {
+        const token = getToken()
+        const resp = await fetch('/api/update', {
+          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          signal: controller.signal,
+        })
+        if (!resp.ok || !resp.body) {
+          fail(resp.status === 401
+            ? 'Not authorized to run the update (please sign in again).'
+            : 'Could not reach update service')
+          return
+        }
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        // SSE frames are separated by a blank line; each frame has `event:` +
+        // `data:` lines (and `:`-prefixed keep-alive comments we skip).
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          let sep: number
+          while ((sep = buffer.indexOf('\n\n')) !== -1) {
+            const frame = buffer.slice(0, sep)
+            buffer = buffer.slice(sep + 2)
+            let eventType = 'message'
+            const dataLines: string[] = []
+            for (const rawLine of frame.split('\n')) {
+              const line = rawLine.replace(/\r$/, '')
+              if (line.startsWith(':')) continue
+              if (line.startsWith('event:')) eventType = line.slice(6).trim()
+              else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
+            }
+            if (eventType !== 'message' || dataLines.length) dispatch(eventType, dataLines.join('\n'))
           }
         }
-        return [...prev, data]
-      })
-    })
-
-    es.addEventListener('done', () => {
-      window.clearTimeout(stallTimer)
-      closed = true
-      setPhase('done')
-      phaseRef.current = 'done'
-      es.close()
-      setTimeout(() => window.location.reload(), 4000)
-    })
-
-    es.addEventListener('error', (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as { message?: string; manualCommand?: string }
-        fail(data.message ?? 'Update failed', data.manualCommand)
-      } catch {
-        fail('Update failed — run manually')
+        // Stream ended without a terminal `done` → surface it (the api restarts
+        // itself AFTER `done`, so a clean end always has `done` first).
+        if (!closed && phaseRef.current !== 'done') {
+          fail('Update stream ended before completing.')
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) fail('Could not reach update service')
       }
-    })
-
-    // Transport-level failure (e.g. 503 no socket, connection dropped).
-    es.onerror = () => {
-      fail('Could not reach update service')
-    }
+    })()
 
     return () => {
       closed = true
       window.clearTimeout(stallTimer)
-      es.close()
+      controller.abort()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attempt])

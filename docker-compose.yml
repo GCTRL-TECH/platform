@@ -68,6 +68,10 @@ services:
       # Expose operator-chosen vault folders read-only. The API reads .md bytes
       # from here for server-side Obsidian folder vaults (under GCTRL_VAULTS_ROOT).
       - ${GCTRL_VAULTS_ROOT_HOST:-./vaults}:/vaults:ro
+      # The in-dashboard "Update now" button drives docker via this socket
+      # (pull + recreate). Without it the update executor can't reach docker
+      # (matches deploy/compose-template.yml, which already mounts it).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - GCTRL
       - ollama-net

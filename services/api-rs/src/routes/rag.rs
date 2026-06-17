@@ -22,6 +22,10 @@ struct QueryReq {
     depth: Option<String>,
     #[serde(rename = "llmConfig")] llm_config: Option<Value>,
     #[serde(rename = "conversationId")] conversation_id: Option<Uuid>,
+    /// Incognito-mode conversation history sent by the client (never persisted —
+    /// GDPR). Standard mode loads history server-side from `conversation_id`. Each
+    /// item is `{ role: 'human'|'ai'|'user'|'assistant', content }`.
+    context: Option<Vec<Value>>,
 }
 
 impl QueryReq {
@@ -332,6 +336,100 @@ async fn match_wiki_page(
     best.map(|(_, t, b, c)| (t, b, c))
 }
 
+// ── Working memory (conversation history) ─────────────────────────────────────
+// The hot/warm/cold/wiki memory layers are all in place; the missing tier is
+// WORKING memory — the running conversation. Without it every question is answered
+// in isolation, so follow-ups ("and his email?") lose their referent and the user
+// must re-state context. These helpers thread the recent turns into both the
+// prompt (so the model resolves references) AND the retrieval query (so search
+// finds the right entity for an elliptical follow-up).
+
+/// Load the last `limit` turns of a conversation as provider-neutral chat messages
+/// (`[{role:'user'|'assistant', content}]`) in chronological order. Owner-scoped via
+/// the join on `conversations.user_id`. DB roles 'human'/'ai' map to user/assistant;
+/// each content is capped to bound tokens. Best-effort — empty on any DB issue.
+async fn load_recent_turns(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    conversation_id: Uuid,
+    limit: i64,
+) -> Vec<Value> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT m.role, m.content FROM messages m \
+         JOIN conversations c ON c.id = m.conversation_id \
+         WHERE m.conversation_id = $1 AND c.user_id = $2 \
+         ORDER BY m.created_at DESC LIMIT $3"
+    ).bind(conversation_id).bind(user_id).bind(limit)
+     .fetch_all(db).await.unwrap_or_default();
+    // Rows come newest-first; reverse to chronological for the prompt.
+    rows.into_iter().rev().map(|(role, content)| {
+        let r = if role == "ai" { "assistant" } else { "user" };
+        let c: String = content.chars().take(2000).collect();
+        json!({ "role": r, "content": c })
+    }).collect()
+}
+
+/// Normalize a client-sent `context` array (incognito — never persisted) into the
+/// same provider-neutral message shape, keeping the last `limit` turns in order.
+fn history_from_context(ctx: &[Value], limit: usize) -> Vec<Value> {
+    let mapped: Vec<Value> = ctx.iter().filter_map(|m| {
+        let role = m.get("role").and_then(|r| r.as_str())?;
+        let content = m.get("content").and_then(|c| c.as_str())?;
+        if content.trim().is_empty() { return None; }
+        let r = match role { "ai" | "assistant" => "assistant", _ => "user" };
+        let c: String = content.chars().take(2000).collect();
+        Some(json!({ "role": r, "content": c }))
+    }).collect();
+    let start = mapped.len().saturating_sub(limit);
+    mapped[start..].to_vec()
+}
+
+/// Resolve the conversation history for grounding follow-ups:
+///   • incognito → the client-sent `context` (server stays stateless — GDPR);
+///   • standard  → the persisted turns loaded by `conversation_id`.
+async fn resolve_history(
+    db: &sqlx::PgPool,
+    claims: &Option<JwtClaims>,
+    req: &QueryReq,
+) -> Vec<Value> {
+    const MAX_TURNS: usize = 8; // 4 exchanges — enough context, bounded tokens
+    if req.mode.as_deref() == Some("incognito") {
+        return req.context.as_deref().map(|c| history_from_context(c, MAX_TURNS)).unwrap_or_default();
+    }
+    match (claims, req.conversation_id) {
+        (Some(c), Some(cid)) => load_recent_turns(db, c.sub, cid, MAX_TURNS as i64).await,
+        _ => Vec::new(),
+    }
+}
+
+/// Rewrite a possibly-elliptical follow-up into a STANDALONE retrieval query using
+/// the recent history ("and his email?" → "Fabio Chiaramonte email"). One cheap LLM
+/// call; returns the original message unchanged when there is no history or on any
+/// failure, so first turns pay nothing and retrieval never breaks.
+async fn contextualize_query(
+    client: &reqwest::Client,
+    target: &crate::services::llm::LlmTarget,
+    history: &[Value],
+    message: &str,
+) -> String {
+    if history.is_empty() { return message.to_string(); }
+    let convo = history.iter().filter_map(|m| {
+        let r = m["role"].as_str()?;
+        let c = m["content"].as_str()?;
+        let who = if r == "assistant" { "Assistant" } else { "User" };
+        Some(format!("{who}: {}", c.chars().take(400).collect::<String>()))
+    }).collect::<Vec<_>>().join("\n");
+    let sys = "You rewrite a user's latest chat message into ONE standalone search query that resolves all pronouns and references using the conversation above. Output ONLY the query text — no quotes, no preamble, no explanation. If the message is already self-contained, return it unchanged.";
+    let user = format!("Conversation so far:\n{convo}\n\nLatest message: {message}\n\nStandalone search query:");
+    match crate::services::llm::chat_once(client, target, sys, &user).await {
+        Ok(s) => {
+            let q = s.trim().trim_matches('"').trim().to_string();
+            if q.is_empty() || q.chars().count() > 400 { message.to_string() } else { q }
+        }
+        Err(_) => message.to_string(),
+    }
+}
+
 async fn query(
     State(state): State<Arc<crate::models::AppState>>,
     Extension(claims): Extension<Option<JwtClaims>>,
@@ -410,6 +508,11 @@ async fn query(
 
     let client = reqwest::Client::new();
 
+    // WORKING MEMORY: resolve the running conversation — persisted turns (standard)
+    // or client-sent context (incognito) — so BOTH the deep and fast paths can
+    // ground elliptical follow-ups instead of answering each question in isolation.
+    let history = resolve_history(&state.db, &claims, &req).await;
+
     // ── Deep (agentic) mode ───────────────────────────────────────────────────
     // Opt-in multi-hop path: drive the agent's tool-calling loop instead of one
     // single-pass LLM call. Requires authentication (the agent tools resolve a
@@ -418,9 +521,35 @@ async fn query(
     // unauthenticated callers — they have no agent tools/provider to drive.
     if req.is_deep() {
         if let Some(ref c) = claims {
-            return deep_query(&state, c, &req, eff_rank).await;
+            return deep_query(&state, c, &req, eff_rank, &history).await;
         }
         // No claims → no agent context; fall through to the fast public path.
+    }
+
+    // Resolve the per-user provider/model up front (the fast path needs it BEFORE
+    // retrieval so it can contextualize the search query). Honours
+    // llmConfig.provider/model; unauthenticated → Ollama default.
+    let requested_provider = req.llm_config.as_ref().and_then(|c| c["provider"].as_str());
+    let requested_model = req.llm_config.as_ref().and_then(|c| c["model"].as_str());
+    let target = match &claims {
+        Some(c) => crate::services::llm::resolve_for_user(
+            &state.db, c.sub, requested_provider, requested_model,
+        ).await,
+        None => crate::services::llm::LlmTarget {
+            provider: "ollama".into(),
+            model: requested_model.unwrap_or("qwen2.5:7b").to_string(),
+            base_url: None,
+            api_key: None,
+        },
+    };
+
+    // Contextualize retrieval: for a follow-up, rewrite it into a standalone query
+    // using the conversation so search finds the right entity. First turn (no
+    // history) → unchanged, so no extra cost. Used for chunk search + dossier/entity
+    // resolution; the ORIGINAL message stays the question shown to the model.
+    let search_query = contextualize_query(&client, &target, &history, &req.message).await;
+    if search_query != req.message {
+        tracing::info!("rag: contextualized follow-up '{}' → '{}'", req.message, search_query);
     }
 
     // ── 1. Semantic search via KEX ────────────────────────────────────────────
@@ -439,15 +568,18 @@ async fn query(
 
     let kex_url = format!("{}/search", state.cfg.kex_worker_url);
     let kex_body = json!({
-        "query":          req.message,
-        "limit":          5,
+        // Contextualized query (resolves follow-up references); falls back to the
+        // raw message on the first turn. Fetch a larger candidate pool (8) so the
+        // hybrid dense+lexical fusion has more to rank, then we rerank + keep top 5.
+        "query":          search_query,
+        "limit":          8,
         "compilation_id": req.compilation_id,
         // Scope retrieval to the caller's own chunks (grounding + no cross-user leak).
         "user_id":        claims.as_ref().map(|c| c.sub),
         "max_rank":       eff_rank,
     });
 
-    let chunks: Vec<KexChunk> = match client
+    let mut chunks: Vec<KexChunk> = match client
         .post(&kex_url)
         .json(&kex_body)
         .timeout(std::time::Duration::from_secs(10))
@@ -466,6 +598,39 @@ async fn query(
             vec![]
         }
     };
+
+    // Query-aware rerank over the hybrid-fused candidates. KEX already fuses
+    // dense+lexical (RRF); this nudges chunks whose text / entity mentions overlap
+    // the (contextualized) query terms to the top, then keeps the best 5 so the
+    // prompt stays focused. A small additive bonus — it breaks ties toward
+    // query-relevant chunks without overriding a strongly-retrieved one.
+    {
+        let terms: Vec<String> = search_query
+            .to_lowercase()
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|t| t.chars().count() >= 3)
+            .map(|t| t.to_string())
+            .collect();
+        if !terms.is_empty() {
+            let score_of = |base: f64, text: &str, mentions: &Option<Vec<String>>| -> f64 {
+                let hay = text.to_lowercase();
+                let mut overlap = 0.0f64;
+                for t in &terms {
+                    if hay.contains(t) { overlap += 1.0; }
+                    if let Some(ms) = mentions {
+                        if ms.iter().any(|m| m.to_lowercase().contains(t)) { overlap += 0.5; }
+                    }
+                }
+                base + (overlap / terms.len() as f64) * 0.25
+            };
+            chunks.sort_by(|a, b| {
+                let sa = score_of(a.score, &a.text, &a.entity_mentions);
+                let sb = score_of(b.score, &b.text, &b.entity_mentions);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        chunks.truncate(5);
+    }
 
     // A4 — HEAT on chunks. Every chunk that was actually returned by retrieval (and
     // therefore used to ground this answer) gets heat/access bumped in one cheap
@@ -610,12 +775,14 @@ async fn query(
         }
     }
     if let Some(ref c) = claims {
+        // Use the CONTEXTUALIZED query so a follow-up ("and his email?") still
+        // resolves the referenced entity's dossier (the rewrite carries the name).
         let mut candidates =
-            crate::routes::kg::dossiers_referenced_by_query(&state.db, c.sub, &req.message).await;
+            crate::routes::kg::dossiers_referenced_by_query(&state.db, c.sub, &search_query).await;
         // If the query names an OWNED entity that has no dossier yet, build it now.
         if candidates.is_empty() {
             // Cheap heuristic: try the longest capitalised token-run in the query.
-            if let Some(name) = first_proper_name(&req.message) {
+            if let Some(name) = first_proper_name(&search_query) {
                 if crate::routes::kg::build_dossier_via_fuse(&state, c.sub, &name).await
                     .ok().flatten().is_some()
                 {
@@ -734,34 +901,17 @@ async fn query(
         })));
     }
 
-    // ── 4. LLM call with context ──────────────────────────────────────────────
-    // Resolve the per-user provider/model (honours llmConfig.provider/model;
-    // falls back to the user's active provider, else local Ollama). Unauthenticated
-    // callers (no claims) get the Ollama default. The decrypted key is used here
-    // only — never returned to the client.
-    let requested_provider = req.llm_config.as_ref().and_then(|c| c["provider"].as_str());
-    let requested_model = req.llm_config.as_ref().and_then(|c| c["model"].as_str());
-    let target = match &claims {
-        Some(c) => crate::services::llm::resolve_for_user(
-            &state.db, c.sub, requested_provider, requested_model,
-        ).await,
-        None => crate::services::llm::LlmTarget {
-            provider: "ollama".into(),
-            model: requested_model.unwrap_or("qwen2.5:7b").to_string(),
-            base_url: None,
-            api_key: None,
-        },
-    };
-
+    // ── 4. LLM call with context (+ working memory) ───────────────────────────
+    // `target` was resolved up front (before retrieval, for query contextualization).
+    // The conversation `history` is threaded in as prior turns so the model resolves
+    // references ("his email", "that company") instead of forcing the user to repeat.
     let user_content = if context.is_empty() {
         req.message.clone()
     } else {
         format!("Context:\n{context}\n\nQuestion: {}", req.message)
     };
 
-    let answer = crate::services::llm::chat_once(
-        &client,
-        &target,
+    let system_prompt =
         "You are a knowledge-base assistant. Answer the question using ONLY the provided context. \
          The context is ranked into TRUST TIERS, highest first: \
          (1) the HOT BLOCK — a pinned/dossier of authoritative, compiled ground-truth about an entity; \
@@ -771,8 +921,16 @@ async fn query(
          SYNTHESIZE a complete answer FROM the context: read every numbered chunk, pull out the relevant facts, and compile them. When the user asks for a summary, profile, CV, work history, biography, or 'everything about X', BUILD that answer — list the concrete facts you find (roles, employers, education, languages, skills, dates, contact details) and organise them. \
          NEVER reply with 'refer to the file', 'see the document', or 'the full X is not available' when context is present — the context IS the document; report it, don't redirect the user. The chunk text may have minor extraction artefacts (odd spacing); read through them and still report the facts. \
          Cite sources inline as [1], [2], … matching the numbered passages; cite the HOT BLOCK as the dossier and name its origin files when asked about provenance. \
-         If — and only if — NO tier contains a relevant fact, say it isn't in the knowledge base. Do NOT use outside or general knowledge, and do not guess.",
-        &user_content,
+         If — and only if — NO tier contains a relevant fact, say it isn't in the knowledge base. Do NOT use outside or general knowledge, and do not guess. \
+         Use the prior conversation turns to resolve references (pronouns, 'that', 'the same one') — but ground every FACT in the context above, never invent from the chat alone.";
+
+    // Thread the conversation: prior turns first, then the grounded question.
+    let mut chat_msgs: Vec<Value> = history.clone();
+    chat_msgs.push(json!({ "role": "user", "content": user_content }));
+    let answer = crate::services::llm::chat_messages_once(
+        &client,
+        &target,
+        &crate::services::llm::ChatMessages { system: system_prompt, messages: chat_msgs },
     )
     .await
     .map_err(AppError::Internal)?;
@@ -867,6 +1025,7 @@ async fn deep_query(
     claims: &JwtClaims,
     req: &QueryReq,
     eff_rank: i64,
+    history: &[Value],
 ) -> Result<Json<Value>> {
     use crate::services::llm::{self, ChatMessages};
 
@@ -879,6 +1038,11 @@ async fn deep_query(
     let requested_provider = req.llm_config.as_ref().and_then(|c| c["provider"].as_str());
     let requested_model = req.llm_config.as_ref().and_then(|c| c["model"].as_str());
     let target = llm::resolve_for_user(&state.db, claims.sub, requested_provider, requested_model).await;
+
+    // WORKING MEMORY: contextualize the question against the running conversation so
+    // dossier/entity resolution (and the agent's own framing) follow a follow-up's
+    // referent. The original message stays the user turn; this only steers retrieval.
+    let search_query = contextualize_query(&client, &target, history, &req.message).await;
 
     // GCTRL base + the caller's enabled skills, plus a deep-mode preamble nudging
     // the model to gather evidence via tools before answering with citations.
@@ -893,9 +1057,9 @@ async fn deep_query(
     // gets the highest-trust answer before it ever calls a tool, so it states the
     // answer directly instead of hedging or re-querying.
     let mut hot_candidates =
-        crate::routes::kg::dossiers_referenced_by_query(&state.db, claims.sub, &req.message).await;
+        crate::routes::kg::dossiers_referenced_by_query(&state.db, claims.sub, &search_query).await;
     if hot_candidates.is_empty() {
-        if let Some(name) = first_proper_name(&req.message) {
+        if let Some(name) = first_proper_name(&search_query) {
             if crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await
                 .ok().flatten().is_some()
             {
@@ -951,8 +1115,11 @@ async fn deep_query(
         hint = compilation_hint,
     );
 
-    // Conversation transcript threaded across turns (user/assistant/tool).
-    let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": &req.message })];
+    // Conversation transcript threaded across turns (user/assistant/tool). Seed it
+    // with the prior conversation (working memory) so the agent resolves follow-up
+    // references, THEN append this turn's question.
+    let mut messages: Vec<Value> = history.to_vec();
+    messages.push(json!({ "role": "user", "content": &req.message }));
 
     // Evidence surfaced by tools, deduped, for the response `sources`/`graphTrace`.
     let mut sources: Vec<Value> = Vec::new();

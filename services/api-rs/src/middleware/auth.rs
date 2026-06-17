@@ -19,6 +19,12 @@ pub struct JwtClaims {
     /// Drives per-graph grants and the access audit trail. None for JWT auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_id: Option<uuid::Uuid>,
+    /// In-process-only per-session clearance override (NOT part of the JWT). Set
+    /// by the agent chat handler so the onboard CTO agent can run at full access
+    /// (i32::MAX) for an admin, or a downgraded rank. `#[serde(skip)]` means it is
+    /// never read from or written to a token, so it can't be forged.
+    #[serde(skip)]
+    pub agent_override_rank: Option<i32>,
 }
 
 pub async fn require_auth(
@@ -97,6 +103,7 @@ pub async fn require_auth(
             exp: usize::MAX,
             api_key_rank: Some(max_rank),
             api_key_id: Some(key_id),
+            agent_override_rank: None,
         }
     } else {
         return Err(StatusCode::UNAUTHORIZED);
@@ -152,6 +159,7 @@ pub async fn optional_auth(
                 exp: usize::MAX,
                 api_key_rank: Some(max_rank),
                 api_key_id: Some(key_id),
+                agent_override_rank: None,
             })
         }
         _ => None,

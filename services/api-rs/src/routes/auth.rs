@@ -106,6 +106,7 @@ async fn register(
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
         api_key_rank: None,
         api_key_id: None,
+        agent_override_rank: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
@@ -141,6 +142,7 @@ async fn login(
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
         api_key_rank: None,
         api_key_id: None,
+        agent_override_rank: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
@@ -177,6 +179,7 @@ async fn refresh(
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
         api_key_rank: None,
         api_key_id: None,
+        agent_override_rank: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),

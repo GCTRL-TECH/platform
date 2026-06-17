@@ -22,7 +22,16 @@ interface AgentContextValue {
   setLlmProvider: (p: string) => void
   llmModel: string
   setLlmModel: (m: string) => void
+  // Per-session clearance the agent operates at (a classification rank, or
+  // FULL_ACCESS_RANK for "full access"). null = use the server default
+  // (admins → full access). Sent on each chat request.
+  overrideClearanceRank: number | null
+  setOverrideClearanceRank: (r: number | null) => void
 }
+
+// i32::MAX — the backend's "full access" sentinel (must fit in an i32, so NOT
+// Number.MAX_SAFE_INTEGER).
+export const FULL_ACCESS_RANK = 2147483647
 
 const AgentContext = createContext<AgentContextValue | null>(null)
 
@@ -40,6 +49,22 @@ function lsGet(key: string, fallback: string): string {
   }
 }
 
+// Turn a raw LLM transport error into a useful hint. A local Ollama model that
+// crashes the runner ("signal arrived during cgo execution" / "runner process
+// has terminated", usually a 500) means *that model* can't run on this machine —
+// guide the user to switch models rather than showing a wall of stack text.
+function humanizeAgentError(raw: string): string {
+  const r = raw.toLowerCase()
+  if (
+    r.includes('cgo execution') ||
+    r.includes('runner process has terminated') ||
+    (r.includes('500') && r.includes('llm error'))
+  ) {
+    return 'This model failed to run on your machine (the local Ollama runner crashed). Pick a different model from the selector (top-right) — a cloud model usually works.'
+  }
+  return raw
+}
+
 export function AgentProvider({ children }: { children: ReactNode }) {
   const [isOpen, setIsOpen] = useState(false)
   const [messages, setMessages] = useState<AgentMessage[]>([])
@@ -54,6 +79,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     setLlmModelState(m)
     try { localStorage.setItem(LS_MODEL, m) } catch { /* ignore */ }
   }, [])
+  // null until the Agent page decides the default (admin → full access).
+  const [overrideClearanceRank, setOverrideClearanceRank] = useState<number | null>(null)
   const sessionId = useRef<string>(crypto.randomUUID())
 
   const sendMessage = useCallback(async (text: string) => {
@@ -90,6 +117,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
           sessionId: sessionId.current,
           llmProvider,
           llmModel,
+          ...(overrideClearanceRank != null ? { overrideClearanceRank } : {}),
         }),
       })
 
@@ -160,7 +188,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
             } else if (event.type === 'error') {
               setMessages(prev => prev.map(m =>
                 m.id === assistantMsgId
-                  ? { ...m, content: `Error: ${event.message ?? 'Unknown error'}`, isStreaming: false }
+                  ? { ...m, content: humanizeAgentError(event.message ?? 'Unknown error'), isStreaming: false }
                   : m
               ))
             }
@@ -178,7 +206,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsStreaming(false)
     }
-  }, [isStreaming, llmProvider, llmModel])
+  }, [isStreaming, llmProvider, llmModel, overrideClearanceRank])
 
   return (
     <AgentContext.Provider value={{
@@ -197,6 +225,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       setLlmProvider,
       llmModel,
       setLlmModel,
+      overrideClearanceRank,
+      setOverrideClearanceRank,
     }}>
       {children}
     </AgentContext.Provider>

@@ -20,6 +20,12 @@ fn is_valid_neo4j_label(s: &str) -> bool {
 /// Fetch the effective clearance_rank for this request.
 /// Takes the user's DB rank and caps it at api_key_rank when an API key was used.
 pub(crate) async fn get_user_clearance_rank(db: &sqlx::PgPool, claims: &JwtClaims) -> i32 {
+    // Per-session agent override wins (the chat handler already validated it: admin
+    // → full access; non-admin → capped to their stored rank). It's `#[serde(skip)]`
+    // so it can only be set in-process, never via a token.
+    if let Some(o) = claims.agent_override_rank {
+        return o;
+    }
     let db_rank = sqlx::query_scalar::<_, i32>("SELECT COALESCE(clearance_rank, 100) FROM users WHERE id = $1")
         .bind(claims.sub)
         .fetch_optional(db)

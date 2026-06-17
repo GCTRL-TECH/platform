@@ -4,7 +4,11 @@ import { BrowserRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { AuthProvider } from '@/hooks/useAuth'
 import { App } from './App'
+import { initAnalytics } from '@/lib/analytics'
 import '@/styles/globals.css'
+
+// Cookieless, privacy-first analytics. No-op unless VITE_UMAMI_WEBSITE_ID is set.
+initAnalytics()
 
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -12,10 +12,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Terminal, Send, Trash2, Loader2, ShieldCheck, Cpu, Brain } from 'lucide-react'
-import { useAgent } from '@/components/agent/AgentProvider'
+import { useAgent, FULL_ACCESS_RANK } from '@/components/agent/AgentProvider'
 import { ToolCallCard } from '@/components/agent/ToolCallCard'
 import { useApiQuery } from '@/hooks/useApi'
 import { useAuth } from '@/hooks/useAuth'
+import { pickDefaultChatModel, isValidChatSelection } from '@/lib/models'
 import { cn } from '@/lib/utils'
 
 interface LlmModelOption {
@@ -26,8 +27,9 @@ interface LlmModelOption {
   requiresKey?: boolean
 }
 interface LlmModelsResponse { models: LlmModelOption[] }
-interface LlmProviderState { provider: string; connected: boolean }
+interface LlmProviderState { provider: string; connected: boolean; defaultModel?: string | null }
 interface LlmProvidersResponse { providers: LlmProviderState[] }
+interface ClassificationLevel { id: string; name: string; display_name: string; rank: number; is_active?: boolean }
 
 const SUGGESTIONS = [
   'List all my knowledge graphs',
@@ -46,9 +48,12 @@ export function AgentPage() {
     setLlmProvider,
     llmModel,
     setLlmModel,
+    overrideClearanceRank,
+    setOverrideClearanceRank,
   } = useAgent()
   const { user } = useAuth()
   const navigate = useNavigate()
+  const isAdmin = user?.role === 'admin'
 
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -78,6 +83,60 @@ export function AgentPage() {
     const cloud = models.filter((m) => m.provider !== 'ollama' && m.provider !== 'ollama_cloud')
     return { localModels: local, ollamaCloudModels: ollamaCloud, cloudModels: cloud }
   }, [models])
+
+  // ── Per-session clearance the agent runs at ──────────────────────────────────
+  // The onboard CTO agent (admin) defaults to FULL access and can be downgraded;
+  // a non-admin is capped at their own stored clearance (downgrade only).
+  const { data: levelsData } = useApiQuery<{ levels: ClassificationLevel[] }>(
+    ['classification', 'levels'],
+    '/classification/levels',
+    { retry: false, staleTime: 300_000 },
+  )
+  const levels = useMemo(
+    () => [...(levelsData?.levels ?? [])].filter((l) => l.is_active !== false).sort((a, b) => a.rank - b.rank),
+    [levelsData],
+  )
+  const storedRank = useMemo(
+    () => levels.find((l) => l.name === user?.clearance)?.rank ?? 100,
+    [levels, user],
+  )
+  const clearanceOptions = useMemo(() => {
+    const opts = levels
+      .filter((l) => isAdmin || l.rank <= storedRank) // non-admin: no escalation
+      .map((l) => ({ value: l.rank, label: l.display_name || l.name }))
+    if (isAdmin) opts.push({ value: FULL_ACCESS_RANK, label: 'Full access (all data)' })
+    return opts
+  }, [levels, isAdmin, storedRank])
+
+  // Seed the default once levels load: admin → full access; others → stored rank.
+  useEffect(() => {
+    if (overrideClearanceRank != null || levels.length === 0) return
+    setOverrideClearanceRank(isAdmin ? FULL_ACCESS_RANK : storedRank)
+  }, [levels, isAdmin, storedRank, overrideClearanceRank, setOverrideClearanceRank])
+
+  const effectiveClearanceLabel =
+    overrideClearanceRank === FULL_ACCESS_RANK
+      ? 'FULL'
+      : clearanceOptions.find((o) => o.value === overrideClearanceRank)?.label
+        ?? user?.clearance ?? '—'
+
+  // Default/repair the model: prefer the user's configured provider default (e.g.
+  // a working cloud model) over the "biggest local" heuristic, so the agent never
+  // lands on a local model that crashes the Ollama runner on this machine.
+  useEffect(() => {
+    if (models.length === 0) return
+    if (!isValidChatSelection(llmModel, models)) {
+      const configured = (providersData?.providers ?? [])
+        .find((p) => p.connected && p.defaultModel)?.defaultModel
+      const def = pickDefaultChatModel(models, configured)
+      if (def && def !== llmModel) {
+        const match = models.find((m) => m.model === def)
+        if (match && match.provider !== llmProvider) setLlmProvider(match.provider)
+        setLlmModel(def)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [models, providersData])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -117,11 +176,30 @@ export function AgentPage() {
               {user?.role ?? 'user'}
             </span>
             <span className="text-slate-600">·</span>
-            clearance <span className="text-slate-300">{user?.clearance ?? '—'}</span>
+            clearance <span className={cn('text-slate-300', effectiveClearanceLabel === 'FULL' && 'text-emerald-300')}>{effectiveClearanceLabel}</span>
+            {isAdmin && overrideClearanceRank !== FULL_ACCESS_RANK && (
+              <span className="text-amber-500/70">(downgraded)</span>
+            )}
           </p>
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          {/* Clearance picker — admin defaults to full access, downgradable */}
+          {clearanceOptions.length > 0 && (
+            <div className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1" title="Clearance the agent operates at this session">
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
+              <select
+                value={overrideClearanceRank ?? ''}
+                onChange={(e) => setOverrideClearanceRank(Number(e.target.value))}
+                className="bg-transparent text-xs text-slate-200 focus:outline-none"
+                style={{ colorScheme: 'dark' }}
+              >
+                {clearanceOptions.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+          )}
           {/* Model picker */}
           <div className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1">
             <Cpu className="h-3.5 w-3.5 text-slate-500" />
@@ -133,6 +211,9 @@ export function AgentPage() {
                 setLlmModel(rest.join(':'))
               }}
               className="bg-transparent text-xs text-slate-200 focus:outline-none"
+              // Native <option> popup must render dark — without color-scheme the
+              // list shows white-on-white (light text on the browser's white menu).
+              style={{ colorScheme: 'dark' }}
             >
               {!models.some((m) => m.provider === llmProvider && m.model === llmModel) && (
                 <option value={`${llmProvider}:${llmModel}`}>{llmProvider} · {llmModel}</option>

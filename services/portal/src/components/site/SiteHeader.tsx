@@ -85,7 +85,7 @@ export function SiteHeader() {
           <Link to="/login" className="text-sm text-slate-400 transition-colors hover:text-white">
             Sign In
           </Link>
-          <Link to="/register" className="btn-cta-primary !py-2 !px-4 !text-xs">
+          <Link to="/register" className="btn-cta-primary !py-2 !px-4 !text-xs" data-umami-event="cta_register">
             Get Started
           </Link>
         </div>

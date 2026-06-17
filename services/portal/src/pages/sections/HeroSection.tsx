@@ -480,7 +480,7 @@ export function HeroSection() {
         </div>
 
         <div className="flex flex-wrap items-center justify-center gap-4">
-          <Link to="/register" className="btn-cta-primary">
+          <Link to="/register" className="btn-cta-primary" data-umami-event="cta_register">
             Get Started Free
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
@@ -522,6 +522,7 @@ export function HeroSection() {
                 copyTimerRef.current = window.setTimeout(() => setCopied(false), 1800)
               }
             }}
+            data-umami-event="install_copy"
             aria-label={copied ? 'Copied to clipboard' : 'Copy install command'}
             title={copied ? 'Copied' : 'Copy install command'}
             className={`ml-1 inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${

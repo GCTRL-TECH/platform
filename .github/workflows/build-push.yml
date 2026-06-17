@@ -295,7 +295,10 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: services/portal
-          build-args: VITE_API_URL=https://api.gctrl.tech
+          build-args: |
+            VITE_API_URL=https://api.gctrl.tech
+            VITE_UMAMI_SCRIPT_URL=https://analytics.gctrl.tech/script.js
+            VITE_UMAMI_WEBSITE_ID=${{ vars.VITE_UMAMI_WEBSITE_ID }}
           push: true
           tags: |
             ghcr.io/gctrl-tech/portal:latest
