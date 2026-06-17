@@ -344,17 +344,25 @@ def _fetch_grounding_chunks(
 
 # ── LLM call (isolated so cloud providers can be slotted in) ──────────────────
 
-def _llm_complete(prompt: str) -> str:
+def _llm_complete(
+    prompt: str, model: Optional[str] = None, ollama_base: Optional[str] = None
+) -> str:
     """Single completion. Default path = local Ollama /api/generate (zero config).
 
     `DISTILL_PROVIDER` selects the backend; only 'ollama' is implemented,
     but the structure keeps the call site clean for adding openai/nim later.
+
+    `model` / `ollama_base` are optional per-job overrides (the owner's
+    Settings → AI Models distill model + Settings → Infrastructure Ollama base);
+    empty/None falls back to the env defaults so the default install is unchanged.
     """
+    distill_model = (model or "").strip() or DISTILL_MODEL
+    base = (ollama_base or "").strip() or OLLAMA_BASE
     provider = DISTILL_PROVIDER.lower()
     if provider == "ollama":
         resp = requests.post(
-            f"{OLLAMA_BASE}/api/generate",
-            json={"model": DISTILL_MODEL, "prompt": prompt, "stream": False},
+            f"{base.rstrip('/')}/api/generate",
+            json={"model": distill_model, "prompt": prompt, "stream": False},
             timeout=_LLM_TIMEOUT,
         )
         resp.raise_for_status()
@@ -521,7 +529,13 @@ def _content_hash(entity: dict, citations: list[dict]) -> str:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def distill(compilation_id: str, user_id: str, limit: int = 15) -> dict:
+def distill(
+    compilation_id: str,
+    user_id: str,
+    limit: int = 15,
+    model: Optional[str] = None,
+    ollama_base: Optional[str] = None,
+) -> dict:
     """Distil a WIKI compilation into a faithful living wiki.
 
     Pipeline:
@@ -602,7 +616,9 @@ def distill(compilation_id: str, user_id: str, limit: int = 15) -> dict:
                 core = _strip_backlinks_section(_strip_frontmatter(prior_body)).rstrip() + "\n"
             else:
                 try:
-                    core = _llm_complete(_build_prompt(ent, citations))
+                    core = _llm_complete(
+                        _build_prompt(ent, citations), model=model, ollama_base=ollama_base
+                    )
                 except Exception as exc:
                     logger.warning(f"[distill {compilation_id}] LLM failed for '{ent['name']}': {exc}")
                     core = _fallback_body(ent, citations)

@@ -257,12 +257,17 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         compilation_id = payload.get("compilation_id")
         user_id = payload.get("user_id", "system")
         limit = int(payload.get("limit", 15))
+        distill_model = payload.get("distill_model")
+        ollama_base = payload.get("ollama_base")
         logger.info(f"Worker: received distill job for {compilation_id}")
 
         if job_id != "unknown":
             _update_job_status(job_id, "processing")
 
-        result = distiller.distill(compilation_id, user_id, limit=limit)
+        result = distiller.distill(
+            compilation_id, user_id, limit=limit,
+            model=distill_model, ollama_base=ollama_base,
+        )
 
         if job_id != "unknown":
             _update_job_status(job_id, "completed", result=result)
@@ -450,6 +455,10 @@ class DistillRequest(BaseModel):
     compilation_id: str
     user_id: str
     limit: int = 15
+    # Optional per-job overrides from the owner's Settings → AI Models / Infra.
+    # Omitted/empty → distiller env defaults (GCTRL_DISTILL_MODEL / OLLAMA_BASE).
+    distill_model: Optional[str] = None
+    ollama_base: Optional[str] = None
 
 
 class MergeResponse(BaseModel):
@@ -495,7 +504,10 @@ async def merge_endpoint(req: MergeRequest):
 async def distill_endpoint(req: DistillRequest):
     """Distil a WIKI compilation into wiki pages synchronously (M1 sync path)."""
     try:
-        return distiller.distill(req.compilation_id, req.user_id, limit=req.limit)
+        return distiller.distill(
+            req.compilation_id, req.user_id, limit=req.limit,
+            model=req.distill_model, ollama_base=req.ollama_base,
+        )
     except ValueError as exc:
         # Bad request: not a WIKI comp / missing source / unknown comp.
         raise HTTPException(status_code=400, detail=str(exc))

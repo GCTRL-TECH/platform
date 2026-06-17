@@ -110,6 +110,7 @@ class RelationExtractor:
         text: str,
         entities: list[dict],
         ollama_base: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> list[dict]:
         """
         Extract relations from text given a list of entity dicts.
@@ -154,7 +155,7 @@ class RelationExtractor:
         entity_lines = self._format_entity_list(prompt_entities)
         prompt = _build_prompt(truncated_text, entity_lines)
 
-        raw_response = self._call_ollama(prompt, ollama_base=ollama_base)
+        raw_response = self._call_ollama(prompt, ollama_base=ollama_base, model=model)
         if raw_response is None:
             # _call_ollama already recorded the reason on self.last_degraded_*.
             return []
@@ -208,12 +209,17 @@ class RelationExtractor:
                 seen.add(surface.lower())
         return "\n".join(lines)
 
-    def _call_ollama(self, prompt: str, ollama_base: Optional[str] = None) -> Optional[str]:
+    def _call_ollama(
+        self, prompt: str, ollama_base: Optional[str] = None, model: Optional[str] = None
+    ) -> Optional[str]:
         """Call Ollama /api/generate; return response text or None on error.
 
         `ollama_base` overrides `config.OLLAMA_BASE` for this call when provided
-        (per-job endpoint from the API); otherwise the env-configured default."""
+        (per-job endpoint from the API); otherwise the env-configured default.
+        `model` overrides `config.RELEX_MODEL` (per-job relation model from the
+        user's model prefs); empty/None falls back to the env default."""
         base = (ollama_base or "").strip() or config.OLLAMA_BASE
+        relex_model = (model or "").strip() or config.RELEX_MODEL
         _unavailable = (
             "Relation extraction skipped — LLM unavailable. Connect a working "
             "Ollama in Settings → Infrastructure to enable relation extraction."
@@ -222,7 +228,7 @@ class RelationExtractor:
             resp = requests.post(
                 f"{base.rstrip('/')}/api/generate",
                 json={
-                    "model": config.RELEX_MODEL,
+                    "model": relex_model,
                     "prompt": prompt,
                     "stream": False,
                     "options": {

@@ -136,6 +136,8 @@ def run_pipeline(
     ollama_base: str | None = None,
     embedding_base_url: str | None = None,
     embedding_provider: str | None = None,
+    embedding_model: str | None = None,
+    relex_model: str | None = None,
 ) -> dict:
     """
     Full extraction pipeline: NER -> RelEx -> KG Builder -> Chunking -> Embedding -> Vector Store.
@@ -186,7 +188,7 @@ def run_pipeline(
     warnings: list[str] = []
     relex = get_extractor()
     try:
-        relations = relex.extract_relations(text, entities, ollama_base=ollama_base)
+        relations = relex.extract_relations(text, entities, ollama_base=ollama_base, model=relex_model)
         if getattr(relex, "last_degraded", False) and relex.last_degraded_reason:
             warnings.append(relex.last_degraded_reason)
             logger.warning(f"[{job_id}] RelEx degraded: {relex.last_degraded_reason}")
@@ -228,6 +230,7 @@ def run_pipeline(
         embedding_base_url=embedding_base_url,
         embedding_provider=embedding_provider,
         ollama_base=ollama_base,
+        embedding_model=embedding_model,
     )
     embeddings = embedder.embed_batch([c["content"] for c in chunks])
     successful_embeddings = sum(1 for v in embeddings if v is not None)
@@ -357,6 +360,10 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             ollama_base = payload.get("ollama_base")
             embedding_base_url = payload.get("embedding_base_url")
             embedding_provider = payload.get("embedding_provider")
+            # Per-purpose model choices (Settings → AI Models → Models). Absent →
+            # the worker uses its env defaults (EMBEDDING_MODEL / RELEX_MODEL).
+            embedding_model = payload.get("embedding_model")
+            relex_model = payload.get("relex_model")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -459,6 +466,8 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 ollama_base=ollama_base,
                 embedding_base_url=embedding_base_url,
                 embedding_provider=embedding_provider,
+                embedding_model=embedding_model,
+                relex_model=relex_model,
             )
             # Record crawl provenance on the result for the dashboard.
             if crawled_urls:

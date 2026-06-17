@@ -62,6 +62,68 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/providers/:provider", axum::routing::delete(delete_provider))
         .route("/providers/:provider/test", post(test_provider))
         .route("/models", get(list_models))
+        // Model configurator: per-purpose model selection (embedding/relation/distill)
+        // + a recommended catalog with local-Ollama install state, and a one-click pull.
+        .route("/model-prefs", get(get_model_prefs).put(set_model_prefs))
+        .route("/ollama/catalog", get(ollama_catalog))
+        .route("/ollama/pull", post(ollama_pull))
+}
+
+// ── Recommended model catalog ───────────────────────────────────────────────
+// The curated, shippable defaults. Kept LOCAL-first so a fresh install runs with
+// no cloud token spend. Each entry carries enough metadata for the UI to show
+// "runs on your system?" (ram_gb) + a speed/quality hint, and to flag the
+// recommended pick per purpose. `purpose`: embedding | relation | distill.
+
+struct RecModel {
+    name: &'static str,
+    purpose: &'static str,
+    size_gb: f64,   // download size
+    ram_gb: f64,    // rough resident RAM to run it
+    speed: u8,      // 1..5 (5 = fastest)
+    quality: u8,    // 1..5 (5 = best)
+    recommended: bool,
+    note: &'static str,
+}
+
+const CATALOG: &[RecModel] = &[
+    // ── Embedding (must be able to run LOCAL — cloud embeddings burn tokens) ──
+    RecModel { name: "nomic-embed-text", purpose: "embedding", size_gb: 0.27, ram_gb: 1.0, speed: 5, quality: 4, recommended: true,  note: "Default. Fast, strong general-purpose embeddings. Low RAM." },
+    RecModel { name: "mxbai-embed-large", purpose: "embedding", size_gb: 0.67, ram_gb: 1.5, speed: 4, quality: 5, recommended: false, note: "Higher retrieval quality, a bit larger/slower." },
+    RecModel { name: "all-minilm",        purpose: "embedding", size_gb: 0.05, ram_gb: 0.5, speed: 5, quality: 3, recommended: false, note: "Tiny + fastest; lower quality. Good for weak hardware." },
+    // ── Relation extraction (chat-style; quality matters for relation F1) ──
+    RecModel { name: "qwen2.5:7b",  purpose: "relation", size_gb: 4.7, ram_gb: 6.0, speed: 3, quality: 5, recommended: true,  note: "Default. Best local relation F1 (~0.86). Needs ~6GB free RAM." },
+    RecModel { name: "qwen2.5:3b",  purpose: "relation", size_gb: 1.9, ram_gb: 3.0, speed: 4, quality: 4, recommended: false, note: "Lighter; good relations on ~4GB RAM." },
+    RecModel { name: "llama3.2:3b", purpose: "relation", size_gb: 2.0, ram_gb: 3.0, speed: 4, quality: 3, recommended: false, note: "Fast, modest quality. Low-RAM fallback." },
+    // ── Distillation (wiki prose; instruction-following + fluency) ──
+    RecModel { name: "llama3.2",   purpose: "distill", size_gb: 2.0, ram_gb: 3.0, speed: 4, quality: 3, recommended: true,  note: "Default. Light, fast wiki prose; runs on ~3GB RAM." },
+    RecModel { name: "qwen2.5:7b", purpose: "distill", size_gb: 4.7, ram_gb: 6.0, speed: 3, quality: 5, recommended: false, note: "More coherent prose for richer wikis. Needs ~6GB RAM." },
+];
+
+/// Recommended default model per purpose (mirrors the kex/fuse env defaults so the
+/// UI shows the same baseline the engine actually uses when nothing is configured).
+pub(crate) fn default_model_for(purpose: &str) -> &'static str {
+    match purpose {
+        "embedding" => "nomic-embed-text",
+        "relation"  => "qwen2.5:7b",
+        "distill"   => "llama3.2",
+        _ => "",
+    }
+}
+
+/// Total system RAM in GB (best-effort, Linux /proc/meminfo). 0.0 when unknown
+/// (e.g. non-Linux) — the UI then just hides the "won't fit" warnings.
+fn system_ram_gb() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<f64>().ok())
+                .map(|kb| kb / 1_048_576.0) // kB → GB
+        })
+        .unwrap_or(0.0)
 }
 
 // ── GET /providers ────────────────────────────────────────────────────────────
@@ -441,4 +503,199 @@ async fn list_models(
     }
 
     Json(json!({ "models": models }))
+}
+
+// ── Model preferences (per-purpose) ─────────────────────────────────────────
+
+#[derive(sqlx::FromRow, Default)]
+struct ModelPrefsRow {
+    embedding_model: Option<String>,
+    embedding_provider: Option<String>,
+    embedding_base_url: Option<String>,
+    relation_model: Option<String>,
+    distill_model: Option<String>,
+}
+
+/// GET /api/llm/model-prefs — the user's per-purpose model choices, with the
+/// recommended defaults applied for anything unset (so the UI always shows the
+/// model the engine will actually use).
+async fn get_model_prefs(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    let row: ModelPrefsRow = sqlx::query_as(
+        "SELECT embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model
+         FROM user_model_prefs WHERE user_id = $1",
+    )
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await?
+    .unwrap_or_default();
+
+    Ok(Json(json!({
+        "embeddingModel":   row.embedding_model.unwrap_or_else(|| default_model_for("embedding").into()),
+        "embeddingProvider": row.embedding_provider.unwrap_or_else(|| "ollama".into()),
+        "embeddingBaseUrl": row.embedding_base_url,
+        "relationModel":    row.relation_model.unwrap_or_else(|| default_model_for("relation").into()),
+        "distillModel":     row.distill_model.unwrap_or_else(|| default_model_for("distill").into()),
+    })))
+}
+
+#[derive(Deserialize)]
+struct SetPrefsReq {
+    #[serde(rename = "embeddingModel")]    embedding_model:    Option<String>,
+    #[serde(rename = "embeddingProvider")] embedding_provider: Option<String>,
+    #[serde(rename = "embeddingBaseUrl")]  embedding_base_url: Option<String>,
+    #[serde(rename = "relationModel")]     relation_model:     Option<String>,
+    #[serde(rename = "distillModel")]      distill_model:      Option<String>,
+}
+
+/// PUT /api/llm/model-prefs — upsert the per-purpose model choices. Empty string
+/// → NULL (reset that purpose to the recommended default).
+async fn set_model_prefs(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<SetPrefsReq>,
+) -> Result<Json<Value>> {
+    let norm = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    // A cloud embedding base is rejected unless it's a valid embedding endpoint;
+    // for ollama/local we keep it NULL (uses the user's ollama base).
+    let emb_base = norm(req.embedding_base_url);
+    sqlx::query(
+        "INSERT INTO user_model_prefs
+            (user_id, embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (user_id) DO UPDATE SET
+            embedding_model    = $2,
+            embedding_provider = $3,
+            embedding_base_url = $4,
+            relation_model     = $5,
+            distill_model      = $6,
+            updated_at         = now()",
+    )
+    .bind(claims.sub)
+    .bind(norm(req.embedding_model))
+    .bind(norm(req.embedding_provider))
+    .bind(emb_base)
+    .bind(norm(req.relation_model))
+    .bind(norm(req.distill_model))
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ── Ollama model catalog + install ──────────────────────────────────────────
+
+/// Resolve the user's effective Ollama base + (decrypted) key, re-validated.
+async fn resolve_user_ollama(db: &sqlx::PgPool, user_id: uuid::Uuid) -> (String, Option<String>) {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT base_url, api_key FROM user_llm_providers WHERE user_id = $1 AND provider = 'ollama'",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let stored_base = row.as_ref().and_then(|(b, _)| b.clone()).filter(|s| !s.trim().is_empty());
+    let key = row
+        .and_then(|(_, k)| k)
+        .map(|c| crate::services::crypto::open(&c))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let base = crate::services::llm::validate_llm_base("ollama", stored_base.as_deref())
+        .map(|u| u.as_str().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| crate::services::llm::ollama_default_base());
+    (base, key)
+}
+
+/// GET /api/llm/ollama/catalog — the recommended model catalog enriched with
+/// local install state + whether each model fits this machine's RAM, plus the
+/// list of every model already installed locally. Drives the Settings chooser.
+async fn ollama_catalog(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Json<Value> {
+    let (base, key) = resolve_user_ollama(&state.db, claims.sub).await;
+    let client = reqwest::Client::new();
+
+    // Which models are installed locally right now.
+    let mut installed: Vec<String> = Vec::new();
+    let mut rb = client.get(format!("{base}/api/tags")).timeout(Duration::from_secs(4));
+    if let Some(ref k) = key { rb = rb.bearer_auth(k); }
+    if let Ok(resp) = rb.send().await {
+        if let Ok(v) = resp.json::<Value>().await {
+            if let Some(arr) = v["models"].as_array() {
+                for m in arr {
+                    if let Some(n) = m["name"].as_str() { installed.push(n.to_string()); }
+                }
+            }
+        }
+    }
+    // Match installed loosely: ollama tags often carry a `:latest`/`:tag` suffix.
+    let is_installed = |name: &str| {
+        installed.iter().any(|i| i == name || i.split(':').next() == Some(name) || name.split(':').next() == i.split(':').next())
+    };
+
+    let ram = system_ram_gb();
+    let catalog: Vec<Value> = CATALOG
+        .iter()
+        .map(|m| json!({
+            "name": m.name, "purpose": m.purpose,
+            "sizeGb": m.size_gb, "ramGb": m.ram_gb,
+            "speed": m.speed, "quality": m.quality,
+            "recommended": m.recommended, "note": m.note,
+            "installed": is_installed(m.name),
+            // 0.0 RAM = unknown → don't warn. Else flag if it needs more than we have.
+            "fitsRam": ram == 0.0 || m.ram_gb <= ram,
+        }))
+        .collect();
+
+    Json(json!({
+        "systemRamGb": (ram * 10.0).round() / 10.0,
+        "ollamaBase": base,
+        "ollamaReachable": !installed.is_empty(),
+        "installed": installed,
+        "catalog": catalog,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PullReq { model: String }
+
+/// POST /api/llm/ollama/pull — install a model into the user's local Ollama
+/// (`/api/pull`, blocking until done). One-click for the recommended models
+/// (e.g. nomic-embed-text) so the user never has to drop to a shell.
+async fn ollama_pull(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<PullReq>,
+) -> Result<Json<Value>> {
+    let model = req.model.trim().to_string();
+    if model.is_empty() || model.len() > 128 || model.contains(char::is_whitespace) {
+        return Err(AppError::BadRequest("invalid model name".into()));
+    }
+    let (base, key) = resolve_user_ollama(&state.db, claims.sub).await;
+    let client = reqwest::Client::new();
+    let mut rb = client
+        .post(format!("{base}/api/pull"))
+        .json(&json!({ "name": model, "stream": false }))
+        // Model pulls can be large; allow generous time.
+        .timeout(Duration::from_secs(1800));
+    if let Some(ref k) = key { rb = rb.bearer_auth(k); }
+
+    match rb.send().await {
+        Ok(r) if r.status().is_success() => {
+            // Ollama returns {"status":"success"} on completion.
+            let body: Value = r.json().await.unwrap_or(json!({}));
+            let ok = body["status"].as_str() == Some("success") || body.get("error").is_none();
+            if ok {
+                Ok(Json(json!({ "ok": true, "model": model })))
+            } else {
+                Ok(Json(json!({ "ok": false, "model": model, "error": body["error"] })))
+            }
+        }
+        Ok(r) => Ok(Json(json!({ "ok": false, "model": model, "error": format!("Ollama returned {}", r.status()) }))),
+        Err(e) => Ok(Json(json!({ "ok": false, "model": model, "error": format!("pull failed: {e}") }))),
+    }
 }

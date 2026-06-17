@@ -685,6 +685,10 @@ async fn distill(
     }
 
     let limit = req.limit.unwrap_or(15).clamp(1, 100);
+    // Per-user distill model + Ollama base (Settings → AI Models / Infra). Unset →
+    // FUSE uses its env defaults, so existing installs are untouched.
+    let (distill_model, ollama_base) =
+        crate::services::llm::resolve_distill_overrides(&state.db, claims.sub).await;
     let fuse_url = format!("{}/distill", state.cfg.fuse_url);
     let client = reqwest::Client::new();
     let resp = client
@@ -693,6 +697,8 @@ async fn distill(
             "compilation_id": id.to_string(),
             "user_id": claims.sub.to_string(),
             "limit": limit,
+            "distill_model": distill_model,
+            "ollama_base": ollama_base,
         }))
         // Distillation calls the LLM once per entity — give it room.
         .timeout(std::time::Duration::from_secs(600))

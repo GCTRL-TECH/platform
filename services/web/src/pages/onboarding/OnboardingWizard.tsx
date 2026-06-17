@@ -219,6 +219,10 @@ export default function OnboardingWizard() {
                   {connectingOllama ? <Loader2 size={14} className="animate-spin" /> : <Server size={14} />}
                   Use local Ollama
                 </button>
+                <p className="text-center text-[11px] text-slate-500">
+                  In AI Model settings you can pick the embedding / extraction / wiki models and
+                  install the recommended local ones (e.g. nomic-embed-text) with one click.
+                </p>
               </div>
 
               {/* Connection status / gate hint */}

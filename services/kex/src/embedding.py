@@ -163,6 +163,7 @@ def build_embedding_client(
     embedding_base_url: Optional[str] = None,
     embedding_provider: Optional[str] = None,
     ollama_base: Optional[str] = None,
+    embedding_model: Optional[str] = None,
 ) -> EmbeddingClient:
     """Build an EmbeddingClient honoring optional per-job overrides.
 
@@ -179,13 +180,14 @@ def build_embedding_client(
     """
     base_override = (embedding_base_url or "").strip() or (ollama_base or "").strip()
     provider = (embedding_provider or "").strip() or config.EMBEDDING_PROVIDER
+    model = (embedding_model or "").strip() or config.EMBEDDING_MODEL
     # No override at all → reuse the cached singleton (identical behaviour to today).
-    if not base_override and not (embedding_provider or "").strip():
+    if not base_override and not (embedding_provider or "").strip() and not (embedding_model or "").strip():
         return get_embedding_client()
     base_url = base_override or config.EMBEDDING_BASE_URL or config.OLLAMA_BASE
     return EmbeddingClient(
         provider=provider,
         base_url=base_url,
-        model=config.EMBEDDING_MODEL,
+        model=model,
         api_key=config.EMBEDDING_API_KEY,
     )

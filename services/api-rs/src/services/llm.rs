@@ -317,17 +317,70 @@ pub async fn inject_ollama_overrides(
     user_id: uuid::Uuid,
     payload: &mut Value,
 ) {
-    if let Some(base) = resolve_ollama_base_for_user(db, user_id).await {
-        if let Some(map) = payload.as_object_mut() {
+    let ollama_base = resolve_ollama_base_for_user(db, user_id).await;
+
+    // Per-purpose model selection (Settings → AI Models → Models). NULLs mean
+    // "use the engine's env defaults", so existing installs are untouched.
+    let prefs: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT embedding_model, embedding_provider, embedding_base_url, relation_model
+             FROM user_model_prefs WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    let (emb_model, emb_provider, emb_base_pref, rel_model) =
+        prefs.unwrap_or((None, None, None, None));
+    let nz = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(ref base) = ollama_base {
             map.insert("ollama_base".into(), json!(base));
-            // KEX's embedding provider defaults to Ollama and falls back to
-            // OLLAMA_BASE; point its embedding endpoint at the same instance so a
-            // native-Ollama switch covers embeddings too. `embedding_provider`
-            // is intentionally omitted — we only redirect the base, not change
-            // the provider, so non-Ollama embedding setups are left alone.
+            // Point embeddings at the same Ollama by default (a native-Ollama
+            // switch covers embeddings too). A per-user embedding base below wins.
             map.insert("embedding_base_url".into(), json!(base));
         }
+        // Explicit embedding base override (e.g. a deliberate cloud embedder).
+        if let Some(b) = nz(emb_base_pref) {
+            map.insert("embedding_base_url".into(), json!(b));
+        }
+        // The actual model choices the worker should use for THIS job.
+        if let Some(m) = nz(emb_model) {
+            map.insert("embedding_model".into(), json!(m));
+        }
+        if let Some(p) = nz(emb_provider) {
+            map.insert("embedding_provider".into(), json!(p));
+        }
+        if let Some(m) = nz(rel_model) {
+            map.insert("relex_model".into(), json!(m));
+        }
     }
+}
+
+/// Resolve the wiki-distillation overrides for a user: the chosen distill model
+/// (Settings → AI Models → Models, `user_model_prefs.distill_model`) and the
+/// runtime Ollama base. Either is `None` when unset, so the FUSE distiller falls
+/// back to its env defaults (`GCTRL_DISTILL_MODEL` / `OLLAMA_BASE`) and existing
+/// installs are untouched.
+pub async fn resolve_distill_overrides(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> (Option<String>, Option<String>) {
+    let distill_model: Option<String> = sqlx::query_scalar(
+        "SELECT distill_model FROM user_model_prefs WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|s: String| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+
+    let ollama_base = resolve_ollama_base_for_user(db, user_id).await;
+    (distill_model, ollama_base)
 }
 
 // ── Request building ──────────────────────────────────────────────────────────

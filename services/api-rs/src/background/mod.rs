@@ -285,6 +285,10 @@ async fn enqueue_one_distill(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Per-user distill model + Ollama base (Settings → AI Models / Infra). Unset →
+    // FUSE uses its env defaults, so scheduled distills match the sync HTTP path.
+    let (distill_model, ollama_base) =
+        crate::services::llm::resolve_distill_overrides(&state.db, user_id).await;
     crate::services::redis::lpush(
         &state.redis,
         "distill:jobs",
@@ -292,6 +296,8 @@ async fn enqueue_one_distill(
             "job_id": job_id.to_string(),
             "compilation_id": compilation_id.to_string(),
             "user_id": user_id.to_string(),
+            "distill_model": distill_model,
+            "ollama_base": ollama_base,
         })
         .to_string(),
     )

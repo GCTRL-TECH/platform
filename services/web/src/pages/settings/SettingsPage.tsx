@@ -38,6 +38,10 @@ import {
   Plus,
   AlertTriangle,
   ShieldAlert,
+  Download,
+  Gauge,
+  Zap,
+  Cpu,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
@@ -345,6 +349,303 @@ function ProviderCard({
 
 // ConnectorModal removed — replaced by unified inline integrations list
 
+// ─── Model chooser (KEX embedding / relation + wiki distill) ──────────────────
+
+interface CatalogModel {
+  name: string
+  purpose: 'embedding' | 'relation' | 'distill'
+  sizeGb: number
+  ramGb: number
+  speed: number   // 1..5
+  quality: number // 1..5
+  recommended: boolean
+  note: string
+  installed: boolean
+  fitsRam: boolean
+}
+
+interface CatalogResponse {
+  systemRamGb: number
+  ollamaBase: string
+  ollamaReachable: boolean
+  installed: string[]
+  catalog: CatalogModel[]
+}
+
+interface ModelPrefs {
+  embeddingModel: string
+  embeddingProvider: string
+  embeddingBaseUrl: string | null
+  relationModel: string
+  distillModel: string
+}
+
+const PURPOSE_META: Record<CatalogModel['purpose'], { title: string; blurb: string; prefKey: keyof ModelPrefs }> = {
+  embedding: {
+    title: 'Embedding model (KEX)',
+    blurb: 'Vectorizes every chunk for search & RAG. Kept LOCAL by default — a cloud embedder would burn tokens and add latency on high volume. nomic-embed-text is fast, low-RAM, and the recommended default.',
+    prefKey: 'embeddingModel',
+  },
+  relation: {
+    title: 'Relation extraction model (KEX)',
+    blurb: 'Reads each document and proposes entity relationships. Quality drives the knowledge graph; a stronger model means better edges, at the cost of speed/RAM.',
+    prefKey: 'relationModel',
+  },
+  distill: {
+    title: 'Wiki distillation model (FUSE)',
+    blurb: 'Writes the living wiki prose from your graph. Needs good instruction-following and fluency.',
+    prefKey: 'distillModel',
+  },
+}
+
+/** 1..5 level bar (speed / quality) — minimal vector dots, CI-aligned. */
+function LevelBar({ level, icon: Icon, label }: { level: number; icon: typeof Zap; label: string }) {
+  return (
+    <span className="flex items-center gap-1" title={`${label}: ${level}/5`}>
+      <Icon size={11} className="text-slate-500" />
+      <span className="flex gap-0.5">
+        {[1, 2, 3, 4, 5].map((i) => (
+          <span
+            key={i}
+            className={cn('h-1.5 w-1.5 rounded-full', i <= level ? 'bg-indigo-400' : 'bg-slate-700')}
+          />
+        ))}
+      </span>
+    </span>
+  )
+}
+
+function ModelChooser() {
+  const [data, setData] = useState<CatalogResponse | null>(null)
+  const [prefs, setPrefs] = useState<ModelPrefs | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [pulling, setPulling] = useState<string | null>(null)
+  const [pullMsg, setPullMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const loadCatalog = useCallback(async () => {
+    try {
+      const { data } = await api.get('/llm/ollama/catalog')
+      setData(data as CatalogResponse)
+    } catch { /* non-fatal */ }
+  }, [])
+
+  const loadPrefs = useCallback(async () => {
+    try {
+      const { data } = await api.get('/llm/model-prefs')
+      setPrefs(data as ModelPrefs)
+    } catch { /* non-fatal */ }
+  }, [])
+
+  useEffect(() => {
+    void (async () => {
+      setLoading(true)
+      await Promise.all([loadCatalog(), loadPrefs()])
+      setLoading(false)
+    })()
+  }, [loadCatalog, loadPrefs])
+
+  function selected(purpose: CatalogModel['purpose']): string {
+    if (!prefs) return ''
+    return String(prefs[PURPOSE_META[purpose].prefKey] ?? '')
+  }
+
+  function choose(purpose: CatalogModel['purpose'], name: string) {
+    setPrefs((p) => (p ? { ...p, [PURPOSE_META[purpose].prefKey]: name } : p))
+    setSaved(false)
+  }
+
+  async function savePrefs() {
+    if (!prefs) return
+    setSaving(true)
+    try {
+      await api.put('/llm/model-prefs', {
+        embeddingModel: prefs.embeddingModel,
+        embeddingProvider: prefs.embeddingProvider || 'ollama',
+        embeddingBaseUrl: prefs.embeddingBaseUrl || '',
+        relationModel: prefs.relationModel,
+        distillModel: prefs.distillModel,
+      })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2500)
+    } catch { /* non-fatal */ } finally {
+      setSaving(false)
+    }
+  }
+
+  async function pull(name: string) {
+    setPulling(name)
+    setPullMsg(null)
+    try {
+      const { data } = await api.post('/llm/ollama/pull', { model: name })
+      if (data.ok) {
+        setPullMsg({ ok: true, text: `Installed ${name}.` })
+        await loadCatalog()
+      } else {
+        setPullMsg({ ok: false, text: `Install failed: ${data.error ?? 'unknown error'}` })
+      }
+    } catch {
+      setPullMsg({ ok: false, text: `Install failed — is Ollama reachable?` })
+    } finally {
+      setPulling(null)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/30 px-4 py-6 text-sm text-slate-500">
+        <Loader2 size={15} className="animate-spin" /> Probing your Ollama for installed models…
+      </div>
+    )
+  }
+
+  const purposes: CatalogModel['purpose'][] = ['embedding', 'relation', 'distill']
+
+  return (
+    <div className="space-y-5">
+      {/* System summary */}
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/30 px-4 py-3 text-xs">
+        <span className="flex items-center gap-1.5 text-slate-300">
+          <Cpu size={13} className="text-indigo-400" />
+          {data && data.systemRamGb > 0 ? `${data.systemRamGb} GB system RAM` : 'System RAM unknown'}
+        </span>
+        <span className="text-slate-600">·</span>
+        {data?.ollamaReachable ? (
+          <span className="flex items-center gap-1 text-emerald-400">
+            <Wifi size={12} /> Ollama reachable ({data.installed.length} model{data.installed.length === 1 ? '' : 's'} installed)
+          </span>
+        ) : (
+          <span className="flex items-center gap-1 text-amber-400">
+            <WifiOff size={12} /> Ollama not reachable — set the base URL above, then reload
+          </span>
+        )}
+        <button
+          onClick={() => void loadCatalog()}
+          className="ml-auto flex items-center gap-1 text-slate-500 hover:text-slate-300"
+        >
+          <RefreshCw size={12} /> Refresh
+        </button>
+      </div>
+
+      {pullMsg && (
+        <div className={cn(
+          'flex items-start gap-2 rounded-md border px-3 py-2 text-[11px]',
+          pullMsg.ok
+            ? 'border-emerald-900/40 bg-emerald-950/20 text-emerald-300'
+            : 'border-red-900/40 bg-red-950/20 text-red-400'
+        )}>
+          {pullMsg.ok ? <Check size={13} className="mt-0.5 shrink-0" /> : <AlertTriangle size={13} className="mt-0.5 shrink-0" />}
+          <span>{pullMsg.text}</span>
+        </div>
+      )}
+
+      {purposes.map((purpose) => {
+        const meta = PURPOSE_META[purpose]
+        const models = (data?.catalog ?? []).filter((m) => m.purpose === purpose)
+        const sel = selected(purpose)
+        const selInstalled = models.find((m) => m.name === sel)?.installed ?? false
+        return (
+          <section key={purpose}>
+            <h3 className="text-sm font-medium text-slate-200">{meta.title}</h3>
+            <p className="mb-3 mt-0.5 text-xs text-slate-500">{meta.blurb}</p>
+            <div className="space-y-2">
+              {models.map((m) => {
+                const isSel = m.name === sel
+                return (
+                  <div
+                    key={m.name}
+                    onClick={() => choose(purpose, m.name)}
+                    className={cn(
+                      'cursor-pointer rounded-lg border p-3 transition-colors',
+                      isSel
+                        ? 'border-indigo-500/60 bg-indigo-500/5'
+                        : 'border-slate-800 bg-slate-900/40 hover:border-slate-700'
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={cn(
+                        'flex h-4 w-4 shrink-0 items-center justify-center rounded-full border',
+                        isSel ? 'border-indigo-400 bg-indigo-400' : 'border-slate-600'
+                      )}>
+                        {isSel && <span className="h-1.5 w-1.5 rounded-full bg-slate-950" />}
+                      </span>
+                      <span className="font-mono text-sm text-slate-200">{m.name}</span>
+                      {m.recommended && (
+                        <span className="flex items-center gap-1 rounded-full bg-indigo-500/10 px-2 py-0.5 text-[10px] font-medium text-indigo-300">
+                          <Sparkles size={9} /> Recommended
+                        </span>
+                      )}
+                      {m.installed ? (
+                        <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
+                          <Check size={9} /> Installed
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-500">
+                          Not installed
+                        </span>
+                      )}
+                      {!m.fitsRam && (
+                        <span className="flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400" title={`Needs ~${m.ramGb} GB RAM`}>
+                          <AlertTriangle size={9} /> May not fit RAM
+                        </span>
+                      )}
+                      <div className="ml-auto flex items-center gap-3">
+                        <LevelBar level={m.speed} icon={Zap} label="Speed" />
+                        <LevelBar level={m.quality} icon={Gauge} label="Quality" />
+                      </div>
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 pl-6 text-[11px] text-slate-500">
+                      <span>{m.note}</span>
+                      <span className="text-slate-600">·</span>
+                      <span>{m.sizeGb} GB download</span>
+                      <span className="text-slate-600">·</span>
+                      <span>~{m.ramGb} GB RAM</span>
+                      {!m.installed && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); void pull(m.name) }}
+                          disabled={pulling !== null}
+                          className="ml-auto flex items-center gap-1.5 rounded-md bg-indigo-500/20 px-2.5 py-1 text-[11px] font-medium text-indigo-300 transition-colors hover:bg-indigo-500/30 disabled:opacity-50"
+                        >
+                          {pulling === m.name ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}
+                          {pulling === m.name ? 'Installing…' : 'Install'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            {sel && !selInstalled && (
+              <p className="mt-1.5 flex items-center gap-1 text-[11px] text-amber-400">
+                <AlertTriangle size={11} /> The selected model isn't installed yet — click Install so the engine can use it.
+              </p>
+            )}
+          </section>
+        )
+      })}
+
+      <div className="flex items-center gap-3 border-t border-slate-800 pt-4">
+        <button
+          onClick={() => void savePrefs()}
+          disabled={saving || !prefs}
+          className={cn(
+            'flex items-center gap-1.5 rounded-md px-4 py-2 text-sm font-medium transition-colors',
+            saved ? 'bg-emerald-500/20 text-emerald-400' : 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30',
+            'disabled:opacity-50'
+          )}
+        >
+          {saving ? <Loader2 size={14} className="animate-spin" /> : saved ? <Check size={14} /> : <Save size={14} />}
+          {saved ? 'Saved' : 'Save model selection'}
+        </button>
+        <p className="text-[11px] text-slate-500">
+          Applies to your next extraction / distillation. No code changes needed.
+        </p>
+      </div>
+    </div>
+  )
+}
+
 // ─── Tab: AI Models ───────────────────────────────────────────────────────────
 
 function ModelsTab() {
@@ -510,6 +811,16 @@ function ModelsTab() {
             )}
           </div>
         </div>
+      </section>
+
+      <section>
+        <SectionHeader>Pipeline models (out-of-the-box)</SectionHeader>
+        <p className="mb-4 -mt-2 text-xs text-slate-500">
+          Choose the models KEX and FUSE use for embedding, relation extraction, and wiki
+          distillation. Recommended defaults run locally on your Ollama for speed and GDPR
+          compliance. Missing models can be installed with one click.
+        </p>
+        <ModelChooser />
       </section>
     </div>
   )
