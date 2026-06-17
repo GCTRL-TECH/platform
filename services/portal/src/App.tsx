@@ -15,6 +15,8 @@ import { AdminPage } from '@/pages/AdminPage'
 // out of the main (landing) bundle.
 const DocsPage = lazy(() => import('@/pages/docs/DocsPage').then((m) => ({ default: m.DocsPage })))
 const UseCasesPage = lazy(() => import('@/pages/UseCasesPage').then((m) => ({ default: m.UseCasesPage })))
+const ImprintPage = lazy(() => import('@/pages/legal/LegalPages').then((m) => ({ default: m.ImprintPage })))
+const PrivacyPolicyPage = lazy(() => import('@/pages/legal/LegalPages').then((m) => ({ default: m.PrivacyPolicyPage })))
 
 function Spinner() {
   return (
@@ -80,6 +82,8 @@ export function App() {
       <Route path="/docs" element={<DocsPage />} />
       <Route path="/docs/:slug" element={<DocsPage />} />
       <Route path="/use-cases" element={<UseCasesPage />} />
+      <Route path="/imprint" element={<ImprintPage />} />
+      <Route path="/privacy" element={<PrivacyPolicyPage />} />
 
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
