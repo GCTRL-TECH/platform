@@ -506,9 +506,9 @@ function ModelChooser() {
     <div className="space-y-5">
       {/* System summary */}
       <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/30 px-4 py-3 text-xs">
-        <span className="flex items-center gap-1.5 text-slate-300">
+        <span className="flex items-center gap-1.5 text-slate-300" title={data?.ollamaBase}>
           <Cpu size={13} className="text-indigo-400" />
-          {data && data.systemRamGb > 0 ? `${data.systemRamGb} GB system RAM` : 'System RAM unknown'}
+          Ollama: <span className="font-mono text-slate-400">{data?.ollamaBase ?? 'unknown'}</span>
         </span>
         <span className="text-slate-600">·</span>
         {data?.ollamaReachable ? (
@@ -544,7 +544,19 @@ function ModelChooser() {
         const meta = PURPOSE_META[purpose]
         const models = (data?.catalog ?? []).filter((m) => m.purpose === purpose)
         const sel = selected(purpose)
-        const selInstalled = models.find((m) => m.name === sel)?.installed ?? false
+        const installedList = data?.installed ?? []
+        const isInstalled = (n: string) =>
+          installedList.some((i) => i === n || i.split(':')[0] === n.split(':')[0])
+        const selInstalled = isInstalled(sel)
+        // Installed models NOT in the curated set — surfaced so a user whose local
+        // generation models crash (or who runs cloud-passthrough models) can still
+        // pick something that works here, without code changes. Embedding models
+        // are name-gated so chat models don't pollute the embedding picker.
+        const isEmbeddingName = (n: string) => /embed|minilm|nomic|bge|mxbai|gte|e5-/i.test(n)
+        const curatedNames = new Set(models.map((m) => m.name))
+        const otherInstalled = installedList
+          .filter((n) => !curatedNames.has(n) && !curatedNames.has(n.split(':')[0]))
+          .filter((n) => (purpose === 'embedding' ? isEmbeddingName(n) : !isEmbeddingName(n)))
         return (
           <section key={purpose}>
             <h3 className="text-sm font-medium text-slate-200">{meta.title}</h3>
@@ -585,11 +597,6 @@ function ModelChooser() {
                           Not installed
                         </span>
                       )}
-                      {!m.fitsRam && (
-                        <span className="flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400" title={`Needs ~${m.ramGb} GB RAM`}>
-                          <AlertTriangle size={9} /> May not fit RAM
-                        </span>
-                      )}
                       <div className="ml-auto flex items-center gap-3">
                         <LevelBar level={m.speed} icon={Zap} label="Speed" />
                         <LevelBar level={m.quality} icon={Gauge} label="Quality" />
@@ -616,12 +623,52 @@ function ModelChooser() {
                 )
               })}
             </div>
+
+            {/* Other installed models (e.g. cloud-passthrough or non-curated
+                locals) — pick one when the curated locals don't run on this box. */}
+            {otherInstalled.length > 0 && (
+              <div className="mt-2">
+                <p className="mb-1.5 text-[11px] text-slate-500">Other installed models on your Ollama:</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {otherInstalled.map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => choose(purpose, n)}
+                      className={cn(
+                        'rounded-md border px-2 py-1 font-mono text-[11px] transition-colors',
+                        n === sel
+                          ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-300'
+                          : 'border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-600'
+                      )}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Escape hatch: any model name (handles models not yet pulled, or a
+                remote/cloud model the engine should call by name). */}
+            <div className="mt-2 flex items-center gap-2">
+              <span className="shrink-0 text-[11px] text-slate-500">Custom:</span>
+              <input
+                value={sel}
+                onChange={(e) => choose(purpose, e.target.value)}
+                placeholder="exact model name, e.g. gpt-oss:120b-cloud"
+                className="flex-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 font-mono text-[11px] text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/40"
+              />
+            </div>
+
             {/* Only warn about a missing install when we can actually see the
                 installed set — if Ollama is unreachable the list is empty and
                 every model would falsely look uninstalled. */}
             {sel && !selInstalled && data?.ollamaReachable && (
               <p className="mt-1.5 flex items-center gap-1 text-[11px] text-amber-400">
-                <AlertTriangle size={11} /> The selected model isn't installed yet — click Install so the engine can use it.
+                <AlertTriangle size={11} />
+                {curatedNames.has(sel)
+                  ? "The selected model isn't installed yet — click Install so the engine can use it."
+                  : `"${sel}" isn't installed on your Ollama — pull it first, or pick an installed model above.`}
               </p>
             )}
           </section>
