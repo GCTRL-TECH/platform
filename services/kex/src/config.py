@@ -9,12 +9,15 @@ OLLAMA_BASE: str = os.environ.get("OLLAMA_BASE", "http://host.docker.internal:11
 # Relation-extraction model. qwen2.5:7b (4.7 GB, ~6 GB RAM resident) is the
 # selected winner: closed-vocab + direction-enforced prompt + validation yields
 # relation F1 ~0.86 on the gold set vs ~0.45 for the old free-form llama3.2.
-# SETUP REQUIREMENT (zero-cost-local): the model MUST be pulled in the Ollama
-# container before KEX can extract relations:
-#     docker exec ollama ollama pull qwen2.5:7b
-# If absent, relation extraction degrades gracefully to an empty list (entities
-# still extracted). See bench/kex/REPORT.md.
+# OUT-OF-THE-BOX: no manual pull needed. KEX warms this model on startup AND
+# relex.py self-heals (pulls on a 404, one-time) on the first extraction, so a
+# fresh install produces linked graphs with zero setup. See bench/kex/REPORT.md.
 RELEX_MODEL: str = os.environ.get("RELEX_MODEL", "qwen2.5:7b")
+
+# Lighter fallback relation model. If the primary model can't run on this host
+# (OOM / crashed Ollama runner) or can't be pulled, relex falls back to this one
+# (1.9 GB, ~3 GB RAM) so modest machines still get relations out of the box.
+RELEX_FALLBACK_MODEL: str = os.environ.get("RELEX_FALLBACK_MODEL", "qwen2.5:3b")
 
 # Neo4j graph database
 NEO4J_URI: str = os.environ.get("NEO4J_URI", "bolt://localhost:7687")

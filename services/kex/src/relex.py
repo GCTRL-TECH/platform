@@ -24,6 +24,7 @@ Relation F1 on the gold set: ~0.45 (old free-form llama3.2) -> ~0.86 (this).
 import json
 import logging
 import re
+import threading
 from typing import Optional
 
 import requests
@@ -212,58 +213,121 @@ class RelationExtractor:
     def _call_ollama(
         self, prompt: str, ollama_base: Optional[str] = None, model: Optional[str] = None
     ) -> Optional[str]:
-        """Call Ollama /api/generate; return response text or None on error.
+        """Call Ollama /api/generate with SELF-HEALING model provisioning.
 
-        `ollama_base` overrides `config.OLLAMA_BASE` for this call when provided
-        (per-job endpoint from the API); otherwise the env-configured default.
-        `model` overrides `config.RELEX_MODEL` (per-job relation model from the
-        user's model prefs); empty/None falls back to the env default."""
+        Out-of-the-box guarantee — no manual `ollama pull` and no Settings step
+        needed for a fresh install to extract relations:
+          1. primary model = per-job `model` (user prefs) or `config.RELEX_MODEL`.
+          2. if Ollama reports the model isn't installed (404), pull it once and
+             retry — the first extraction provisions the model itself.
+          3. if the primary model can't run (OOM / crashed runner / timeout) or
+             can't be pulled, fall back to the lighter `config.RELEX_FALLBACK_MODEL`.
+          4. only if every candidate fails do we degrade (entities-only) with a
+             human-readable reason on self.last_degraded_*.
+
+        `ollama_base` overrides `config.OLLAMA_BASE` for this call when provided.
+        """
         base = (ollama_base or "").strip() or config.OLLAMA_BASE
-        relex_model = (model or "").strip() or config.RELEX_MODEL
-        _unavailable = (
-            "Relation extraction skipped — LLM unavailable. Connect a working "
-            "Ollama in Settings → Infrastructure to enable relation extraction."
+        primary = (model or "").strip() or config.RELEX_MODEL
+        candidates = [primary]
+        fallback = (getattr(config, "RELEX_FALLBACK_MODEL", "") or "").strip()
+        if fallback and fallback != primary:
+            candidates.append(fallback)
+
+        for idx, m in enumerate(candidates):
+            status, text = self._generate_once(base, m, prompt)
+            if status == "ok":
+                if idx > 0:
+                    logger.warning(f"RelEx fell back to '{m}' (primary '{primary}' unavailable)")
+                return text
+            if status == "not_found":
+                # Model isn't installed — provision it once, then retry the same model.
+                if self._pull_model(base, m):
+                    status2, text2 = self._generate_once(base, m, prompt)
+                    if status2 == "ok":
+                        if idx > 0:
+                            logger.warning(f"RelEx fell back to '{m}' and pulled it on demand")
+                        return text2
+                continue  # pull failed or still unusable → try the next candidate
+            if status == "server_error":
+                # OOM / crashed runner / timeout on this model → try the lighter fallback.
+                logger.warning(f"RelEx model '{m}' could not run; trying fallback model")
+                continue
+            if status == "unreachable":
+                break  # Ollama itself is down — a different model won't help.
+
+        self.last_degraded = True
+        self.last_degraded_reason = (
+            "Relation extraction skipped — no usable relation model. Connect a working "
+            "Ollama (Settings → Infrastructure) or pick an installed model (Settings → AI Models)."
         )
+        return None
+
+    def _generate_once(self, base: str, model: str, prompt: str) -> tuple[str, Optional[str]]:
+        """One Ollama /api/generate call. Returns (status, text) where status is
+        'ok' | 'not_found' | 'server_error' | 'unreachable'."""
         try:
             resp = requests.post(
                 f"{base.rstrip('/')}/api/generate",
                 json={
-                    "model": relex_model,
+                    "model": model,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {
-                        "temperature": 0.0,
-                        "num_predict": 1024,
-                    },
+                    "options": {"temperature": 0.0, "num_predict": 1024},
                 },
                 timeout=180,
                 # SSRF hardening: don't follow redirects to a metadata endpoint.
                 allow_redirects=False,
             )
+            if resp.status_code == 404:  # Ollama: "model '…' not found, try pulling it first"
+                return ("not_found", None)
+            if resp.status_code >= 500:
+                logger.warning(f"Ollama 5xx for relation model '{model}': {resp.status_code}")
+                return ("server_error", None)
             resp.raise_for_status()
-            data = resp.json()
-            return data.get("response", "")
+            return ("ok", resp.json().get("response", ""))
         except requests.exceptions.ConnectionError:
             logger.warning("Ollama not reachable - skipping relation extraction")
-            self.last_degraded = True
-            self.last_degraded_reason = _unavailable
-            return None
+            return ("unreachable", None)
         except requests.exceptions.Timeout:
-            logger.warning("Ollama timed out during relation extraction")
-            self.last_degraded = True
-            self.last_degraded_reason = _unavailable
-            return None
+            logger.warning(f"Ollama timed out for relation model '{model}'")
+            return ("server_error", None)  # a heavy model timing out → try the lighter one
         except requests.exceptions.HTTPError as exc:
-            # 5xx / model crash (e.g. "llama runner process has terminated").
-            logger.warning(f"Ollama returned an error - skipping relation extraction: {exc}")
-            self.last_degraded = True
-            self.last_degraded_reason = _unavailable
-            return None
+            logger.warning(f"Ollama HTTP error for relation model '{model}': {exc}")
+            return ("server_error", None)
         except Exception as exc:
-            logger.error(f"Ollama call failed: {exc}")
-            self.last_degraded = True
-            self.last_degraded_reason = _unavailable
-            return None
+            logger.error(f"Ollama call failed for relation model '{model}': {exc}")
+            return ("unreachable", None)
+
+    def _pull_model(self, base: str, model: str) -> bool:
+        """Pull a model into Ollama, ONCE per process (best-effort, blocking).
+
+        Guarded so concurrent workers / repeated jobs don't re-trigger a multi-GB
+        download. Returns True only on a confirmed successful pull."""
+        with _pull_lock:
+            if model in _pull_attempted:
+                return model in _pulled_ok
+            _pull_attempted.add(model)
+        logger.info(f"RelEx: relation model '{model}' not installed — pulling it now (one-time)…")
+        try:
+            resp = requests.post(
+                f"{base.rstrip('/')}/api/pull",
+                json={"name": model, "stream": False},
+                timeout=1800,  # a multi-GB model can take a while on first install
+                allow_redirects=False,
+            )
+            resp.raise_for_status()
+            ok = "error" not in (resp.text or "").lower()
+            if ok:
+                with _pull_lock:
+                    _pulled_ok.add(model)
+                logger.info(f"RelEx: pulled relation model '{model}'.")
+            else:
+                logger.warning(f"RelEx: pull of '{model}' reported an error: {(resp.text or '')[:200]}")
+            return ok
+        except Exception as exc:
+            logger.warning(f"RelEx: could not pull relation model '{model}': {exc}")
+            return False
 
     def _parse_json_array(self, response_text: str) -> list[dict]:
         """Parse a JSON array of relation objects from the model response.
@@ -376,6 +440,13 @@ class RelationExtractor:
 
         return relations
 
+
+# One-time, process-wide guard so concurrent workers / repeated jobs never
+# re-trigger a multi-GB model download. `_pulled_ok` records confirmed pulls so a
+# second worker can reuse the result instead of re-attempting.
+_pull_lock = threading.Lock()
+_pull_attempted: set[str] = set()
+_pulled_ok: set[str] = set()
 
 # Module-level singleton
 _extractor = RelationExtractor()

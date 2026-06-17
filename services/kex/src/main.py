@@ -745,6 +745,33 @@ def _warmup_model():
     logger.error("KEX NER model failed to initialise after retries")
 
 
+def _warmup_relation_model():
+    """Proactively pull the relation-extraction model into Ollama in the BACKGROUND
+    so the first PDF doesn't block on a multi-GB download. Best-effort and silent on
+    failure: relex.py also self-heals (pull-on-demand) if this hasn't finished or was
+    skipped. Honors OLLAMA_BASE."""
+    import requests as _rq
+
+    base = (config.OLLAMA_BASE or "").rstrip("/")
+    model = config.RELEX_MODEL
+    if not base or not model:
+        return
+    try:
+        tags = _rq.get(f"{base}/api/tags", timeout=10)
+        present = {m.get("name", "") for m in (tags.json().get("models") or [])} if tags.ok else set()
+        if model in present:
+            logger.info(f"KEX relation model '{model}' already present")
+            return
+        logger.info(f"KEX: pulling relation model '{model}' in background (one-time)…")
+        r = _rq.post(f"{base}/api/pull", json={"name": model, "stream": False}, timeout=1800)
+        if r.ok and "error" not in (r.text or "").lower():
+            logger.info(f"KEX relation model '{model}' ready")
+        else:
+            logger.warning(f"KEX: background pull of '{model}' unconfirmed — relex will self-heal on demand")
+    except Exception as exc:
+        logger.warning(f"KEX: background relation-model pull skipped ({exc}); relex self-heals on demand")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -761,6 +788,11 @@ async def lifespan(app: FastAPI):
     # model is ~1.5GB on a fresh install). Progress + auto-retry are reported via
     # /model-status, which the dashboard polls to show an "engine initialising" UI.
     threading.Thread(target=_warmup_model, name="kex-model-warmup", daemon=True).start()
+
+    # Proactively pull the relation-extraction model in the BACKGROUND so the first
+    # extraction produces a LINKED graph without a multi-GB download mid-job. RelEx
+    # also self-heals (pull-on-demand) if this is still running or was skipped.
+    threading.Thread(target=_warmup_relation_model, name="kex-relmodel-warmup", daemon=True).start()
 
     # Ensure the Qdrant collection exists at startup (create-if-missing). This is
     # what makes a fresh install / post-purge work turnkey: without it the first
