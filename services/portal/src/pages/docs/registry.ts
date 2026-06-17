@@ -42,6 +42,7 @@ export const DOC_GROUPS: DocGroup[] = [
     group: 'Enterprise',
     pages: [
       { slug: 'access-control', title: 'Access Control' },
+      { slug: 'security', title: 'Securing Your Deployment' },
       { slug: 'compliance', title: 'Compliance & Sovereignty' },
     ],
   },

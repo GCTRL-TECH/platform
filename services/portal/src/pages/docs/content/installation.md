@@ -45,6 +45,8 @@ The script is interactive on first run: it detects your environment, lets you pi
 | FUSE (fusion / entity resolution) | `:4020` |
 | License agent | `:7070` |
 
+> **Keep the data-layer ports private.** The bundled Neo4j, Postgres, Qdrant and Ollama are for local/Docker access only — never expose them to the internet. Database passwords are generated uniquely per install into `~/gctrl/.env`. Before exposing anything beyond `localhost`, read [Securing Your Deployment](security.md).
+
 ## Non-interactive install
 
 To skip the model picker, set `GCTRL_MODEL` and the installer runs unattended:

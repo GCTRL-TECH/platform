@@ -243,8 +243,24 @@ generate_config() {
   curl -fsSL "${API_URL}/v1/public-key" -o "${CONFIG_DIR}/license.pub"
   chmod 600 "${CONFIG_DIR}/license.pub"
 
-  local jwt_secret
-  jwt_secret=$(openssl rand -hex 32)
+  # Secrets are generated per-install (unique passwords, not shared defaults), but
+  # PRESERVED on re-install: a bundled DB bakes its auth into its data volume on
+  # first start, so rotating the password on a re-run would lock us out. If an
+  # .env already exists we keep its values; otherwise we generate fresh ones.
+  local prev_env="${INSTALL_DIR}/.env"
+  read_prev() { [ -f "$prev_env" ] && sed -n "s/^$1=//p" "$prev_env" | head -1 || true; }
+
+  local jwt_secret pg_pw
+  jwt_secret="$(read_prev JWT_SECRET)";  [ -n "$jwt_secret" ] || jwt_secret="$(openssl rand -hex 32)"
+  pg_pw="$(read_prev POSTGRES_PASSWORD)"; [ -n "$pg_pw" ]     || pg_pw="$(openssl rand -hex 24)"
+
+  # Bundled Neo4j → unique generated password (the fresh container initialises
+  # with it). A reused/external Neo4j keeps its own configured auth (we can't
+  # change a database we don't own).
+  if [ "${NEO4J_URI}" = "bolt://gctrl-neo4j:7687" ]; then
+    local neo_prev; neo_prev="$(read_prev NEO4J_PASSWORD)"
+    NEO4J_PASSWORD="${neo_prev:-$(openssl rand -hex 24)}"
+  fi
 
   cat > "${INSTALL_DIR}/.env" <<EOF
 GCTRL_API_URL=https://api.gctrl.tech
@@ -257,7 +273,7 @@ QDRANT_URL=${QDRANT_URL}
 OLLAMA_BASE=${OLLAMA_BASE}
 RELEX_MODEL=${CHAT_MODEL:-qwen2.5:7b}
 AUTO_CLASSIFY_MODEL=${CHAT_MODEL:-llama3.2}
-POSTGRES_PASSWORD=gctrl-postgres-password
+POSTGRES_PASSWORD=${pg_pw}
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
 
