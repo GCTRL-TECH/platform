@@ -22,23 +22,29 @@ cd "$GCTRL_DIR"
 needs_update() {
   local image="$1"
 
+  # Local manifest-INDEX digest (what `docker pull <tag>` records for a multi-arch
+  # tag). RepoDigests is "image@sha256:...".
   local local_digest
-  local_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "")
+  local_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null | sed 's/.*@//' || echo "")
 
   if [ -z "$local_digest" ]; then
     return 0  # not pulled yet — definitely needs pull
   fi
 
+  # Remote INDEX digest = sha256 of the raw manifest-list bytes. NOTE: the old
+  # check grep'd the FIRST child "digest" out of `docker manifest inspect` — for a
+  # multi-arch image that's a per-platform digest, never the index digest, so it
+  # NEVER matched and every service always showed "update available". Hashing the
+  # raw index manifest gives the same digest the daemon stores locally.
   local remote_digest
-  remote_digest=$(docker manifest inspect "$image" 2>/dev/null \
-    | grep -oP '"digest":\s*"\Ksha256:[a-f0-9]+' | head -1 || echo "")
+  remote_digest=$(docker buildx imagetools inspect "$image" --raw 2>/dev/null | sha256sum | awk 'NR==1{print "sha256:"$1}')
 
-  if [ -z "$remote_digest" ]; then
+  # buildx missing / image unreachable → sha256 of empty input. Can't check → pull.
+  if [ -z "$remote_digest" ] || [ "$remote_digest" = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]; then
     return 0  # can't check — pull to be safe
   fi
 
-  # local_digest is "image@sha256:abc", remote is "sha256:abc"
-  if echo "$local_digest" | grep -q "$remote_digest"; then
+  if [ "$local_digest" = "$remote_digest" ]; then
     return 1  # already up to date
   fi
 
