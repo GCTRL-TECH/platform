@@ -13,6 +13,8 @@ import {
   Brain,
   Server,
   Loader2,
+  KeyRound,
+  Copy,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
@@ -21,12 +23,14 @@ import { useAuth } from '@/hooks/useAuth'
 const STEPS = [
   { id: 'welcome', title: 'Welcome', icon: Zap },
   { id: 'model', title: 'Connect AI', icon: Brain },
+  { id: 'license', title: 'Activate', icon: KeyRound },
+  { id: 'connect', title: 'Connect Agent', icon: Plug },
   { id: 'source', title: 'Add a Source', icon: Upload },
   { id: 'extract', title: 'First Extraction', icon: Database },
   { id: 'chat', title: 'Talk to Your Data', icon: MessageSquare },
 ]
 
-type StepId = 'welcome' | 'model' | 'source' | 'extract' | 'chat'
+type StepId = 'welcome' | 'model' | 'license' | 'connect' | 'source' | 'extract' | 'chat'
 
 export default function OnboardingWizard() {
   const navigate = useNavigate()
@@ -38,6 +42,70 @@ export default function OnboardingWizard() {
   const [extracting, setExtracting] = useState(false)
   const [extracted, setExtracted] = useState(false)
   const [_jobId, setJobId] = useState<string | null>(null)
+
+  // ── License activation (step 3) ──────────────────────────────────────
+  const [licenseKey, setLicenseKey] = useState('')
+  const [activating, setActivating] = useState(false)
+  const [activated, setActivated] = useState(false)
+  const [activateError, setActivateError] = useState('')
+
+  // ── Full-access token + MCP (step 4) ─────────────────────────────────
+  const [generatingToken, setGeneratingToken] = useState(false)
+  const [agentToken, setAgentToken] = useState('')
+  const [tokenError, setTokenError] = useState('')
+  const [copied, setCopied] = useState('')
+
+  const mcpConfig = JSON.stringify({
+    mcpServers: {
+      gctrl: {
+        type: 'http',
+        url: `${window.location.origin}/api/agent/mcp`,
+        headers: { Authorization: `ApiKey ${agentToken || '<your-token>'}` },
+      },
+    },
+  }, null, 2)
+
+  function copy(text: string, what: string) {
+    void navigator.clipboard.writeText(text)
+    setCopied(what)
+    setTimeout(() => setCopied(''), 2000)
+  }
+
+  async function handleActivate() {
+    if (!licenseKey.trim()) return
+    setActivating(true)
+    setActivateError('')
+    try {
+      const { data } = await api.post('/setup/activate', { license_key: licenseKey.trim() })
+      if (data?.ok === false) {
+        setActivateError(data.error ?? 'Activation failed — check the key.')
+      } else {
+        setActivated(true)
+        try { localStorage.setItem('gctrl_activated', 'true') } catch { /* ignore */ }
+      }
+    } catch {
+      setActivateError('Activation failed — check the key and that the license agent is running.')
+    } finally {
+      setActivating(false)
+    }
+  }
+
+  async function handleGenerateToken() {
+    setGeneratingToken(true)
+    setTokenError('')
+    try {
+      const { data } = await api.post('/users/api-keys', {
+        name: 'Full Access (MCP)',
+        maxClearanceRank: 1000,
+        kbScoped: false,
+      })
+      setAgentToken(data.key as string)
+    } catch {
+      setTokenError('Could not create token.')
+    } finally {
+      setGeneratingToken(false)
+    }
+  }
 
   // ── LLM connection gate ──────────────────────────────────────────────
   // GCTRL is agent-first: the user must connect at least one LLM provider
@@ -223,6 +291,9 @@ export default function OnboardingWizard() {
                   In AI Model settings you can pick the embedding / extraction / wiki models and
                   install the recommended local ones (e.g. nomic-embed-text) with one click.
                 </p>
+                <p className="flex items-center justify-center gap-1.5 text-center text-[11px] text-amber-400/80">
+                  <Zap size={11} /> For GPU speed, run Ollama <strong>natively</strong> and point GCTRL at it in Settings → Infrastructure (Docker Ollama is CPU-only).
+                </p>
               </div>
 
               {/* Connection status / gate hint */}
@@ -250,10 +321,127 @@ export default function OnboardingWizard() {
                     Skip for now
                   </button>
                   <button
-                    onClick={() => setCurrentStep('source')}
+                    onClick={() => setCurrentStep('license')}
                     disabled={!llmConnected}
                     className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
                   >
+                    Continue <ArrowRight size={14} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── License activation ─────────────────────── */}
+          {currentStep === 'license' && (
+            <div className="space-y-6">
+              <div className="text-center">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
+                  <KeyRound size={32} className="text-indigo-400" />
+                </div>
+                <h2 className="mt-4 text-xl font-bold text-slate-100">Activate Your License</h2>
+                <p className="mx-auto mt-2 max-w-md text-sm text-slate-400">
+                  Register at <a href="https://gctrl.tech" target="_blank" rel="noreferrer" className="text-indigo-400 hover:text-indigo-300">gctrl.tech</a> to get your license key, then paste it here.
+                  Activation is hardware-bound and unlocks the tuned resolution profile — your data never leaves the machine.
+                </p>
+              </div>
+
+              {activated ? (
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-center">
+                  <Check size={24} className="mx-auto text-emerald-400" />
+                  <p className="mt-2 text-sm font-medium text-emerald-300">License activated</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <input
+                      value={licenseKey}
+                      onChange={(e) => setLicenseKey(e.target.value)}
+                      placeholder="GCTRL-XXXX-XXXX-XXXX-XXXX-XXXX"
+                      className="flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm font-mono text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+                    />
+                    <button
+                      onClick={() => void handleActivate()}
+                      disabled={activating || !licenseKey.trim()}
+                      className="btn-primary disabled:opacity-50"
+                    >
+                      {activating ? <Loader2 size={14} className="animate-spin" /> : 'Activate'}
+                    </button>
+                  </div>
+                  {activateError && <p className="text-[11px] text-red-400">{activateError}</p>}
+                  <p className="text-[11px] text-slate-500">
+                    No key yet? You can skip — the platform runs on safe generic defaults until activated.
+                  </p>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-2">
+                <button onClick={() => setCurrentStep('model')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <div className="flex items-center gap-4">
+                  <button onClick={() => setCurrentStep('connect')} className="text-xs text-slate-500 hover:text-slate-300">Skip for now</button>
+                  <button onClick={() => setCurrentStep('connect')} className="btn-primary">
+                    Continue <ArrowRight size={14} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Connect an agent (token + MCP) ─────────── */}
+          {currentStep === 'connect' && (
+            <div className="space-y-6">
+              <div className="text-center">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
+                  <Plug size={32} className="text-indigo-400" />
+                </div>
+                <h2 className="mt-4 text-xl font-bold text-slate-100">Connect Your Agent</h2>
+                <p className="mx-auto mt-2 max-w-md text-sm text-slate-400">
+                  Generate a full-access token and drop the MCP config into Claude Code, Codex, Cursor —
+                  your agent gets durable, access-controlled memory over GCTRL.
+                </p>
+              </div>
+
+              {!agentToken ? (
+                <button
+                  onClick={() => void handleGenerateToken()}
+                  disabled={generatingToken}
+                  className="btn-primary w-full justify-center disabled:opacity-50"
+                >
+                  {generatingToken ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
+                  Generate full-access token
+                </button>
+              ) : (
+                <div className="space-y-3">
+                  <div>
+                    <p className="mb-1 text-[11px] text-slate-500">Your token (shown once — copy it now):</p>
+                    <div className="flex gap-2">
+                      <code className="flex-1 truncate rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-cyan-300">{agentToken}</code>
+                      <button onClick={() => copy(agentToken, 'token')} className="rounded-lg border border-slate-700 bg-slate-800 px-3 text-slate-300 hover:bg-slate-700">
+                        {copied === 'token' ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <p className="mb-1 text-[11px] text-slate-500">MCP config (Claude Code / Codex / Cursor):</p>
+                    <div className="relative">
+                      <pre className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-3 text-[11px] leading-relaxed text-slate-300"><code>{mcpConfig}</code></pre>
+                      <button onClick={() => copy(mcpConfig, 'config')} className="absolute right-2 top-2 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-700">
+                        {copied === 'config' ? 'Copied' : 'Copy'}
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-amber-400/80">
+                    For a remote agent, enable the MCP-over-HTTP gateway in Settings → Agent and make sure port :4000 is reachable.
+                  </p>
+                </div>
+              )}
+              {tokenError && <p className="text-[11px] text-red-400">{tokenError}</p>}
+
+              <div className="flex items-center justify-between pt-2">
+                <button onClick={() => setCurrentStep('license')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <div className="flex items-center gap-4">
+                  <button onClick={() => setCurrentStep('source')} className="text-xs text-slate-500 hover:text-slate-300">Skip for now</button>
+                  <button onClick={() => setCurrentStep('source')} className="btn-primary">
                     Continue <ArrowRight size={14} />
                   </button>
                 </div>
@@ -287,7 +475,7 @@ export default function OnboardingWizard() {
                 ))}
               </div>
               <div className="flex justify-between pt-2">
-                <button onClick={() => setCurrentStep('model')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <button onClick={() => setCurrentStep('connect')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
                 <button onClick={() => setCurrentStep('extract')} className="text-xs text-indigo-400 hover:text-indigo-300">Skip — use sample text</button>
               </div>
             </div>

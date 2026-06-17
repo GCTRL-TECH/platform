@@ -1,3 +1,15 @@
+# Licenses
+
+## Ground Control (GCTRL) — own license
+
+GCTRL is **dual-licensed**: open source under the **GNU AGPL v3** ([`/LICENSE`](../LICENSE)),
+or under a **commercial license** for proprietary/closed/hosted use without AGPL
+copyleft obligations. See [`/LICENSING.md`](../LICENSING.md) for the full explanation
+and how to obtain a commercial license. (The `n8n-nodes-gctrl` connector is
+separately MIT-licensed.)
+
+---
+
 # Third-Party License Notices
 
 ## LIMES — Link Discovery Framework for Metric Spaces

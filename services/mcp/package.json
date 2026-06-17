@@ -1,6 +1,7 @@
 {
   "name": "gctrl-mcp",
   "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
   "description": "GCTRL MCP Server — exposes KEX, FUSE, KG, and RAG as tools for AI agents",
   "type": "module",
   "main": "dist/index.js",
