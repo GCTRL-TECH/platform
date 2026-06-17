@@ -1,7 +1,12 @@
 # GCTRL dashboard (React + nginx). Built multi-arch (amd64 + arm64) in CI so it
 # runs natively on Apple Silicon — no platform-mismatch warning on a Mac install.
-# Stage 1: Build
-FROM node:20-alpine AS build
+#
+# Stage 1: Build — PINNED to the native build platform ($BUILDPLATFORM). The Vite
+# output (dist/) is pure static JS/CSS/HTML and arch-independent, so we must NOT
+# re-run npm/vite under QEMU emulation for the arm64 target — that build crawls and
+# routinely hangs esbuild under emulation (a web-only deploy stalled ~1.5h). We
+# build once natively and copy the same dist into each target-arch nginx image.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS build
 
 WORKDIR /app
 
