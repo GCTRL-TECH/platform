@@ -1186,12 +1186,11 @@ async fn deep_query(
             .map_err(AppError::Internal)?;
         let trimmed = reply.trim().to_string();
 
-        // Detect a tool call (same protocol as agent::chat).
-        let tool_call: Option<Value> = if trimmed.starts_with('{') {
-            serde_json::from_str::<Value>(&trimmed).ok().filter(|v| v["tool"].is_string())
-        } else {
-            crate::routes::agent::find_tool_json(&trimmed)
-        };
+        // Detect a tool call (same protocol as agent::chat). find_tool_json parses
+        // the first tool object and tolerates trailing content (a second call /
+        // prose), so the model still gets its tool executed instead of being
+        // skipped (which made the agent hallucinate empty results).
+        let tool_call: Option<Value> = crate::routes::agent::find_tool_json(&trimmed);
 
         let Some(call) = tool_call else {
             // No tool call → this is the final answer.

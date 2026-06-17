@@ -224,7 +224,8 @@ remembered so re-extraction never re-introduces it):
 - delete_node        : Remove an entity and its edges. Args: { compilationId: string, name: string, reason?: string }
 - delete_chunk       : Remove a source text chunk from Postgres + Qdrant. Args: { chunkId: string }
 
-To use a tool, respond with ONLY a JSON object on a single line:
+To use a tool, respond with ONLY a JSON object on a single line — exactly ONE tool
+call, no prose, no second object. Wait for its result before the next call:
 {"tool": "tool_name", "args": {...}}
 
 How to think and act:
@@ -1146,15 +1147,12 @@ async fn chat(
                 }
             }
 
-            // Detect a tool call in the full accumulated response.
+            // Detect a tool call in the full accumulated response. find_tool_json
+            // parses the FIRST tool-call object and tolerates trailing content
+            // (a second tool call / prose), so a model that emits more than one
+            // call or adds chatter still gets its tool executed.
             let trimmed = accumulated.trim().to_string();
-            let tool_call: Option<Value> = if trimmed.starts_with('{') {
-                serde_json::from_str(&trimmed).ok().and_then(|v: Value| {
-                    if v["tool"].is_string() { Some(v) } else { None }
-                })
-            } else {
-                find_tool_json(&trimmed)
-            };
+            let tool_call: Option<Value> = find_tool_json(&trimmed);
 
             let Some(call) = tool_call else {
                 // No tool call. If we suppressed a `{`-leading turn that turned out
@@ -1228,11 +1226,19 @@ async fn list_tools(
 // ── Helper: scan text for embedded {"tool": ...} JSON ────────────────────────
 
 pub(crate) fn find_tool_json(text: &str) -> Option<Value> {
-    // Walk through the string looking for '{' that opens a valid tool call
+    // Walk through the string looking for a '{' that opens a tool call. We parse
+    // the FIRST JSON value starting there and IGNORE any trailing content — a
+    // second tool call, prose, a code fence, etc. `serde_json::from_str` requires
+    // the whole remainder to be exactly one value and fails on concatenated /
+    // trailing output (e.g. `{"tool":"list_graphs"}{"tool":"list_extractions"}`),
+    // which small/local models routinely emit — that failure was making the agent
+    // silently skip the tool and hallucinate empty results. The streaming
+    // Deserializer stops cleanly at the end of the first value instead.
     let bytes = text.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'{' {
-            if let Ok(candidate) = serde_json::from_str::<Value>(&text[i..]) {
+            let mut it = serde_json::Deserializer::from_str(&text[i..]).into_iter::<Value>();
+            if let Some(Ok(candidate)) = it.next() {
                 if candidate["tool"].is_string() {
                     return Some(candidate);
                 }
