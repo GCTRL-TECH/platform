@@ -68,6 +68,31 @@ When editing existing work, touch only what the request requires. Preserve the s
 Turn the task into explicit, verifiable success criteria. Work step by step and loop until each criterion is actually met — don't stop at "looks done". State what you verified.
 "#;
 
+pub const NATIVE_OLLAMA_SKILL_MD: &str = r#"# Connecting native Ollama (GPU)
+
+When the user asks how to use their GPU, switch to native Ollama, or reports
+"Ollama not reachable / not connecting", guide them — but you CANNOT run host
+commands yourself (you run inside a container; changing the host's Ollama service
+needs host access, which would be a security hole). Explain and instruct only.
+
+Why it happens: GCTRL's bundled Ollama runs in Docker and is CPU-only. A NATIVE
+Ollama (for GPU) listens on `127.0.0.1` by default, so the GCTRL containers can't
+reach it. Two steps fix it:
+
+1. Make Ollama listen on all interfaces (Ollama's own setting, one env var), then
+   restart it. Give the command for THEIR OS:
+   - Linux (systemd): create `/etc/systemd/system/ollama.service.d/override.conf`
+     with `[Service]` + `Environment="OLLAMA_HOST=0.0.0.0:11434"`, then
+     `sudo systemctl daemon-reload && sudo systemctl restart ollama`.
+   - macOS: `launchctl setenv OLLAMA_HOST "0.0.0.0:11434"`, then quit and reopen
+     the Ollama app.
+   - Windows: `setx OLLAMA_HOST "0.0.0.0:11434"`, then restart Ollama from the tray.
+2. In Settings → AI Models, set the Ollama base URL to `http://localhost:11434`
+   (GCTRL auto-routes localhost to the host) and Test connection.
+
+Ask which OS they're on if unknown. Full guide: gctrl.tech/docs/gpu.
+"#;
+
 /// Idempotently ensure the system skills exist/upgraded so the internal Pi agent
 /// always carries the core guidance. Single source: each manifest prompt is the
 /// const above. Not locked → users can disable any of them.
@@ -84,6 +109,12 @@ pub async fn ensure_system_skills(db: &sqlx::PgPool) {
             "Agent Discipline",
             "Think before doing, keep it simple, make surgical edits, and verify against explicit success criteria.",
             AGENT_DISCIPLINE_MD,
+        ),
+        (
+            "native-ollama-setup",
+            "Native Ollama (GPU) setup",
+            "Guide the user through connecting a native (GPU) Ollama — expose it on 0.0.0.0 and point GCTRL at localhost.",
+            NATIVE_OLLAMA_SKILL_MD,
         ),
     ];
     for (slug, name, description, prompt) in upserts {

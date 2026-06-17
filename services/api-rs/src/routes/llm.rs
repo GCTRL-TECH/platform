@@ -617,7 +617,7 @@ async fn resolve_user_ollama(db: &sqlx::PgPool, user_id: uuid::Uuid) -> (String,
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let base = crate::services::llm::validate_llm_base("ollama", stored_base.as_deref())
-        .map(|u| u.as_str().trim_end_matches('/').to_string())
+        .map(|u| crate::services::llm::containerize_ollama_base(u.as_str().trim_end_matches('/')))
         .unwrap_or_else(|_| crate::services::llm::ollama_default_base());
     (base, key)
 }

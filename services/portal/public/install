@@ -57,6 +57,23 @@ probe_tcp() {
   timeout 2 bash -c ">/dev/tcp/127.0.0.1/$port" 2>/dev/null
 }
 
+# Is Ollama on :11434 reachable from CONTAINERS (bound to all interfaces), or only
+# from the host (loopback)? A native Ollama on 127.0.0.1 answers our probe here but
+# the Dockerised GCTRL stack can't reach it. Best-effort via ss/netstat; "unknown"
+# → assume OK (the dashboard guides the user if it turns out unreachable).
+ollama_bound_all_ifaces() {
+  local binds=""
+  if command -v ss >/dev/null 2>&1; then
+    binds=$(ss -tlnH 2>/dev/null | awk '{print $4}')
+  elif command -v netstat >/dev/null 2>&1; then
+    binds=$(netstat -tln 2>/dev/null | awk '{print $4}')
+  fi
+  [ -z "$binds" ] && return 0
+  echo "$binds" | grep -qE '(0\.0\.0\.0|\*|\[::\]):11434$' && return 0
+  echo "$binds" | grep -qE '127\.0\.0\.1:11434$' && return 1
+  return 0
+}
+
 PROFILES=()
 NEO4J_URI=""
 NEO4J_USER="neo4j"
@@ -151,8 +168,20 @@ detect_services() {
   fi
 
   if probe_tcp 11434; then
-    OLLAMA_BASE="http://host.docker.internal:11434"
-    success "Ollama detected on :11434 — will connect to existing instance"
+    if ollama_bound_all_ifaces; then
+      OLLAMA_BASE="http://host.docker.internal:11434"
+      success "Ollama detected on :11434 — connecting to your native instance (GPU-capable)"
+    else
+      # Native Ollama listens on localhost only → the GCTRL containers can't reach
+      # it. Bundle the CPU Ollama so the platform works out of the box; the user can
+      # switch to native (GPU) later by exposing it.
+      PROFILES+=("bundled-ollama")
+      OLLAMA_BASE="http://gctrl-ollama:11434"
+      skip "Native Ollama found, but it listens on localhost only — Docker can't reach it."
+      skip "→ Using the bundled (CPU) Ollama so GCTRL works out of the box."
+      skip "  For GPU: set OLLAMA_HOST=0.0.0.0 on your Ollama, then switch in the"
+      skip "  dashboard (Settings → AI Models). Guide: https://gctrl.tech/docs/gpu"
+    fi
   else
     PROFILES+=("bundled-ollama")
     OLLAMA_BASE="http://gctrl-ollama:11434"
@@ -396,14 +425,15 @@ start_stack() {
     echo "  GPU       : CPU mode (no compatible GPU or toolkit found)"
   fi
   echo ""
-  if probe_tcp 11434; then
-    echo "  Ollama    : connected at ${OLLAMA_BASE}"
-  else
+  # Pull models into the bundled Ollama whenever we deployed it (a localhost-only
+  # native Ollama still answers probe_tcp here, so gate on the profile, not the
+  # probe). Otherwise we're pointed at a reachable native Ollama.
+  if printf '%s\n' "${PROFILES[@]}" | grep -qx "bundled-ollama"; then
     # Bundled Ollama: pull the models KEX needs so extraction works out of the
-    # box, fully local at zero token cost.
-    #   qwen2.5:7b       — relation extraction (RELEX_MODEL). ~4.7 GB.
-    #   nomic-embed-text — chunk embeddings (EMBEDDING_MODEL). ~0.3 GB.
+    # box, fully local at zero token cost (nomic-embed-text + the chosen model).
     pull_ollama_models
+  else
+    echo "  Ollama    : connected at ${OLLAMA_BASE}"
   fi
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

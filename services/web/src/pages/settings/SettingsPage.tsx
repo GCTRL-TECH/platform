@@ -54,6 +54,7 @@ import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 import ObsidianVaultManager from '@/components/connectors/ObsidianVaultManager'
 import SSOPage from './SSOPage'
 import WebhooksPage from './WebhooksPage'
+import { NativeOllamaGuide } from './NativeOllamaGuide'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -517,7 +518,7 @@ function ModelChooser() {
           </span>
         ) : (
           <span className="flex items-center gap-1 text-amber-400">
-            <WifiOff size={12} /> Ollama not reachable — set the base URL above, then reload
+            <WifiOff size={12} /> Ollama not reachable
           </span>
         )}
         <button
@@ -527,6 +528,11 @@ function ModelChooser() {
           <RefreshCw size={12} /> Refresh
         </button>
       </div>
+
+      {/* Not reachable → guide the user through exposing native Ollama (GPU). */}
+      {data && !data.ollamaReachable && (
+        <NativeOllamaGuide ollamaBase={data.ollamaBase} onRetest={() => void loadCatalog()} />
+      )}
 
       {pullMsg && (
         <div className={cn(

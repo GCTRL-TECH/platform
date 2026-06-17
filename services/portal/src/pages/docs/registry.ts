@@ -20,6 +20,7 @@ export const DOC_GROUPS: DocGroup[] = [
     pages: [
       { slug: 'llm-providers', title: 'LLM Providers' },
       { slug: 'infrastructure', title: 'Infrastructure & Ollama' },
+      { slug: 'gpu', title: 'Use Your GPU (native Ollama)' },
       { slug: 'performance', title: 'Performance Guide' },
     ],
   },

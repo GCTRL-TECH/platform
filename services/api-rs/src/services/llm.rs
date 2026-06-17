@@ -121,6 +121,30 @@ pub fn validate_llm_base(provider: &str, base: Option<&str>) -> Result<url::Url,
     }
 }
 
+/// When the API runs inside a container, an Ollama base pointing at
+/// localhost/127.0.0.1/0.0.0.0 refers to the *container itself*, not the host
+/// where a user's NATIVE Ollama (the GPU one) listens. Rewrite the host to
+/// `host.docker.internal` so a user can paste the natural `http://localhost:11434`
+/// and it just reaches their host. Outside a container (dev, `cargo run`) this is
+/// a no-op so localhost keeps meaning the dev box. Cloud providers never use a
+/// loopback host, so this only ever affects Ollama.
+pub fn containerize_ollama_base(base: &str) -> String {
+    if !std::path::Path::new("/.dockerenv").exists() {
+        return base.to_string();
+    }
+    match url::Url::parse(base) {
+        Ok(mut u) => {
+            let loopback = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "0.0.0.0"));
+            if loopback && u.set_host(Some("host.docker.internal")).is_ok() {
+                u.as_str().trim_end_matches('/').to_string()
+            } else {
+                base.to_string()
+            }
+        }
+        Err(_) => base.to_string(),
+    }
+}
+
 impl LlmTarget {
     /// Resolve the base URL to actually hit, re-validating the stored `base_url`
     /// against [`validate_llm_base`] at REQUEST time. This is the second line of
@@ -134,7 +158,7 @@ impl LlmTarget {
             .clone()
             .filter(|s| !s.trim().is_empty());
         match validate_llm_base(&self.provider, candidate.as_deref()) {
-            Ok(u) => u.as_str().trim_end_matches('/').to_string(),
+            Ok(u) => containerize_ollama_base(u.as_str().trim_end_matches('/')),
             // Validation failed (e.g. a bad cloud host snuck into the DB): fall
             // back to the provider's safe canonical base rather than the
             // attacker-supplied value.
@@ -299,7 +323,7 @@ pub async fn resolve_ollama_base_for_user(
 
     let raw = stored.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
     match validate_llm_base("ollama", Some(&raw)) {
-        Ok(u) => Some(u.as_str().trim_end_matches('/').to_string()),
+        Ok(u) => Some(containerize_ollama_base(u.as_str().trim_end_matches('/'))),
         Err(_) => None,
     }
 }
