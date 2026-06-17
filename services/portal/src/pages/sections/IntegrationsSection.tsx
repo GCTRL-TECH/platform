@@ -1,21 +1,34 @@
+import type { ReactNode } from 'react'
 import { Plug2 } from 'lucide-react'
 
 // simpleicons CDN supports a /COLOR suffix that recolours the SVG server-side,
-// so we don't have to fake white-out with brightness-0/invert (which broke a
-// couple of multi-fill icons like the old Microsoft tile).
+// so we don't have to fake white-out with brightness-0/invert.
 const CDN = 'https://cdn.simpleicons.org'
 const WHITE = 'FFFFFF'
 
-const INTEGRATIONS = [
-  { name: 'SharePoint',    logo: `${CDN}/microsoftsharepoint/${WHITE}`, desc: 'Enterprise docs'  },
-  { name: 'Google Drive',  logo: `${CDN}/googledrive/${WHITE}`,  desc: 'Cloud document source' },
-  { name: 'Confluence',    logo: `${CDN}/confluence/${WHITE}`,   desc: 'Wiki & documentation'  },
-  { name: 'Notion',        logo: `${CDN}/notion/${WHITE}`,      desc: 'Workspace & docs'      },
-  { name: 'GitHub',        logo: `${CDN}/github/${WHITE}`,       desc: 'Code & docs'           },
-  { name: 'Obsidian',      logo: `${CDN}/obsidian/${WHITE}`,     desc: 'Knowledge vault'       },
-  { name: 'Neo4j',         logo: `${CDN}/neo4j/${WHITE}`,        desc: 'Swappable KG store'    },
-  { name: 'Qdrant',        logo: `${CDN}/qdrant/${WHITE}`,       desc: 'Swappable vector store'},
-  { name: 'REST API',      logo: null,                            desc: 'Any custom source'     },
+// Microsoft pulled its brand marks from simpleicons (sharepoint/office/azure/
+// onedrive all 404 there now), so the Microsoft tile is an inline white
+// 4-square mark instead — renders reliably and matches the monochrome style.
+function MicrosoftLogo() {
+  return (
+    <svg viewBox="0 0 23 23" className="h-8 w-8" aria-hidden="true" fill="#FFFFFF">
+      <rect x="1" y="1" width="10" height="10" />
+      <rect x="12" y="1" width="10" height="10" />
+      <rect x="1" y="12" width="10" height="10" />
+      <rect x="12" y="12" width="10" height="10" />
+    </svg>
+  )
+}
+
+const INTEGRATIONS: { name: string; logo: string | null; node?: ReactNode; desc: string }[] = [
+  { name: 'Microsoft 365', logo: null, node: <MicrosoftLogo />, desc: 'SharePoint & Office docs' },
+  { name: 'Google Drive',  logo: `${CDN}/googledrive/${WHITE}`, desc: 'Cloud document source' },
+  { name: 'Confluence',    logo: `${CDN}/confluence/${WHITE}`,  desc: 'Wiki & documentation'  },
+  { name: 'GitHub',        logo: `${CDN}/github/${WHITE}`,      desc: 'Code & docs'           },
+  { name: 'Obsidian',      logo: `${CDN}/obsidian/${WHITE}`,    desc: 'Knowledge vault'       },
+  { name: 'Neo4j',         logo: `${CDN}/neo4j/${WHITE}`,       desc: 'Swappable KG store'    },
+  { name: 'Qdrant',        logo: `${CDN}/qdrant/${WHITE}`,      desc: 'Swappable vector store'},
+  { name: 'REST API',      logo: null,                          desc: 'Any custom source'     },
 ]
 
 export function IntegrationsSection() {
@@ -36,9 +49,11 @@ export function IntegrationsSection() {
               key={int.name}
               className={`reveal reveal-delay-${(i % 4) + 1} flex flex-col items-center gap-2 rounded-2xl border border-slate-800 bg-slate-900/40 p-5 text-center backdrop-blur-sm transition-all hover:border-indigo-500/30 hover:bg-slate-800/60`}
             >
-              {int.logo
-                ? <img src={int.logo} alt={int.name} width={32} height={32} className="w-8 h-8" loading="lazy" />
-                : <Plug2 size={32} className="text-slate-400" />
+              {int.node
+                ? int.node
+                : int.logo
+                  ? <img src={int.logo} alt={int.name} width={32} height={32} className="w-8 h-8" loading="lazy" />
+                  : <Plug2 size={32} className="text-slate-400" />
               }
               <span className="text-sm font-semibold text-slate-200">{int.name}</span>
               <span className="text-[11px] text-slate-500">{int.desc}</span>
