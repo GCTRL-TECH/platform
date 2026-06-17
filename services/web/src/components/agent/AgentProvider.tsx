@@ -26,12 +26,34 @@ interface AgentContextValue {
 
 const AgentContext = createContext<AgentContextValue | null>(null)
 
+// Persist the chosen agent model across reloads/navigation (per device). The
+// backend honors the model sent on each request; this just stops the widget from
+// snapping back to the llama3.2 default every time.
+const LS_PROVIDER = 'gctrl.agent.llmProvider'
+const LS_MODEL = 'gctrl.agent.llmModel'
+function lsGet(key: string, fallback: string): string {
+  try {
+    const v = localStorage.getItem(key)
+    return v && v.trim() ? v : fallback
+  } catch {
+    return fallback
+  }
+}
+
 export function AgentProvider({ children }: { children: ReactNode }) {
   const [isOpen, setIsOpen] = useState(false)
   const [messages, setMessages] = useState<AgentMessage[]>([])
   const [isStreaming, setIsStreaming] = useState(false)
-  const [llmProvider, setLlmProvider] = useState<string>('ollama')
-  const [llmModel, setLlmModel] = useState('llama3.2')
+  const [llmProvider, setLlmProviderState] = useState<string>(() => lsGet(LS_PROVIDER, 'ollama'))
+  const [llmModel, setLlmModelState] = useState(() => lsGet(LS_MODEL, 'llama3.2'))
+  const setLlmProvider = useCallback((p: string) => {
+    setLlmProviderState(p)
+    try { localStorage.setItem(LS_PROVIDER, p) } catch { /* ignore */ }
+  }, [])
+  const setLlmModel = useCallback((m: string) => {
+    setLlmModelState(m)
+    try { localStorage.setItem(LS_MODEL, m) } catch { /* ignore */ }
+  }, [])
   const sessionId = useRef<string>(crypto.randomUUID())
 
   const sendMessage = useCallback(async (text: string) => {

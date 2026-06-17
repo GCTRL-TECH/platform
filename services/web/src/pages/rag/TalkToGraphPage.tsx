@@ -1092,7 +1092,12 @@ export function TalkToGraphPage() {
 
   // Config
   const [selectedCompilation, setSelectedCompilation] = useState('')
-  const [selectedModel, setSelectedModel] = useState('')
+  // Remember the last chat model per device so Talk-to-Graph doesn't snap back to
+  // the default on every reload/navigation. (The default effect below still
+  // repairs a saved model that's no longer valid/available.)
+  const [selectedModel, setSelectedModel] = useState(() => {
+    try { return localStorage.getItem('gctrl.rag.model') ?? '' } catch { return '' }
+  })
   const [apiKey, setApiKey] = useState('')
   const [showApiKeyInput, setShowApiKeyInput] = useState(false)
 
@@ -1193,6 +1198,13 @@ export function TalkToGraphPage() {
       if (def) setSelectedModel(def)
     }
   }, [models, selectedModel])
+
+  // Persist the chosen model (per device) so it's remembered next time.
+  useEffect(() => {
+    try {
+      if (selectedModel) localStorage.setItem('gctrl.rag.model', selectedModel)
+    } catch { /* ignore */ }
+  }, [selectedModel])
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -1753,7 +1765,7 @@ export function TalkToGraphPage() {
                 <select
                   value={selectedCompilation}
                   onChange={(e) => setSelectedCompilation(e.target.value)}
-                  className="w-auto min-w-[130px] rounded-md border border-slate-700/50 bg-slate-950/60 px-2.5 py-1 pl-7 pr-6 text-[11px] text-slate-400 focus:border-slate-600 focus:outline-none transition-all hover:border-slate-600 hover:text-slate-300 cursor-pointer"
+                  className="w-auto min-w-[130px] rounded-md border border-slate-700/50 bg-slate-950/60 px-2.5 py-1 pl-7 pr-6 text-[11px] text-slate-200 focus:border-slate-600 focus:outline-none transition-all hover:border-slate-600 hover:text-white cursor-pointer"
                   style={{ colorScheme: 'dark' }}
                 >
                   <option value="">All Graphs</option>
@@ -1777,7 +1789,7 @@ export function TalkToGraphPage() {
                     if (opt?.requiresKey) setShowApiKeyInput(true)
                     else setShowApiKeyInput(false)
                   }}
-                  className="w-auto min-w-[130px] rounded-md border border-slate-700/50 bg-slate-950/60 px-2.5 py-1 pl-7 pr-6 text-[11px] text-slate-400 focus:border-slate-600 focus:outline-none transition-all hover:border-slate-600 hover:text-slate-300 cursor-pointer"
+                  className="w-auto min-w-[130px] rounded-md border border-slate-700/50 bg-slate-950/60 px-2.5 py-1 pl-7 pr-6 text-[11px] text-slate-200 focus:border-slate-600 focus:outline-none transition-all hover:border-slate-600 hover:text-white cursor-pointer"
                   style={{ colorScheme: 'dark' }}
                 >
                   <option value="">Select model...</option>

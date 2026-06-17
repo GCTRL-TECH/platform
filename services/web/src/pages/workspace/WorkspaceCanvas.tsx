@@ -90,13 +90,43 @@ const MAX_NODES = 4000
 const MIN_ZOOM = 0.35
 const MAX_ZOOM = 8
 
-class CanvasBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
-  constructor(props: { children: ReactNode }) {
+/** One-time probe: can this browser/device create a WebGL context at all?
+ *  three.js (the 3D renderer) throws "Error creating WebGL context" when it
+ *  can't — headless/remote sessions, GPU-less VMs, blocklisted drivers, or too
+ *  many live contexts. We probe once and cache, so the UI can pre-empt the crash
+ *  by hiding/disabling 3D and staying in 2D instead of showing a dead error card. */
+let _webglOk: boolean | null = null
+function webglAvailable(): boolean {
+  if (_webglOk !== null) return _webglOk
+  try {
+    const c = document.createElement('canvas')
+    const gl =
+      c.getContext('webgl2') ||
+      c.getContext('webgl') ||
+      c.getContext('experimental-webgl')
+    _webglOk = !!gl
+  } catch {
+    _webglOk = false
+  }
+  return _webglOk
+}
+
+class CanvasBoundary extends Component<
+  { children: ReactNode; onError?: (error: Error) => void },
+  { error: Error | null }
+> {
+  constructor(props: { children: ReactNode; onError?: (error: Error) => void }) {
     super(props)
     this.state = { error: null }
   }
   static getDerivedStateFromError(error: Error) {
     return { error }
+  }
+  componentDidCatch(error: Error) {
+    // Let the parent recover (e.g. drop 3D → 2D). The parent re-keys this
+    // boundary on view change, which remounts it clean, so we don't need to
+    // clear our own error state here.
+    this.props.onError?.(error)
   }
   render() {
     if (this.state.error) {
@@ -131,6 +161,16 @@ interface WorkspaceCanvasProps {
 
 export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId = null, className }: WorkspaceCanvasProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('2d')
+  // Whether 3D can run here at all (WebGL probe). When false we keep the user in
+  // 2D and disable the 3D toggle instead of letting three.js throw.
+  const canUse3D = webglAvailable()
+  // Set when 3D had to be abandoned (a render error forced a fallback) so we can
+  // tell the user why they're seeing 2D. Default 2D needs no warning.
+  const [render3dWarning, setRender3dWarning] = useState<string | null>(null)
+  const switchTo2D = useCallback((reason: string) => {
+    setViewMode('2d')
+    setRender3dWarning(reason)
+  }, [])
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const fg2dRef = useRef<any>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -687,14 +727,28 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
           </button>
         )}
         <div className="flex overflow-hidden rounded-lg border border-slate-700 bg-slate-900/90">
-          <button onClick={() => setViewMode('2d')} className={cn('flex items-center gap-1 px-2 py-1 text-[11px]', viewMode === '2d' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300')}>
+          <button onClick={() => { setViewMode('2d'); setRender3dWarning(null) }} className={cn('flex items-center gap-1 px-2 py-1 text-[11px]', viewMode === '2d' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300')}>
             <Square size={11} /> 2D
           </button>
-          <button onClick={() => setViewMode('3d')} className={cn('flex items-center gap-1 px-2 py-1 text-[11px]', viewMode === '3d' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300')}>
+          <button
+            onClick={() => { if (canUse3D) { setViewMode('3d'); setRender3dWarning(null) } }}
+            disabled={!canUse3D}
+            title={canUse3D ? '3D view' : '3D needs WebGL, which is unavailable on this device/browser'}
+            className={cn('flex items-center gap-1 px-2 py-1 text-[11px]',
+              viewMode === '3d' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300',
+              !canUse3D && 'cursor-not-allowed opacity-40 hover:text-slate-500')}
+          >
             <Box size={11} /> 3D
           </button>
         </div>
       </div>
+
+      {/* 3D unavailable / fell back to 2D — explain instead of a dead error card. */}
+      {render3dWarning && (
+        <div className="absolute right-3 top-12 z-20 flex items-center gap-1.5 rounded-md border border-amber-700/50 bg-amber-950/40 px-2 py-1 text-[10px] text-amber-300">
+          <AlertCircle size={11} /> {render3dWarning}
+        </div>
+      )}
 
       {/* FPS guard surfaced: labels auto-dropped under load (2D + 3D). */}
       {showLabels && labelsThrottled && (
@@ -709,7 +763,18 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
         </div>
       )}
 
-      <CanvasBoundary>
+      <CanvasBoundary
+        key={viewMode}
+        onError={() => {
+          // A render crash in 3D (e.g. WebGL context lost) drops us to 2D with a
+          // note, instead of stranding the user on the error card. Remember the
+          // probe failed so the 3D toggle stays disabled this session.
+          if (viewMode === '3d') {
+            _webglOk = false
+            switchTo2D('3D rendering failed on this device — showing 2D.')
+          }
+        }}
+      >
         {ready && displayNodes.length > 0 && (
           <Suspense fallback={<div className="flex h-full items-center justify-center text-xs text-slate-500">Loading renderer…</div>}>
             {viewMode === '2d' ? (

@@ -189,6 +189,9 @@ export function PiConsole() {
                     setLlmModel(rest.join(':'))
                   }}
                   className="flex-1 rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  // Render the native dropdown popup dark — without this the
+                  // <option> list shows white-on-white on Windows/Chrome.
+                  style={{ colorScheme: 'dark' }}
                 >
                   {/* Keep the current selection visible even before models load. */}
                   {!models.some(m => m.provider === llmProvider && m.model === llmModel) && (
