@@ -93,6 +93,45 @@ function LegacyRevivalDiagram() {
   )
 }
 
+function ProjectIsolationDiagram() {
+  const Project = ({ name, client, agent, color }: { name: string; client: string; agent: string; color: string }) => (
+    <div className={`rounded-xl border p-3 ${color}`}>
+      <p className="text-sm font-semibold text-slate-100">{name}</p>
+      <p className="text-[10px] uppercase tracking-wider text-slate-400">{client}</p>
+      <div className="mt-2 rounded-lg border border-slate-700/60 bg-slate-950/50 px-2 py-1.5 text-center">
+        <p className="text-[11px] text-slate-300">{agent}</p>
+        <p className="text-[9px] uppercase tracking-wider text-slate-500">scoped · class-gated</p>
+      </div>
+    </div>
+  )
+  return (
+    <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-6 backdrop-blur-sm sm:p-8">
+      {/* Single source of truth */}
+      <div className="rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-6 py-5 text-center">
+        <div className="bg-gradient-to-r from-emerald-300 via-teal-300 to-cyan-300 bg-clip-text text-xl font-bold text-transparent">
+          GCTRL
+        </div>
+        <p className="text-[11px] uppercase tracking-[0.2em] text-slate-300">one source of truth · on-prem</p>
+      </div>
+
+      <div className="my-4 text-center text-slate-600">↓ &nbsp; partitioned by classification &nbsp; ↓</div>
+
+      {/* Isolated project lanes */}
+      <div className="grid grid-cols-3 gap-3">
+        <Project name="Project Atlas" client="Client A" agent="Engineer · Claude Code" color="border-emerald-400/30 bg-emerald-500/10" />
+        <Project name="Project Bolt" client="Client B" agent="Analyst · Cursor" color="border-teal-400/30 bg-teal-500/10" />
+        <Project name="Internal R&D" client="Confidential" agent="Exec · Hermes" color="border-cyan-400/30 bg-cyan-500/10" />
+      </div>
+
+      {/* Wall note */}
+      <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-center">
+        <p className="text-sm font-semibold text-slate-200">No cross-project bleed</p>
+        <p className="text-xs text-slate-500">an agent on one project can’t see, cite, or leak another — by accident or otherwise</p>
+      </div>
+    </div>
+  )
+}
+
 export function UseCasesPage() {
   useScrollReveal()
   const location = useLocation()
@@ -121,8 +160,9 @@ export function UseCasesPage() {
             </span>
           </h1>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
-            Two ways organizations put GCTRL to work as the shared, access-controlled memory layer for their
-            entire AI workforce — from live team knowledge to decades of locked-away legacy data.
+            Three ways organizations put GCTRL to work as the shared, access-controlled memory layer for their
+            entire AI workforce — from live team knowledge to airtight client projects to decades of locked-away
+            legacy data.
           </p>
           <div className="mt-8 flex flex-wrap justify-center gap-3">
             <Link
@@ -130,6 +170,12 @@ export function UseCasesPage() {
               className="rounded-xl border border-indigo-400/30 bg-indigo-500/10 px-3 py-2 text-sm font-medium text-indigo-200 transition hover:border-indigo-400/60 hover:text-white"
             >
               Agentic Team Memory
+            </Link>
+            <Link
+              to="#project-isolation"
+              className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm font-medium text-emerald-100 transition hover:border-emerald-400/60 hover:text-white"
+            >
+              Airtight Client Projects
             </Link>
             <Link
               to="#legacy-revival"
@@ -209,6 +255,88 @@ export function UseCasesPage() {
                 <li>1. <Link to="/docs/installation" className="text-indigo-400 hover:text-indigo-300">Install GCTRL</Link> on a central machine</li>
                 <li>2. Create <Link to="/docs/access-control" className="text-indigo-400 hover:text-indigo-300">scoped tokens</Link> per colleague</li>
                 <li>3. <Link to="/docs/agents-mcp" className="text-indigo-400 hover:text-indigo-300">Connect each agent over MCP</Link></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* One Source of Truth, Airtight Projects */}
+      <section id="project-isolation" className="scroll-mt-24 px-6 pb-24">
+        <div className="mx-auto max-w-6xl">
+          <div className="grid items-center gap-12 lg:grid-cols-2">
+            <div className="reveal-left">
+              <p className="text-xs font-semibold uppercase tracking-wider text-emerald-400">Agency use case</p>
+              <h2 className="mt-2 text-3xl font-bold text-white sm:text-4xl">
+                One Source of Truth,{' '}
+                <span className="bg-gradient-to-r from-emerald-400 via-teal-400 to-cyan-400 bg-clip-text text-transparent">
+                  Airtight Projects
+                </span>
+              </h2>
+              <p className="mt-5 text-lg leading-relaxed text-slate-400">
+                Run your whole agency on <span className="font-medium text-slate-200">one platform</span> — a single
+                source of truth instead of a sprawl of disconnected tools per client. Every project and client gets its
+                own walled knowledge base, and every colleague or agent connects with a{' '}
+                <span className="font-medium text-slate-200">token scoped to exactly the projects they’re on</span>.
+              </p>
+              <p className="mt-4 text-lg leading-relaxed text-slate-400">
+                Classification and fine-grained access control mean project knowledge{' '}
+                <span className="font-medium text-slate-200">can never get mixed up — not even by accident</span>. An
+                agent working Client A’s project literally can’t retrieve, cite, or leak Client B’s data: over-clearance
+                queries return nothing, and <span className="font-medium text-slate-200">every node, edge, chunk and
+                wiki page</span> is gated at query time. One source of truth, zero cross-project bleed — with a full
+                audit trail on every access.
+              </p>
+            </div>
+            <div className="reveal-right">
+              <ProjectIsolationDiagram />
+            </div>
+          </div>
+
+          {/* Why GCTRL is unique here */}
+          <div className="reveal mt-16 rounded-2xl border border-slate-800 bg-slate-900/40 p-8">
+            <h3 className="text-xl font-semibold text-white">Why nothing else does this</h3>
+            <p className="mt-3 max-w-3xl leading-relaxed text-slate-400">
+              Folder permissions and per-client workspaces rely on someone never making a mistake — one wrong share, one
+              pasted doc, one agent with too-broad context, and a client’s data ends up where it shouldn’t. GCTRL makes
+              isolation <span className="font-medium text-slate-200">structural</span>: clearance lives on the data
+              itself and is enforced at retrieval, so a leak across projects isn’t <em>discouraged</em> — it’s{' '}
+              <span className="font-medium text-slate-200">not representable</span>.
+            </p>
+            <div className="mt-7 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+              {[
+                ['Per-element classification', 'Every node, edge, chunk and wiki page carries its own clearance — gating is on the data, not a folder rule someone can forget.'],
+                ['Enforced at query time', 'Over-clearance results vanish during retrieval — an agent can’t surface what its token isn’t cleared for, even with a perfect prompt.'],
+                ['Project-scoped tokens', 'A token is bound to its project’s knowledge bases; every other project is invisible, not merely hidden.'],
+                ['Accidental-leak proof', 'If it’s out of scope it can’t be retrieved, cited, or fused into another project — there is no “oops, wrong client.”'],
+                ['One platform, not ten', 'A single source of truth and one ops surface — instead of a siloed tool per client that never compounds into shared value.'],
+                ['Audit every access', 'Token, action, resource and outcome — every grant and every denial is logged, for your client and your auditor.'],
+              ].map(([title, body]) => (
+                <div key={title}>
+                  <p className="font-semibold text-slate-100">{title}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-slate-400">{body}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Ideal for + setup */}
+          <div className="reveal mt-8 grid gap-4 sm:grid-cols-2">
+            <div className="feature-card-landing">
+              <h4 className="font-semibold text-slate-100">Ideal for</h4>
+              <ul className="mt-3 space-y-1.5 text-sm text-slate-400">
+                <li>• Agencies &amp; consultancies running many clients on one platform</li>
+                <li>• Multi-client work under NDA or strict confidentiality</li>
+                <li>• Chinese-wall separation between projects, deals or case teams</li>
+                <li>• Anyone who can’t risk one client’s data in another’s deliverable</li>
+              </ul>
+            </div>
+            <div className="feature-card-landing">
+              <h4 className="font-semibold text-slate-100">How to set it up</h4>
+              <ul className="mt-3 space-y-1.5 text-sm text-slate-400">
+                <li>1. <Link to="/docs/installation" className="text-indigo-400 hover:text-indigo-300">Install GCTRL</Link> once as your agency’s source of truth</li>
+                <li>2. Create a KB per project + <Link to="/docs/access-control" className="text-indigo-400 hover:text-indigo-300">scoped tokens</Link> per colleague</li>
+                <li>3. Set <Link to="/docs/compliance" className="text-indigo-400 hover:text-indigo-300">classification</Link> per element; <Link to="/docs/agents-mcp" className="text-indigo-400 hover:text-indigo-300">connect agents over MCP</Link></li>
               </ul>
             </div>
           </div>

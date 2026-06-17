@@ -17,6 +17,11 @@ RUN python3 -m pip install --no-cache-dir -r requirements.txt lxml_html_clean
 
 COPY src ./src
 ENV TRANSFORMERS_CACHE=/app/models
+ENV HF_HOME=/app/models
+# Robust first-run model download (see prod Dockerfiles).
+ENV HF_HUB_DISABLE_XET=1
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV HF_HUB_DOWNLOAD_TIMEOUT=30
 ENV NVIDIA_VISIBLE_DEVICES=all
 EXPOSE 4010
 CMD ["python3", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4010"]

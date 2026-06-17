@@ -35,7 +35,16 @@ type StepId = 'welcome' | 'model' | 'license' | 'connect' | 'source' | 'extract'
 export default function OnboardingWizard() {
   const navigate = useNavigate()
   const { user } = useAuth()
-  const [currentStep, setCurrentStep] = useState<StepId>('welcome')
+  const [currentStep, setCurrentStep] = useState<StepId>(() => {
+    // Resume where the user left off instead of resetting to 'welcome'.
+    const valid: StepId[] = ['welcome', 'model', 'license', 'connect', 'source', 'extract', 'chat']
+    const saved = localStorage.getItem('onboarding_step') as StepId | null
+    return saved && valid.includes(saved) ? saved : 'welcome'
+  })
+  // Persist progress so a refresh or a quick detour keeps the user's place.
+  useEffect(() => {
+    try { localStorage.setItem('onboarding_step', currentStep) } catch { /* ignore */ }
+  }, [currentStep])
   const [sampleText, setSampleText] = useState(
     'GCTRL is a structured data platform for AI. It extracts knowledge from documents, merges graphs, and lets you talk to your data with GDPR-compliant RAG.'
   )
@@ -176,14 +185,16 @@ export default function OnboardingWizard() {
   function handleComplete() {
     // Mark onboarding as done in localStorage
     localStorage.setItem('onboarding_complete', 'true')
+    localStorage.removeItem('onboarding_step')
     navigate('/dashboard')
   }
 
   function handleSkip() {
-    // User opted out of the guided tour. Honor that — they can re-trigger it
-    // from Settings if they ever want it back.
+    // User opted out of the guided tour. Honor that — they can re-launch it any
+    // time via the "Setup guide" button on the dashboard.
     localStorage.setItem('onboarding_complete', 'true')
     localStorage.setItem('onboarding_skipped', 'true')
+    localStorage.removeItem('onboarding_step')
     navigate('/dashboard')
   }
 
@@ -283,9 +294,10 @@ export default function OnboardingWizard() {
               <div className="space-y-3">
                 <button
                   onClick={() => {
-                    // Deep-link to the AI Models settings tab. Mark onboarding
-                    // continuable — the gate re-checks on window focus / return.
-                    navigate('/settings?tab=models')
+                    // Open settings in a NEW TAB so the wizard never unmounts.
+                    // When the user returns to this tab, the LLM gate re-checks
+                    // on window focus and unlocks Continue automatically.
+                    window.open('/settings?tab=models', '_blank', 'noopener,noreferrer')
                   }}
                   className="btn-primary w-full justify-center"
                 >
@@ -301,7 +313,8 @@ export default function OnboardingWizard() {
                   Use local Ollama
                 </button>
                 <p className="text-center text-[11px] text-slate-500">
-                  In AI Model settings you can pick the embedding / extraction / wiki models and
+                  Settings open in a new tab — set up your model there, then come back here and we’ll
+                  detect it automatically. You can pick the embedding / extraction / wiki models and
                   install the recommended local ones (e.g. nomic-embed-text) with one click.
                 </p>
                 <p className="flex items-center justify-center gap-1.5 text-center text-[11px] text-amber-400/80">
@@ -473,7 +486,7 @@ export default function OnboardingWizard() {
                 {[
                   { icon: Upload, label: 'Upload Files', desc: 'PDF, DOCX, XLSX, images...', action: () => { setCurrentStep('extract') } },
                   { icon: Globe, label: 'Paste Text', desc: 'Quick start with any text', action: () => { setCurrentStep('extract') } },
-                  { icon: Plug, label: 'Google Drive', desc: 'Connect your workspace', action: () => { navigate('/settings'); localStorage.setItem('onboarding_complete', 'true') } },
+                  { icon: Plug, label: 'Google Drive', desc: 'Connect your workspace', action: () => { window.open('/settings?tab=integrations', '_blank', 'noopener,noreferrer') } },
                   { icon: Globe, label: 'Crawl Website', desc: 'Extract from any URL', action: () => { setCurrentStep('extract') } },
                 ].map((opt) => (
                   <button key={opt.label} onClick={opt.action}

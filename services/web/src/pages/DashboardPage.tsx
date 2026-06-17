@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { Zap, Network, ArrowRight, Clock, type LucideIcon } from 'lucide-react'
+import { Zap, Network, ArrowRight, Clock, Compass, type LucideIcon } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
@@ -120,6 +120,14 @@ export function DashboardPage() {
         >
           <Network size={14} />
           Browse Graphs
+        </button>
+        <button
+          onClick={() => navigate('/onboarding')}
+          className="btn-secondary"
+          title="Replay the guided setup"
+        >
+          <Compass size={14} />
+          Setup guide
         </button>
       </div>
 

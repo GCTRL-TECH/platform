@@ -36,6 +36,11 @@ RUN python3 -m pip install --no-cache-dir cython==3.0.11 setuptools && \
 # re-downloaded on every container recreate (huggingface_hub keys off HF_HOME).
 ENV TRANSFORMERS_CACHE=/app/models
 ENV HF_HOME=/app/models
+# Robust first-run model download: avoid the flaky Xet transfer, use hf_transfer
+# (parallel/resumable), and time out a stalled connection so warmup retries it.
+ENV HF_HUB_DISABLE_XET=1
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV HF_HUB_DOWNLOAD_TIMEOUT=30
 ENV NVIDIA_VISIBLE_DEVICES=all
 EXPOSE 4010
 CMD ["python3", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4010"]

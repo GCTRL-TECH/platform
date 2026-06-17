@@ -569,10 +569,11 @@ async fn query(
     let kex_url = format!("{}/search", state.cfg.kex_worker_url);
     let kex_body = json!({
         // Contextualized query (resolves follow-up references); falls back to the
-        // raw message on the first turn. Fetch a larger candidate pool (8) so the
-        // hybrid dense+lexical fusion has more to rank, then we rerank + keep top 5.
+        // raw message on the first turn. Fetch a larger candidate pool (12) so the
+        // hybrid dense+lexical fusion has more to rank — wider net = more distinct
+        // source sessions for parent-document expansion (Hebel 1: recall).
         "query":          search_query,
-        "limit":          8,
+        "limit":          12,
         "compilation_id": req.compilation_id,
         // Scope retrieval to the caller's own chunks (grounding + no cross-user leak).
         "user_id":        claims.as_ref().map(|c| c.sub),
@@ -629,7 +630,7 @@ async fn query(
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-        chunks.truncate(5);
+        chunks.truncate(6);
     }
 
     // A4 — HEAT on chunks. Every chunk that was actually returned by retrieval (and
@@ -730,24 +731,51 @@ async fn query(
     // returns an empty `source`, and a chunk's provenance is the most reliable
     // answer to "which file does this come from" (the entity name in the chunk is
     // frequently partial, e.g. "Fabio" for the node "Fabio Chiaramonte").
-    let chunk_files: std::collections::HashMap<String, String> = match &claims {
-        Some(c) => {
-            let ids: Vec<Uuid> = chunks.iter()
-                .filter_map(|ch| ch.chunk_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()))
-                .collect();
-            if ids.is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                sqlx::query_as::<_, (Uuid, Option<String>)>(
-                    "SELECT tc.id, COALESCE(j.input->>'fileName', j.input->>'sourceRef') \
-                     FROM text_chunks tc JOIN jobs j ON j.id = tc.job_id \
-                     WHERE tc.id = ANY($1) AND tc.user_id = $2"
-                ).bind(&ids).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default()
-                 .into_iter().filter_map(|(id, f)| f.map(|ff| (id.to_string(), ff))).collect()
+    // Resolve each retrieved chunk's ORIGIN FILE and PARENT DOCUMENT. HEBEL 1 —
+    // parent-document ("read whole files") retrieval: a chunk is just a fragment of
+    // a source session (one KEX extract job, full text in jobs.input.text). When a
+    // chunk matches we put the WHOLE session into context, so a fact elsewhere in
+    // the same session (a date, a name) is found even if its exact chunk didn't
+    // rank top-k — directly targeting the "right session not retrieved" miss class.
+    // Clearance is implicit: a chunk only survives the min_rank filter if its
+    // session is within the caller's clearance, so its full text is safe to include.
+    let mut chunk_files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut parent_docs: Vec<(String, String)> = Vec::new(); // (source, full_text), rank-ordered, deduped by job
+    if let Some(ref c) = claims {
+        let ids: Vec<Uuid> = chunks.iter()
+            .filter_map(|ch| ch.chunk_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()))
+            .collect();
+        if !ids.is_empty() {
+            let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, Option<String>)>(
+                "SELECT tc.id, tc.job_id, COALESCE(j.input->>'fileName', j.input->>'sourceRef'), j.input->>'text' \
+                 FROM text_chunks tc JOIN jobs j ON j.id = tc.job_id \
+                 WHERE tc.id = ANY($1) AND tc.user_id = $2"
+            ).bind(&ids).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default();
+            // chunk_id -> (job_id, source, full_text)
+            let mut by_chunk: std::collections::HashMap<String, (Uuid, Option<String>, Option<String>)> =
+                std::collections::HashMap::new();
+            for (cid_, jid, src, txt) in rows {
+                if let Some(ref s) = src { chunk_files.insert(cid_.to_string(), s.clone()); }
+                by_chunk.insert(cid_.to_string(), (jid, src, txt));
+            }
+            // Build parent docs in chunk-RANK order, deduped by job, capped to the
+            // top 4 distinct sessions (× ~4k chars) so the prompt stays bounded.
+            let mut seen_jobs: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+            for ch in chunks.iter() {
+                if parent_docs.len() >= 4 { break; }
+                let Some(cid_) = ch.chunk_id.as_deref() else { continue; };
+                let Some((jid, src, txt)) = by_chunk.get(cid_) else { continue; };
+                if !seen_jobs.insert(*jid) { continue; }
+                if let Some(t) = txt {
+                    if !t.trim().is_empty() {
+                        let name = src.clone().unwrap_or_else(|| "source".into());
+                        let capped: String = t.chars().take(4000).collect();
+                        parent_docs.push((name, capped));
+                    }
+                }
             }
         }
-        None => std::collections::HashMap::new(),
-    };
+    }
 
     // ── 3. Assemble context string ────────────────────────────────────────────
     // A3 — GROUND-TRUTH INJECTION HIERARCHY. Blocks are ordered by trust tier and
@@ -805,6 +833,17 @@ async fn query(
             );
             context_parts.push(hot_block);
             hot_matched = matched;
+        }
+    }
+
+    // TIER 2.5 — FULL SOURCE SESSIONS (parent documents). The whole sessions the
+    // top passages were carved from, so the model can read them end-to-end and find
+    // a fact that the fragment retrieval narrowly missed (Hebel 1: recall).
+    if !parent_docs.is_empty() {
+        context_parts.push(
+            "--- FULL SOURCE SESSIONS (read each in full; the answer may be anywhere inside) ---".to_string());
+        for (i, (name, text)) in parent_docs.iter().enumerate() {
+            context_parts.push(format!("[Source {} — {}]\n{}\n", i + 1, name, text));
         }
     }
 

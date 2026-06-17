@@ -11,6 +11,7 @@ Endpoints:
 
 import json
 import logging
+import os
 import threading
 import time
 import traceback
@@ -656,6 +657,94 @@ def stop_worker() -> None:
 
 # ── Lifespan (startup / shutdown) ────────────────────────────────────
 
+# ── NER model warmup status (drives the dashboard "engine initialising" UI) ────
+# The NER model (~1.5GB) downloads on first start. We load it in the BACKGROUND so
+# the API serves immediately, expose progress via /model-status, and auto-retry a
+# stalled/failed download. State: starting | downloading | loading | ready |
+# retrying | error. `progress` is a best-effort 0..100 from the on-disk cache size.
+_model_status = {"state": "starting", "progress": 0, "attempt": 0, "detail": ""}
+_model_status_lock = threading.Lock()
+# Best-effort total bytes of the NER model cache, for the progress bar.
+_MODEL_EXPECTED_BYTES = 1_500_000_000
+
+
+def _set_model_status(**kw):
+    with _model_status_lock:
+        _model_status.update(kw)
+
+
+def get_model_status():
+    with _model_status_lock:
+        s = dict(_model_status)
+    # The worker can lazy-load the model independently of warmup; reflect that.
+    try:
+        if get_ner_pipeline().is_loaded:
+            s["state"] = "ready"
+            s["progress"] = 100
+    except Exception:
+        pass
+    return s
+
+
+def _model_cache_bytes():
+    base = os.environ.get("HF_HOME") or "/app/models"
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(base):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
+def _model_progress_loop(stop_event):
+    """Update `progress` from the growing cache while a download attempt runs."""
+    while not stop_event.wait(2.0):
+        pct = int(_model_cache_bytes() * 100 / _MODEL_EXPECTED_BYTES)
+        pct = max(0, min(99, pct))
+        cur = get_model_status()
+        # Once bytes are basically all there but the call hasn't returned, we're in
+        # the local load phase — show "loading" instead of a stuck 99%.
+        new_state = "loading" if pct >= 98 and cur.get("state") == "downloading" else None
+        if new_state:
+            _set_model_status(progress=pct, state=new_state)
+        else:
+            _set_model_status(progress=pct)
+
+
+def _warmup_model():
+    """Download + load the NER model in the background, auto-retrying a stalled or
+    failed download (HF_HUB_DOWNLOAD_TIMEOUT turns a stall into an exception, and
+    huggingface_hub resumes partial files on the next attempt)."""
+    max_attempts = 8
+    for attempt in range(1, max_attempts + 1):
+        _set_model_status(
+            state=("downloading" if attempt == 1 else "retrying"),
+            attempt=attempt,
+            detail="",
+        )
+        stop = threading.Event()
+        pt = threading.Thread(target=_model_progress_loop, args=(stop,), daemon=True)
+        pt.start()
+        try:
+            get_ner_pipeline()._get_model()  # download (resumable) + local load
+            stop.set()
+            _set_model_status(state="ready", progress=100, detail="")
+            logger.info("KEX NER model ready")
+            return
+        except Exception as exc:
+            stop.set()
+            logger.warning(f"KEX model init attempt {attempt}/{max_attempts} failed/stalled: {exc}")
+            _set_model_status(state="retrying", detail=str(exc)[:200])
+            time.sleep(min(5 * attempt, 30))
+    _set_model_status(state="error", detail="model initialisation failed after retries")
+    logger.error("KEX NER model failed to initialise after retries")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -668,11 +757,10 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Neo4j not available at startup: {exc}")
 
-    # Warm up GLiNER model (lazy — will load on first request if skipped)
-    try:
-        get_ner_pipeline()._get_model()
-    except Exception as exc:
-        logger.warning(f"GLiNER model pre-load failed: {exc}")
+    # Warm up the NER model in the BACKGROUND so the API serves immediately (the
+    # model is ~1.5GB on a fresh install). Progress + auto-retry are reported via
+    # /model-status, which the dashboard polls to show an "engine initialising" UI.
+    threading.Thread(target=_warmup_model, name="kex-model-warmup", daemon=True).start()
 
     # Ensure the Qdrant collection exists at startup (create-if-missing). This is
     # what makes a fresh install / post-purge work turnkey: without it the first
@@ -928,6 +1016,14 @@ async def upload_endpoint(
             "error": "pipeline_failed",
             "message": str(exc),
         })
+
+
+@app.get("/model-status")
+async def model_status_endpoint():
+    """Cheap, dependency-free status of the NER model warmup (no network probes),
+    polled by the dashboard to show the first-run "engine initialising" notice +
+    progress bar. Returns: {state, progress, attempt, detail}."""
+    return get_model_status()
 
 
 @app.get("/health")

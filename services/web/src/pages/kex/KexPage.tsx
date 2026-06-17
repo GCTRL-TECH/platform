@@ -33,6 +33,7 @@ import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
 import { ExtractionsTable } from './components/ExtractionsTable'
+import { KexEngineBanner } from './components/KexEngineBanner'
 import LocalFolderManager from '@/components/connectors/LocalFolderManager'
 import {
   listLocalVaults,
@@ -559,6 +560,8 @@ export function KexPage() {
 
   return (
     <div className="space-y-6 animate-slide-up">
+      {/* First-run: extraction engine still downloading its model component */}
+      <KexEngineBanner />
       {/* Extraction card */}
       <div className="card">
         <div className="mb-4 flex items-start justify-between">

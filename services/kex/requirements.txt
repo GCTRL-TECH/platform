@@ -4,6 +4,7 @@ uvicorn==0.30.0
 transformers==4.44.0
 torch==2.4.0
 gliner==0.2.7
+hf_transfer==0.1.8
 neo4j==5.25.0
 redis==5.0.0
 requests==2.32.0

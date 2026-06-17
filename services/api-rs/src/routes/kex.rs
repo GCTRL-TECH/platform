@@ -77,6 +77,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/chunks",          get(list_chunks))
         .route("/chunks/:id",      axum::routing::delete(delete_chunk))
         .route("/queue",           get(queue_depth))
+        .route("/model-status",    get(model_status))
         .route("/threads",         axum::routing::put(set_threads))
 }
 
@@ -459,6 +460,25 @@ async fn queue_depth(State(state): State<Arc<crate::models::AppState>>) -> Resul
         .unwrap_or(1)
         .clamp(1, 10);
     Ok(Json(json!({ "depth": depth, "threads": threads })))
+}
+
+/// GET /api/kex/model-status — proxy the KEX worker's NER-model warmup status so
+/// the dashboard can show a first-run "extraction engine is initialising" notice
+/// with progress. Never errors: if KEX isn't serving yet (still booting), report
+/// a "starting" state so the UI still shows the notice.
+async fn model_status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value> {
+    let url = format!("{}/model-status", state.cfg.kex_worker_url.trim_end_matches('/'));
+    let fallback = json!({ "state": "starting", "progress": 0, "attempt": 0, "detail": "" });
+    let body = match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(fallback),
+        _ => fallback,
+    };
+    Json(body)
 }
 
 #[derive(Deserialize)]
