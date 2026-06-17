@@ -91,6 +91,13 @@ services:
       - PORT=4020
       - SIMILARITY_THRESHOLD=0.85
       - RESOLVER_URL=http://gctrl-resolver:8080
+      # Distill needs Postgres (compilations), Qdrant (grounding chunks) and an
+      # Ollama (wiki prose). Without these, distill fails to resolve hostnames or
+      # produces no prose. Mirror the api/kex service names.
+      - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
+      - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
+      - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
+      - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
     depends_on:
       gctrl-agent:
         condition: service_healthy
@@ -122,6 +129,9 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - FRONTEND_URL=http://localhost:3001
       - KEX_WORKER_URL=http://gctrl-kex:4010
+      # Without this the API defaults FUSE to localhost:4020 (= itself, in the
+      # container) → "FUSE unreachable" and distill/fuse fail out of the box.
+      - FUSE_URL=http://gctrl-fuse:4020
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
     depends_on:
