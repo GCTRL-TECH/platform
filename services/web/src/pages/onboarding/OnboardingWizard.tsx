@@ -231,22 +231,35 @@ export default function OnboardingWizard() {
               <div>
                 <h1 className="text-2xl font-bold text-slate-100">Welcome to GCTRL{user?.name ? `, ${user.name}` : ''}!</h1>
                 <p className="mt-2 text-sm text-slate-400">
-                  Drop any data. Get structured knowledge. Let's set up your first knowledge extraction in under 2 minutes.
+                  GCTRL is installed. Here's the quick path to a working, agent-ready knowledge graph — about 5 minutes.
                 </p>
               </div>
-              <div className="grid grid-cols-3 gap-4 pt-4">
+              {/* Quick Start roadmap — mirrors gctrl.tech/docs/quickstart */}
+              <div className="space-y-2 text-left">
                 {[
-                  { icon: Upload, title: 'Extract', desc: 'Upload documents, connect sources' },
-                  { icon: Database, title: 'Build Graphs', desc: 'Structured knowledge, auto-fused' },
-                  { icon: MessageSquare, title: 'Ask Questions', desc: 'RAG chat with your data' },
-                ].map((f) => (
-                  <div key={f.title} className="rounded-xl border border-slate-800 bg-slate-900/50 p-4 text-center">
-                    <f.icon size={20} className="mx-auto text-slate-400" />
-                    <p className="mt-2 text-xs font-medium text-slate-200">{f.title}</p>
-                    <p className="mt-1 text-[10px] text-slate-500">{f.desc}</p>
+                  { n: 1, label: 'Connect an AI model', desc: 'Cloud, or local Ollama — run it natively for GPU speed.' },
+                  { n: 2, label: 'Register & activate your license', desc: 'Grab a key at gctrl.tech, then activate it here.' },
+                  { n: 3, label: 'Create a full-access agent token', desc: 'Drop the MCP config into Claude Code, Codex, or Cursor.' },
+                  { n: 4, label: 'Ingest a source & build the graph', desc: 'Upload a PDF or paste text — KEX extracts entities & relations.' },
+                  { n: 5, label: 'Talk to your data', desc: 'Grounded, local RAG over your knowledge graph.' },
+                ].map((s) => (
+                  <div key={s.n} className="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 text-xs font-semibold text-indigo-300">{s.n}</span>
+                    <div>
+                      <p className="text-sm font-medium text-slate-200">{s.label}</p>
+                      <p className="text-[11px] text-slate-500">{s.desc}</p>
+                    </div>
                   </div>
                 ))}
               </div>
+              <a
+                href="https://gctrl.tech/docs/quickstart"
+                target="_blank"
+                rel="noreferrer"
+                className="inline-block text-xs text-indigo-400 hover:text-indigo-300"
+              >
+                Full Quick Start guide ↗
+              </a>
               <button onClick={() => setCurrentStep('model')} className="btn-primary mx-auto">
                 Get Started <ArrowRight size={14} />
               </button>
