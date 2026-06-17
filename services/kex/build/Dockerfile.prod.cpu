@@ -47,6 +47,10 @@ RUN pip install --no-cache-dir -r requirements.txt lxml_html_clean
 # Compiled engine (.so) + thin .py entrypoint/__init__ only — no engine source.
 COPY --from=compiler /build/src ./src
 
+# HF_HOME persists the GLiNER model on the /app/models volume so it isn't
+# re-downloaded (~1.4GB) on every container recreate. TRANSFORMERS_CACHE is
+# deprecated; huggingface_hub (GLiNER's downloader) keys off HF_HOME.
 ENV TRANSFORMERS_CACHE=/app/models
+ENV HF_HOME=/app/models
 EXPOSE 4010
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4010"]

@@ -84,6 +84,10 @@ services:
       - PORT=4020
       - SIMILARITY_THRESHOLD=0.85
       - RESOLVER_URL=http://gctrl-resolver:8080
+      # Where the wiki-distiller's LLM lives (same Ollama as kex/api). Without it,
+      # distill falls back to a non-existent `ollama:11434` and produces no prose.
+      - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
+      - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
     depends_on:
       gctrl-agent:
         condition: service_healthy
@@ -111,6 +115,9 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - FRONTEND_URL=http://localhost:3001
       - KEX_WORKER_URL=http://gctrl-kex:4010
+      # Without this the API defaults to localhost:4020 and can't reach the FUSE
+      # container → community detection / fusion / distill triggers all fail.
+      - FUSE_URL=http://gctrl-fuse:4020
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
     depends_on:

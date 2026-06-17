@@ -32,7 +32,10 @@ RUN python3 -m pip install --no-cache-dir cython==3.0.11 setuptools && \
     python3 -m pip uninstall -y cython && \
     echo "=== shipped modules ===" && find src -name '*.so' -o -name '*.py' | sort
 
+# HF_HOME persists the GLiNER model on the /app/models volume so it isn't
+# re-downloaded on every container recreate (huggingface_hub keys off HF_HOME).
 ENV TRANSFORMERS_CACHE=/app/models
+ENV HF_HOME=/app/models
 ENV NVIDIA_VISIBLE_DEVICES=all
 EXPOSE 4010
 CMD ["python3", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "4010"]
