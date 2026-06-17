@@ -88,6 +88,11 @@ services:
       # distill falls back to a non-existent `ollama:11434` and produces no prose.
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
       - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
+      # FUSE reads Postgres (compilations/wiki sources) + Qdrant (chunk passages)
+      # during distill. Without these it falls back to non-existent hosts
+      # `postgres`/`qdrant` and distill can't read sources or enrich pages.
+      - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
+      - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
     depends_on:
       gctrl-agent:
         condition: service_healthy
