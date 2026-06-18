@@ -4,7 +4,7 @@ The knowledge-infrastructure layer for enterprise AI — extract structured
 knowledge from your documents, fuse it into one governed knowledge graph, and
 ground your LLMs/agents on it with full access control.
 
-**Modules:** KEX (knowledge extraction) · FUSE (graph fusion, powered by LIMES) ·
+**Modules:** KEX (knowledge extraction) · FUSE (graph fusion) ·
 Knowledge-Graph management · Talk-to-Graph (GDPR-compliant RAG) · Pi agent.
 
 ## Install
@@ -30,8 +30,7 @@ anyone forge admin tokens; default DB passwords are public knowledge.
 
 ## License
 
-GCTRL is **dual-licensed** (the same model as the bundled
-[LIMES](https://github.com/dice-group/LIMES)):
+GCTRL is **dual-licensed**:
 
 - **Open source — GNU AGPL v3** ([`LICENSE`](./LICENSE)): free to use, modify, and
   self-host, as long as your own stack stays open under the AGPL.
