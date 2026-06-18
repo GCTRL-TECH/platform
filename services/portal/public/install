@@ -177,10 +177,10 @@ detect_services() {
       # switch to native (GPU) later by exposing it.
       PROFILES+=("bundled-ollama")
       OLLAMA_BASE="http://gctrl-ollama:11434"
-      skip "Native Ollama found, but it listens on localhost only — Docker can't reach it."
-      skip "→ Using the bundled (CPU) Ollama so GCTRL works out of the box."
-      skip "  For GPU: set OLLAMA_HOST=0.0.0.0 on your Ollama, then switch in the"
-      skip "  dashboard (Settings → AI Models). Guide: https://gctrl.tech/docs/gpu"
+      warn "Native Ollama found, but it listens on localhost only — Docker can't reach it."
+      warn "→ Using the bundled (CPU) Ollama so GCTRL works out of the box."
+      warn "  For GPU: set OLLAMA_HOST=0.0.0.0 on your Ollama, then switch in the"
+      warn "  dashboard (Settings → AI Models). Guide: https://gctrl.tech/docs/gpu"
     fi
   else
     PROFILES+=("bundled-ollama")
