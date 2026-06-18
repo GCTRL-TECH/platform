@@ -1234,10 +1234,21 @@ pub(crate) fn find_tool_json(text: &str) -> Option<Value> {
     // which small/local models routinely emit — that failure was making the agent
     // silently skip the tool and hallucinate empty results. The streaming
     // Deserializer stops cleanly at the end of the first value instead.
-    let bytes = text.as_bytes();
+    // Strip markdown code fences (```json … ```) up front: deepseek-v4-pro and other
+    // frontier models routinely WRAP a tool call in a fenced block, which otherwise
+    // leaves fence text around the object and — when a fence lands mid-`args` — breaks
+    // the round-trip so the call leaks back as a plain "answer". Dropping fence lines
+    // makes the object parse cleanly; a bare unfenced object is unaffected.
+    let cleaned: String = if text.contains("```") {
+        text.lines().filter(|l| !l.trim_start().starts_with("```")).collect::<Vec<_>>().join("\n")
+    } else {
+        text.to_string()
+    };
+    let scan = cleaned.as_str();
+    let bytes = scan.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'{' {
-            let mut it = serde_json::Deserializer::from_str(&text[i..]).into_iter::<Value>();
+            let mut it = serde_json::Deserializer::from_str(&scan[i..]).into_iter::<Value>();
             if let Some(Ok(candidate)) = it.next() {
                 if candidate["tool"].is_string() {
                     return Some(candidate);

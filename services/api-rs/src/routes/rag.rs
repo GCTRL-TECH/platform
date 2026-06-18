@@ -602,9 +602,10 @@ async fn query(
 
     // Query-aware rerank over the hybrid-fused candidates. KEX already fuses
     // dense+lexical (RRF); this nudges chunks whose text / entity mentions overlap
-    // the (contextualized) query terms to the top, then keeps the best 5 so the
+    // the (contextualized) query terms to the top, then keeps the best 6 so the
     // prompt stays focused. A small additive bonus — it breaks ties toward
-    // query-relevant chunks without overriding a strongly-retrieved one.
+    // query-relevant chunks without overriding a strongly-retrieved one. (A cross-
+    // encoder reranker was A/B-tested here and REGRESSED — see kex/reranker.py.)
     {
         let terms: Vec<String> = search_query
             .to_lowercase()
@@ -661,6 +662,7 @@ async fn query(
         from:     String,
         relation: String,
         to:       String,
+        ts:       i64, // when this edge was last asserted (epoch ms) — recency axis
     }
 
     // Bug 2: Scope Neo4j queries to the authenticated user's nodes (plus shared nodes
@@ -670,12 +672,18 @@ async fn query(
     let (graph_triples, cypher_used) = if entity_names.is_empty() {
         (vec![], None)
     } else {
+        // Order edges newest-first so that, when the same (subject, predicate) has
+        // CHANGED over time (a new extraction created a fresh edge to a different
+        // object — e.g. role Engineer→Manager), the current value is surfaced first
+        // and the history is preserved below it (audit trail). `asserted_at` is bumped
+        // on every re-extraction; fall back to `created_at` for pre-existing edges.
         let cypher = format!(
             "MATCH (n) WHERE n.name IN $names AND (n.user_id IS NULL OR n.user_id = $uid) \
              AND coalesce(n._min_rank,0) <= $rank \
              OPTIONAL MATCH (n)-[r]->(m) \
                WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
-             RETURN n, r, m LIMIT 100"
+             WITH n, r, m, coalesce(r.asserted_at, r.created_at, 0) AS ts \
+             RETURN n, r, m, ts ORDER BY ts DESC LIMIT 100"
         );
         let mut triples: Vec<GraphTriple> = vec![];
 
@@ -707,12 +715,14 @@ async fn query(
                         .ok()
                         .and_then(|n| n.get::<String>("name").ok());
 
+                    let ts = row.get::<i64>("ts").unwrap_or(0);
                     if let (Some(rel), Some(to)) = (rel_type, to_name) {
                         if !from_name.is_empty() && !to.is_empty() {
                             triples.push(GraphTriple {
                                 from:     from_name,
                                 relation: rel,
                                 to,
+                                ts,
                             });
                         }
                     }
@@ -740,23 +750,59 @@ async fn query(
     // Clearance is implicit: a chunk only survives the min_rank filter if its
     // session is within the caller's clearance, so its full text is safe to include.
     let mut chunk_files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut parent_docs: Vec<(String, String)> = Vec::new(); // (source, full_text), rank-ordered, deduped by job
+    // RECENCY: (session_ord, source, full_text) — parent docs, sorted oldest→newest
+    // before render so the model can apply the "latest value wins" rule on conflict.
+    let mut parent_docs: Vec<(i64, String, String)> = Vec::new();
+    // chunk_id -> session ordinal (recency axis) for tagging numbered passages.
+    let mut chunk_ord: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Some(ref c) = claims {
         let ids: Vec<Uuid> = chunks.iter()
             .filter_map(|ch| ch.chunk_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()))
             .collect();
         if !ids.is_empty() {
-            let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, Option<String>)>(
-                "SELECT tc.id, tc.job_id, COALESCE(j.input->>'fileName', j.input->>'sourceRef'), j.input->>'text' \
+            // TP1 — carry recency out of the join: the session ordinal (parsed from
+            // `sourceRef` = "… / session N") plus ingestion epoch as the fallback rank.
+            let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, Option<String>, i64, Option<String>)>(
+                "SELECT tc.id, tc.job_id, COALESCE(j.input->>'fileName', j.input->>'sourceRef'), \
+                        j.input->>'text', EXTRACT(EPOCH FROM j.created_at)::bigint, j.input->>'sourceRef' \
                  FROM text_chunks tc JOIN jobs j ON j.id = tc.job_id \
                  WHERE tc.id = ANY($1) AND tc.user_id = $2"
             ).bind(&ids).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default();
-            // chunk_id -> (job_id, source, full_text)
-            let mut by_chunk: std::collections::HashMap<String, (Uuid, Option<String>, Option<String>)> =
+            // Parse "session N" out of a sourceRef string (benchmark + real ingestion).
+            fn parse_session_ord(s: &str) -> Option<i64> {
+                let idx = s.to_lowercase().find("session ")?;
+                let rest = &s[idx + 8..];
+                let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                digits.parse().ok()
+            }
+            // chunk_id -> (job_id, source, full_text, epoch, parsed_session_ord)
+            let mut by_chunk: std::collections::HashMap<String, (Uuid, Option<String>, Option<String>, i64, Option<i64>)> =
                 std::collections::HashMap::new();
-            for (cid_, jid, src, txt) in rows {
+            let mut epochs: Vec<i64> = Vec::new();
+            for (cid_, jid, src, txt, epoch, sref) in rows {
                 if let Some(ref s) = src { chunk_files.insert(cid_.to_string(), s.clone()); }
-                by_chunk.insert(cid_.to_string(), (jid, src, txt));
+                let ord = sref.as_deref().and_then(parse_session_ord);
+                epochs.push(epoch);
+                by_chunk.insert(cid_.to_string(), (jid, src, txt, epoch, ord));
+            }
+            // Fallback recency rank: dense-rank distinct ingestion epochs (1 = oldest)
+            // for chunks whose sourceRef has no explicit "session N".
+            epochs.sort_unstable();
+            epochs.dedup();
+            let epoch_rank = |e: i64| -> i64 {
+                epochs.iter().position(|x| *x == e).map(|p| p as i64 + 1).unwrap_or(1)
+            };
+            // The effective recency ordinal: explicit session number when present,
+            // else the epoch-derived rank.
+            let recency_ord = |b: &(Uuid, Option<String>, Option<String>, i64, Option<i64>)| -> i64 {
+                b.4.unwrap_or_else(|| epoch_rank(b.3))
+            };
+            for ch in chunks.iter() {
+                if let Some(cid_) = ch.chunk_id.as_deref() {
+                    if let Some(b) = by_chunk.get(cid_) {
+                        chunk_ord.insert(cid_.to_string(), recency_ord(b));
+                    }
+                }
             }
             // Build parent docs in chunk-RANK order, deduped by job, capped to the
             // top 4 distinct sessions (× ~4k chars) so the prompt stays bounded.
@@ -764,16 +810,20 @@ async fn query(
             for ch in chunks.iter() {
                 if parent_docs.len() >= 4 { break; }
                 let Some(cid_) = ch.chunk_id.as_deref() else { continue; };
-                let Some((jid, src, txt)) = by_chunk.get(cid_) else { continue; };
+                let Some(b) = by_chunk.get(cid_) else { continue; };
+                let (jid, src, txt, _epoch, _ord) = b;
                 if !seen_jobs.insert(*jid) { continue; }
                 if let Some(t) = txt {
                     if !t.trim().is_empty() {
                         let name = src.clone().unwrap_or_else(|| "source".into());
                         let capped: String = t.chars().take(4000).collect();
-                        parent_docs.push((name, capped));
+                        parent_docs.push((recency_ord(b), name, capped));
                     }
                 }
             }
+            // TP2 — order parent sessions oldest→newest so the most recent is physically
+            // LAST (recency-primacy); the model reads the newest value last.
+            parent_docs.sort_by_key(|(ord, _, _)| *ord);
         }
     }
 
@@ -841,9 +891,11 @@ async fn query(
     // a fact that the fragment retrieval narrowly missed (Hebel 1: recall).
     if !parent_docs.is_empty() {
         context_parts.push(
-            "--- FULL SOURCE SESSIONS (read each in full; the answer may be anywhere inside) ---".to_string());
-        for (i, (name, text)) in parent_docs.iter().enumerate() {
-            context_parts.push(format!("[Source {} — {}]\n{}\n", i + 1, name, text));
+            "--- FULL SOURCE SESSIONS (read each in full; the answer may be anywhere inside; \
+             ordered OLDEST→NEWEST — when the same fact changes across sessions, the one with \
+             the HIGHEST session number is the current value) ---".to_string());
+        for (i, (ord, name, text)) in parent_docs.iter().enumerate() {
+            context_parts.push(format!("[Source {} — {} · session {}]\n{}\n", i + 1, name, ord, text));
         }
     }
 
@@ -856,20 +908,54 @@ async fn query(
                 .or(chunk.source.as_deref())
                 .filter(|s| !s.is_empty())
                 .unwrap_or("unknown");
+            let ord_str = chunk.chunk_id.as_deref()
+                .and_then(|id| chunk_ord.get(id))
+                .map(|o| format!(", session: {}", o))
+                .unwrap_or_default();
             context_parts.push(format!(
-                "[{}] {} (source file: {}, relevance: {:.2})",
+                "[{}] {} (source file: {}{}, relevance: {:.2})",
                 i + 1,
                 chunk.text,
                 source_str,
+                ord_str,
                 chunk.score
             ));
         }
     }
 
     if !graph_triples.is_empty() {
-        context_parts.push("\n--- TRUST TIER 2 · graph relationships (structured facts) ---".to_string());
+        use std::collections::HashSet;
+        // Detect CHANGED attributes: a (subject, predicate) that points to more than
+        // one distinct object across edges is a fact that evolved over time. Edges are
+        // ordered newest-first (Cypher ORDER BY ts DESC), so the first object we see for
+        // such a key is the current value; later distinct objects are historical. We
+        // KEEP the history (audit/lineage — compliance value) but label which is current.
+        let mut distinct_to: std::collections::HashMap<(String, String), HashSet<String>> =
+            std::collections::HashMap::new();
         for t in &graph_triples {
-            context_parts.push(format!("{} -[{}]-> {}", t.from, t.relation, t.to));
+            distinct_to.entry((t.from.clone(), t.relation.clone()))
+                .or_default().insert(t.to.clone());
+        }
+        context_parts.push(
+            "\n--- TRUST TIER 2 · graph relationships (structured facts; a (subject, predicate) \
+             shown with multiple values is a fact that CHANGED over time — the one marked (current) \
+             is the latest value, (superseded) are historical; for 'what is the current/latest X' \
+             answer with (current)) ---".to_string());
+        let mut emitted_current: HashSet<(String, String)> = HashSet::new();
+        let mut seen_triple: HashSet<(String, String, String)> = HashSet::new();
+        for t in &graph_triples {
+            // Drop exact-duplicate re-assertions of the same edge.
+            if !seen_triple.insert((t.from.clone(), t.relation.clone(), t.to.clone())) {
+                continue;
+            }
+            let key = (t.from.clone(), t.relation.clone());
+            let changed = distinct_to.get(&key).map(|s| s.len() > 1).unwrap_or(false);
+            let tag = if changed {
+                if emitted_current.insert(key) { "  (current)" } else { "  (superseded — earlier value)" }
+            } else {
+                ""
+            };
+            context_parts.push(format!("{} -[{}]-> {}{}", t.from, t.relation, t.to, tag));
         }
     }
 
@@ -960,6 +1046,8 @@ async fn query(
          SYNTHESIZE a complete answer FROM the context: read every numbered chunk, pull out the relevant facts, and compile them. When the user asks for a summary, profile, CV, work history, biography, or 'everything about X', BUILD that answer — list the concrete facts you find (roles, employers, education, languages, skills, dates, contact details) and organise them. \
          NEVER reply with 'refer to the file', 'see the document', or 'the full X is not available' when context is present — the context IS the document; report it, don't redirect the user. The chunk text may have minor extraction artefacts (odd spacing); read through them and still report the facts. \
          Cite sources inline as [1], [2], … matching the numbered passages; cite the HOT BLOCK as the dossier and name its origin files when asked about provenance. \
+         CONFLICTING EVIDENCE: if two or more passages make CONTRADICTORY claims about the SAME fact (e.g. one says something never happened and another says it did, or two passages give different values for the same attribute), do NOT silently pick one side — SURFACE the conflict: state that the sources disagree, present BOTH claims with their citations, and (if the question asks 'did I / have I …') flag it as contradictory rather than answering a flat yes/no. \
+         LATEST VALUE WINS: each passage and source is tagged with its 'session N' (higher N = more recent). When the SAME attribute has DIFFERENT values across sessions and the question asks for the current/total/latest state (counts, totals, status, metrics that change over time), report the value from the HIGHEST session number as current (you may note it superseded an earlier value); do not report a stale lower-session value as if current. \
          If — and only if — NO tier contains a relevant fact, say it isn't in the knowledge base. Do NOT use outside or general knowledge, and do not guess. \
          Use the prior conversation turns to resolve references (pronouns, 'that', 'the same one') — but ground every FACT in the context above, never invent from the chat alone.";
 
@@ -1193,7 +1281,22 @@ async fn deep_query(
         let tool_call: Option<Value> = crate::routes::agent::find_tool_json(&trimmed);
 
         let Some(call) = tool_call else {
-            // No tool call → this is the final answer.
+            // No *parseable* tool call. Guard against a tool-SHAPED but unparseable
+            // string (smart quotes, single quotes, a reasoning preamble, a malformed
+            // object from deepseek-v4-pro) leaking to the user verbatim as the answer.
+            // If it still looks like an attempted tool call and we have turns left,
+            // nudge the model to emit clean JSON or answer in plain text, then retry.
+            let looks_like_tool = trimmed.contains("\"tool\"") || trimmed.contains("'tool'");
+            if looks_like_tool && iter < MAX_ITERS - 1 {
+                messages.push(json!({ "role": "assistant", "content": &trimmed }));
+                messages.push(json!({ "role": "user", "content":
+                    "Your previous message looked like a tool call but was not valid JSON. \
+                     Either emit EXACTLY one tool call as a single-line JSON object \
+                     {\"tool\":\"...\",\"args\":{...}} with NO code fences and no extra text, \
+                     or, if you already have enough evidence, write your final answer in plain text." }));
+                continue;
+            }
+            // Genuine plain answer.
             final_answer = trimmed;
             break;
         };

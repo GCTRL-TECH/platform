@@ -39,6 +39,7 @@ from .middleware.license_check import check_credits, report_usage
 from .ner import get_ner_pipeline
 from .pii_detector import detect_pii, redact_pii
 from .relex import get_extractor
+from . import reranker
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
@@ -1470,11 +1471,17 @@ async def search_endpoint(req: SearchReq):
         corpus_lex = _lexical_search(corpus_req)
         fused = _rrf_fuse([corpus_lex], limit=max(1, req.limit))
 
+    # Cross-encoder rerank: RRF orders by rank-fusion, but only a true query×passage
+    # cross-encoder scores actual relevance. Reorders the fused candidate pool so the
+    # best passages bubble to the top before rag.rs cuts to its final few. Degrades to
+    # a no-op (RRF order) if the model is unavailable.
+    reranked = reranker.rerank(query, fused, top_k=max(1, req.limit))
+
     logger.info(
-        "/search hybrid: dense=%d lexical=%d fused=%d (comp=%s)",
-        len(dense_hits), len(lexical_hits), len(fused), req.compilation_id,
+        "/search hybrid: dense=%d lexical=%d fused=%d reranked=%d (comp=%s)",
+        len(dense_hits), len(lexical_hits), len(fused), len(reranked), req.compilation_id,
     )
-    return {"chunks": fused}
+    return {"chunks": reranked}
 
 
 # ── A5: semantic dedup-merge ──────────────────────────────────────────

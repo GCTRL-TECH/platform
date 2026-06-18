@@ -124,11 +124,42 @@ class KGBuilder:
         # a relationship they already corrected. Keyed by (head, sanitised_rel, tail).
         corrected = self._load_corrected_triples(user_id)
 
+        # GRAPH PRUNING — keep the graph meaningful: GLiNER over-extracts (emotions,
+        # generic nouns, fragments), and writing each as a node yields thousands of
+        # orphans. Write a NON-core entity as a graph node only if it participates in a
+        # relation; core named entities (person/org/location/work) stay even if isolated.
+        # GRAPH-ONLY: entities still go to the vector store in the pipeline, so retrieval
+        # is unaffected — this just stops orphan concepts from polluting the graph.
+        graph_entities = entities
+        if getattr(config, "GRAPH_PRUNE_ISOLATED", False):
+            related: set = set()
+            for rel in relations:
+                h = str(rel.get("head", "")).strip().lower()
+                t = str(rel.get("tail", "")).strip().lower()
+                if h:
+                    related.add(h)
+                if t:
+                    related.add(t)
+            keep_types = getattr(config, "GRAPH_KEEP_TYPES",
+                                 {"person", "organization", "location", "work"})
+            graph_entities = []
+            for ent in entities:
+                nm = (ent.get("text") or "").strip()
+                if not nm:
+                    continue
+                ctype = (ent.get("coarse_type") or ent.get("type") or "other").lower()
+                if nm.lower() in related or ctype in keep_types:
+                    graph_entities.append(ent)
+            pruned = len(entities) - len(graph_entities)
+            if pruned:
+                logger.info("KGBuilder: pruned %d isolated non-core entities from the graph "
+                            "(kept %d; still searchable in vectors)", pruned, len(graph_entities))
+
         # Build a stable surface-name -> uri map ONCE, from the (already
         # type-consolidated) entity list. Relations are matched by this uri so
         # the write can never cartesian-fan-out over same-named duplicate nodes.
         name_to_uri: dict[str, str] = {}
-        for ent in entities:
+        for ent in graph_entities:
             name = (ent.get("text") or "").strip()
             if not name:
                 continue
@@ -138,7 +169,7 @@ class KGBuilder:
 
         with self._driver.session() as session:
             entities_created = session.execute_write(
-                self._write_entities, job_id, user_id, entities,
+                self._write_entities, job_id, user_id, graph_entities,
                 label_json, rank, level_name, origin,
             )
             relations_created = session.execute_write(
@@ -376,10 +407,15 @@ class KGBuilder:
                     r._label_ranks     = [$rank],
                     r._min_rank        = $rank,
                     r._class_conflict  = false,
-                    r.created_at       = timestamp()
+                    r.created_at       = timestamp(),
+                    r.asserted_at      = timestamp()
                 ON MATCH SET
                     r._source_job   = $job_id,
                     r._source_chunk = coalesce($source_chunk, r._source_chunk),
+                    // Recency/lineage: bump on every re-extraction so retrieval can
+                    // tell which competing fact about an entity was asserted most
+                    // recently (latest-value-wins) — cheap, no LLM, no schema change.
+                    r.asserted_at   = timestamp(),
                     // Idempotent re-extraction: keep the most-confident reading,
                     // never multiply edges (MERGE already dedups by h,rel,t).
                     r.confidence    = CASE WHEN $confidence > coalesce(r.confidence, 0.0)

@@ -2108,7 +2108,8 @@ class ThreeStageEntityMerger:
                b.name AS tail_name, b.type AS tail_type,
                r._source_job AS source_job,
                r._class_labels AS class_labels, r._label_ranks AS label_ranks,
-               r._classification AS classification
+               r._classification AS classification,
+               coalesce(r.asserted_at, r.created_at, 0) AS asserted_at
         """
         with self.driver.session() as session:
             result = session.run(query, job_ids=source_job_ids)
@@ -2129,6 +2130,10 @@ class ThreeStageEntityMerger:
                 head_name, head_type, rel_type, tail_name, tail_type = key
                 safe_type = rel_type.replace("`", "``")
                 class_labels, label_ranks, min_rank, conflict = _union_labels(members)
+                # Preserve recency through fusion: the merged fact's asserted_at is the
+                # NEWEST source assertion, so latest-value-wins survives into the
+                # compiled graph (incremental refresh keeps temporal ordering correct).
+                max_asserted = max((m.get("asserted_at") or 0) for m in members)
                 if conflict:
                     conflicts.append({
                         "element_kind": "edge",
@@ -2148,10 +2153,12 @@ class ThreeStageEntityMerger:
                         r._label_ranks = $label_ranks,
                         r._min_rank = $min_rank,
                         r._class_conflict = $conflict,
-                        r._owner = $user_id
+                        r._owner = $user_id,
+                        r.asserted_at = $asserted_at
                     RETURN count(r) AS cnt
                     """,
                     cid=compilation_id,
+                    asserted_at=max_asserted,
                     head_name=head_name,
                     head_type=head_type,
                     tail_name=tail_name,

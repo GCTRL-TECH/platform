@@ -95,6 +95,39 @@ Rules:
 JSON array:"""
 
 
+def _build_gapfill_prompt(text: str, entity_lines: str, isolated_names: list[str]) -> str:
+    """Focused SECOND-pass prompt: the first pass left these entities with NO
+    relations even though they appear in the text. Concentrate the model's attention
+    on them so the per-document graph comes out connected instead of orphaned."""
+    vocab_block = relvocab.vocab_prompt_block()
+    iso = "\n".join(f"  - {n}" for n in isolated_names)
+    return f"""You extract directed relationships from text. The HEAD is the subject (the doer); the TAIL is the object. Direction matters.
+
+FOCUS — these entities appear in the text but currently have NO relationship. Re-read the text carefully and extract EVERY relationship that involves each of them (as HEAD or TAIL). Look hard for employment, job role, who-reports-to-whom, team/membership, location, ownership, part-of, who-uses/builds-what, authorship, and family/social ties. Do not stop at the obvious — connect each listed entity to whatever the text says about it.
+
+Entities still missing relations:
+{iso}
+
+Allowed relations (pick ONLY from this list, HEAD then TAIL):
+{vocab_block}
+
+Text:
+\"\"\"
+{text}
+\"\"\"
+
+All entities (use these EXACT surface forms for head and tail):
+{entity_lines}
+
+Rules:
+- head and tail must both be in the entity list, and must be different.
+- Use ONLY a relation from the allowed list; if none fits a pair, skip it (never invent a name).
+- Keep direction correct (who performs/holds the relation is the HEAD).
+- Return ONLY a JSON array of objects with keys "head", "relation", "tail". No prose.
+
+JSON array:"""
+
+
 class RelationExtractor:
     """Ollama-backed relation extractor with closed vocab + validation."""
 
@@ -163,7 +196,7 @@ class RelationExtractor:
 
         try:
             parsed = self._parse_json_array(raw_response)
-            return self._validate(parsed, entities)
+            relations = self._validate(parsed, entities)
         except Exception as exc:
             # A parsing / validation defect must never fail the whole job.
             logger.warning(f"Relation parse/validation failed (non-fatal): {exc}")
@@ -173,7 +206,83 @@ class RelationExtractor:
             )
             return []
 
+        # ── Recursive gap-fill: re-target entities the first pass left ISOLATED ──
+        # so the per-document graph comes out connected, not a cloud of orphans.
+        if getattr(config, "RELEX_GAPFILL_ENABLED", False):
+            relations = self._gap_fill(
+                truncated_text, entities, prompt_entities, relations, ollama_base, model
+            )
+        return relations
+
     # ── internal helpers ──────────────────────────────────────────────
+
+    # Entity coarse types that should NOT force a relation when isolated — a bare
+    # date / number / quantity legitimately stands alone, so don't burn a gap-fill
+    # pass chasing relations for it (avoids spurious edges + wasted LLM calls).
+    _ISOLATED_SKIP_LABELS = {
+        "temporal", "date", "time", "number", "cardinal", "ordinal", "percent",
+        "money", "financial", "quantity", "duration", "age", "other",
+    }
+
+    def _gap_fill(
+        self,
+        text: str,
+        entities: list[dict],
+        prompt_entities: list[dict],
+        relations: list[dict],
+        ollama_base: Optional[str],
+        model: Optional[str],
+    ) -> list[dict]:
+        """Up to RELEX_GAPFILL_MAX_PASSES focused re-extractions targeting entities
+        that appear in the text but ended up in NO relation. Each pass adds only
+        deduped, validated triples and stops early when a pass finds nothing new."""
+        max_passes = max(0, int(getattr(config, "RELEX_GAPFILL_MAX_PASSES", 0)))
+        entity_lines = self._format_entity_list(prompt_entities)
+        for _pass in range(max_passes):
+            connected = set()
+            for r in relations:
+                connected.add(str(r.get("head", "")).lower())
+                connected.add(str(r.get("tail", "")).lower())
+            isolated_names: list[str] = []
+            seen: set[str] = set()
+            for ent in prompt_entities:
+                surf = (ent.get("text") or "").strip()
+                if not surf:
+                    continue
+                low = surf.lower()
+                if low in connected or low in seen:
+                    continue
+                if (ent.get("label") or "entity").lower() in self._ISOLATED_SKIP_LABELS:
+                    continue
+                isolated_names.append(surf)
+                seen.add(low)
+            if not isolated_names:
+                break  # everything important is connected — done
+
+            gap_prompt = _build_gapfill_prompt(text, entity_lines, isolated_names)
+            raw = self._call_ollama(gap_prompt, ollama_base=ollama_base, model=model)
+            if raw is None:
+                break  # LLM degraded mid-cycle — keep what we have, never fail
+            try:
+                new_rels = self._validate(self._parse_json_array(raw), entities)
+            except Exception:
+                break
+
+            existing = {(r["head"], r["type"], r["tail"]) for r in relations}
+            added = 0
+            for r in new_rels:
+                key = (r.get("head"), r.get("type"), r.get("tail"))
+                if key not in existing:
+                    existing.add(key)
+                    relations.append(r)
+                    added += 1
+            logger.info(
+                "RelEx gap-fill pass %d: %d isolated → +%d relations",
+                _pass + 1, len(isolated_names), added,
+            )
+            if added == 0:
+                break  # converged — no new relations this pass
+        return relations
 
     def _select_prompt_entities(self, entities: list[dict], text: str) -> list[dict]:
         """Pick the most relation-relevant entities to put in the prompt.

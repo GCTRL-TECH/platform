@@ -19,6 +19,25 @@ RELEX_MODEL: str = os.environ.get("RELEX_MODEL", "qwen2.5:7b")
 # (1.9 GB, ~3 GB RAM) so modest machines still get relations out of the box.
 RELEX_FALLBACK_MODEL: str = os.environ.get("RELEX_FALLBACK_MODEL", "qwen2.5:3b")
 
+# Recursive gap-fill: after the first relation pass, re-target entities left
+# ISOLATED (in the text but in no relation) with a focused second pass, so the
+# per-document graph comes out CONNECTED instead of a cloud of orphan nodes. Each
+# pass is one extra LLM call and only fires when isolated important entities remain
+# → cheap on already-connected docs, recall boost on under-connected ones. Bound the
+# passes for speed. Set RELEX_GAPFILL_ENABLED=false to restore single-pass behavior.
+RELEX_GAPFILL_ENABLED: bool = os.environ.get("RELEX_GAPFILL_ENABLED", "true").lower() in ("1", "true", "yes")
+RELEX_GAPFILL_MAX_PASSES: int = int(os.environ.get("RELEX_GAPFILL_MAX_PASSES", "2"))
+
+# Graph pruning: GLiNER over-extracts — it promotes emotions ("Cool"), generic nouns
+# ("software", "box"), and sentence fragments to entities, which become thousands of
+# ORPHAN graph nodes that add nothing (they stay searchable in the vector store either
+# way). When enabled, a non-core entity is written to the GRAPH only if it participates
+# in ≥1 relation; core named entities (person/organization/location/work) are always
+# kept even if isolated. This is a GRAPH-only filter — entities remain in chunks/vectors
+# for retrieval, so nothing is lost to search. Set false to write every entity as a node.
+GRAPH_PRUNE_ISOLATED: bool = os.environ.get("GRAPH_PRUNE_ISOLATED", "true").lower() in ("1", "true", "yes")
+GRAPH_KEEP_TYPES: set = {"person", "organization", "location", "work"}
+
 # Neo4j graph database
 NEO4J_URI: str = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER: str = os.environ.get("NEO4J_USER", "neo4j")

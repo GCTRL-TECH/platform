@@ -46,6 +46,18 @@ RELATIONS: dict[str, dict] = {
         "tail_types": {"organization"},
         "desc": "X works at organization Y",
     },
+    "reports_to": {
+        "synonyms": ["reports_into", "supervised_by", "managed_by", "answers_to"],
+        "head_types": {"person"},
+        "tail_types": {"person"},
+        "desc": "X reports to / is supervised by person Y",
+    },
+    "manages": {
+        "synonyms": ["supervises", "oversees", "manager_of", "leads_team"],
+        "head_types": {"person"},
+        "tail_types": {"person", "organization"},
+        "desc": "X manages / supervises person or team Y",
+    },
     "professor_at": {
         "synonyms": ["teaches_at", "is_professor_at", "faculty_at"],
         "head_types": {"person"},
