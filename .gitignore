@@ -23,3 +23,10 @@ coverage/
 .pytest_cache/
 e2e-output.txt
 .gstack/
+
+# Local-only: AI-assistant config + internal session notes (never public).
+# These hold local tokens / internal ops notes and are NOT needed to run GCTRL.
+.mcp.json
+CLAUDE.md
+.planning/
+tasks/
