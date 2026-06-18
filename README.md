@@ -20,6 +20,14 @@ curl -fsSL https://gctrl.tech/uninstall | bash               # keep your data
 curl -fsSL https://gctrl.tech/uninstall | bash -s -- --purge  # wipe everything
 ```
 
+## ⚠️ Before production — change the default secrets
+
+The bundled compose files ship with **well-known placeholder secrets**
+(`POSTGRES_PASSWORD`, `NEO4J_PASSWORD`, `JWT_SECRET`, …) so GCTRL runs out of the
+box on localhost. **Set your own real values** (via a local `.env`, never
+committed) before exposing GCTRL to a network. A predictable `JWT_SECRET` lets
+anyone forge admin tokens; default DB passwords are public knowledge.
+
 ## License
 
 GCTRL is **dual-licensed** (the same model as the bundled

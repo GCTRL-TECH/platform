@@ -30,3 +30,6 @@ e2e-output.txt
 CLAUDE.md
 .planning/
 tasks/
+
+# Internal design docs / plans — not for the public repo.
+docs/superpowers/
