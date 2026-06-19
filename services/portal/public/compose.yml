@@ -216,8 +216,11 @@ services:
     container_name: gctrl-ollama
     restart: unless-stopped
     profiles: [bundled-ollama]
-    ports:
-      - "127.0.0.1:11434:11434"
+    # NO host port publish on purpose: the GCTRL services reach this Ollama over the
+    # compose network as `gctrl-ollama:11434` (see OLLAMA_BASE), which needs no host
+    # port. Publishing 127.0.0.1:11434 would COLLIDE with a native Ollama already on
+    # that port and abort the install. To talk to it from the host, use
+    # `docker exec gctrl-ollama ollama ...`.
     volumes:
       - gctrl-ollama-models:/root/.ollama
     networks:

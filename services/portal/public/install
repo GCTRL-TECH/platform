@@ -404,13 +404,35 @@ start_stack() {
     "${profile_flags[@]}" \
     up -d
 
-  info "Waiting for services to be ready (up to 120s)..."
+  info "Waiting for the web UI to come up (up to 120s)..."
   local max_wait=120 waited=0
   while ! curl -sf http://localhost:3001 &>/dev/null; do
     sleep 3
     waited=$((waited + 3))
     [ $waited -ge $max_wait ] && error "Timeout. Check: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
   done
+  echo ""
+  success "Web UI is live → http://localhost:3001"
+  echo ""
+}
+
+# ── Finalize: apply the chosen model, pull local models, final message ─────────
+# Runs AFTER the stack (incl. web) is already up, so the model question never
+# blocks the user from seeing the UI. If the picker chose a model different from
+# the placeholder the .env was generated with, patch the .env and restart the
+# services that read it (kex/fuse) so the choice takes effect.
+finalize() {
+  if [ -n "${CHAT_MODEL}" ]; then
+    sed -i.bak \
+      -e "s|^RELEX_MODEL=.*|RELEX_MODEL=${CHAT_MODEL}|" \
+      -e "s|^AUTO_CLASSIFY_MODEL=.*|AUTO_CLASSIFY_MODEL=${CHAT_MODEL}|" \
+      "${INSTALL_DIR}/.env" 2>/dev/null && rm -f "${INSTALL_DIR}/.env.bak"
+    local profile_flags=()
+    for p in "${PROFILES[@]}"; do profile_flags+=("--profile" "$p"); done
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" \
+      --env-file "${INSTALL_DIR}/.env" "${profile_flags[@]}" \
+      up -d gctrl-kex gctrl-fuse >/dev/null 2>&1 || true
+  fi
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -426,11 +448,8 @@ start_stack() {
   fi
   echo ""
   # Pull models into the bundled Ollama whenever we deployed it (a localhost-only
-  # native Ollama still answers probe_tcp here, so gate on the profile, not the
-  # probe). Otherwise we're pointed at a reachable native Ollama.
+  # native Ollama still answers probe_tcp, so gate on the profile, not the probe).
   if printf '%s\n' "${PROFILES[@]}" | grep -qx "bundled-ollama"; then
-    # Bundled Ollama: pull the models KEX needs so extraction works out of the
-    # box, fully local at zero token cost (nomic-embed-text + the chosen model).
     pull_ollama_models
   else
     echo "  Ollama    : connected at ${OLLAMA_BASE}"
@@ -456,10 +475,11 @@ pull_ollama_models() {
 main() {
   check_prereqs
   detect_gpu
-  detect_services
-  choose_model
-  generate_config
-  start_stack
+  detect_services      # auto-decides Ollama (native if reachable, else bundled — never conflicts)
+  generate_config      # .env written with a sensible default model placeholder
+  start_stack          # bring the stack up FIRST → web UI live at :3001
+  choose_model         # ask the model question only NOW, after the UI is up
+  finalize             # apply the chosen model (restart kex/fuse) + pull local models
 }
 
 main "$@"
