@@ -140,6 +140,8 @@ def run_pipeline(
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
     relex_model: str | None = None,
+    generation_kind: str = "ollama",
+    generation_api_key: str | None = None,
 ) -> dict:
     """
     Full extraction pipeline: NER -> RelEx -> KG Builder -> Chunking -> Embedding -> Vector Store.
@@ -190,7 +192,13 @@ def run_pipeline(
     warnings: list[str] = []
     relex = get_extractor()
     try:
-        relations = relex.extract_relations(text, entities, ollama_base=ollama_base, model=relex_model)
+        relations = relex.extract_relations(
+            text, entities,
+            ollama_base=ollama_base,
+            model=relex_model,
+            kind=generation_kind,
+            api_key=generation_api_key,
+        )
         if getattr(relex, "last_degraded", False) and relex.last_degraded_reason:
             warnings.append(relex.last_degraded_reason)
             logger.warning(f"[{job_id}] RelEx degraded: {relex.last_degraded_reason}")
@@ -366,6 +374,10 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             # the worker uses its env defaults (EMBEDDING_MODEL / RELEX_MODEL).
             embedding_model = payload.get("embedding_model")
             relex_model = payload.get("relex_model")
+            # LLM runtime kind + optional API key for OpenAI-compatible providers.
+            # Defaults to "ollama" so existing jobs are unchanged.
+            generation_kind = payload.get("generation_kind") or "ollama"
+            generation_api_key = payload.get("generation_api_key")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -470,6 +482,8 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 embedding_provider=embedding_provider,
                 embedding_model=embedding_model,
                 relex_model=relex_model,
+                generation_kind=generation_kind,
+                generation_api_key=generation_api_key,
             )
             # Record crawl provenance on the result for the dashboard.
             if crawled_urls:

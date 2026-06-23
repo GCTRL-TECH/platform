@@ -259,6 +259,10 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         limit = int(payload.get("limit", 15))
         distill_model = payload.get("distill_model")
         ollama_base = payload.get("ollama_base")
+        # LLM runtime kind + optional API key for OpenAI-compatible providers.
+        # Defaults to "ollama" so existing distill jobs are unchanged.
+        generation_kind = payload.get("generation_kind") or "ollama"
+        generation_api_key = payload.get("generation_api_key")
         logger.info(f"Worker: received distill job for {compilation_id}")
 
         if job_id != "unknown":
@@ -267,6 +271,7 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         result = distiller.distill(
             compilation_id, user_id, limit=limit,
             model=distill_model, ollama_base=ollama_base,
+            kind=generation_kind, api_key=generation_api_key,
         )
 
         if job_id != "unknown":
@@ -459,6 +464,9 @@ class DistillRequest(BaseModel):
     # Omitted/empty → distiller env defaults (GCTRL_DISTILL_MODEL / OLLAMA_BASE).
     distill_model: Optional[str] = None
     ollama_base: Optional[str] = None
+    # LLM runtime selection. Default "ollama" → zero behaviour change.
+    generation_kind: str = "ollama"
+    generation_api_key: Optional[str] = None
 
 
 class MergeResponse(BaseModel):
@@ -507,6 +515,7 @@ async def distill_endpoint(req: DistillRequest):
         return distiller.distill(
             req.compilation_id, req.user_id, limit=req.limit,
             model=req.distill_model, ollama_base=req.ollama_base,
+            kind=req.generation_kind, api_key=req.generation_api_key,
         )
     except ValueError as exc:
         # Bad request: not a WIKI comp / missing source / unknown comp.
