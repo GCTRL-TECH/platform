@@ -25,14 +25,17 @@
 
 use axum::{
     extract::{Extension, Path, State},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::error::{AppError, Result};
@@ -52,6 +55,95 @@ fn apply_note(_service: &str) -> &'static str {
 
 fn is_swappable(s: &str) -> bool {
     SWAPPABLE.contains(&s)
+}
+
+// ── Model catalog ─────────────────────────────────────────────────────────────
+
+/// Per-runtime generation model catalog.
+/// Each entry: (id, label, ollama_tag, llamacpp_hf_arg, vllm_repo, ram_gb)
+struct GenModelEntry {
+    id: &'static str,
+    label: &'static str,
+    ollama: &'static str,
+    llamacpp: &'static str,
+    vllm: &'static str,
+    ram_gb: f32,
+}
+
+const RUNTIME_GEN_MODELS: &[GenModelEntry] = &[
+    GenModelEntry {
+        id: "qwen2.5-3b",
+        label: "Qwen 2.5 3B Instruct",
+        ollama: "qwen2.5:3b",
+        llamacpp: "bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M",
+        vllm: "Qwen/Qwen2.5-3B-Instruct",
+        ram_gb: 3.0,
+    },
+    GenModelEntry {
+        id: "qwen2.5-7b",
+        label: "Qwen 2.5 7B Instruct",
+        ollama: "qwen2.5:7b",
+        llamacpp: "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M",
+        vllm: "Qwen/Qwen2.5-7B-Instruct",
+        ram_gb: 6.0,
+    },
+    GenModelEntry {
+        id: "llama-3.2-3b",
+        label: "Llama 3.2 3B Instruct",
+        ollama: "llama3.2",
+        llamacpp: "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",
+        vllm: "meta-llama/Llama-3.2-3B-Instruct",
+        ram_gb: 3.0,
+    },
+];
+
+/// Resolve the per-runtime argument for a given model ID.
+/// Returns `None` for unknown model IDs.
+/// runtime: "ollama" | "llamacpp" | "vllm"
+pub fn resolve_model_arg(model_id: &str, runtime: &str) -> Option<String> {
+    let entry = RUNTIME_GEN_MODELS.iter().find(|e| e.id == model_id)?;
+    let arg = match runtime {
+        "ollama"   => entry.ollama,
+        "llamacpp" => entry.llamacpp,
+        "vllm"     => entry.vllm,
+        _          => return None,
+    };
+    Some(arg.to_string())
+}
+
+// ── Shared persist_runtime helper ─────────────────────────────────────────────
+
+/// Shared helper: UPSERT `runtime_config` row (id=1).
+/// Seals `api_key` when provided; COALESCE preserves existing key otherwise.
+async fn persist_runtime(
+    db: &sqlx::PgPool,
+    provider: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+) -> crate::error::Result<()> {
+    let sealed_key: Option<String> = api_key
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(crate::services::crypto::seal);
+
+    sqlx::query(
+        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, updated_at)
+         VALUES (1, $1, $2, $3, $4, now())
+         ON CONFLICT (id) DO UPDATE SET
+             provider   = $1,
+             base_url   = $2,
+             model      = $3,
+             api_key    = COALESCE($4, runtime_config.api_key),
+             updated_at = now()",
+    )
+    .bind(provider)
+    .bind(base_url)
+    .bind(model)
+    .bind(sealed_key)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// The bundled (onboard) default endpoint for a swappable service — what GCTRL
@@ -97,6 +189,10 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/active-runtime", get(get_active_runtime))
         .route("/runtimes", get(list_runtimes))
         .route("/runtime", post(set_runtime))
+        // ── Runtime-aware model catalog ──────────────────────────────────────
+        .route("/models", get(list_gen_models))
+        // ── Runtime switch (SSE, admin-only) ────────────────────────────────
+        .route("/switch-runtime", post(switch_runtime))
 }
 
 // ── GET /overrides ──────────────────────────────────────────────────────────
@@ -612,6 +708,377 @@ async fn set_runtime(
     Ok(Json(resp))
 }
 
+// ── GET /api/infra/models ─────────────────────────────────────────────────────
+
+/// `GET /api/infra/models?runtime=<kind>` → model catalog for a given runtime.
+/// runtime: "ollama" | "llamacpp" | "vllm"
+async fn list_gen_models(
+    Extension(_claims): Extension<crate::middleware::auth::JwtClaims>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let runtime = params.get("runtime").map(|s| s.as_str()).unwrap_or("ollama");
+    let models: Vec<Value> = RUNTIME_GEN_MODELS
+        .iter()
+        .map(|e| {
+            let arg = resolve_model_arg(e.id, runtime);
+            json!({
+                "id":      e.id,
+                "label":   e.label,
+                "arg":     arg,
+                "ram_gb":  e.ram_gb,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "runtime": runtime, "models": models })))
+}
+
+// ── POST /api/infra/switch-runtime ───────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct SwitchRuntimeReq {
+    runtime:  String,
+    model:    Option<String>,
+    base_url: Option<String>,
+    api_key:  Option<String>,
+}
+
+/// `POST /api/infra/switch-runtime` — SSE stream, admin-only.
+/// Body: `{ runtime, model?, base_url?, api_key? }`
+/// runtime ∈ "ollama" | "llamacpp" | "external"
+async fn switch_runtime(
+    Extension(claims): Extension<crate::middleware::auth::JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<SwitchRuntimeReq>,
+) -> axum::response::Response {
+    if let Err(e) = crate::middleware::auth::require_role(&claims, "admin") {
+        return axum::response::IntoResponse::into_response(e);
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<std::result::Result<Event, Infallible>>();
+
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        run_switch_runtime(tx, db, req).await;
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(item) = rx.recv().await {
+            yield item;
+        }
+    };
+
+    let sse = Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    );
+    axum::response::IntoResponse::into_response(sse)
+}
+
+async fn run_switch_runtime(
+    tx: mpsc::UnboundedSender<std::result::Result<Event, Infallible>>,
+    db: sqlx::PgPool,
+    req: SwitchRuntimeReq,
+) {
+    let send = |event: &str, data: serde_json::Value| {
+        let _ = tx.send(Ok(Event::default().event(event).data(data.to_string())));
+    };
+
+    let runtime = req.runtime.trim().to_string();
+
+    match runtime.as_str() {
+        "external" => {
+            // Validate base_url and health-probe before saving.
+            send("progress", json!({ "step": "validating", "message": "Validating external endpoint…" }));
+
+            let base_url = match req.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(b) => b.to_string(),
+                None => {
+                    send("error", json!({ "message": "base_url is required for external runtime" }));
+                    return;
+                }
+            };
+
+            if let Err(e) = crate::services::llm::validate_llm_base("openai_compatible", Some(&base_url)) {
+                send("error", json!({ "message": format!("Invalid base_url: {e}") }));
+                return;
+            }
+
+            let model_str = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                .unwrap_or("llama3.2").to_string();
+
+            let health_client = reqwest::Client::new();
+            let target = crate::services::llm::LlmTarget {
+                provider: "openai_compatible".into(),
+                model: model_str.clone(),
+                base_url: Some(base_url.clone()),
+                api_key: None,
+            };
+            let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+            if !healthy {
+                send("progress", json!({ "step": "validating", "message": "Health probe returned unhealthy — saving anyway (server may still be starting)." }));
+            }
+
+            send("progress", json!({ "step": "saving", "message": "Saving runtime config…" }));
+
+            let api_key_opt = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if let Err(e) = persist_runtime(&db, "openai_compatible", Some(&base_url), Some(&model_str), api_key_opt).await {
+                send("error", json!({ "message": format!("DB save failed: {e}") }));
+                return;
+            }
+
+            send("done", json!({ "provider": "openai_compatible", "base_url": base_url, "model": model_str, "healthy": healthy }));
+        }
+
+        "ollama" => {
+            send("progress", json!({ "step": "saving", "message": "Switching back to bundled Ollama…" }));
+
+            if let Err(e) = persist_runtime(&db, "ollama", None, None, None).await {
+                send("error", json!({ "message": format!("DB save failed: {e}") }));
+                return;
+            }
+
+            // Best-effort: stop gctrl-llamacpp if running (ignore errors).
+            let _ = tokio::task::spawn_blocking(|| {
+                let _ = crate::routes::update::docker_http(
+                    "POST",
+                    "/containers/gctrl-llamacpp/stop",
+                    None,
+                    10,
+                );
+            }).await;
+
+            send("done", json!({ "provider": "ollama" }));
+        }
+
+        "llamacpp" => {
+            // 1. Resolve model arg (default: qwen2.5-3b)
+            let model_id = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                .unwrap_or("qwen2.5-3b");
+            let hf_arg = match resolve_model_arg(model_id, "llamacpp") {
+                Some(a) => a,
+                None => {
+                    send("error", json!({ "message": format!("Unknown model id '{model_id}'. Valid: qwen2.5-3b, qwen2.5-7b, llama-3.2-3b") }));
+                    return;
+                }
+            };
+
+            if !std::path::Path::new("/var/run/docker.sock").exists() {
+                send("error", json!({ "message": "Docker socket not accessible — cannot launch llama.cpp container" }));
+                return;
+            }
+
+            // 2. Pull image
+            send("progress", json!({ "step": "pull", "message": "Pulling ghcr.io/ggml-org/llama.cpp:server…" }));
+            let pull_img = "ghcr.io/ggml-org/llama.cpp:server".to_string();
+            match tokio::task::spawn_blocking(move || crate::routes::update::pull_image(&pull_img)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    send("error", json!({ "message": format!("Image pull failed: {e}") }));
+                    return;
+                }
+                Err(e) => {
+                    send("error", json!({ "message": format!("Pull task failed: {e}") }));
+                    return;
+                }
+            }
+
+            // 3. Detect our own network by inspecting our container
+            send("progress", json!({ "step": "create", "message": "Detecting container network…" }));
+            let network_mode = detect_own_network().unwrap_or_else(|| "bridge".to_string());
+
+            // 3b. Remove old container if exists, then create + start
+            send("progress", json!({ "step": "create", "message": format!("Creating gctrl-llamacpp on network '{network_mode}'…") }));
+            let hf_arg_clone = hf_arg.clone();
+            let net_clone = network_mode.clone();
+            match tokio::task::spawn_blocking(move || {
+                launch_llamacpp_container(&hf_arg_clone, &net_clone)
+            }).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    send("error", json!({ "message": format!("Container create/start failed: {e}") }));
+                    return;
+                }
+                Err(e) => {
+                    send("error", json!({ "message": format!("Container task failed: {e}") }));
+                    return;
+                }
+            }
+
+            // 4. Poll health until ready (GGUF download can take minutes)
+            send("progress", json!({ "step": "downloading model", "message": format!("Waiting for llama.cpp to download model '{hf_arg}'… (this may take several minutes)") }));
+            let health_client = reqwest::Client::new();
+            let model_id_owned = model_id.to_string();
+            let target = crate::services::llm::LlmTarget {
+                provider: "openai_compatible".into(),
+                model: model_id_owned.clone(),
+                base_url: Some("http://gctrl-llamacpp:8080".into()),
+                api_key: None,
+            };
+            let healthy = poll_llamacpp_health(&health_client, &target, &tx).await;
+
+            // 5. UPSERT runtime_config regardless of health (download continues)
+            if let Err(e) = persist_runtime(
+                &db,
+                "openai_compatible",
+                Some("http://gctrl-llamacpp:8080"),
+                Some(&model_id_owned),
+                None,
+            ).await {
+                send("error", json!({ "message": format!("DB save failed: {e}") }));
+                return;
+            }
+
+            if healthy {
+                send("done", json!({
+                    "provider": "openai_compatible",
+                    "base_url": "http://gctrl-llamacpp:8080",
+                    "model": model_id_owned,
+                    "note": "llama.cpp is running and healthy"
+                }));
+            } else {
+                send("done", json!({
+                    "provider": "openai_compatible",
+                    "base_url": "http://gctrl-llamacpp:8080",
+                    "model": model_id_owned,
+                    "note": "llama.cpp container started but model download is still in progress — runtime config saved; it will serve requests once the download completes"
+                }));
+            }
+        }
+
+        other => {
+            send("error", json!({ "message": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, external") }));
+        }
+    }
+}
+
+/// Poll gctrl-llamacpp's health endpoint until it responds or times out.
+/// Emits periodic progress events. Returns true if healthy within the window.
+async fn poll_llamacpp_health(
+    client: &reqwest::Client,
+    target: &crate::services::llm::LlmTarget,
+    tx: &mpsc::UnboundedSender<std::result::Result<Event, Infallible>>,
+) -> bool {
+    // Allow up to 10 minutes for model download
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    let mut attempt = 0u32;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = tx.send(Ok(Event::default()
+                .event("progress")
+                .data(json!({ "step": "downloading model", "message": "Timed out waiting for llama.cpp — model download continues in background" }).to_string())));
+            return false;
+        }
+
+        interval.tick().await;
+        attempt += 1;
+
+        if crate::services::llm::runtime_health(client, target).await {
+            return true;
+        }
+
+        let _ = tx.send(Ok(Event::default()
+            .event("progress")
+            .data(json!({ "step": "downloading model", "message": format!("Still waiting for llama.cpp (attempt {attempt})…") }).to_string())));
+    }
+}
+
+/// Detect this container's primary network by inspecting our own container.
+/// Reads the container hostname from the HOSTNAME env var (Docker sets it to
+/// the short container ID), then calls `GET /containers/{id}/json` and reads
+/// the first key in `NetworkSettings.Networks`.
+///
+/// Returns None if the socket is unreachable or we're not in a container.
+fn detect_own_network() -> Option<String> {
+    // Docker sets HOSTNAME to the container short-id.
+    let hostname = std::env::var("HOSTNAME").ok().filter(|s| !s.trim().is_empty())?;
+    let hostname = hostname.trim();
+
+    let (status, body) = crate::routes::update::docker_http(
+        "GET",
+        &format!("/containers/{hostname}/json"),
+        None,
+        10,
+    ).ok()?;
+
+    if status != 200 { return None; }
+
+    let inspect = crate::routes::update::json_from_body(&body);
+
+    // First try the stored NetworkMode from HostConfig.
+    if let Some(nm) = inspect["HostConfig"]["NetworkMode"].as_str() {
+        let nm = nm.trim();
+        if !nm.is_empty() && nm != "default" {
+            return Some(nm.to_string());
+        }
+    }
+
+    // Fall back: the first key in NetworkSettings.Networks.
+    if let Some(networks) = inspect["NetworkSettings"]["Networks"].as_object() {
+        if let Some(net_name) = networks.keys().next() {
+            let n = net_name.trim();
+            if !n.is_empty() {
+                return Some(n.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Create (or replace) and start the `gctrl-llamacpp` container.
+/// - Force-removes any existing container first.
+/// - Mounts a named volume `gctrl-llamacpp-models:/root/.cache` for the GGUF cache.
+/// - Joins the API's own network so it's reachable at `gctrl-llamacpp:8080`.
+fn launch_llamacpp_container(hf_arg: &str, network_mode: &str) -> std::result::Result<(), String> {
+    // Force-remove existing container (ignore 404).
+    let _ = crate::routes::update::docker_http(
+        "DELETE",
+        "/containers/gctrl-llamacpp?force=true",
+        None,
+        30,
+    );
+
+    let create_body = serde_json::json!({
+        "Image": "ghcr.io/ggml-org/llama.cpp:server",
+        "Cmd": ["-hf", hf_arg, "--host", "0.0.0.0", "--port", "8080", "-c", "8192"],
+        "HostConfig": {
+            "Binds": ["gctrl-llamacpp-models:/root/.cache"],
+            "NetworkMode": network_mode,
+            "RestartPolicy": { "Name": "unless-stopped" }
+        }
+    }).to_string();
+
+    let (create_status, create_body_resp) = crate::routes::update::docker_http(
+        "POST",
+        "/containers/create?name=gctrl-llamacpp",
+        Some(&create_body),
+        30,
+    )?;
+
+    if create_status != 201 {
+        return Err(format!("Container create HTTP {create_status}: {create_body_resp}"));
+    }
+
+    let created = crate::routes::update::json_from_body(&create_body_resp);
+    let id = created["Id"].as_str().unwrap_or("gctrl-llamacpp");
+
+    let (start_status, _) = crate::routes::update::docker_http(
+        "POST",
+        &format!("/containers/{id}/start"),
+        None,
+        10,
+    )?;
+
+    if start_status != 204 && start_status != 304 {
+        return Err(format!("Container start HTTP {start_status}"));
+    }
+
+    Ok(())
+}
+
 // ── Unit tests (pure validation logic — no DB harness) ───────────────────────
 
 #[cfg(test)]
@@ -711,5 +1178,116 @@ mod runtime_tests {
     fn openai_compatible_bad_scheme_rejected() {
         let err = validate_runtime_input("openai_compatible", Some("gopher://localhost")).unwrap_err();
         assert!(!err.is_empty(), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod switch_runtime_tests {
+    use super::{resolve_model_arg, RUNTIME_GEN_MODELS};
+
+    // ── resolve_model_arg ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_qwen25_3b_ollama() {
+        assert_eq!(resolve_model_arg("qwen2.5-3b", "ollama").as_deref(), Some("qwen2.5:3b"));
+    }
+
+    #[test]
+    fn resolve_qwen25_3b_llamacpp() {
+        assert_eq!(
+            resolve_model_arg("qwen2.5-3b", "llamacpp").as_deref(),
+            Some("bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M"),
+        );
+    }
+
+    #[test]
+    fn resolve_qwen25_3b_vllm() {
+        assert_eq!(
+            resolve_model_arg("qwen2.5-3b", "vllm").as_deref(),
+            Some("Qwen/Qwen2.5-3B-Instruct"),
+        );
+    }
+
+    #[test]
+    fn resolve_qwen25_7b_ollama() {
+        assert_eq!(resolve_model_arg("qwen2.5-7b", "ollama").as_deref(), Some("qwen2.5:7b"));
+    }
+
+    #[test]
+    fn resolve_qwen25_7b_llamacpp() {
+        assert_eq!(
+            resolve_model_arg("qwen2.5-7b", "llamacpp").as_deref(),
+            Some("bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M"),
+        );
+    }
+
+    #[test]
+    fn resolve_llama32_3b_all_runtimes() {
+        assert_eq!(resolve_model_arg("llama-3.2-3b", "ollama").as_deref(), Some("llama3.2"));
+        assert_eq!(
+            resolve_model_arg("llama-3.2-3b", "llamacpp").as_deref(),
+            Some("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"),
+        );
+        assert_eq!(
+            resolve_model_arg("llama-3.2-3b", "vllm").as_deref(),
+            Some("meta-llama/Llama-3.2-3B-Instruct"),
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_model_returns_none() {
+        assert!(resolve_model_arg("gpt-4o", "ollama").is_none());
+        assert!(resolve_model_arg("", "llamacpp").is_none());
+        assert!(resolve_model_arg("nonexistent", "vllm").is_none());
+    }
+
+    #[test]
+    fn resolve_unknown_runtime_returns_none() {
+        assert!(resolve_model_arg("qwen2.5-3b", "tgi").is_none());
+        assert!(resolve_model_arg("qwen2.5-3b", "").is_none());
+        assert!(resolve_model_arg("qwen2.5-7b", "lmstudio").is_none());
+    }
+
+    #[test]
+    fn default_model_id_resolves_llamacpp() {
+        // The default model when none is specified is "qwen2.5-3b"
+        let default_id = "qwen2.5-3b";
+        let arg = resolve_model_arg(default_id, "llamacpp");
+        assert!(arg.is_some(), "default model must resolve for llamacpp");
+        assert_eq!(arg.as_deref(), Some("bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M"));
+    }
+
+    #[test]
+    fn catalog_has_three_entries() {
+        assert_eq!(RUNTIME_GEN_MODELS.len(), 3);
+    }
+
+    #[test]
+    fn all_catalog_entries_have_all_runtimes() {
+        for entry in RUNTIME_GEN_MODELS {
+            assert!(!entry.ollama.is_empty(), "ollama tag missing for {}", entry.id);
+            assert!(!entry.llamacpp.is_empty(), "llamacpp arg missing for {}", entry.id);
+            assert!(!entry.vllm.is_empty(), "vllm repo missing for {}", entry.id);
+            assert!(entry.ram_gb > 0.0, "ram_gb must be positive for {}", entry.id);
+        }
+    }
+
+    // ── Runtime string validation ────────────────────────────────────────────
+
+    #[test]
+    fn valid_runtimes() {
+        // These are the three valid runtime strings for switch-runtime
+        for rt in &["ollama", "llamacpp", "external"] {
+            assert!(matches!(*rt, "ollama" | "llamacpp" | "external"),
+                "runtime '{rt}' should be valid");
+        }
+    }
+
+    #[test]
+    fn invalid_runtimes_not_in_set() {
+        for rt in &["vllm", "openai", "tgi", ""] {
+            assert!(!matches!(*rt, "ollama" | "llamacpp" | "external"),
+                "runtime '{rt}' should be invalid");
+        }
     }
 }

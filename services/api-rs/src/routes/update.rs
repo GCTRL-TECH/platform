@@ -400,7 +400,7 @@ async fn notify_agent_updated() {
 // ─── Docker socket helpers ────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn docker_http(method: &str, path: &str, body: Option<&str>, timeout_secs: u64) -> Result<(u16, String), String> {
+pub(crate) fn docker_http(method: &str, path: &str, body: Option<&str>, timeout_secs: u64) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -428,11 +428,11 @@ fn docker_http(method: &str, path: &str, body: Option<&str>, timeout_secs: u64) 
 }
 
 #[cfg(not(unix))]
-fn docker_http(_method: &str, _path: &str, _body: Option<&str>, _timeout: u64) -> Result<(u16, String), String> {
+pub(crate) fn docker_http(_method: &str, _path: &str, _body: Option<&str>, _timeout: u64) -> Result<(u16, String), String> {
     Err("Not supported on non-Unix platforms".into())
 }
 
-fn json_from_body(body: &str) -> serde_json::Value {
+pub(crate) fn json_from_body(body: &str) -> serde_json::Value {
     // Docker may return chunked bodies; find the first '{' or '['
     let start = body.find('{').or_else(|| body.find('['));
     start
@@ -440,7 +440,7 @@ fn json_from_body(body: &str) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn pull_image(image: &str) -> Result<(), String> {
+pub(crate) fn pull_image(image: &str) -> Result<(), String> {
     let (name, tag) = match image.rfind(':') {
         Some(p) => (&image[..p], &image[p + 1..]),
         None => (image, "latest"),
