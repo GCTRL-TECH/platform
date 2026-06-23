@@ -391,10 +391,16 @@ class RelationExtractor:
                 break  # server is down — a different model won't help.
 
         self.last_degraded = True
-        self.last_degraded_reason = (
-            "Relation extraction skipped — no usable relation model. Connect a working "
-            "Ollama (Settings → Infrastructure) or pick an installed model (Settings → AI Models)."
-        )
+        if kind == "ollama":
+            self.last_degraded_reason = (
+                "Relation extraction skipped — no usable relation model. Connect a working "
+                "Ollama (Settings → Infrastructure) or pick an installed model (Settings → AI Models)."
+            )
+        else:
+            self.last_degraded_reason = (
+                f"Relation extraction skipped — relation model '{primary}' not reachable on the "
+                f"configured runtime ({kind}) at {base} — check the endpoint URL and model name."
+            )
         return None
 
     def _generate_once(

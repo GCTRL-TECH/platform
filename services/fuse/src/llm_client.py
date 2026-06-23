@@ -23,8 +23,6 @@ Per-caller timeout and options contract:
 import httpx
 import requests
 
-_TIMEOUT = 120  # seconds — matches distiller.py's _LLM_TIMEOUT
-
 
 def complete(
     prompt: str,
