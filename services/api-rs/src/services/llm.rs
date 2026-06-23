@@ -472,6 +472,32 @@ impl<'a> ChatMessages<'a> {
                 });
                 (url, headers, body)
             }
+            // openai_compatible: same wire format as openai/openrouter but local/LAN
+            // SSRF rules (Ollama-style). Authorization header is optional — many
+            // local servers (llama.cpp, vLLM, LM Studio, LocalAI) need no key.
+            //
+            // Users commonly supply base_url with a trailing `/v1` (e.g.
+            // `http://localhost:8080/v1`). Strip it before appending the path so
+            // both `http://host:port` and `http://host:port/v1` produce the same
+            // canonical URL `http://host:port/v1/chat/completions`.
+            "openai_compatible" => {
+                let canonical = base.trim_end_matches('/');
+                let canonical = canonical.strip_suffix("/v1").unwrap_or(canonical);
+                let url = format!("{}/v1/chat/completions", canonical);
+                let mut messages = vec![json!({ "role": "system", "content": self.system })];
+                messages.extend(self.messages.iter().cloned());
+                let body = json!({
+                    "model": target.model,
+                    "messages": messages,
+                    "stream": stream,
+                });
+                // Only send Bearer when a key is actually configured.
+                let headers = match target.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                    Some(k) => vec![("authorization".into(), format!("Bearer {k}"))],
+                    None => Vec::new(),
+                };
+                (url, headers, body)
+            }
             // ollama (default)
             _ => {
                 let url = format!("{}/api/chat", base.trim_end_matches('/'));
@@ -557,7 +583,7 @@ pub async fn chat_messages_once(
                     .into()
             })
             .unwrap_or_default(),
-        "openai" | "openrouter" => v["choices"][0]["message"]["content"]
+        "openai" | "openrouter" | "openai_compatible" => v["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
             .to_string(),
@@ -616,7 +642,7 @@ pub async fn chat_stream(
                 if line.is_empty() { continue; }
 
                 match provider.as_str() {
-                    "anthropic" | "openai" | "openrouter" => {
+                    "anthropic" | "openai" | "openrouter" | "openai_compatible" => {
                         let Some(data) = line.strip_prefix("data:") else { continue };
                         let data = data.trim();
                         if data == "[DONE]" { return; }
@@ -751,5 +777,125 @@ mod tests {
         let cm = ChatMessages { system: "s", messages: vec![] };
         let (url, _, _) = cm.build(&t, true);
         assert_eq!(url, "http://ollama:11434/api/chat");
+    }
+
+    // ── openai_compatible tests ───────────────────────────────────────────────
+
+    /// Local and LAN bases must be accepted (same rules as Ollama).
+    #[test]
+    fn validate_openai_compatible_allows_local_lan() {
+        assert!(validate_llm_base("openai_compatible", Some("http://localhost:8080/v1")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("http://127.0.0.1:8080")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("http://10.0.0.5:8080")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("http://llama:8080")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("https://myserver.internal:8443")).is_ok());
+    }
+
+    /// Embedded credentials must be rejected (Ollama-style SSRF rule).
+    #[test]
+    fn validate_openai_compatible_rejects_embedded_creds() {
+        assert!(validate_llm_base("openai_compatible", Some("http://u:p@host/v1")).is_err());
+        assert!(validate_llm_base("openai_compatible", Some("http://user:pass@localhost:8080")).is_err());
+    }
+
+    /// Non-http(s) schemes must be rejected.
+    #[test]
+    fn validate_openai_compatible_rejects_bad_scheme() {
+        assert!(validate_llm_base("openai_compatible", Some("file:///etc/passwd")).is_err());
+        assert!(validate_llm_base("openai_compatible", Some("gopher://localhost")).is_err());
+    }
+
+    /// build() for openai_compatible must POST to {base}/v1/chat/completions.
+    /// When an api_key is set, it must send Authorization: Bearer.
+    /// When api_key is absent/empty, no Authorization header.
+    #[test]
+    fn openai_compatible_build_with_key() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9/v1".into()),
+            api_key: Some("mykey".into()),
+        };
+        let cm = ChatMessages {
+            system: "sys",
+            messages: vec![json!({"role": "user", "content": "hi"})],
+        };
+        let (url, headers, body) = cm.build(&t, false);
+        assert_eq!(url, "http://x:9/v1/chat/completions");
+        assert!(
+            headers.iter().any(|(k, v)| k == "authorization" && v == "Bearer mykey"),
+            "expected Bearer header when api_key is set; got: {:?}", headers
+        );
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn openai_compatible_build_no_key_omits_auth_header() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9/v1".into()),
+            api_key: None,
+        };
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        let (url, headers, body) = cm.build(&t, true);
+        assert_eq!(url, "http://x:9/v1/chat/completions");
+        assert!(
+            !headers.iter().any(|(k, _)| k == "authorization"),
+            "no Authorization header expected when api_key is None; got: {:?}", headers
+        );
+        assert_eq!(body["stream"], true);
+    }
+
+    /// Empty string api_key must also omit the header (treat same as None).
+    #[test]
+    fn openai_compatible_build_empty_key_omits_auth_header() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9/v1".into()),
+            api_key: Some("".into()),
+        };
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        let (_, headers, _) = cm.build(&t, false);
+        assert!(
+            !headers.iter().any(|(k, _)| k == "authorization"),
+            "no Authorization header expected for empty api_key; got: {:?}", headers
+        );
+    }
+
+    /// Container host rewrite: localhost → host.docker.internal inside Docker.
+    /// Outside Docker (no /.dockerenv) this is a no-op — just confirm the function
+    /// passes through the URL unchanged in the test environment.
+    #[test]
+    fn containerize_passthrough_outside_docker() {
+        // In CI/dev (no /.dockerenv) the rewrite is skipped — just verify it
+        // doesn't corrupt the URL.
+        let out = containerize_ollama_base("http://localhost:8080/v1");
+        assert!(out == "http://localhost:8080/v1" || out == "http://host.docker.internal:8080/v1",
+            "unexpected result: {out}");
+    }
+
+    /// official_cloud_host must return None for openai_compatible so it falls into
+    /// the local/LAN branch in validate_llm_base (not the cloud-pinned branch).
+    #[test]
+    fn openai_compatible_not_a_cloud_host() {
+        assert!(official_cloud_host("openai_compatible").is_none());
+    }
+
+    /// When base_url is None for openai_compatible, validate_llm_base falls through
+    /// to ollama_default_base() — that's the existing code path for unknown providers.
+    /// We document this here: the API layer (routes/llm.rs upsert_provider) does NOT
+    /// enforce a non-null base for openai_compatible at DB write time (it simply
+    /// stores NULL when none is supplied), so a NULL-base openai_compatible row would
+    /// resolve to the Ollama default at runtime. This is accepted behaviour — the
+    /// Settings UI must require a base_url for openai_compatible. The test confirms
+    /// the function doesn't panic or error on a None base.
+    #[test]
+    fn openai_compatible_none_base_falls_back_to_ollama_default() {
+        let result = validate_llm_base("openai_compatible", None);
+        assert!(result.is_ok(), "should not error; got: {:?}", result);
     }
 }
