@@ -25,7 +25,7 @@
 
 use axum::{
     extract::{Extension, Path, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -93,6 +93,10 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
             axum::routing::put(upsert_override).delete(delete_override),
         )
         .route("/overrides/:service/test", axum::routing::post(test_override))
+        // ── Global runtime (active LLM generation runtime) ─────────────────
+        .route("/active-runtime", get(get_active_runtime))
+        .route("/runtimes", get(list_runtimes))
+        .route("/runtime", post(set_runtime))
 }
 
 // ── GET /overrides ──────────────────────────────────────────────────────────
@@ -398,4 +402,314 @@ fn parse_host_port(url: &str) -> std::result::Result<(String, u16), String> {
         return Err("missing port (include it in the URL, e.g. host:7687)".into());
     }
     Ok((host, port))
+}
+
+// ── Global runtime config endpoints ─────────────────────────────────────────
+//
+// These three endpoints manage the operator-level "active runtime" — the
+// default generation backend used when no per-user provider is configured.
+// The singleton row in `runtime_config` (id=1) stores the choice; absence
+// means "unset → bundled Ollama default".
+
+// ── Validate runtime input (pure, testable) ──────────────────────────────────
+
+/// Validate the body fields for `POST /runtime` without touching the DB.
+///
+/// - `provider` must be one of `{"ollama","openai_compatible"}`.
+/// - `openai_compatible` requires a non-empty `base_url`.
+/// - When `base_url` is present it is run through the SSRF guard.
+///
+/// Returns `Ok(validated_base)` — the validated base URL string for
+/// `openai_compatible`, or `None` for `ollama` (the base is optional and
+/// validated later at request time via `containerize_ollama_base`).
+pub fn validate_runtime_input(
+    provider: &str,
+    base_url: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    match provider {
+        "ollama" => {
+            // Base is optional for Ollama (falls back to OLLAMA_BASE / bundled default).
+            // Validate it when provided so bad values are rejected at write time.
+            if let Some(b) = base_url.map(str::trim).filter(|s| !s.is_empty()) {
+                crate::services::llm::validate_llm_base("ollama", Some(b))
+                    .map(|_| Some(b.to_string()))
+                    .map_err(|e| e)
+            } else {
+                Ok(None)
+            }
+        }
+        "openai_compatible" => {
+            let b = base_url
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "base_url is required for openai_compatible".to_string())?;
+            crate::services::llm::validate_llm_base("openai_compatible", Some(b))
+                .map(|u| Some(u.as_str().trim_end_matches('/').to_string()))
+                .map_err(|e| e)
+        }
+        other => Err(format!(
+            "Unknown provider '{other}'. Valid values: ollama, openai_compatible"
+        )),
+    }
+}
+
+// ── GET /api/infra/active-runtime ────────────────────────────────────────────
+
+/// Return the current global runtime — provider, endpoint, model, and a live
+/// health probe result. The `api_key` is NEVER returned; `configured` is true
+/// when a provider row exists and the provider field is non-empty.
+async fn get_active_runtime(
+    Extension(_claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    // Any authenticated user may read (not admin-only — the UI shows this in
+    // the Settings summary for all users to understand the active backend).
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT provider, base_url, model, embedding_mode
+             FROM runtime_config WHERE id = 1",
+        )
+        .fetch_optional(&state.db)
+        .await?;
+
+    let (provider, base_url, model, embedding_mode, configured) = match row {
+        Some((Some(p), b, m, em)) if !p.trim().is_empty() => {
+            (p.trim().to_string(), b, m, em, true)
+        }
+        Some((_, b, m, em)) => ("ollama".to_string(), b, m, em, false),
+        None => ("ollama".to_string(), None, None, None, false),
+    };
+
+    // Build a temporary target for the health probe — no key needed for probing.
+    let health_client = reqwest::Client::new();
+    let target = crate::services::llm::LlmTarget {
+        provider: provider.clone(),
+        model: model.clone().unwrap_or_else(|| "llama3.2".to_string()),
+        base_url: base_url.clone(),
+        api_key: None,
+    };
+    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+
+    Ok(Json(json!({
+        "provider":       provider,
+        "base_url":       base_url,
+        "model":          model,
+        "embedding_mode": embedding_mode.unwrap_or_else(|| "pinned".to_string()),
+        "configured":     configured,
+        "healthy":        healthy,
+    })))
+}
+
+// ── GET /api/infra/runtimes ───────────────────────────────────────────────────
+
+/// Return the static catalog of selectable runtime kinds for the UI.
+/// Only `ollama` and `openai_compatible` are offered in this phase.
+async fn list_runtimes(
+    Extension(_claims): Extension<JwtClaims>,
+) -> Result<Json<Value>> {
+    Ok(Json(json!({
+        "runtimes": [
+            {
+                "id":           "ollama",
+                "label":        "Bundled Ollama",
+                "kind":         "ollama",
+                "needs_base_url": false,
+                "description":  "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
+            },
+            {
+                "id":           "openai_compatible",
+                "label":        "OpenAI-compatible endpoint",
+                "kind":         "openai_compatible",
+                "needs_base_url": true,
+                "description":  "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API.",
+            },
+        ]
+    })))
+}
+
+// ── POST /api/infra/runtime ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetRuntimeReq {
+    provider: String,
+    base_url: Option<String>,
+    api_key:  Option<String>,
+    model:    Option<String>,
+}
+
+/// Set (UPSERT) the global active runtime. Admin-only.
+///
+/// Steps:
+///   1. Validate provider and base_url (SSRF guard via validate_runtime_input).
+///   2. Build a temporary LlmTarget and probe health — still saves even if unhealthy.
+///   3. UPSERT the singleton row; seal api_key when provided; preserve existing
+///      key when omitted (mirrors routes/llm.rs preserve-on-omit behaviour).
+async fn set_runtime(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<SetRuntimeReq>,
+) -> Result<Json<Value>> {
+    require_role(&claims, "admin")?;
+
+    let provider = req.provider.trim().to_string();
+    let base_url_raw = req.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let model = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+
+    // (a)+(b) Validate provider + base_url with SSRF guard.
+    let validated_base: Option<String> = validate_runtime_input(&provider, base_url_raw)
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    // (c) Health probe — save regardless of result but signal the caller.
+    let health_client = reqwest::Client::new();
+    let target = crate::services::llm::LlmTarget {
+        provider: provider.clone(),
+        model: model.clone().unwrap_or_else(|| "llama3.2".to_string()),
+        base_url: validated_base.clone(),
+        api_key: None, // health probe doesn't need the key
+    };
+    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+
+    // (d) Seal the api_key when provided.
+    let sealed_key: Option<String> = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(crate::services::crypto::seal);
+
+    // UPSERT singleton row (id=1). When api_key is omitted (NULL), COALESCE
+    // preserves the existing stored key so the operator doesn't need to re-enter
+    // it on every model/URL change — matching routes/llm.rs upsert behaviour.
+    sqlx::query(
+        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, updated_at)
+         VALUES (1, $1, $2, $3, $4, now())
+         ON CONFLICT (id) DO UPDATE SET
+             provider   = $1,
+             base_url   = $2,
+             model      = $3,
+             api_key    = COALESCE($4, runtime_config.api_key),
+             updated_at = now()",
+    )
+    .bind(&provider)
+    .bind(&validated_base)
+    .bind(&model)
+    .bind(&sealed_key)
+    .execute(&state.db)
+    .await?;
+
+    crate::services::audit::log_access(
+        &state.db, &claims, "infra.runtime.set", "runtime_config", "1",
+        0, None, true, None,
+    ).await;
+
+    let mut resp = json!({ "saved": true, "healthy": healthy });
+    if !healthy {
+        resp["warning"] = json!(
+            "Runtime saved but health probe failed. The server may not be running yet — \
+             it will be used once it is reachable."
+        );
+    }
+    Ok(Json(resp))
+}
+
+// ── Unit tests (pure validation logic — no DB harness) ───────────────────────
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::validate_runtime_input;
+
+    // ── Provider validation ───────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_provider_is_rejected() {
+        let err = validate_runtime_input("gpt-4o", None).unwrap_err();
+        assert!(err.contains("Unknown provider"), "got: {err}");
+    }
+
+    #[test]
+    fn openai_provider_is_rejected() {
+        // "openai" is not in the runtime catalog (it lives in per-user providers)
+        let err = validate_runtime_input("openai", None).unwrap_err();
+        assert!(err.contains("Unknown provider"), "got: {err}");
+    }
+
+    #[test]
+    fn anthropic_provider_is_rejected() {
+        let err = validate_runtime_input("anthropic", None).unwrap_err();
+        assert!(err.contains("Unknown provider"), "got: {err}");
+    }
+
+    // ── ollama ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ollama_no_base_is_ok() {
+        let result = validate_runtime_input("ollama", None);
+        assert!(result.is_ok(), "got: {:?}", result);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn ollama_with_local_base_is_ok() {
+        let result = validate_runtime_input("ollama", Some("http://localhost:11434"));
+        assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn ollama_with_lan_base_is_ok() {
+        let result = validate_runtime_input("ollama", Some("http://10.0.0.5:11434"));
+        assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn ollama_with_bad_scheme_is_rejected() {
+        let err = validate_runtime_input("ollama", Some("file:///etc/passwd")).unwrap_err();
+        assert!(!err.is_empty(), "got: {err}");
+    }
+
+    #[test]
+    fn ollama_with_embedded_creds_is_rejected() {
+        let err = validate_runtime_input("ollama", Some("http://user:pass@localhost:11434")).unwrap_err();
+        assert!(!err.is_empty(), "got: {err}");
+    }
+
+    // ── openai_compatible ─────────────────────────────────────────────────────
+
+    #[test]
+    fn openai_compatible_requires_base_url() {
+        let err = validate_runtime_input("openai_compatible", None).unwrap_err();
+        assert!(err.contains("base_url is required"), "got: {err}");
+    }
+
+    #[test]
+    fn openai_compatible_empty_base_url_rejected() {
+        let err = validate_runtime_input("openai_compatible", Some("  ")).unwrap_err();
+        assert!(err.contains("base_url is required"), "got: {err}");
+    }
+
+    #[test]
+    fn openai_compatible_local_base_is_ok() {
+        let result = validate_runtime_input("openai_compatible", Some("http://localhost:8080/v1"));
+        assert!(result.is_ok(), "got: {:?}", result);
+        let base = result.unwrap().unwrap();
+        // Trailing slash stripped, /v1 path preserved or stripped — just check it parses.
+        assert!(base.starts_with("http://localhost:8080"), "got: {base}");
+    }
+
+    #[test]
+    fn openai_compatible_lan_base_is_ok() {
+        let result = validate_runtime_input("openai_compatible", Some("http://10.0.0.5:8080"));
+        assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn openai_compatible_embedded_creds_rejected() {
+        let err = validate_runtime_input("openai_compatible", Some("http://u:p@host/v1")).unwrap_err();
+        assert!(!err.is_empty(), "got: {err}");
+    }
+
+    #[test]
+    fn openai_compatible_bad_scheme_rejected() {
+        let err = validate_runtime_input("openai_compatible", Some("gopher://localhost")).unwrap_err();
+        assert!(!err.is_empty(), "got: {err}");
+    }
 }
