@@ -141,6 +141,7 @@ def run_pipeline(
     embedding_model: str | None = None,
     relex_model: str | None = None,
     generation_kind: str = "ollama",
+    generation_base: str | None = None,
     generation_api_key: str | None = None,
 ) -> dict:
     """
@@ -192,9 +193,12 @@ def run_pipeline(
     warnings: list[str] = []
     relex = get_extractor()
     try:
+        # Use generation_base for the generation step when provided;
+        # otherwise fall through to ollama_base (default install unchanged).
+        relex_base = generation_base if generation_base else ollama_base
         relations = relex.extract_relations(
             text, entities,
-            ollama_base=ollama_base,
+            ollama_base=relex_base,
             model=relex_model,
             kind=generation_kind,
             api_key=generation_api_key,
@@ -378,6 +382,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             # Defaults to "ollama" so existing jobs are unchanged.
             generation_kind = payload.get("generation_kind") or "ollama"
             generation_api_key = payload.get("generation_api_key")
+            generation_base = payload.get("generation_base")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -483,6 +488,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 embedding_model=embedding_model,
                 relex_model=relex_model,
                 generation_kind=generation_kind,
+                generation_base=generation_base,
                 generation_api_key=generation_api_key,
             )
             # Record crawl provenance on the result for the dashboard.

@@ -262,15 +262,19 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         # LLM runtime kind + optional API key for OpenAI-compatible providers.
         # Defaults to "ollama" so existing distill jobs are unchanged.
         generation_kind = payload.get("generation_kind") or "ollama"
+        generation_base = payload.get("generation_base")
         generation_api_key = payload.get("generation_api_key")
         logger.info(f"Worker: received distill job for {compilation_id}")
 
         if job_id != "unknown":
             _update_job_status(job_id, "processing")
 
+        # Use generation_base for the distiller's generation step when provided;
+        # fall back to ollama_base (default install unchanged).
+        distill_base = generation_base if generation_base else ollama_base
         result = distiller.distill(
             compilation_id, user_id, limit=limit,
-            model=distill_model, ollama_base=ollama_base,
+            model=distill_model, ollama_base=distill_base,
             kind=generation_kind, api_key=generation_api_key,
         )
 

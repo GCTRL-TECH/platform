@@ -422,6 +422,32 @@ pub async fn resolve_ollama_base_for_user(
     }
 }
 
+/// Pure helper: given a resolved `LlmTarget`, decide whether to inject
+/// `generation_*` fields into a worker payload map for KEX/FUSE.
+///
+/// Injects ONLY when `target.provider == "openai_compatible"`:
+///   - generation_kind = "openai_compatible"
+///   - generation_base = target.base() (canonical, no /v1)
+///   - generation_model = target.model
+///   - generation_api_key = target.api_key (only when Some+non-empty)
+///
+/// For all other providers (ollama, cloud, anthropic) — does nothing, so
+/// generation stays on Ollama as today (backward compatible).
+pub fn apply_generation_overrides(target: &LlmTarget, map: &mut serde_json::Map<String, Value>) {
+    if target.provider != "openai_compatible" {
+        return;
+    }
+    map.insert("generation_kind".into(), json!("openai_compatible"));
+    map.insert("generation_base".into(), json!(target.base()));
+    map.insert("generation_model".into(), json!(target.model));
+    if let Some(ref k) = target.api_key {
+        let k = k.trim();
+        if !k.is_empty() {
+            map.insert("generation_api_key".into(), json!(k));
+        }
+    }
+}
+
 /// Inject the owner's runtime Ollama endpoint into a KEX `kex:jobs` payload so the
 /// extraction worker honors the Settings → Infrastructure base URL for THIS job
 /// (relation extraction + embedding) instead of its container-baked env defaults.
@@ -481,6 +507,9 @@ pub async fn inject_ollama_overrides(
         if let Some(m) = nz(rel_model) {
             map.insert("relex_model".into(), json!(m));
         }
+        // ── Generation runtime (openai_compatible → inject generation_* fields)
+        let gen = resolve_for_user(db, user_id, None, None).await;
+        apply_generation_overrides(&gen, map);
     }
 }
 
@@ -506,6 +535,24 @@ pub async fn resolve_distill_overrides(
 
     let ollama_base = resolve_ollama_base_for_user(db, user_id).await;
     (distill_model, ollama_base)
+}
+
+/// Resolve the generation-runtime overrides for FUSE distill jobs.
+///
+/// Returns `Some(target)` ONLY when the active runtime is `openai_compatible`
+/// (the only non-Ollama provider supported for worker generation today).
+/// Returns `None` for all other runtimes so callers add nothing and generation
+/// stays on Ollama (backward compatible).
+pub async fn resolve_distill_generation_overrides(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> Option<LlmTarget> {
+    let gen = resolve_for_user(db, user_id, None, None).await;
+    if gen.provider == "openai_compatible" {
+        Some(gen)
+    } else {
+        None
+    }
 }
 
 // ── Request building ──────────────────────────────────────────────────────────
@@ -1112,5 +1159,104 @@ mod tests {
             format!("{}/api/tags", base.trim_end_matches('/'))
         };
         assert_eq!(url, "http://ollama:11434/api/tags");
+    }
+
+    // ── apply_generation_overrides (pure, no DB) ─────────────────────────────
+
+    /// openai_compatible → all four generation_* fields injected.
+    #[test]
+    fn apply_gen_overrides_injects_for_openai_compatible() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "qwen2.5:7b".into(),
+            base_url: Some("http://localhost:8080".into()),
+            api_key: Some("mykey".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert_eq!(map["generation_kind"], json!("openai_compatible"));
+        assert_eq!(map["generation_model"], json!("qwen2.5:7b"));
+        assert!(map.contains_key("generation_base"), "generation_base must be set");
+        assert_eq!(map["generation_api_key"], json!("mykey"));
+    }
+
+    /// ollama → no generation_* fields injected (backward compatible).
+    #[test]
+    fn apply_gen_overrides_noop_for_ollama() {
+        let t = LlmTarget {
+            provider: "ollama".into(),
+            model: "llama3.2".into(),
+            base_url: None,
+            api_key: None,
+        };
+        let mut map = serde_json::Map::new();
+        map.insert("ollama_base".into(), json!("http://ollama:11434"));
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_kind"), "ollama must not inject generation_kind");
+        assert!(!map.contains_key("generation_base"));
+        assert!(!map.contains_key("generation_model"));
+        assert!(!map.contains_key("generation_api_key"));
+        // ollama_base untouched
+        assert_eq!(map["ollama_base"], json!("http://ollama:11434"));
+    }
+
+    /// openai provider → no generation_* injected (cloud out of scope).
+    #[test]
+    fn apply_gen_overrides_noop_for_openai() {
+        let t = LlmTarget {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            base_url: None,
+            api_key: Some("sk-x".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_kind"));
+    }
+
+    /// anthropic provider → no generation_* injected (cloud out of scope).
+    #[test]
+    fn apply_gen_overrides_noop_for_anthropic() {
+        let t = LlmTarget {
+            provider: "anthropic".into(),
+            model: "claude-3-5-sonnet-20241022".into(),
+            base_url: None,
+            api_key: Some("k".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_kind"));
+    }
+
+    /// Empty api_key → generation_api_key NOT injected.
+    #[test]
+    fn apply_gen_overrides_omits_empty_api_key() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9".into()),
+            api_key: Some("  ".into()), // whitespace-only
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_api_key"), "empty/whitespace api_key must not be injected");
+        // But the other three fields ARE there.
+        assert!(map.contains_key("generation_kind"));
+        assert!(map.contains_key("generation_base"));
+        assert!(map.contains_key("generation_model"));
+    }
+
+    /// None api_key → generation_api_key NOT injected.
+    #[test]
+    fn apply_gen_overrides_omits_none_api_key() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9".into()),
+            api_key: None,
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_api_key"));
     }
 }

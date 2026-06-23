@@ -210,3 +210,124 @@ class TestRelexDefaultKind:
                 args, kwargs = c
                 passed_kind = kwargs.get("kind") or (args[3] if len(args) > 3 else None)
                 assert passed_kind == "ollama", f"Expected default kind='ollama', got {passed_kind!r}"
+
+
+# ── 4. generation_base routing (Task 2.3) ────────────────────────────────────
+
+class TestRelexGenerationBase:
+    """Verify the relex_base routing expression introduced in run_pipeline (Task 2.3).
+
+    run_pipeline now computes:
+        relex_base = generation_base if generation_base else ollama_base
+
+    and passes that as ollama_base= to relex.extract_relations.
+
+    These tests verify the logic via src.relex.RelationExtractor directly —
+    the same layer tested by TestRelexOpenAICompatible — so they don't need
+    to import src.main (which has heavy FastAPI/redis/qdrant top-level imports
+    incompatible with the unit-test environment).
+    """
+
+    def test_generation_base_routes_to_relex(self):
+        """With generation_base set, relex must receive generation_base as its
+        ollama_base argument (not the ollama_base fallback).
+
+        relex._call_ollama resolves: base = (ollama_base or "").strip() or config.OLLAMA_BASE
+        then calls: llm_client.complete(prompt, model, base, kind, ...)
+        so 'base' is the 3rd positional argument (index 2)."""
+        from src.relex import RelationExtractor
+
+        ollama_base = "http://ollama:11434"
+        generation_base = "http://openai-compat:8080"
+        # Simulate the routing expression from run_pipeline
+        relex_base = generation_base if generation_base else ollama_base
+
+        with patch("src.relex.llm_client") as mock_client:
+            mock_client.complete.return_value = "[]"
+
+            ext = RelationExtractor()
+            ext.extract_relations(
+                "Alice is the CEO of Acme.",
+                [
+                    {"text": "Alice", "label": "person", "coarse_type": "person"},
+                    {"text": "Acme", "label": "organization", "coarse_type": "organization"},
+                ],
+                ollama_base=relex_base,
+                model="qwen2.5:7b",
+                kind="openai_compatible",
+                api_key="sk-test",
+            )
+
+        assert mock_client.complete.called, "llm_client.complete must be called"
+        _args, _kwargs = mock_client.complete.call_args
+        # base is the 3rd positional arg: complete(prompt, model, base, kind, ...)
+        passed_base = _kwargs.get("base") if "base" in _kwargs else (_args[2] if len(_args) > 2 else None)
+        assert passed_base == generation_base, (
+            f"relex must receive generation_base as base; got {passed_base!r}"
+        )
+        assert passed_base != ollama_base, (
+            "relex must NOT receive ollama_base when generation_base is set"
+        )
+
+    def test_no_generation_base_falls_through_to_ollama_base(self):
+        """When generation_base is None (ollama runtime), relex_base falls back to
+        ollama_base — parity with today's behaviour.
+
+        relex._call_ollama resolves: base = (ollama_base or "").strip() or config.OLLAMA_BASE
+        so when ollama_base="http://ollama:11434" is passed, that base is what
+        llm_client.complete receives as its 3rd positional arg."""
+        from src.relex import RelationExtractor
+
+        ollama_base = "http://ollama:11434"
+        generation_base = None
+        # Simulate the routing expression from run_pipeline
+        relex_base = generation_base if generation_base else ollama_base
+
+        # relex_base must equal ollama_base when generation_base is None/falsy
+        assert relex_base == ollama_base, (
+            f"When generation_base is None, relex_base must be ollama_base; got {relex_base!r}"
+        )
+        assert relex_base != "http://openai-compat:8080", (
+            "relex must NOT receive a generation_base value when runtime is ollama"
+        )
+
+        with patch("src.relex.llm_client") as mock_client:
+            mock_client.complete.return_value = "[]"
+
+            ext = RelationExtractor()
+            ext.extract_relations(
+                "Bob works at Corp.",
+                [
+                    {"text": "Bob", "label": "person", "coarse_type": "person"},
+                    {"text": "Corp", "label": "organization", "coarse_type": "organization"},
+                ],
+                ollama_base=relex_base,
+                model="qwen2.5:7b",
+                kind="ollama",
+            )
+
+        assert mock_client.complete.called
+        _args, _kwargs = mock_client.complete.call_args
+        # base is the 3rd positional arg: complete(prompt, model, base, kind, ...)
+        passed_base = _kwargs.get("base") if "base" in _kwargs else (_args[2] if len(_args) > 2 else None)
+        assert passed_base == ollama_base, (
+            f"relex must receive ollama_base when generation_base is absent; got {passed_base!r}"
+        )
+
+    def test_relex_base_routing_expression_pure(self):
+        """Pure unit test of the routing expression (no mocks needed).
+
+        Asserts the semantics of:
+            relex_base = generation_base if generation_base else ollama_base
+        """
+        ollama = "http://ollama:11434"
+        gen = "http://openai-compat:8080"
+
+        # Case 1: generation_base set → use it
+        assert (gen if gen else ollama) == gen
+
+        # Case 2: generation_base None → fall back to ollama
+        assert (None if None else ollama) == ollama
+
+        # Case 3: generation_base empty string → treat as falsy, fall back
+        assert ("" if "" else ollama) == ollama
