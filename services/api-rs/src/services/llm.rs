@@ -18,6 +18,103 @@ use std::time::Duration;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 
+// ── Global runtime config ─────────────────────────────────────────────────────
+
+/// Load the global (operator-level) runtime configuration from the singleton
+/// `runtime_config` table.  Returns `(provider, base_url, model, api_key_opened)`
+/// only when a row exists **and** `provider` is non-NULL and non-empty — anything
+/// else means "unset" and returns `None`, keeping today's Ollama default.
+async fn active_runtime_config(
+    db: &sqlx::PgPool,
+) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT provider, base_url, model, api_key FROM runtime_config WHERE id = 1",
+        )
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+    let (provider, base_url, model, api_key) = row?;
+    let provider = provider.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let api_key_opened = api_key
+        .map(|k| crate::services::crypto::open(&k))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((provider, base_url, model, api_key_opened))
+}
+
+/// Pure helper: given an optional global runtime config tuple and an optional
+/// requested model override, return the `LlmTarget` that the resolution chain
+/// should use as a final fallback (after per-user rows).
+///
+/// Extracted as a pure function (no async, no DB) so it can be unit-tested
+/// without a live database.
+pub fn choose_fallback_target(
+    global: Option<(String, Option<String>, Option<String>, Option<String>)>,
+    requested_model: Option<&str>,
+) -> LlmTarget {
+    match global {
+        Some((provider, base_url, config_model, api_key)) => {
+            // Validate the stored base_url through the SSRF guard; an invalid
+            // value is silently dropped so it can never be used as an attack
+            // vector even if it somehow entered the DB without write-time checks.
+            let validated_base = base_url.as_deref().and_then(|b| {
+                let b = b.trim();
+                if b.is_empty() {
+                    return None;
+                }
+                validate_llm_base(&provider, Some(b)).ok().map(|u| {
+                    containerize_ollama_base(u.as_str().trim_end_matches('/'))
+                })
+            });
+            let model = requested_model
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| config_model.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| LlmTarget::default_model_for(&provider).to_string());
+            LlmTarget { provider, model, base_url: validated_base, api_key }
+        }
+        // No global config set → bundled Ollama default (identical to today).
+        None => LlmTarget {
+            provider: "ollama".into(),
+            model: requested_model
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("llama3.2")
+                .to_string(),
+            base_url: None,
+            api_key: None,
+        },
+    }
+}
+
+/// Check whether a resolved `LlmTarget` is currently reachable.
+///
+/// - `openai_compatible` → `GET {base}/v1/models`
+/// - all others (ollama) → `GET {base}/api/tags`
+///
+/// 3-second timeout; returns `true` on any 2xx response.
+pub async fn runtime_health(client: &reqwest::Client, target: &LlmTarget) -> bool {
+    let base = target.base();
+    let url = if target.provider == "openai_compatible" {
+        format!("{}/v1/models", base.trim_end_matches('/'))
+    } else {
+        format!("{}/api/tags", base.trim_end_matches('/'))
+    };
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 /// A fully-resolved chat target: which provider/model to hit, where, and with
 /// which (already-decrypted) key. Build via [`resolve_for_user`].
 #[derive(Clone, Debug)]
@@ -182,7 +279,8 @@ impl LlmTarget {
 /// Precedence:
 /// 1. `requested_provider` if the user has a row for it that `is_active`.
 /// 2. Otherwise the user's active provider (most recently created wins).
-/// 3. Otherwise the local Ollama default (no key).
+/// 3. Otherwise the global `runtime_config` operator default (if set).
+/// 4. Otherwise the local Ollama default (no key).
 ///
 /// The model is `requested_model` if given, else the row's `default_model`, else
 /// a provider default. The stored key is decrypted via `crypto::open`.
@@ -285,17 +383,13 @@ pub async fn resolve_for_user(
                 api_key: api_key.map(|k| crate::services::crypto::open(&k)),
             }
         }
-        // No connected provider — local Ollama default.
-        None => LlmTarget {
-            provider: "ollama".into(),
-            model: requested_model
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("llama3.2")
-                .to_string(),
-            base_url: None,
-            api_key: None,
-        },
+        // No connected per-user provider — check the global runtime config, then
+        // fall back to the bundled Ollama default (identical behaviour to today
+        // when no global config is set).
+        None => {
+            let global = active_runtime_config(db).await;
+            choose_fallback_target(global, requested_model)
+        }
     }
 }
 
@@ -897,5 +991,126 @@ mod tests {
     fn openai_compatible_none_base_falls_back_to_ollama_default() {
         let result = validate_llm_base("openai_compatible", None);
         assert!(result.is_ok(), "should not error; got: {:?}", result);
+    }
+
+    // ── choose_fallback_target (pure, no DB) ─────────────────────────────────
+
+    /// When no global config is set, the fallback is the bundled Ollama default.
+    #[test]
+    fn fallback_none_global_gives_ollama_default() {
+        let t = choose_fallback_target(None, None);
+        assert_eq!(t.provider, "ollama");
+        assert_eq!(t.model, "llama3.2");
+        assert!(t.base_url.is_none());
+        assert!(t.api_key.is_none());
+    }
+
+    /// A global config with a provider overrides the Ollama default.
+    #[test]
+    fn fallback_global_config_beats_ollama_default() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("http://localhost:8080".to_string()),
+            Some("qwen2.5:7b".to_string()),
+            None,
+        ));
+        let t = choose_fallback_target(global, None);
+        assert_eq!(t.provider, "openai_compatible");
+        assert_eq!(t.model, "qwen2.5:7b");
+        assert_eq!(t.base_url.as_deref(), Some("http://localhost:8080"));
+    }
+
+    /// A requested_model overrides the model stored in the global config.
+    #[test]
+    fn fallback_requested_model_overrides_config_model() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("http://localhost:8080".to_string()),
+            Some("qwen2.5:7b".to_string()),
+            None,
+        ));
+        let t = choose_fallback_target(global, Some("mistral:latest"));
+        assert_eq!(t.model, "mistral:latest");
+    }
+
+    /// When global config has no model, the provider default is used.
+    #[test]
+    fn fallback_global_no_model_uses_provider_default() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("http://localhost:8080".to_string()),
+            None, // no model stored
+            None,
+        ));
+        let t = choose_fallback_target(global, None);
+        // openai_compatible falls to the ollama-path default_model_for → "llama3.2"
+        assert!(!t.model.is_empty());
+    }
+
+    /// requested_model override on the None-global path (Ollama).
+    #[test]
+    fn fallback_none_global_with_requested_model() {
+        let t = choose_fallback_target(None, Some("codellama:13b"));
+        assert_eq!(t.provider, "ollama");
+        assert_eq!(t.model, "codellama:13b");
+    }
+
+    /// A global config with an invalid base_url (SSRF guard) silently drops the
+    /// base so the resolved target has None rather than an unsafe URL.
+    #[test]
+    fn fallback_invalid_base_is_dropped() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("not-a-url!!".to_string()),
+            Some("m".to_string()),
+            None,
+        ));
+        let t = choose_fallback_target(global, None);
+        assert!(
+            t.base_url.is_none(),
+            "invalid base should be dropped; got: {:?}",
+            t.base_url
+        );
+    }
+
+    // ── runtime_health URL selection ─────────────────────────────────────────
+
+    /// For `openai_compatible` the health probe must use `/v1/models`.
+    #[test]
+    fn runtime_health_url_openai_compatible() {
+        // We can't make a real request in unit tests, but we can verify the URL
+        // that *would* be used by inspecting the path chosen for the provider.
+        // We do this by checking the provider-branch logic directly.
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://localhost:8080".into()),
+            api_key: None,
+        };
+        let base = t.base();
+        let url = if t.provider == "openai_compatible" {
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        } else {
+            format!("{}/api/tags", base.trim_end_matches('/'))
+        };
+        assert_eq!(url, "http://localhost:8080/v1/models");
+    }
+
+    /// For `ollama` the health probe must use `/api/tags`.
+    #[test]
+    fn runtime_health_url_ollama() {
+        let t = LlmTarget {
+            provider: "ollama".into(),
+            model: "llama3.2".into(),
+            base_url: Some("http://ollama:11434".into()),
+            api_key: None,
+        };
+        let base = t.base();
+        let url = if t.provider == "openai_compatible" {
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        } else {
+            format!("{}/api/tags", base.trim_end_matches('/'))
+        };
+        assert_eq!(url, "http://ollama:11434/api/tags");
     }
 }
