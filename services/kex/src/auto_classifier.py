@@ -37,6 +37,7 @@ async def auto_classify(
             OLLAMA_BASE,
             kind,
             api_key=api_key,
+            timeout=30.0,
         )
         result = result.strip().upper()
         valid = {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "STRICTLY_CONFIDENTIAL"}

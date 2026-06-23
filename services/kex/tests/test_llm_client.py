@@ -3,6 +3,11 @@
 Mocking strategy:
   - sync `complete`: monkeypatch `requests.post`
   - async `acomplete`: patch `httpx.AsyncClient.post` via unittest.mock
+
+Per-caller contract (parity with e71ecaf):
+  - options=None  → "options" key ABSENT from body (distiller / auto_classifier parity)
+  - options={...} → "options" key present with exactly the provided dict (relex parity)
+  - timeout       → forwarded to the underlying HTTP client
 """
 
 import asyncio
@@ -114,6 +119,17 @@ class TestCompleteOpenAI:
             url = mock_post.call_args[0][0]
             assert url == "http://x/v1/chat/completions"
 
+    def test_openai_timeout_forwarded(self):
+        """The timeout arg must be forwarded to requests.post."""
+        from src.llm_client import complete
+        fake_resp = _make_sync_resp({
+            "choices": [{"message": {"content": "ok"}}]
+        })
+        with patch("requests.post", return_value=fake_resp) as mock_post:
+            complete("hi", "m", "http://x", "openai", timeout=45)
+            timeout_arg = mock_post.call_args.kwargs.get("timeout") or mock_post.call_args[1].get("timeout")
+            assert timeout_arg == 45
+
 
 class TestCompleteOllama:
     def test_posts_to_api_generate(self):
@@ -124,7 +140,9 @@ class TestCompleteOllama:
             url = mock_post.call_args[0][0]
             assert url == "http://ollama:11434/api/generate"
 
-    def test_body_shape(self):
+    def test_body_no_options_key_when_options_none(self):
+        """When options=None (default), the body must NOT contain an 'options' key.
+        This is the byte-parity requirement for distiller + auto_classifier (e71ecaf)."""
         from src.llm_client import complete
         fake_resp = _make_sync_resp({"response": "borg"})
         with patch("requests.post", return_value=fake_resp) as mock_post:
@@ -133,9 +151,35 @@ class TestCompleteOllama:
             assert body["model"] == "llama3.2"
             assert body["prompt"] == "hi"
             assert body["stream"] is False
+            assert "options" not in body, (
+                f"'options' key must be absent when options=None, got body={body}"
+            )
+
+    def test_body_with_options_key_when_options_provided(self):
+        """When options is provided, the body carries exactly that dict as 'options'.
+        This is the byte-parity requirement for relex (e71ecaf)."""
+        from src.llm_client import complete
+        fake_resp = _make_sync_resp({"response": "borg"})
+        with patch("requests.post", return_value=fake_resp) as mock_post:
+            complete(
+                "hi", "llama3.2", "http://ollama:11434", "ollama",
+                options={"temperature": 0.0, "num_predict": 1024},
+            )
+            body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
             assert "options" in body
-            assert body["options"]["temperature"] == 0.0
-            assert body["options"]["num_predict"] == 1024
+            assert body["options"] == {"temperature": 0.0, "num_predict": 1024}
+
+    def test_options_sent_as_is_no_merge(self):
+        """Caller-supplied options are forwarded verbatim — no hidden default merge."""
+        from src.llm_client import complete
+        fake_resp = _make_sync_resp({"response": "ok"})
+        with patch("requests.post", return_value=fake_resp) as mock_post:
+            complete("hi", "llama3.2", "http://ollama:11434", "ollama",
+                     options={"num_predict": 512, "top_k": 5})
+            body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+            # Exactly the provided dict — no baked-in temperature added
+            assert body["options"] == {"num_predict": 512, "top_k": 5}
+            assert "temperature" not in body["options"]
 
     def test_returns_response_field(self):
         from src.llm_client import complete
@@ -144,17 +188,24 @@ class TestCompleteOllama:
             result = complete("hi", "llama3.2", "http://ollama:11434", "ollama")
             assert result == "extracted text"
 
-    def test_options_merge(self):
-        """Caller-supplied options should merge into the defaults."""
+    def test_timeout_default_is_120(self):
+        """Default timeout for ollama must be 120 s."""
+        from src.llm_client import complete
+        fake_resp = _make_sync_resp({"response": "ok"})
+        with patch("requests.post", return_value=fake_resp) as mock_post:
+            complete("hi", "llama3.2", "http://ollama:11434", "ollama")
+            timeout_arg = mock_post.call_args.kwargs.get("timeout") or mock_post.call_args[1].get("timeout")
+            assert timeout_arg == 120
+
+    def test_timeout_forwarded_to_requests(self):
+        """A caller-supplied timeout must reach requests.post (relex passes 180)."""
         from src.llm_client import complete
         fake_resp = _make_sync_resp({"response": "ok"})
         with patch("requests.post", return_value=fake_resp) as mock_post:
             complete("hi", "llama3.2", "http://ollama:11434", "ollama",
-                     options={"num_predict": 512, "top_k": 5})
-            body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
-            assert body["options"]["temperature"] == 0.0   # default preserved
-            assert body["options"]["num_predict"] == 512   # caller overrides
-            assert body["options"]["top_k"] == 5           # caller extra
+                     options={"temperature": 0.0, "num_predict": 1024}, timeout=180)
+            timeout_arg = mock_post.call_args.kwargs.get("timeout") or mock_post.call_args[1].get("timeout")
+            assert timeout_arg == 180
 
 
 # ── async: acomplete ──────────────────────────────────────────────────────────
@@ -214,6 +265,33 @@ class TestACompleteOllama:
             url = async_post.call_args[0][0]
             assert url == "http://ollama:11434/api/generate"
 
+    def test_body_no_options_key_when_options_none(self):
+        """When options=None (default), body must NOT contain 'options'.
+        Parity with original auto_classifier behaviour (e71ecaf)."""
+        from src.llm_client import acomplete
+        fake_resp = _make_async_resp({"response": "extracted"})
+        async_post = AsyncMock(return_value=fake_resp)
+        with patch("httpx.AsyncClient.post", async_post):
+            asyncio.run(acomplete("hi", "llama3.2", "http://ollama:11434", "ollama"))
+            body = async_post.call_args.kwargs.get("json") or async_post.call_args[1].get("json")
+            assert "options" not in body, (
+                f"'options' key must be absent when options=None, got body={body}"
+            )
+
+    def test_body_with_options_key_when_options_provided(self):
+        """When options is provided, body carries exactly that dict."""
+        from src.llm_client import acomplete
+        fake_resp = _make_async_resp({"response": "ok"})
+        async_post = AsyncMock(return_value=fake_resp)
+        with patch("httpx.AsyncClient.post", async_post):
+            asyncio.run(acomplete(
+                "hi", "llama3.2", "http://ollama:11434", "ollama",
+                options={"temperature": 0.0, "num_predict": 1024},
+            ))
+            body = async_post.call_args.kwargs.get("json") or async_post.call_args[1].get("json")
+            assert "options" in body
+            assert body["options"] == {"temperature": 0.0, "num_predict": 1024}
+
     def test_returns_response_field(self):
         from src.llm_client import acomplete
         fake_resp = _make_async_resp({"response": "extracted"})
@@ -221,3 +299,28 @@ class TestACompleteOllama:
         with patch("httpx.AsyncClient.post", async_post):
             result = asyncio.run(acomplete("hi", "llama3.2", "http://ollama:11434", "ollama"))
             assert result == "extracted"
+
+    def test_timeout_forwarded_to_httpx(self):
+        """A caller-supplied timeout (e.g. 30 for auto_classifier) must reach
+        the httpx.AsyncClient constructor."""
+        from src.llm_client import acomplete
+        fake_resp = _make_async_resp({"response": "ok"})
+        async_post = AsyncMock(return_value=fake_resp)
+
+        captured_timeouts = []
+
+        class _FakeClient:
+            def __init__(self, timeout=None):
+                captured_timeouts.append(timeout)
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                pass
+            async def post(self, *a, **kw):
+                return fake_resp
+
+        with patch("httpx.AsyncClient", _FakeClient):
+            asyncio.run(acomplete(
+                "hi", "llama3.2", "http://ollama:11434", "ollama", timeout=30
+            ))
+        assert captured_timeouts == [30], f"Expected timeout=30, got {captured_timeouts}"

@@ -420,6 +420,7 @@ class RelationExtractor:
                 kind,
                 api_key=api_key,
                 options={"temperature": 0.0, "num_predict": 1024},
+                timeout=180,
             )
             return ("ok", text)
         except requests.exceptions.HTTPError as exc:

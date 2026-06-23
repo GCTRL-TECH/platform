@@ -370,6 +370,7 @@ def _llm_complete(
         base,
         kind,
         api_key=api_key,
+        timeout=_LLM_TIMEOUT,
     ).strip()
 
 

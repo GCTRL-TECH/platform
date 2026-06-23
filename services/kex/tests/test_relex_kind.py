@@ -158,6 +158,34 @@ class TestRelexOllama404AutoPull:
                 passed_kind = kwargs.get("kind") or (args[3] if len(args) > 3 else None)
                 assert passed_kind == "ollama", f"Expected kind='ollama', got {passed_kind!r}"
 
+    def test_ollama_passes_options_and_timeout_180(self):
+        """Parity with e71ecaf: relex must pass options={temperature:0.0, num_predict:1024}
+        and timeout=180 to llm_client.complete for every Ollama call."""
+        from src.relex import RelationExtractor
+
+        with patch("src.relex.llm_client") as mock_client:
+            mock_client.complete.return_value = "[]"
+
+            ext = RelationExtractor()
+            ext.extract_relations(
+                _text(), _entities(),
+                kind="ollama",
+                ollama_base="http://ollama:11434",
+                model="qwen2.5:7b",
+            )
+
+            assert mock_client.complete.called
+            for c in mock_client.complete.call_args_list:
+                args, kwargs = c
+                passed_options = kwargs.get("options")
+                passed_timeout = kwargs.get("timeout")
+                assert passed_options == {"temperature": 0.0, "num_predict": 1024}, (
+                    f"Expected options={{'temperature':0.0,'num_predict':1024}}, got {passed_options!r}"
+                )
+                assert passed_timeout == 180, (
+                    f"Expected timeout=180, got {passed_timeout!r}"
+                )
+
 
 # ── 3. default kind="ollama" is used when not specified
 

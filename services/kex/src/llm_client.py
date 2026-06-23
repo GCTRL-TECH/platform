@@ -11,12 +11,17 @@ Both a sync variant (`complete`, uses `requests`) and an async variant
 
 Cython-safety note: NO local variable is annotated as dict/list/set.
 Request bodies are built as inline literals passed directly to `.json=`.
+
+Per-caller timeout and options contract:
+  - `timeout` defaults to 120 s; callers override to match their original posture
+    (relex: 180 s, auto_classifier: 30 s).
+  - `options` for the Ollama branch: when None (the default) the key is OMITTED
+    from the request body entirely (distiller / auto_classifier parity with
+    e71ecaf).  When provided, it is sent as-is — no baked-in defaults, no merge.
 """
 
 import httpx
 import requests
-
-_TIMEOUT = 120  # seconds — matches relex.py's existing timeout posture
 
 
 def complete(
@@ -26,6 +31,7 @@ def complete(
     kind: str,
     api_key=None,
     options=None,
+    timeout=120,
 ) -> str:
     """Synchronous LLM completion.  Uses `requests`.
 
@@ -35,7 +41,11 @@ def complete(
         base:    Base URL of the inference server (trailing slash stripped).
         kind:    "ollama" | "openai" | "openai_compatible"
         api_key: Bearer token; omitted from headers when None or empty string.
-        options: Extra Ollama options dict merged into defaults (ollama only).
+        options: Ollama options dict sent as-is in the request body.  When None
+                 (the default) the "options" key is omitted entirely from the
+                 body — preserving byte-parity with the original distiller and
+                 auto_classifier behaviour.
+        timeout: Request timeout in seconds (default 120).  Pass 180 for relex.
 
     Returns:
         The generated text as a string.
@@ -47,13 +57,14 @@ def complete(
     base = base.rstrip("/")
 
     if kind == "ollama":
-        merged_options = {"temperature": 0.0, "num_predict": 1024}
-        if options:
-            merged_options.update(options)
+        if options is not None:
+            body = {"model": model, "prompt": prompt, "stream": False, "options": options}
+        else:
+            body = {"model": model, "prompt": prompt, "stream": False}
         resp = requests.post(
             f"{base}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False, "options": merged_options},
-            timeout=_TIMEOUT,
+            json=body,
+            timeout=timeout,
             allow_redirects=False,
         )
         resp.raise_for_status()
@@ -72,7 +83,7 @@ def complete(
                 "temperature": 0,
             },
             headers=headers if headers else None,
-            timeout=_TIMEOUT,
+            timeout=timeout,
             allow_redirects=False,
         )
         resp.raise_for_status()
@@ -88,22 +99,30 @@ async def acomplete(
     kind: str,
     api_key=None,
     options=None,
+    timeout=120,
 ) -> str:
     """Async LLM completion.  Uses `httpx`.
 
     Same semantics as `complete`; use this from async code paths (e.g.
     auto_classifier.py FastAPI handlers).
+
+    Args:
+        options: Ollama options dict sent as-is.  When None the "options" key is
+                 omitted from the body (byte-parity with original auto_classifier).
+        timeout: Request timeout in seconds (default 120).  Pass 30 for
+                 auto_classifier.
     """
     base = base.rstrip("/")
 
     if kind == "ollama":
-        merged_options = {"temperature": 0.0, "num_predict": 1024}
-        if options:
-            merged_options.update(options)
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        if options is not None:
+            body = {"model": model, "prompt": prompt, "stream": False, "options": options}
+        else:
+            body = {"model": model, "prompt": prompt, "stream": False}
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{base}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False, "options": merged_options},
+                json=body,
             )
             resp.raise_for_status()
             return resp.json()["response"]
@@ -112,7 +131,7 @@ async def acomplete(
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{base}/v1/chat/completions",
                 json={
