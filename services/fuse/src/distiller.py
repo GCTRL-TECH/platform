@@ -49,6 +49,7 @@ import requests
 from neo4j import GraphDatabase
 
 from . import config
+from . import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -345,32 +346,32 @@ def _fetch_grounding_chunks(
 # ── LLM call (isolated so cloud providers can be slotted in) ──────────────────
 
 def _llm_complete(
-    prompt: str, model: Optional[str] = None, ollama_base: Optional[str] = None
+    prompt: str,
+    model: Optional[str] = None,
+    ollama_base: Optional[str] = None,
+    kind: str = "ollama",
+    api_key=None,
 ) -> str:
-    """Single completion. Default path = local Ollama /api/generate (zero config).
+    """Single completion routed through the runtime-aware llm_client.
 
-    `DISTILL_PROVIDER` selects the backend; only 'ollama' is implemented,
-    but the structure keeps the call site clean for adding openai/nim later.
+    `kind` selects the backend ("ollama" | "openai" | "openai_compatible").
+    Default kind="ollama" preserves existing behaviour (zero config, local Ollama).
 
     `model` / `ollama_base` are optional per-job overrides (the owner's
     Settings → AI Models distill model + Settings → Infrastructure Ollama base);
     empty/None falls back to the env defaults so the default install is unchanged.
+    `api_key` is forwarded to llm_client for OpenAI-compatible providers.
     """
     distill_model = (model or "").strip() or DISTILL_MODEL
     base = (ollama_base or "").strip() or OLLAMA_BASE
-    provider = DISTILL_PROVIDER.lower()
-    if provider == "ollama":
-        resp = requests.post(
-            f"{base.rstrip('/')}/api/generate",
-            json={"model": distill_model, "prompt": prompt, "stream": False},
-            timeout=_LLM_TIMEOUT,
-            # SSRF hardening: don't follow redirects to a metadata endpoint.
-            allow_redirects=False,
-        )
-        resp.raise_for_status()
-        return (resp.json().get("response") or "").strip()
-    # Future: openai / nim via OpenAI-compatible /v1/chat/completions.
-    raise RuntimeError(f"distill: unsupported GCTRL_DISTILL_PROVIDER '{DISTILL_PROVIDER}'")
+    return llm_client.complete(
+        prompt,
+        distill_model,
+        base,
+        kind,
+        api_key=api_key,
+        timeout=_LLM_TIMEOUT,
+    ).strip()
 
 
 def _build_prompt(entity: dict, citations: list[dict]) -> str:
@@ -537,6 +538,8 @@ def distill(
     limit: int = 15,
     model: Optional[str] = None,
     ollama_base: Optional[str] = None,
+    kind: str = "ollama",
+    api_key=None,
 ) -> dict:
     """Distil a WIKI compilation into a faithful living wiki.
 
@@ -619,7 +622,11 @@ def distill(
             else:
                 try:
                     core = _llm_complete(
-                        _build_prompt(ent, citations), model=model, ollama_base=ollama_base
+                        _build_prompt(ent, citations),
+                        model=model,
+                        ollama_base=ollama_base,
+                        kind=kind,
+                        api_key=api_key,
                     )
                 except Exception as exc:
                     logger.warning(f"[distill {compilation_id}] LLM failed for '{ent['name']}': {exc}")

@@ -30,6 +30,7 @@ from typing import Optional
 import requests
 
 from . import config
+from . import llm_client
 from . import relvocab
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,8 @@ class RelationExtractor:
         entities: list[dict],
         ollama_base: Optional[str] = None,
         model: Optional[str] = None,
+        kind: str = "ollama",
+        api_key: Optional[str] = None,
     ) -> list[dict]:
         """
         Extract relations from text given a list of entity dicts.
@@ -189,7 +192,9 @@ class RelationExtractor:
         entity_lines = self._format_entity_list(prompt_entities)
         prompt = _build_prompt(truncated_text, entity_lines)
 
-        raw_response = self._call_ollama(prompt, ollama_base=ollama_base, model=model)
+        raw_response = self._call_ollama(
+            prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key
+        )
         if raw_response is None:
             # _call_ollama already recorded the reason on self.last_degraded_*.
             return []
@@ -210,7 +215,8 @@ class RelationExtractor:
         # so the per-document graph comes out connected, not a cloud of orphans.
         if getattr(config, "RELEX_GAPFILL_ENABLED", False):
             relations = self._gap_fill(
-                truncated_text, entities, prompt_entities, relations, ollama_base, model
+                truncated_text, entities, prompt_entities, relations,
+                ollama_base, model, kind, api_key,
             )
         return relations
 
@@ -232,6 +238,8 @@ class RelationExtractor:
         relations: list[dict],
         ollama_base: Optional[str],
         model: Optional[str],
+        kind: str = "ollama",
+        api_key: Optional[str] = None,
     ) -> list[dict]:
         """Up to RELEX_GAPFILL_MAX_PASSES focused re-extractions targeting entities
         that appear in the text but ended up in NO relation. Each pass adds only
@@ -260,7 +268,9 @@ class RelationExtractor:
                 break  # everything important is connected — done
 
             gap_prompt = _build_gapfill_prompt(text, entity_lines, isolated_names)
-            raw = self._call_ollama(gap_prompt, ollama_base=ollama_base, model=model)
+            raw = self._call_ollama(
+                gap_prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key
+            )
             if raw is None:
                 break  # LLM degraded mid-cycle — keep what we have, never fail
             try:
@@ -320,12 +330,17 @@ class RelationExtractor:
         return "\n".join(lines)
 
     def _call_ollama(
-        self, prompt: str, ollama_base: Optional[str] = None, model: Optional[str] = None
+        self,
+        prompt: str,
+        ollama_base: Optional[str] = None,
+        model: Optional[str] = None,
+        kind: str = "ollama",
+        api_key: Optional[str] = None,
     ) -> Optional[str]:
-        """Call Ollama /api/generate with SELF-HEALING model provisioning.
+        """Call the LLM with SELF-HEALING model provisioning (Ollama) or direct
+        passthrough (OpenAI-compatible).
 
-        Out-of-the-box guarantee — no manual `ollama pull` and no Settings step
-        needed for a fresh install to extract relations:
+        For kind=="ollama" the full self-healing guarantee is preserved:
           1. primary model = per-job `model` (user prefs) or `config.RELEX_MODEL`.
           2. if Ollama reports the model isn't installed (404), pull it once and
              retry — the first extraction provisions the model itself.
@@ -334,78 +349,104 @@ class RelationExtractor:
           4. only if every candidate fails do we degrade (entities-only) with a
              human-readable reason on self.last_degraded_*.
 
+        For kind in ("openai", "openai_compatible"):
+          - No auto-pull (not applicable to external providers).
+          - Calls _generate_once which delegates to llm_client.complete.
+          - Degrades on unreachable/server_error with the same mechanism.
+
         `ollama_base` overrides `config.OLLAMA_BASE` for this call when provided.
         """
         base = (ollama_base or "").strip() or config.OLLAMA_BASE
         primary = (model or "").strip() or config.RELEX_MODEL
         candidates = [primary]
-        fallback = (getattr(config, "RELEX_FALLBACK_MODEL", "") or "").strip()
-        if fallback and fallback != primary:
-            candidates.append(fallback)
+        # Fallback model only makes sense for Ollama (local model switching).
+        if kind == "ollama":
+            fallback = (getattr(config, "RELEX_FALLBACK_MODEL", "") or "").strip()
+            if fallback and fallback != primary:
+                candidates.append(fallback)
 
         for idx, m in enumerate(candidates):
-            status, text = self._generate_once(base, m, prompt)
+            status, text = self._generate_once(base, m, prompt, kind=kind, api_key=api_key)
             if status == "ok":
                 if idx > 0:
                     logger.warning(f"RelEx fell back to '{m}' (primary '{primary}' unavailable)")
                 return text
             if status == "not_found":
-                # Model isn't installed — provision it once, then retry the same model.
-                if self._pull_model(base, m):
-                    status2, text2 = self._generate_once(base, m, prompt)
-                    if status2 == "ok":
-                        if idx > 0:
-                            logger.warning(f"RelEx fell back to '{m}' and pulled it on demand")
-                        return text2
+                if kind == "ollama":
+                    # Model isn't installed — provision it once, then retry the same model.
+                    if self._pull_model(base, m):
+                        status2, text2 = self._generate_once(
+                            base, m, prompt, kind=kind, api_key=api_key
+                        )
+                        if status2 == "ok":
+                            if idx > 0:
+                                logger.warning(f"RelEx fell back to '{m}' and pulled it on demand")
+                            return text2
                 continue  # pull failed or still unusable → try the next candidate
             if status == "server_error":
                 # OOM / crashed runner / timeout on this model → try the lighter fallback.
                 logger.warning(f"RelEx model '{m}' could not run; trying fallback model")
                 continue
             if status == "unreachable":
-                break  # Ollama itself is down — a different model won't help.
+                break  # server is down — a different model won't help.
 
         self.last_degraded = True
-        self.last_degraded_reason = (
-            "Relation extraction skipped — no usable relation model. Connect a working "
-            "Ollama (Settings → Infrastructure) or pick an installed model (Settings → AI Models)."
-        )
+        if kind == "ollama":
+            self.last_degraded_reason = (
+                "Relation extraction skipped — no usable relation model. Connect a working "
+                "Ollama (Settings → Infrastructure) or pick an installed model (Settings → AI Models)."
+            )
+        else:
+            self.last_degraded_reason = (
+                f"Relation extraction skipped — relation model '{primary}' not reachable on the "
+                f"configured runtime ({kind}) at {base} — check the endpoint URL and model name."
+            )
         return None
 
-    def _generate_once(self, base: str, model: str, prompt: str) -> tuple[str, Optional[str]]:
-        """One Ollama /api/generate call. Returns (status, text) where status is
-        'ok' | 'not_found' | 'server_error' | 'unreachable'."""
+    def _generate_once(
+        self,
+        base: str,
+        model: str,
+        prompt: str,
+        kind: str = "ollama",
+        api_key: Optional[str] = None,
+    ) -> tuple[str, Optional[str]]:
+        """One LLM call via llm_client. Returns (status, text) where status is
+        'ok' | 'not_found' | 'server_error' | 'unreachable'.
+
+        For kind=="ollama" the Ollama-specific 404 (model not found) is detected
+        via the HTTP 404 response and returned as "not_found" so the caller can
+        trigger auto-pull. For other kinds, 404 is treated as a server error.
+        """
         try:
-            resp = requests.post(
-                f"{base.rstrip('/')}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.0, "num_predict": 1024},
-                },
+            text = llm_client.complete(
+                prompt,
+                model,
+                base,
+                kind,
+                api_key=api_key,
+                options={"temperature": 0.0, "num_predict": 1024},
                 timeout=180,
-                # SSRF hardening: don't follow redirects to a metadata endpoint.
-                allow_redirects=False,
             )
-            if resp.status_code == 404:  # Ollama: "model '…' not found, try pulling it first"
+            return ("ok", text)
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            if kind == "ollama" and status_code == 404:
+                # Ollama: "model '…' not found, try pulling it first"
                 return ("not_found", None)
-            if resp.status_code >= 500:
-                logger.warning(f"Ollama 5xx for relation model '{model}': {resp.status_code}")
+            if status_code >= 500:
+                logger.warning(f"LLM 5xx for relation model '{model}': {status_code}")
                 return ("server_error", None)
-            resp.raise_for_status()
-            return ("ok", resp.json().get("response", ""))
+            logger.warning(f"LLM HTTP error for relation model '{model}': {exc}")
+            return ("server_error", None)
         except requests.exceptions.ConnectionError:
-            logger.warning("Ollama not reachable - skipping relation extraction")
+            logger.warning("LLM server not reachable - skipping relation extraction")
             return ("unreachable", None)
         except requests.exceptions.Timeout:
-            logger.warning(f"Ollama timed out for relation model '{model}'")
+            logger.warning(f"LLM timed out for relation model '{model}'")
             return ("server_error", None)  # a heavy model timing out → try the lighter one
-        except requests.exceptions.HTTPError as exc:
-            logger.warning(f"Ollama HTTP error for relation model '{model}': {exc}")
-            return ("server_error", None)
         except Exception as exc:
-            logger.error(f"Ollama call failed for relation model '{model}': {exc}")
+            logger.error(f"LLM call failed for relation model '{model}': {exc}")
             return ("unreachable", None)
 
     def _pull_model(self, base: str, model: str) -> bool:

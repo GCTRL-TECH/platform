@@ -259,14 +259,23 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         limit = int(payload.get("limit", 15))
         distill_model = payload.get("distill_model")
         ollama_base = payload.get("ollama_base")
+        # LLM runtime kind + optional API key for OpenAI-compatible providers.
+        # Defaults to "ollama" so existing distill jobs are unchanged.
+        generation_kind = payload.get("generation_kind") or "ollama"
+        generation_base = payload.get("generation_base")
+        generation_api_key = payload.get("generation_api_key")
         logger.info(f"Worker: received distill job for {compilation_id}")
 
         if job_id != "unknown":
             _update_job_status(job_id, "processing")
 
+        # Use generation_base for the distiller's generation step when provided;
+        # fall back to ollama_base (default install unchanged).
+        distill_base = generation_base if generation_base else ollama_base
         result = distiller.distill(
             compilation_id, user_id, limit=limit,
-            model=distill_model, ollama_base=ollama_base,
+            model=distill_model, ollama_base=distill_base,
+            kind=generation_kind, api_key=generation_api_key,
         )
 
         if job_id != "unknown":
@@ -459,6 +468,10 @@ class DistillRequest(BaseModel):
     # Omitted/empty → distiller env defaults (GCTRL_DISTILL_MODEL / OLLAMA_BASE).
     distill_model: Optional[str] = None
     ollama_base: Optional[str] = None
+    # LLM runtime selection. Default "ollama" → zero behaviour change.
+    generation_kind: str = "ollama"
+    generation_base: Optional[str] = None
+    generation_api_key: Optional[str] = None
 
 
 class MergeResponse(BaseModel):
@@ -504,9 +517,13 @@ async def merge_endpoint(req: MergeRequest):
 async def distill_endpoint(req: DistillRequest):
     """Distil a WIKI compilation into wiki pages synchronously (M1 sync path)."""
     try:
+        # Mirror the worker path: prefer generation_base for the distiller's
+        # LLM step; fall back to ollama_base so the default install is unchanged.
+        distill_base = req.generation_base if req.generation_base else req.ollama_base
         return distiller.distill(
             req.compilation_id, req.user_id, limit=req.limit,
-            model=req.distill_model, ollama_base=req.ollama_base,
+            model=req.distill_model, ollama_base=distill_base,
+            kind=req.generation_kind, api_key=req.generation_api_key,
         )
     except ValueError as exc:
         # Bad request: not a WIKI comp / missing source / unknown comp.

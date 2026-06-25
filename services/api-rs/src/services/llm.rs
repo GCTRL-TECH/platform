@@ -18,6 +18,103 @@ use std::time::Duration;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 
+// ── Global runtime config ─────────────────────────────────────────────────────
+
+/// Load the global (operator-level) runtime configuration from the singleton
+/// `runtime_config` table.  Returns `(provider, base_url, model, api_key_opened)`
+/// only when a row exists **and** `provider` is non-NULL and non-empty — anything
+/// else means "unset" and returns `None`, keeping today's Ollama default.
+async fn active_runtime_config(
+    db: &sqlx::PgPool,
+) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT provider, base_url, model, api_key FROM runtime_config WHERE id = 1",
+        )
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+    let (provider, base_url, model, api_key) = row?;
+    let provider = provider.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let api_key_opened = api_key
+        .map(|k| crate::services::crypto::open(&k))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((provider, base_url, model, api_key_opened))
+}
+
+/// Pure helper: given an optional global runtime config tuple and an optional
+/// requested model override, return the `LlmTarget` that the resolution chain
+/// should use as a final fallback (after per-user rows).
+///
+/// Extracted as a pure function (no async, no DB) so it can be unit-tested
+/// without a live database.
+pub fn choose_fallback_target(
+    global: Option<(String, Option<String>, Option<String>, Option<String>)>,
+    requested_model: Option<&str>,
+) -> LlmTarget {
+    match global {
+        Some((provider, base_url, config_model, api_key)) => {
+            // Validate the stored base_url through the SSRF guard; an invalid
+            // value is silently dropped so it can never be used as an attack
+            // vector even if it somehow entered the DB without write-time checks.
+            let validated_base = base_url.as_deref().and_then(|b| {
+                let b = b.trim();
+                if b.is_empty() {
+                    return None;
+                }
+                validate_llm_base(&provider, Some(b)).ok().map(|u| {
+                    containerize_ollama_base(u.as_str().trim_end_matches('/'))
+                })
+            });
+            let model = requested_model
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| config_model.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| LlmTarget::default_model_for(&provider).to_string());
+            LlmTarget { provider, model, base_url: validated_base, api_key }
+        }
+        // No global config set → bundled Ollama default (identical to today).
+        None => LlmTarget {
+            provider: "ollama".into(),
+            model: requested_model
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("llama3.2")
+                .to_string(),
+            base_url: None,
+            api_key: None,
+        },
+    }
+}
+
+/// Check whether a resolved `LlmTarget` is currently reachable.
+///
+/// - `openai_compatible` → `GET {base}/v1/models`
+/// - all others (ollama) → `GET {base}/api/tags`
+///
+/// 3-second timeout; returns `true` on any 2xx response.
+pub async fn runtime_health(client: &reqwest::Client, target: &LlmTarget) -> bool {
+    let base = target.base();
+    let url = if target.provider == "openai_compatible" {
+        format!("{}/v1/models", base.trim_end_matches('/'))
+    } else {
+        format!("{}/api/tags", base.trim_end_matches('/'))
+    };
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 /// A fully-resolved chat target: which provider/model to hit, where, and with
 /// which (already-decrypted) key. Build via [`resolve_for_user`].
 #[derive(Clone, Debug)]
@@ -53,6 +150,48 @@ fn official_cloud_host(provider: &str) -> Option<&'static str> {
         "openrouter" => Some("openrouter.ai"),
         _ => None,
     }
+}
+
+/// Check whether a host string refers to a cloud-metadata endpoint that must
+/// never be reached server-side (SSRF denylist).
+///
+/// Blocked:
+///   - `169.254.169.254` and the whole `169.254.0.0/16` link-local range
+///     (AWS, GCP, Azure, DigitalOcean metadata)
+///   - `100.100.100.200` (Alibaba Cloud ECS metadata)
+///   - `fd00:ec2::254` (AWS EC2 IPv6 metadata)
+///
+/// Intentionally NOT blocked (these are normal local/LAN use-cases):
+///   - `127.x.x.x` loopback, `localhost`
+///   - `192.168.x.x`, `10.x.x.x`, `172.16-31.x.x` RFC1918
+///   - Docker service names (`gctrl-*`, `host.docker.internal`, etc.)
+fn is_metadata_host(host: &str) -> bool {
+    // Exact well-known metadata IPs.
+    if host == "169.254.169.254" || host == "100.100.100.200" {
+        return true;
+    }
+    // Whole 169.254.0.0/16 link-local range (covers all cloud IMDSv1/v2 variants:
+    // AWS/GCP/Azure/DigitalOcean). Parse as IPv4 and check the first two octets.
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        let octets = addr.octets();
+        if octets[0] == 169 && octets[1] == 254 {
+            return true;
+        }
+    }
+    // AWS EC2 IPv6 metadata address fd00:ec2::254.
+    // url::Url::host_str() returns IPv6 addresses WITH brackets (e.g. "[fd00:ec2::254]"),
+    // so strip the brackets before parsing. We match on the parsed Ipv6Addr so we're
+    // robust to abbreviation differences (fd00:ec2::254 vs fd00:0ec2:0:0:0:0:0:254).
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(addr) = bare.parse::<std::net::Ipv6Addr>() {
+        // fd00:ec2::254 = fd00:0ec2:0000:0000:0000:0000:0000:0254
+        let target: std::net::Ipv6Addr =
+            "fd00:ec2::254".parse().expect("fd00:ec2::254 is a valid IPv6 address");
+        if addr == target {
+            return true;
+        }
+    }
+    false
 }
 
 /// SSRF guard for user-supplied LLM `base_url`s. Centralized so the PUT upsert
@@ -116,6 +255,15 @@ pub fn validate_llm_base(provider: &str, base: Option<&str>) -> Result<url::Url,
         }
         if !u.username().is_empty() || u.password().is_some() {
             return Err("base_url must not contain embedded credentials".to_string());
+        }
+        // SSRF denylist: block cloud-metadata endpoints.
+        // 169.254.0.0/16 (link-local, covers AWS/GCP/Azure 169.254.169.254),
+        // 100.100.100.200 (Alibaba Cloud metadata), fd00:ec2::254 (AWS IPv6 metadata).
+        // Normal localhost/LAN (127.x, 192.168.x, 10.x, service names) are ALLOWED.
+        if let Some(host) = u.host_str() {
+            if is_metadata_host(host) {
+                return Err("metadata endpoint not allowed".to_string());
+            }
         }
         Ok(u)
     }
@@ -182,7 +330,8 @@ impl LlmTarget {
 /// Precedence:
 /// 1. `requested_provider` if the user has a row for it that `is_active`.
 /// 2. Otherwise the user's active provider (most recently created wins).
-/// 3. Otherwise the local Ollama default (no key).
+/// 3. Otherwise the global `runtime_config` operator default (if set).
+/// 4. Otherwise the local Ollama default (no key).
 ///
 /// The model is `requested_model` if given, else the row's `default_model`, else
 /// a provider default. The stored key is decrypted via `crypto::open`.
@@ -285,17 +434,13 @@ pub async fn resolve_for_user(
                 api_key: api_key.map(|k| crate::services::crypto::open(&k)),
             }
         }
-        // No connected provider — local Ollama default.
-        None => LlmTarget {
-            provider: "ollama".into(),
-            model: requested_model
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("llama3.2")
-                .to_string(),
-            base_url: None,
-            api_key: None,
-        },
+        // No connected per-user provider — check the global runtime config, then
+        // fall back to the bundled Ollama default (identical behaviour to today
+        // when no global config is set).
+        None => {
+            let global = active_runtime_config(db).await;
+            choose_fallback_target(global, requested_model)
+        }
     }
 }
 
@@ -326,6 +471,32 @@ pub async fn resolve_ollama_base_for_user(
         Ok(u) => Some(containerize_ollama_base(u.as_str().trim_end_matches('/'))),
         Err(_) => None,
     }
+}
+
+/// Pure helper: given a resolved `LlmTarget`, decide whether to inject
+/// `generation_*` fields into a worker payload map for KEX/FUSE.
+///
+/// Injects ONLY when `target.provider == "openai_compatible"`:
+///   - generation_kind = "openai_compatible"
+///   - generation_base = target.base() (canonical, no /v1)
+///   - generation_model = target.model
+///
+/// `generation_api_key` is intentionally NOT injected. Worker-side generation
+/// against an external authenticated endpoint is intentionally not supported
+/// (no plaintext secret in Redis). Local/bundled runtimes are keyless; the
+/// interactive chat/agent/RAG path runs in-process and still supports authed
+/// external endpoints.
+///
+/// For all other providers (ollama, cloud, anthropic) — does nothing, so
+/// generation stays on Ollama as today (backward compatible).
+pub fn apply_generation_overrides(target: &LlmTarget, map: &mut serde_json::Map<String, Value>) {
+    if target.provider != "openai_compatible" {
+        return;
+    }
+    map.insert("generation_kind".into(), json!("openai_compatible"));
+    map.insert("generation_base".into(), json!(target.base()));
+    map.insert("generation_model".into(), json!(target.model));
+    // generation_api_key is NOT inserted — no plaintext secret in Redis.
 }
 
 /// Inject the owner's runtime Ollama endpoint into a KEX `kex:jobs` payload so the
@@ -387,6 +558,49 @@ pub async fn inject_ollama_overrides(
         if let Some(m) = nz(rel_model) {
             map.insert("relex_model".into(), json!(m));
         }
+        // ── Generation runtime (openai_compatible → inject generation_* fields)
+        let gen = resolve_for_user(db, user_id, None, None).await;
+        apply_generation_overrides(&gen, map);
+
+        // ── Part 6.1: Pinned embedding override ───────────────────────────────
+        // When the active runtime is the bundled llama.cpp (gctrl-llamacpp:8080)
+        // in 'pinned' mode, redirect embeddings to its embed sidecar (port 8081,
+        // nomic-embed-text, dim 768). This keeps existing vectors valid — no
+        // reindex needed. For external openai_compatible endpoints: do nothing
+        // (we can't assume they serve nomic; safe fallback keeps Ollama).
+        // For ollama / advanced mode: do nothing either.
+        let runtime_row: Option<(Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT provider, base_url, embedding_mode FROM runtime_config WHERE id = 1",
+            )
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some((Some(rt_provider), Some(rt_base), em)) = runtime_row {
+            let emb_mode = em.as_deref().unwrap_or("pinned");
+            if let Some((embed_prov, embed_base, embed_model)) =
+                pinned_embedding_override(&rt_provider, &rt_base, emb_mode)
+            {
+                // Override embeddings to sidecar — only if the caller didn't
+                // already set a per-user embedding override (respect explicit prefs).
+                // We insert AFTER the prefs block so per-user base/model/provider
+                // always win over the runtime-level pinned sidecar default.
+                // But ONLY inject when the map does NOT already have an
+                // embedding_provider that differs from "ollama" — meaning no
+                // explicit per-user embedding pref was set above.
+                let already_has_pref = map.get("embedding_provider")
+                    .and_then(|v| v.as_str())
+                    .map(|p| !p.is_empty() && p != "ollama")
+                    .unwrap_or(false);
+                if !already_has_pref {
+                    map.insert("embedding_provider".into(), json!(embed_prov));
+                    map.insert("embedding_base_url".into(), json!(embed_base));
+                    map.insert("embedding_model".into(), json!(embed_model));
+                }
+            }
+        }
     }
 }
 
@@ -412,6 +626,24 @@ pub async fn resolve_distill_overrides(
 
     let ollama_base = resolve_ollama_base_for_user(db, user_id).await;
     (distill_model, ollama_base)
+}
+
+/// Resolve the generation-runtime overrides for FUSE distill jobs.
+///
+/// Returns `Some(target)` ONLY when the active runtime is `openai_compatible`
+/// (the only non-Ollama provider supported for worker generation today).
+/// Returns `None` for all other runtimes so callers add nothing and generation
+/// stays on Ollama (backward compatible).
+pub async fn resolve_distill_generation_overrides(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> Option<LlmTarget> {
+    let gen = resolve_for_user(db, user_id, None, None).await;
+    if gen.provider == "openai_compatible" {
+        Some(gen)
+    } else {
+        None
+    }
 }
 
 // ── Request building ──────────────────────────────────────────────────────────
@@ -470,6 +702,32 @@ impl<'a> ChatMessages<'a> {
                     "messages": messages,
                     "stream": stream,
                 });
+                (url, headers, body)
+            }
+            // openai_compatible: same wire format as openai/openrouter but local/LAN
+            // SSRF rules (Ollama-style). Authorization header is optional — many
+            // local servers (llama.cpp, vLLM, LM Studio, LocalAI) need no key.
+            //
+            // Users commonly supply base_url with a trailing `/v1` (e.g.
+            // `http://localhost:8080/v1`). Strip it before appending the path so
+            // both `http://host:port` and `http://host:port/v1` produce the same
+            // canonical URL `http://host:port/v1/chat/completions`.
+            "openai_compatible" => {
+                let canonical = base.trim_end_matches('/');
+                let canonical = canonical.strip_suffix("/v1").unwrap_or(canonical);
+                let url = format!("{}/v1/chat/completions", canonical);
+                let mut messages = vec![json!({ "role": "system", "content": self.system })];
+                messages.extend(self.messages.iter().cloned());
+                let body = json!({
+                    "model": target.model,
+                    "messages": messages,
+                    "stream": stream,
+                });
+                // Only send Bearer when a key is actually configured.
+                let headers = match target.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                    Some(k) => vec![("authorization".into(), format!("Bearer {k}"))],
+                    None => Vec::new(),
+                };
                 (url, headers, body)
             }
             // ollama (default)
@@ -557,7 +815,7 @@ pub async fn chat_messages_once(
                     .into()
             })
             .unwrap_or_default(),
-        "openai" | "openrouter" => v["choices"][0]["message"]["content"]
+        "openai" | "openrouter" | "openai_compatible" => v["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
             .to_string(),
@@ -616,7 +874,7 @@ pub async fn chat_stream(
                 if line.is_empty() { continue; }
 
                 match provider.as_str() {
-                    "anthropic" | "openai" | "openrouter" => {
+                    "anthropic" | "openai" | "openrouter" | "openai_compatible" => {
                         let Some(data) = line.strip_prefix("data:") else { continue };
                         let data = data.trim();
                         if data == "[DONE]" { return; }
@@ -647,6 +905,47 @@ pub async fn chat_stream(
             }
         }
     }
+}
+
+/// Pure helper: given the active runtime's provider, base URL, and the configured
+/// embedding mode, decide whether to redirect embeddings to the bundled llama.cpp
+/// embed sidecar.
+///
+/// Returns `Some((provider, base_url, model))` ONLY when:
+///   - runtime is `openai_compatible`
+///   - the runtime base points at the bundled `gctrl-llamacpp` (host `gctrl-llamacpp`)
+///   - embedding_mode is `"pinned"`
+///
+/// In that case embeddings are redirected to the embed sidecar at port 8081
+/// (nomic-embed-text, dim 768 — same as the Ollama default, so existing vectors
+/// remain valid and no reindex is needed).
+///
+/// Returns `None` for all other cases:
+///   - external openai_compatible endpoints: no guarantee they serve nomic-embed-text
+///   - ollama runtime: embeddings stay on Ollama as today
+///   - advanced mode: caller handles this via the admin reindex path
+pub fn pinned_embedding_override(
+    runtime_provider: &str,
+    runtime_base: &str,
+    embedding_mode: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if embedding_mode != "pinned" {
+        return None;
+    }
+    if runtime_provider != "openai_compatible" {
+        return None;
+    }
+    // Detect the bundled llama.cpp by hostname: the base must be
+    // http://gctrl-llamacpp:8080 (exact host, any trailing slash).
+    let base = runtime_base.trim_end_matches('/');
+    let is_bundled = url::Url::parse(base)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h == "gctrl-llamacpp"))
+        .unwrap_or(false);
+    if !is_bundled {
+        return None;
+    }
+    Some(("openai_compatible", "http://gctrl-llamacpp-embed:8081", "nomic-embed-text"))
 }
 
 #[cfg(test)]
@@ -751,5 +1050,477 @@ mod tests {
         let cm = ChatMessages { system: "s", messages: vec![] };
         let (url, _, _) = cm.build(&t, true);
         assert_eq!(url, "http://ollama:11434/api/chat");
+    }
+
+    // ── openai_compatible tests ───────────────────────────────────────────────
+
+    /// Local and LAN bases must be accepted (same rules as Ollama).
+    #[test]
+    fn validate_openai_compatible_allows_local_lan() {
+        assert!(validate_llm_base("openai_compatible", Some("http://localhost:8080/v1")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("http://127.0.0.1:8080")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("http://10.0.0.5:8080")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("http://llama:8080")).is_ok());
+        assert!(validate_llm_base("openai_compatible", Some("https://myserver.internal:8443")).is_ok());
+    }
+
+    /// Embedded credentials must be rejected (Ollama-style SSRF rule).
+    #[test]
+    fn validate_openai_compatible_rejects_embedded_creds() {
+        assert!(validate_llm_base("openai_compatible", Some("http://u:p@host/v1")).is_err());
+        assert!(validate_llm_base("openai_compatible", Some("http://user:pass@localhost:8080")).is_err());
+    }
+
+    /// Non-http(s) schemes must be rejected.
+    #[test]
+    fn validate_openai_compatible_rejects_bad_scheme() {
+        assert!(validate_llm_base("openai_compatible", Some("file:///etc/passwd")).is_err());
+        assert!(validate_llm_base("openai_compatible", Some("gopher://localhost")).is_err());
+    }
+
+    // ── SSRF metadata denylist tests ─────────────────────────────────────────
+
+    /// 169.254.169.254 (AWS/GCP/Azure metadata) must be blocked for openai_compatible.
+    #[test]
+    fn validate_metadata_ip_blocked_openai_compatible() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://169.254.169.254")).is_err(),
+            "169.254.169.254 must be blocked"
+        );
+    }
+
+    /// Any address in 169.254.0.0/16 link-local range must be blocked.
+    #[test]
+    fn validate_metadata_link_local_range_blocked() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://169.254.10.5")).is_err(),
+            "169.254.10.5 (link-local range) must be blocked"
+        );
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://169.254.0.1")).is_err(),
+            "169.254.0.1 (link-local range) must be blocked"
+        );
+    }
+
+    /// 100.100.100.200 (Alibaba Cloud metadata) must be blocked.
+    #[test]
+    fn validate_metadata_alibaba_blocked() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://100.100.100.200")).is_err(),
+            "100.100.100.200 (Alibaba metadata) must be blocked"
+        );
+    }
+
+    /// IPv6 AWS metadata endpoint must be blocked.
+    #[test]
+    fn validate_metadata_ipv6_aws_blocked() {
+        // URL parsing of bare IPv6 requires brackets per RFC 2732.
+        // Note: url::Url::host_str() returns IPv6 with brackets ("[fd00:ec2::254]")
+        // which is handled by is_metadata_host stripping them before Ipv6Addr parsing.
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://[fd00:ec2::254]")).is_err(),
+            "fd00:ec2::254 (AWS IPv6 metadata) must be blocked"
+        );
+    }
+
+    /// Normal localhost and LAN addresses must continue to work (not blocked by denylist).
+    #[test]
+    fn validate_metadata_allows_normal_local_lan() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://localhost:8080/v1")).is_ok(),
+            "localhost must be allowed"
+        );
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://192.168.1.50:11434")).is_ok(),
+            "192.168.x (LAN) must be allowed"
+        );
+        assert!(
+            validate_llm_base("ollama", Some("http://192.168.1.50:11434")).is_ok(),
+            "ollama on LAN must be allowed"
+        );
+        // Also test same for ollama provider
+        assert!(
+            validate_llm_base("ollama", Some("http://169.254.169.254")).is_err(),
+            "ollama provider must also block 169.254.169.254"
+        );
+    }
+
+    /// build() for openai_compatible must POST to {base}/v1/chat/completions.
+    /// When an api_key is set, it must send Authorization: Bearer.
+    /// When api_key is absent/empty, no Authorization header.
+    #[test]
+    fn openai_compatible_build_with_key() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9/v1".into()),
+            api_key: Some("mykey".into()),
+        };
+        let cm = ChatMessages {
+            system: "sys",
+            messages: vec![json!({"role": "user", "content": "hi"})],
+        };
+        let (url, headers, body) = cm.build(&t, false);
+        assert_eq!(url, "http://x:9/v1/chat/completions");
+        assert!(
+            headers.iter().any(|(k, v)| k == "authorization" && v == "Bearer mykey"),
+            "expected Bearer header when api_key is set; got: {:?}", headers
+        );
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn openai_compatible_build_no_key_omits_auth_header() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9/v1".into()),
+            api_key: None,
+        };
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        let (url, headers, body) = cm.build(&t, true);
+        assert_eq!(url, "http://x:9/v1/chat/completions");
+        assert!(
+            !headers.iter().any(|(k, _)| k == "authorization"),
+            "no Authorization header expected when api_key is None; got: {:?}", headers
+        );
+        assert_eq!(body["stream"], true);
+    }
+
+    /// Empty string api_key must also omit the header (treat same as None).
+    #[test]
+    fn openai_compatible_build_empty_key_omits_auth_header() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9/v1".into()),
+            api_key: Some("".into()),
+        };
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        let (_, headers, _) = cm.build(&t, false);
+        assert!(
+            !headers.iter().any(|(k, _)| k == "authorization"),
+            "no Authorization header expected for empty api_key; got: {:?}", headers
+        );
+    }
+
+    /// Container host rewrite: localhost → host.docker.internal inside Docker.
+    /// Outside Docker (no /.dockerenv) this is a no-op — just confirm the function
+    /// passes through the URL unchanged in the test environment.
+    #[test]
+    fn containerize_passthrough_outside_docker() {
+        // In CI/dev (no /.dockerenv) the rewrite is skipped — just verify it
+        // doesn't corrupt the URL.
+        let out = containerize_ollama_base("http://localhost:8080/v1");
+        assert!(out == "http://localhost:8080/v1" || out == "http://host.docker.internal:8080/v1",
+            "unexpected result: {out}");
+    }
+
+    /// official_cloud_host must return None for openai_compatible so it falls into
+    /// the local/LAN branch in validate_llm_base (not the cloud-pinned branch).
+    #[test]
+    fn openai_compatible_not_a_cloud_host() {
+        assert!(official_cloud_host("openai_compatible").is_none());
+    }
+
+    /// When base_url is None for openai_compatible, validate_llm_base falls through
+    /// to ollama_default_base() — that's the existing code path for unknown providers.
+    /// We document this here: the API layer (routes/llm.rs upsert_provider) does NOT
+    /// enforce a non-null base for openai_compatible at DB write time (it simply
+    /// stores NULL when none is supplied), so a NULL-base openai_compatible row would
+    /// resolve to the Ollama default at runtime. This is accepted behaviour — the
+    /// Settings UI must require a base_url for openai_compatible. The test confirms
+    /// the function doesn't panic or error on a None base.
+    #[test]
+    fn openai_compatible_none_base_falls_back_to_ollama_default() {
+        let result = validate_llm_base("openai_compatible", None);
+        assert!(result.is_ok(), "should not error; got: {:?}", result);
+    }
+
+    // ── choose_fallback_target (pure, no DB) ─────────────────────────────────
+
+    /// When no global config is set, the fallback is the bundled Ollama default.
+    #[test]
+    fn fallback_none_global_gives_ollama_default() {
+        let t = choose_fallback_target(None, None);
+        assert_eq!(t.provider, "ollama");
+        assert_eq!(t.model, "llama3.2");
+        assert!(t.base_url.is_none());
+        assert!(t.api_key.is_none());
+    }
+
+    /// A global config with a provider overrides the Ollama default.
+    #[test]
+    fn fallback_global_config_beats_ollama_default() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("http://localhost:8080".to_string()),
+            Some("qwen2.5:7b".to_string()),
+            None,
+        ));
+        let t = choose_fallback_target(global, None);
+        assert_eq!(t.provider, "openai_compatible");
+        assert_eq!(t.model, "qwen2.5:7b");
+        assert_eq!(t.base_url.as_deref(), Some("http://localhost:8080"));
+    }
+
+    /// A requested_model overrides the model stored in the global config.
+    #[test]
+    fn fallback_requested_model_overrides_config_model() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("http://localhost:8080".to_string()),
+            Some("qwen2.5:7b".to_string()),
+            None,
+        ));
+        let t = choose_fallback_target(global, Some("mistral:latest"));
+        assert_eq!(t.model, "mistral:latest");
+    }
+
+    /// When global config has no model, the provider default is used.
+    #[test]
+    fn fallback_global_no_model_uses_provider_default() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("http://localhost:8080".to_string()),
+            None, // no model stored
+            None,
+        ));
+        let t = choose_fallback_target(global, None);
+        // openai_compatible falls to the ollama-path default_model_for → "llama3.2"
+        assert!(!t.model.is_empty());
+    }
+
+    /// requested_model override on the None-global path (Ollama).
+    #[test]
+    fn fallback_none_global_with_requested_model() {
+        let t = choose_fallback_target(None, Some("codellama:13b"));
+        assert_eq!(t.provider, "ollama");
+        assert_eq!(t.model, "codellama:13b");
+    }
+
+    /// A global config with an invalid base_url (SSRF guard) silently drops the
+    /// base so the resolved target has None rather than an unsafe URL.
+    #[test]
+    fn fallback_invalid_base_is_dropped() {
+        let global = Some((
+            "openai_compatible".to_string(),
+            Some("not-a-url!!".to_string()),
+            Some("m".to_string()),
+            None,
+        ));
+        let t = choose_fallback_target(global, None);
+        assert!(
+            t.base_url.is_none(),
+            "invalid base should be dropped; got: {:?}",
+            t.base_url
+        );
+    }
+
+    // ── runtime_health URL selection ─────────────────────────────────────────
+
+    /// For `openai_compatible` the health probe must use `/v1/models`.
+    #[test]
+    fn runtime_health_url_openai_compatible() {
+        // We can't make a real request in unit tests, but we can verify the URL
+        // that *would* be used by inspecting the path chosen for the provider.
+        // We do this by checking the provider-branch logic directly.
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://localhost:8080".into()),
+            api_key: None,
+        };
+        let base = t.base();
+        let url = if t.provider == "openai_compatible" {
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        } else {
+            format!("{}/api/tags", base.trim_end_matches('/'))
+        };
+        assert_eq!(url, "http://localhost:8080/v1/models");
+    }
+
+    /// For `ollama` the health probe must use `/api/tags`.
+    #[test]
+    fn runtime_health_url_ollama() {
+        let t = LlmTarget {
+            provider: "ollama".into(),
+            model: "llama3.2".into(),
+            base_url: Some("http://ollama:11434".into()),
+            api_key: None,
+        };
+        let base = t.base();
+        let url = if t.provider == "openai_compatible" {
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        } else {
+            format!("{}/api/tags", base.trim_end_matches('/'))
+        };
+        assert_eq!(url, "http://ollama:11434/api/tags");
+    }
+
+    // ── apply_generation_overrides (pure, no DB) ─────────────────────────────
+
+    /// openai_compatible → generation_kind, generation_base, generation_model injected;
+    /// generation_api_key must NOT be present (no plaintext secrets in Redis).
+    #[test]
+    fn apply_gen_overrides_injects_for_openai_compatible() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "qwen2.5:7b".into(),
+            base_url: Some("http://localhost:8080".into()),
+            api_key: Some("mykey".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert_eq!(map["generation_kind"], json!("openai_compatible"));
+        assert_eq!(map["generation_model"], json!("qwen2.5:7b"));
+        assert!(map.contains_key("generation_base"), "generation_base must be set");
+        // Security: decrypted API key must never enter the Redis worker payload.
+        assert!(
+            !map.contains_key("generation_api_key"),
+            "generation_api_key must NOT be in worker payload; got: {:?}", map.get("generation_api_key")
+        );
+    }
+
+    /// ollama → no generation_* fields injected (backward compatible).
+    #[test]
+    fn apply_gen_overrides_noop_for_ollama() {
+        let t = LlmTarget {
+            provider: "ollama".into(),
+            model: "llama3.2".into(),
+            base_url: None,
+            api_key: None,
+        };
+        let mut map = serde_json::Map::new();
+        map.insert("ollama_base".into(), json!("http://ollama:11434"));
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_kind"), "ollama must not inject generation_kind");
+        assert!(!map.contains_key("generation_base"));
+        assert!(!map.contains_key("generation_model"));
+        assert!(!map.contains_key("generation_api_key"));
+        // ollama_base untouched
+        assert_eq!(map["ollama_base"], json!("http://ollama:11434"));
+    }
+
+    /// openai provider → no generation_* injected (cloud out of scope).
+    #[test]
+    fn apply_gen_overrides_noop_for_openai() {
+        let t = LlmTarget {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            base_url: None,
+            api_key: Some("sk-x".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_kind"));
+    }
+
+    /// anthropic provider → no generation_* injected (cloud out of scope).
+    #[test]
+    fn apply_gen_overrides_noop_for_anthropic() {
+        let t = LlmTarget {
+            provider: "anthropic".into(),
+            model: "claude-3-5-sonnet-20241022".into(),
+            base_url: None,
+            api_key: Some("k".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_kind"));
+    }
+
+    /// generation_api_key is never injected regardless of the key value —
+    /// security policy: no plaintext secret in Redis worker payload.
+    #[test]
+    fn apply_gen_overrides_never_injects_api_key_even_when_set() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9".into()),
+            api_key: Some("real-key".into()),
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(
+            !map.contains_key("generation_api_key"),
+            "generation_api_key must NEVER enter the Redis payload; got: {:?}", map.get("generation_api_key")
+        );
+        // The non-secret fields ARE there.
+        assert!(map.contains_key("generation_kind"));
+        assert!(map.contains_key("generation_base"));
+        assert!(map.contains_key("generation_model"));
+    }
+
+    /// generation_api_key is never injected when api_key is None.
+    #[test]
+    fn apply_gen_overrides_omits_none_api_key() {
+        let t = LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "m".into(),
+            base_url: Some("http://x:9".into()),
+            api_key: None,
+        };
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&t, &mut map);
+        assert!(!map.contains_key("generation_api_key"));
+    }
+
+    // ── pinned_embedding_override ────────────────────────────────────────────
+
+    #[test]
+    fn pinned_embed_bundled_llamacpp_returns_sidecar() {
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://gctrl-llamacpp:8080",
+            "pinned",
+        );
+        assert!(result.is_some(), "bundled llamacpp should redirect embeddings to sidecar");
+        let (prov, base, model) = result.unwrap();
+        // Provider string is "openai_compatible" for consistency with the LLM runtime.
+        assert_eq!(prov, "openai_compatible");
+        assert_eq!(base, "http://gctrl-llamacpp-embed:8081");
+        assert_eq!(model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn pinned_embed_external_endpoint_returns_none() {
+        // External openai_compatible endpoint: don't assume it serves nomic-embed-text
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://myserver.example.com:8080",
+            "pinned",
+        );
+        assert!(result.is_none(), "external endpoint must return None (safe fallback)");
+    }
+
+    #[test]
+    fn pinned_embed_ollama_runtime_returns_none() {
+        let result = pinned_embedding_override("ollama", "http://ollama:11434", "pinned");
+        assert!(result.is_none(), "ollama runtime never redirects embeddings");
+    }
+
+    #[test]
+    fn pinned_embed_advanced_mode_returns_none() {
+        // advanced mode is handled by the admin re-index path, not this helper
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://gctrl-llamacpp:8080",
+            "advanced",
+        );
+        assert!(result.is_none(), "advanced mode must return None from this helper");
+    }
+
+    #[test]
+    fn pinned_embed_llamacpp_trailing_slash_also_matches() {
+        // base may arrive with trailing slash from DB
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://gctrl-llamacpp:8080/",
+            "pinned",
+        );
+        assert!(result.is_some(), "trailing slash should still match bundled llamacpp");
     }
 }

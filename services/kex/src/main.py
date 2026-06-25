@@ -45,6 +45,7 @@ from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
 from .sources.obsidian_handler import fetch_note
 from .vector_store import get_vector_store
+from .reindex_worker import drain_reindex_queue
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,6 +141,9 @@ def run_pipeline(
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
     relex_model: str | None = None,
+    generation_kind: str = "ollama",
+    generation_base: str | None = None,
+    generation_api_key: str | None = None,
 ) -> dict:
     """
     Full extraction pipeline: NER -> RelEx -> KG Builder -> Chunking -> Embedding -> Vector Store.
@@ -190,7 +194,16 @@ def run_pipeline(
     warnings: list[str] = []
     relex = get_extractor()
     try:
-        relations = relex.extract_relations(text, entities, ollama_base=ollama_base, model=relex_model)
+        # Use generation_base for the generation step when provided;
+        # otherwise fall through to ollama_base (default install unchanged).
+        relex_base = generation_base if generation_base else ollama_base
+        relations = relex.extract_relations(
+            text, entities,
+            ollama_base=relex_base,
+            model=relex_model,
+            kind=generation_kind,
+            api_key=generation_api_key,
+        )
         if getattr(relex, "last_degraded", False) and relex.last_degraded_reason:
             warnings.append(relex.last_degraded_reason)
             logger.warning(f"[{job_id}] RelEx degraded: {relex.last_degraded_reason}")
@@ -366,6 +379,11 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             # the worker uses its env defaults (EMBEDDING_MODEL / RELEX_MODEL).
             embedding_model = payload.get("embedding_model")
             relex_model = payload.get("relex_model")
+            # LLM runtime kind + optional API key for OpenAI-compatible providers.
+            # Defaults to "ollama" so existing jobs are unchanged.
+            generation_kind = payload.get("generation_kind") or "ollama"
+            generation_api_key = payload.get("generation_api_key")
+            generation_base = payload.get("generation_base")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -470,6 +488,9 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 embedding_provider=embedding_provider,
                 embedding_model=embedding_model,
                 relex_model=relex_model,
+                generation_kind=generation_kind,
+                generation_base=generation_base,
+                generation_api_key=generation_api_key,
             )
             # Record crawl provenance on the result for the dashboard.
             if crawled_urls:
@@ -631,6 +652,31 @@ def _config_watcher() -> None:
         time.sleep(10)
 
 
+def _reindex_loop(stop_event: threading.Event) -> None:
+    """Background thread: drain kex:reindex every 10 seconds.
+
+    Runs independently of the kex:jobs worker pool so a large reindex
+    does not starve incoming extraction jobs.
+    """
+    logger.info("KEX reindex loop started")
+    while _worker_running and not stop_event.is_set():
+        try:
+            r = get_redis()
+            if r is not None:
+                count = drain_reindex_queue(
+                    redis_client=r,
+                    pg_url=config.PG_URL,
+                    qdrant_url=config.QDRANT_URL,
+                    collection=config.QDRANT_COLLECTION,
+                )
+                if count > 0:
+                    logger.info(f"KEX reindex: processed {count} KB(s) this pass")
+        except Exception as exc:
+            logger.warning(f"KEX reindex loop error (non-fatal): {exc}")
+        stop_event.wait(10)
+    logger.info("KEX reindex loop stopped")
+
+
 def start_worker() -> None:
     global _worker_running
     _worker_running = True
@@ -643,6 +689,17 @@ def start_worker() -> None:
     # Start config watcher
     watcher = threading.Thread(target=_config_watcher, name="kex-config-watcher", daemon=True)
     watcher.start()
+
+    # Start reindex loop (drains kex:reindex, runs independently of extraction workers)
+    reindex_stop = threading.Event()
+    reindex_thread = threading.Thread(
+        target=_reindex_loop,
+        args=(reindex_stop,),
+        name="kex-reindex-loop",
+        daemon=True,
+    )
+    reindex_thread.start()
+    _worker_threads.append((reindex_thread, reindex_stop))
 
 
 def stop_worker() -> None:

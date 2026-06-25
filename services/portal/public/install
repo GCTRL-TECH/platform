@@ -291,6 +291,9 @@ generate_config() {
     NEO4J_PASSWORD="${neo_prev:-$(openssl rand -hex 24)}"
   fi
 
+  # Preserve VLLM_MODEL on re-install if already set
+  local vllm_model_prev; vllm_model_prev="$(read_prev VLLM_MODEL)"
+
   cat > "${INSTALL_DIR}/.env" <<EOF
 GCTRL_API_URL=https://api.gctrl.tech
 GCTRL_DATA_DIR=${INSTALL_DIR}/data
@@ -303,6 +306,7 @@ OLLAMA_BASE=${OLLAMA_BASE}
 RELEX_MODEL=${CHAT_MODEL:-qwen2.5:7b}
 AUTO_CLASSIFY_MODEL=${CHAT_MODEL:-llama3.2}
 POSTGRES_PASSWORD=${pg_pw}
+VLLM_MODEL=${vllm_model_prev:-Qwen/Qwen2.5-3B-Instruct}
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
 
@@ -458,6 +462,189 @@ finalize() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
+# ── Hardware Detection ────────────────────────────────────────────────────────
+# Detects host hardware natively and writes <INSTALL_DIR>/hardware.json.
+# Never fails the install — defaults to 0/"" on any detection error.
+# Idempotent: overwrites on re-run.
+detect_hardware() {
+  local cpu_cores=0 ram_gb=0 gpu_name="" vram_gb=0 nvidia_toolkit=false
+  local os_name="" arch_name=""
+
+  # ── OS ──────────────────────────────────────────────────────────────────────
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null || echo "")"
+  case "$uname_s" in
+    Darwin) os_name="darwin" ;;
+    *)      os_name="linux"  ;;
+  esac
+
+  # ── Arch ────────────────────────────────────────────────────────────────────
+  local uname_m
+  uname_m="$(uname -m 2>/dev/null || echo "")"
+  case "$uname_m" in
+    aarch64) arch_name="arm64"   ;;
+    arm64)   arch_name="arm64"   ;;
+    x86_64)  arch_name="x86_64"  ;;
+    *)       arch_name="$uname_m" ;;
+  esac
+
+  # ── CPU cores + RAM ──────────────────────────────────────────────────────────
+  if [ "$os_name" = "darwin" ]; then
+    cpu_cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 0)"
+    local mem_bytes
+    mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    # bytes → GB (1 decimal), guard divide-by-zero
+    if [ "$mem_bytes" -gt 0 ] 2>/dev/null; then
+      ram_gb="$(awk "BEGIN{printf \"%.1f\", $mem_bytes/1073741824}")"
+    else
+      ram_gb=0
+    fi
+  else
+    # Linux
+    cpu_cores="$(nproc 2>/dev/null || echo 0)"
+    if [ -r /proc/meminfo ]; then
+      local mem_kb
+      mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+      if [ "$mem_kb" -gt 0 ] 2>/dev/null; then
+        ram_gb="$(awk "BEGIN{printf \"%.1f\", $mem_kb/1048576}")"
+      else
+        ram_gb=0
+      fi
+    fi
+  fi
+
+  # ── GPU (NVIDIA via nvidia-smi) ──────────────────────────────────────────────
+  if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    local smi_line
+    smi_line="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "")"
+    if [ -n "$smi_line" ]; then
+      # name is everything before the last comma; memory.total is last field (MiB)
+      gpu_name="$(echo "$smi_line" | awk -F',' '{$NF=""; sub(/,[^,]*$/,"",$0); print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      local vram_mib
+      vram_mib="$(echo "$smi_line" | awk -F',' '{print $NF}' | tr -d ' \r' | tr -d '\n')"
+      if [ -n "$vram_mib" ] && [ "$vram_mib" -gt 0 ] 2>/dev/null; then
+        vram_gb="$(awk "BEGIN{printf \"%.1f\", $vram_mib/1024}")"
+      else
+        vram_gb=0
+      fi
+    fi
+  fi
+
+  # ── Apple Silicon GPU name (macOS only) ──────────────────────────────────────
+  if [ "$os_name" = "darwin" ] && [ -z "$gpu_name" ]; then
+    local apple_gpu
+    apple_gpu="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -i "Chipset Model" | head -1 | awk -F': ' '{print $2}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "")"
+    gpu_name="${apple_gpu:-}"
+    # Apple Silicon VRAM is shared; not reliably queryable — leave at 0
+    vram_gb=0
+    nvidia_toolkit=false
+  fi
+
+  # ── nvidia-container-toolkit ─────────────────────────────────────────────────
+  if [ "$os_name" != "darwin" ]; then
+    if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi "nvidia"; then
+      nvidia_toolkit=true
+    elif command -v nvidia-ctk &>/dev/null; then
+      nvidia_toolkit=true
+    fi
+  fi
+
+  # ── Write hardware.json ───────────────────────────────────────────────────────
+  # Guard: ensure numeric fields are actual numbers, not empty strings
+  [ -z "$cpu_cores" ]  && cpu_cores=0
+  [ -z "$ram_gb" ]     && ram_gb=0
+  [ -z "$vram_gb" ]    && vram_gb=0
+  [ -z "$gpu_name" ]   && gpu_name=""
+  [ -z "$arch_name" ]  && arch_name="unknown"
+  [ -z "$os_name" ]    && os_name="linux"
+
+  # Emit strict JSON — numbers unquoted, strings quoted
+  cat > "${INSTALL_DIR}/hardware.json" <<JSON
+{
+  "cpu_cores": ${cpu_cores},
+  "ram_gb": ${ram_gb},
+  "gpu_name": "${gpu_name}",
+  "vram_gb": ${vram_gb},
+  "nvidia_toolkit": ${nvidia_toolkit},
+  "arch": "${arch_name}",
+  "os": "${os_name}"
+}
+JSON
+
+  info "Hardware profile written to ${INSTALL_DIR}/hardware.json (cpu=${cpu_cores}, ram=${ram_gb}GB, gpu='${gpu_name}', vram=${vram_gb}GB, toolkit=${nvidia_toolkit}, arch=${arch_name}, os=${os_name})"
+}
+
+# ── Runtime Picker ────────────────────────────────────────────────────────────
+# Gate: only offered when nvidia_toolkit=true AND vram_gb >= 8 in hardware.json.
+# Reads the file detect_hardware() just wrote. On non-interactive / no-GPU hosts
+# this is a no-op. If selected, adds bundled-vllm to PROFILES and writes
+# VLLM_MODEL into .env so the compose service picks the right HuggingFace repo.
+#
+# The bash-side gate (toolkit && vram >= 8) mirrors vllm_available() in infra.rs.
+VLLM_SELECTED=false
+
+choose_runtime() {
+  local hw_file="${INSTALL_DIR}/hardware.json"
+  [ -f "$hw_file" ] || return 0
+
+  # Read nvidia_toolkit and vram_gb from hardware.json
+  local toolkit vram
+  toolkit="$(grep -o '"nvidia_toolkit":[^,}]*' "$hw_file" | awk -F: '{print $2}' | tr -d ' \r\n')"
+  vram="$(grep -o '"vram_gb":[^,}]*' "$hw_file" | awk -F: '{print $2}' | tr -d ' \r\n')"
+
+  # Default to not-available if parse failed
+  toolkit="${toolkit:-false}"
+  vram="${vram:-0}"
+
+  # Gate: toolkit must be true AND vram_gb >= 8
+  if [ "$toolkit" != "true" ]; then
+    return 0
+  fi
+  # awk for float comparison (bash can only compare integers)
+  local gpu_ok
+  gpu_ok="$(awk "BEGIN{print ($vram >= 8) ? \"yes\" : \"no\"}")"
+  if [ "$gpu_ok" != "yes" ]; then
+    warn "NVIDIA GPU detected but VRAM ${vram} GB < 8 GB — vLLM requires ≥8 GB VRAM; skipping vLLM offer"
+    return 0
+  fi
+
+  # Non-interactive: check env override
+  if [ -n "${GCTRL_RUNTIME:-}" ]; then
+    if [ "$GCTRL_RUNTIME" = "vllm" ]; then
+      VLLM_SELECTED=true
+      PROFILES+=("bundled-vllm")
+      info "Runtime (from GCTRL_RUNTIME): vLLM selected"
+    fi
+    return 0
+  fi
+
+  # No interactive terminal → skip silently (safe default: don't pull 10+ GB vLLM image)
+  if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  info "NVIDIA GPU with ${vram} GB VRAM detected (nvidia-container-toolkit present)"
+  echo "  Optional: enable vLLM for maximum GPU throughput"
+  echo "    1) No  — use bundled Ollama (default, always works)"
+  echo "    2) Yes — enable vLLM (pulls vllm/vllm-openai:latest, ~10 GB)"
+  local rt_choice=""
+  read -rp "  Enable vLLM? [1]: " rt_choice </dev/tty || rt_choice=""
+  case "${rt_choice:-1}" in
+    2)
+      VLLM_SELECTED=true
+      PROFILES+=("bundled-vllm")
+      success "vLLM selected — will deploy gctrl-vllm container"
+      ;;
+    *)
+      info "Keeping bundled Ollama (vLLM can be enabled later in Settings → Infrastructure)"
+      ;;
+  esac
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+}
+
 # Pull the local models KEX requires into the bundled Ollama container. Idempotent
 # (Ollama skips already-present models). Keeps the platform zero-cost-local.
 pull_ollama_models() {
@@ -476,7 +663,9 @@ main() {
   check_prereqs
   detect_gpu
   detect_services      # auto-decides Ollama (native if reachable, else bundled — never conflicts)
-  generate_config      # .env written with a sensible default model placeholder
+  generate_config      # .env written with a sensible default model placeholder; INSTALL_DIR created
+  detect_hardware      # writes hardware.json to INSTALL_DIR for Settings → Infrastructure
+  choose_runtime       # GPU-gate: offer vLLM only when nvidia_toolkit=true AND vram_gb >= 8
   start_stack          # bring the stack up FIRST → web UI live at :3001
   choose_model         # ask the model question only NOW, after the UI is up
   finalize             # apply the chosen model (restart kex/fuse) + pull local models

@@ -29,7 +29,7 @@ use crate::{
     middleware::auth::JwtClaims,
 };
 
-const PROVIDERS: &[&str] = &["ollama", "openai", "anthropic", "openrouter"];
+const PROVIDERS: &[&str] = &["ollama", "openai", "anthropic", "openrouter", "openai_compatible"];
 
 /// Curated model lists surfaced for a connected cloud provider. (We avoid live
 /// `/models` calls here to keep `GET /models` fast and key-safe; the picker only
