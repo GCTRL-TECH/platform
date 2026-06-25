@@ -115,7 +115,7 @@ pub fn resolve_model_arg(model_id: &str, runtime: &str) -> Option<String> {
 
 /// Shared helper: UPSERT `runtime_config` row (id=1).
 /// Seals `api_key` when provided; COALESCE preserves existing key otherwise.
-async fn persist_runtime(
+pub(crate) async fn persist_runtime(
     db: &sqlx::PgPool,
     provider: &str,
     base_url: Option<&str>,
@@ -1359,6 +1359,184 @@ fn launch_llamacpp_container(hf_arg: &str, network_mode: &str) -> std::result::R
     Ok(())
 }
 
+// ── Agent / MCP tool helpers (pure, no axum, callable from execute_tool) ────
+
+/// Read the hardware profile as a plain JSON Value (same logic as GET /hardware).
+/// Overlays live /proc values so stale file values self-correct.
+pub fn hardware_json() -> Value {
+    let mut hw: Hardware = match hardware_json_path() {
+        Some(path) => std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        None => Hardware::default(),
+    };
+    let (live_cores, live_ram) = proc_hardware();
+    if let Some(c) = live_cores { hw.cpu_cores = c; }
+    if let Some(r) = live_ram   { hw.ram_gb    = r; }
+    serde_json::to_value(&hw).unwrap_or(json!({}))
+}
+
+/// Return the recommendation JSON (hardware + recommendation), no IO beyond
+/// reading hardware.json + /proc.
+pub fn recommend_json() -> Value {
+    let mut hw: Hardware = match hardware_json_path() {
+        Some(path) => std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        None => Hardware::default(),
+    };
+    let (live_cores, live_ram) = proc_hardware();
+    if let Some(c) = live_cores { hw.cpu_cores = c; }
+    if let Some(r) = live_ram   { hw.ram_gb    = r; }
+    let rec = recommend(&hw);
+    json!({
+        "runtime":          rec.runtime,
+        "model":            rec.model,
+        "rationale":        rec.rationale,
+        "speedup_estimate": rec.speedup_estimate,
+    })
+}
+
+/// Return the static runtime catalog as JSON (same data as GET /runtimes).
+pub fn runtimes_catalog_json() -> Value {
+    json!({
+        "runtimes": [
+            {
+                "id":             "ollama",
+                "label":          "Bundled Ollama",
+                "kind":           "ollama",
+                "needs_base_url": false,
+                "description":    "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
+            },
+            {
+                "id":             "openai_compatible",
+                "label":          "OpenAI-compatible endpoint",
+                "kind":           "openai_compatible",
+                "needs_base_url": true,
+                "description":    "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API.",
+            },
+        ]
+    })
+}
+
+/// Return the model catalog for a given runtime as JSON (same as GET /models?runtime=…).
+/// `runtime` ∈ "ollama" | "llamacpp" | "vllm"
+pub fn models_for_runtime_json(runtime: &str) -> Value {
+    let models: Vec<Value> = RUNTIME_GEN_MODELS
+        .iter()
+        .map(|e| {
+            json!({
+                "id":     e.id,
+                "label":  e.label,
+                "arg":    resolve_model_arg(e.id, runtime),
+                "ram_gb": e.ram_gb,
+            })
+        })
+        .collect();
+    json!({ "runtime": runtime, "models": models })
+}
+
+/// Return the active runtime status as JSON. Never leaks api_key.
+/// Falls back gracefully when the DB is unreachable.
+pub async fn active_runtime_json(db: &sqlx::PgPool) -> Value {
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT provider, base_url, model, embedding_mode FROM runtime_config WHERE id = 1",
+        )
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+    let (provider, base_url, model, embedding_mode, configured) = match row {
+        Some((Some(p), b, m, em)) if !p.trim().is_empty() => {
+            (p.trim().to_string(), b, m, em, true)
+        }
+        Some((_, b, m, em)) => ("ollama".to_string(), b, m, em, false),
+        None => ("ollama".to_string(), None, None, None, false),
+    };
+
+    // Light health probe — no key needed.
+    let health_client = reqwest::Client::new();
+    let target = crate::services::llm::LlmTarget {
+        provider: provider.clone(),
+        model: model.clone().unwrap_or_else(|| "llama3.2".to_string()),
+        base_url: base_url.clone(),
+        api_key: None,
+    };
+    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+
+    json!({
+        "provider":       provider,
+        "base_url":       base_url,
+        "model":          model,
+        "embedding_mode": embedding_mode.unwrap_or_else(|| "pinned".to_string()),
+        "configured":     configured,
+        "healthy":        healthy,
+    })
+}
+
+/// Validate a new embedding mode string. Returns `Ok(())` for known modes.
+pub fn validate_embedding_mode(mode: &str) -> std::result::Result<(), String> {
+    match mode {
+        "pinned" | "advanced" => Ok(()),
+        other => Err(format!(
+            "Unknown embedding mode '{other}'. Valid values: pinned, advanced"
+        )),
+    }
+}
+
+/// Kick off the llamacpp bring-up in a spawned task and return immediately.
+/// Caller gets `{ ok: true, status: "starting", note: "…" }` without blocking.
+pub fn spawn_llamacpp_startup(db: sqlx::PgPool, model_id: String) {
+    tokio::spawn(async move {
+        let hf_arg = match resolve_model_arg(&model_id, "llamacpp") {
+            Some(a) => a,
+            None => return, // unknown model — silently drop (caller validated already)
+        };
+
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            return;
+        }
+
+        // Pull image
+        let pull_img = "ghcr.io/ggml-org/llama.cpp:server".to_string();
+        let pull_ok = tokio::task::spawn_blocking(move || crate::routes::update::pull_image(&pull_img))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        if !pull_ok {
+            return;
+        }
+
+        // Detect network
+        let network_mode = detect_own_network().unwrap_or_else(|| "bridge".to_string());
+
+        // Create + start container
+        let hf_arg_clone = hf_arg.clone();
+        let net_clone = network_mode.clone();
+        let launch_ok = tokio::task::spawn_blocking(move || launch_llamacpp_container(&hf_arg_clone, &net_clone))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        if !launch_ok {
+            return;
+        }
+
+        // Persist runtime config (download is happening in container)
+        let _ = persist_runtime(
+            &db,
+            "openai_compatible",
+            Some("http://gctrl-llamacpp:8080"),
+            Some(&model_id),
+            None,
+        )
+        .await;
+    });
+}
+
 // ── Unit tests (pure validation logic — no DB harness) ───────────────────────
 
 #[cfg(test)]
@@ -1569,6 +1747,164 @@ mod switch_runtime_tests {
             assert!(!matches!(*rt, "ollama" | "llamacpp" | "external"),
                 "runtime '{rt}' should be invalid");
         }
+    }
+}
+
+// ── Agent / MCP tool helper tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod agent_tool_tests {
+    use super::{
+        hardware_json, recommend_json, runtimes_catalog_json, models_for_runtime_json,
+        validate_embedding_mode,
+    };
+
+    // ── hardware_json ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hardware_json_returns_object() {
+        let hw = hardware_json();
+        // Must be a JSON object (not an error string)
+        assert!(hw.is_object(), "hardware_json() must return a JSON object, got: {hw}");
+    }
+
+    #[test]
+    fn hardware_json_has_expected_keys() {
+        let hw = hardware_json();
+        // All six canonical keys must be present (values may be zero/empty on CI)
+        for key in &["cpu_cores", "ram_gb", "gpu_name", "vram_gb", "nvidia_toolkit", "arch"] {
+            assert!(hw.get(key).is_some(), "hardware_json() missing key '{key}'");
+        }
+    }
+
+    // ── recommend_json ────────────────────────────────────────────────────────
+
+    #[test]
+    fn recommend_json_has_expected_keys() {
+        let rec = recommend_json();
+        for key in &["runtime", "model", "rationale", "speedup_estimate"] {
+            assert!(rec.get(key).is_some(), "recommend_json() missing key '{key}'");
+        }
+    }
+
+    #[test]
+    fn recommend_json_runtime_is_valid() {
+        let rec = recommend_json();
+        let rt = rec["runtime"].as_str().expect("runtime must be a string");
+        assert!(
+            matches!(rt, "ollama" | "llamacpp" | "vllm"),
+            "recommend_json() returned unexpected runtime '{rt}'"
+        );
+    }
+
+    #[test]
+    fn recommend_json_model_is_in_catalog() {
+        use super::RUNTIME_GEN_MODELS;
+        let rec = recommend_json();
+        let model = rec["model"].as_str().expect("model must be a string");
+        assert!(
+            RUNTIME_GEN_MODELS.iter().any(|e| e.id == model),
+            "recommend_json() returned model '{model}' not in catalog"
+        );
+    }
+
+    // ── runtimes_catalog_json ─────────────────────────────────────────────────
+
+    #[test]
+    fn runtimes_catalog_has_runtimes_key() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().expect("runtimes must be an array");
+        assert!(!rts.is_empty(), "runtimes catalog must not be empty");
+    }
+
+    #[test]
+    fn runtimes_catalog_contains_ollama() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().unwrap();
+        assert!(
+            rts.iter().any(|r| r["id"].as_str() == Some("ollama")),
+            "runtimes catalog must contain 'ollama'"
+        );
+    }
+
+    #[test]
+    fn runtimes_catalog_contains_openai_compatible() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().unwrap();
+        assert!(
+            rts.iter().any(|r| r["id"].as_str() == Some("openai_compatible")),
+            "runtimes catalog must contain 'openai_compatible'"
+        );
+    }
+
+    // ── models_for_runtime_json ───────────────────────────────────────────────
+
+    #[test]
+    fn models_for_ollama_runtime() {
+        let result = models_for_runtime_json("ollama");
+        assert_eq!(result["runtime"].as_str(), Some("ollama"));
+        let models = result["models"].as_array().expect("models must be an array");
+        assert!(!models.is_empty(), "models list must not be empty");
+        // Each entry must have id, label, arg, ram_gb
+        for m in models {
+            assert!(m.get("id").is_some(),    "model missing 'id'");
+            assert!(m.get("label").is_some(), "model missing 'label'");
+            assert!(m.get("ram_gb").is_some(),"model missing 'ram_gb'");
+        }
+    }
+
+    #[test]
+    fn models_for_llamacpp_runtime_have_hf_args() {
+        let result = models_for_runtime_json("llamacpp");
+        let models = result["models"].as_array().unwrap();
+        for m in models {
+            // arg must be a non-null string for known catalog entries
+            assert!(
+                m["arg"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+                "llamacpp model '{}' must have a non-empty arg", m["id"]
+            );
+        }
+    }
+
+    #[test]
+    fn models_for_unknown_runtime_returns_null_args() {
+        // Unknown runtime: resolve_model_arg returns None → arg is null
+        let result = models_for_runtime_json("tgi");
+        let models = result["models"].as_array().unwrap();
+        for m in models {
+            assert!(m["arg"].is_null(), "unknown runtime must yield null arg, got {}", m["arg"]);
+        }
+    }
+
+    // ── validate_embedding_mode ───────────────────────────────────────────────
+
+    #[test]
+    fn pinned_mode_is_valid() {
+        assert!(validate_embedding_mode("pinned").is_ok());
+    }
+
+    #[test]
+    fn advanced_mode_is_valid() {
+        assert!(validate_embedding_mode("advanced").is_ok());
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected() {
+        let err = validate_embedding_mode("turbo").unwrap_err();
+        assert!(err.contains("Unknown embedding mode"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_mode_is_rejected() {
+        let err = validate_embedding_mode("").unwrap_err();
+        assert!(err.contains("Unknown embedding mode"), "got: {err}");
+    }
+
+    #[test]
+    fn hybrid_mode_is_rejected() {
+        // "hybrid" is not a recognised mode in this phase
+        let err = validate_embedding_mode("hybrid").unwrap_err();
+        assert!(err.contains("Unknown embedding mode"), "got: {err}");
     }
 }
 

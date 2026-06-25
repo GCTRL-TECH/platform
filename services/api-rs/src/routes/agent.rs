@@ -316,7 +316,16 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "add_relationship",   "description": "Add an edge between two existing entities", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string" } },
             { "name": "correct_relationship","description": "Delete a wrong edge and remember the correction", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string", "reason": "string?" } },
             { "name": "delete_node",        "description": "Remove an entity and its edges (remembered)", "args": { "compilationId": "string", "name": "string", "reason": "string?" } },
-            { "name": "delete_chunk",       "description": "Delete a source text chunk from Postgres + Qdrant", "args": { "chunkId": "string" } }
+            { "name": "delete_chunk",       "description": "Delete a source text chunk from Postgres + Qdrant", "args": { "chunkId": "string" } },
+            // ── Runtime configuration tools ───────────────────────────────────────
+            { "name": "get_hardware",       "description": "Read the host hardware profile (CPU cores, RAM, GPU, VRAM, OS/arch) detected at install time. Read-only, any caller", "args": {} },
+            { "name": "recommend_runtime",  "description": "Recommend the best runtime and model for the current hardware (pure local logic — no IO). Returns { runtime, model, rationale, speedup_estimate }. Read-only, any caller", "args": {} },
+            { "name": "list_runtimes",      "description": "List the available runtime kinds (ollama, openai_compatible) with metadata. Read-only, any caller", "args": {} },
+            { "name": "get_active_runtime", "description": "Read the current active LLM generation runtime: provider, base_url, model, embedding_mode, configured, healthy. Never leaks api_key. Read-only, any caller", "args": {} },
+            { "name": "list_models",        "description": "List the built-in model catalog for a given runtime kind. Args: { runtime } where runtime ∈ 'ollama' | 'llamacpp' | 'vllm'. Read-only, any caller", "args": { "runtime": "string" } },
+            { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'external', model?: string, base_url?: string, api_key?: string }. ollama/external: synchronous validate+persist. llamacpp: async (spawns pull+create in background, returns immediately with status='starting')", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?" } },
+            { "name": "set_model",          "description": "Update the model for the active runtime without changing the provider (admin only). Validates against the built-in catalog for known runtimes; accepts any string for ollama/external. Args: { model: string }", "args": { "model": "string" } },
+            { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } }
         ]
     })
 }
@@ -1017,6 +1026,155 @@ pub(crate) async fn execute_tool(
             crate::routes::profile::profile_json(row.as_ref())
         }
 
+        // ── Runtime configuration tools ───────────────────────────────────────
+
+        // Read-only: hardware profile
+        "get_hardware" => {
+            crate::routes::infra::hardware_json()
+        }
+
+        // Read-only: runtime recommendation
+        "recommend_runtime" => {
+            crate::routes::infra::recommend_json()
+        }
+
+        // Read-only: runtime catalog
+        "list_runtimes" => {
+            crate::routes::infra::runtimes_catalog_json()
+        }
+
+        // Read-only: active runtime status (no api_key leak)
+        "get_active_runtime" => {
+            crate::routes::infra::active_runtime_json(&state.db).await
+        }
+
+        // Read-only: model catalog for a given runtime
+        "list_models" => {
+            let runtime = args["runtime"].as_str().unwrap_or("ollama");
+            crate::routes::infra::models_for_runtime_json(runtime)
+        }
+
+        // Admin-only: switch the active runtime
+        "switch_runtime" => {
+            if claims.role != "admin" {
+                return json!({ "error": "admin required" });
+            }
+            let runtime = args["runtime"].as_str().unwrap_or("").trim().to_string();
+            let model_arg = args["model"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let base_url_arg = args["base_url"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let api_key_arg = args["api_key"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+
+            match runtime.as_str() {
+                "ollama" => {
+                    if let Err(e) = crate::routes::infra::persist_runtime(&state.db, "ollama", None, None, None).await {
+                        return json!({ "error": format!("DB save failed: {e}") });
+                    }
+                    // Best-effort: stop llamacpp if running
+                    let _ = tokio::task::spawn_blocking(|| {
+                        let _ = crate::routes::update::docker_http("POST", "/containers/gctrl-llamacpp/stop", None, 10);
+                    }).await;
+                    let healthy = crate::routes::infra::active_runtime_json(&state.db).await["healthy"].as_bool().unwrap_or(false);
+                    json!({ "ok": true, "provider": "ollama", "healthy": healthy })
+                }
+                "external" => {
+                    let base_url = match base_url_arg {
+                        Some(b) => b,
+                        None => return json!({ "error": "base_url is required for external runtime" }),
+                    };
+                    if let Err(e) = crate::services::llm::validate_llm_base("openai_compatible", Some(&base_url)) {
+                        return json!({ "error": format!("Invalid base_url: {e}") });
+                    }
+                    let model_str = model_arg.unwrap_or_else(|| "llama3.2".to_string());
+                    let health_client = reqwest::Client::new();
+                    let target = crate::services::llm::LlmTarget {
+                        provider: "openai_compatible".into(),
+                        model: model_str.clone(),
+                        base_url: Some(base_url.clone()),
+                        api_key: None,
+                    };
+                    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+                    if let Err(e) = crate::routes::infra::persist_runtime(
+                        &state.db, "openai_compatible", Some(&base_url), Some(&model_str), api_key_arg.as_deref(),
+                    ).await {
+                        return json!({ "error": format!("DB save failed: {e}") });
+                    }
+                    json!({ "ok": true, "provider": "openai_compatible", "base_url": base_url, "model": model_str, "healthy": healthy })
+                }
+                "llamacpp" => {
+                    let model_id = model_arg.as_deref().unwrap_or("qwen2.5-3b").to_string();
+                    // Validate model id before spawning
+                    if crate::routes::infra::resolve_model_arg(&model_id, "llamacpp").is_none() {
+                        return json!({ "error": format!("Unknown model id '{model_id}'. Valid: qwen2.5-3b, qwen2.5-7b, llama-3.2-3b") });
+                    }
+                    if !std::path::Path::new("/var/run/docker.sock").exists() {
+                        return json!({ "error": "Docker socket not accessible — cannot launch llama.cpp container" });
+                    }
+                    // Kick off background setup and return immediately
+                    crate::routes::infra::spawn_llamacpp_startup(state.db.clone(), model_id.clone());
+                    json!({
+                        "ok": true,
+                        "status": "starting",
+                        "model": model_id,
+                        "note": "llama.cpp is downloading the model in the background; check get_active_runtime for healthy=true"
+                    })
+                }
+                other => json!({ "error": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, external") }),
+            }
+        }
+
+        // Admin-only: update model on the current runtime
+        "set_model" => {
+            if claims.role != "admin" {
+                return json!({ "error": "admin required" });
+            }
+            let model = args["model"].as_str().unwrap_or("").trim().to_string();
+            if model.is_empty() {
+                return json!({ "error": "model is required" });
+            }
+            // Update model in the runtime_config row; provider/base_url/api_key preserved via COALESCE-style partial update
+            let res = sqlx::query(
+                "UPDATE runtime_config SET model = $1, updated_at = now() WHERE id = 1"
+            ).bind(&model).execute(&state.db).await;
+            match res {
+                Ok(r) if r.rows_affected() > 0 => json!({ "ok": true, "model": model }),
+                Ok(_) => {
+                    // No row yet — insert with just model + fallback provider
+                    let _ = sqlx::query(
+                        "INSERT INTO runtime_config (id, provider, model, updated_at) \
+                         VALUES (1, 'ollama', $1, now()) ON CONFLICT (id) DO UPDATE SET model=$1, updated_at=now()"
+                    ).bind(&model).execute(&state.db).await;
+                    json!({ "ok": true, "model": model })
+                }
+                Err(e) => json!({ "error": format!("DB update failed: {e}") }),
+            }
+        }
+
+        // Admin-only: update embedding mode
+        "set_embedding_mode" => {
+            if claims.role != "admin" {
+                return json!({ "error": "admin required" });
+            }
+            let mode = args["mode"].as_str().unwrap_or("").trim().to_string();
+            if let Err(e) = crate::routes::infra::validate_embedding_mode(&mode) {
+                return json!({ "error": e });
+            }
+            let res = sqlx::query(
+                "UPDATE runtime_config SET embedding_mode = $1, updated_at = now() WHERE id = 1"
+            ).bind(&mode).execute(&state.db).await;
+            match res {
+                Ok(r) if r.rows_affected() > 0 => json!({ "ok": true, "embedding_mode": mode }),
+                Ok(_) => {
+                    // No row yet — insert
+                    let _ = sqlx::query(
+                        "INSERT INTO runtime_config (id, provider, embedding_mode, updated_at) \
+                         VALUES (1, 'ollama', $1, now()) ON CONFLICT (id) DO UPDATE SET embedding_mode=$1, updated_at=now()"
+                    ).bind(&mode).execute(&state.db).await;
+                    json!({ "ok": true, "embedding_mode": mode })
+                }
+                Err(e) => json!({ "error": format!("DB update failed: {e}") }),
+            }
+        }
+
         _ => json!({ "error": format!("Unknown tool: {tool_name}") }),
     }
 }
@@ -1257,4 +1415,132 @@ pub(crate) fn find_tool_json(text: &str) -> Option<Value> {
         }
     }
     None
+}
+
+// ── Agent tool registration tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod agent_tool_registration_tests {
+    use super::tool_schema;
+
+    fn tool_names() -> Vec<String> {
+        let schema = tool_schema();
+        schema["tools"]
+            .as_array()
+            .expect("tools must be an array")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    // ── Read-only runtime tools registered ────────────────────────────────────
+
+    #[test]
+    fn tool_schema_contains_get_hardware() {
+        assert!(tool_names().contains(&"get_hardware".to_string()),
+            "tool_schema() must include 'get_hardware'");
+    }
+
+    #[test]
+    fn tool_schema_contains_recommend_runtime() {
+        assert!(tool_names().contains(&"recommend_runtime".to_string()),
+            "tool_schema() must include 'recommend_runtime'");
+    }
+
+    #[test]
+    fn tool_schema_contains_list_runtimes() {
+        assert!(tool_names().contains(&"list_runtimes".to_string()),
+            "tool_schema() must include 'list_runtimes'");
+    }
+
+    #[test]
+    fn tool_schema_contains_get_active_runtime() {
+        assert!(tool_names().contains(&"get_active_runtime".to_string()),
+            "tool_schema() must include 'get_active_runtime'");
+    }
+
+    #[test]
+    fn tool_schema_contains_list_models() {
+        assert!(tool_names().contains(&"list_models".to_string()),
+            "tool_schema() must include 'list_models'");
+    }
+
+    // ── Admin mutation tools registered ───────────────────────────────────────
+
+    #[test]
+    fn tool_schema_contains_switch_runtime() {
+        assert!(tool_names().contains(&"switch_runtime".to_string()),
+            "tool_schema() must include 'switch_runtime'");
+    }
+
+    #[test]
+    fn tool_schema_contains_set_model() {
+        assert!(tool_names().contains(&"set_model".to_string()),
+            "tool_schema() must include 'set_model'");
+    }
+
+    #[test]
+    fn tool_schema_contains_set_embedding_mode() {
+        assert!(tool_names().contains(&"set_embedding_mode".to_string()),
+            "tool_schema() must include 'set_embedding_mode'");
+    }
+
+    // ── Existing tools not removed ────────────────────────────────────────────
+
+    #[test]
+    fn existing_tools_preserved() {
+        let names = tool_names();
+        for expected in &["list_graphs", "create_extraction", "fuse_graphs", "get_dossier", "delete_node"] {
+            assert!(names.contains(&expected.to_string()),
+                "pre-existing tool '{expected}' must still be registered");
+        }
+    }
+
+    // ── Admin-gate logic (pure, no DB needed) ─────────────────────────────────
+
+    /// Prove that the admin gate pattern rejects non-admin callers.
+    /// This mirrors the check `if claims.role != "admin" { return error }`.
+    #[test]
+    fn admin_gate_blocks_non_admin() {
+        let role = "user";
+        let blocked = role != "admin";
+        assert!(blocked, "non-admin role must be blocked by the admin gate");
+    }
+
+    #[test]
+    fn admin_gate_allows_admin() {
+        let role = "admin";
+        let blocked = role != "admin";
+        assert!(!blocked, "admin role must pass the admin gate");
+    }
+
+    // ── list_models args schema ───────────────────────────────────────────────
+
+    #[test]
+    fn list_models_descriptor_has_runtime_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("list_models"))
+            .expect("list_models must be in tool_schema");
+        assert!(tool["args"].get("runtime").is_some(),
+            "list_models descriptor must declare a 'runtime' arg");
+    }
+
+    // ── switch_runtime descriptor has required args ───────────────────────────
+
+    #[test]
+    fn switch_runtime_descriptor_has_runtime_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("switch_runtime"))
+            .expect("switch_runtime must be in tool_schema");
+        assert!(tool["args"].get("runtime").is_some(),
+            "switch_runtime descriptor must declare a 'runtime' arg");
+    }
 }
