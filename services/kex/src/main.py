@@ -45,6 +45,7 @@ from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
 from .sources.obsidian_handler import fetch_note
 from .vector_store import get_vector_store
+from .reindex_worker import drain_reindex_queue
 
 logging.basicConfig(
     level=logging.INFO,
@@ -651,6 +652,31 @@ def _config_watcher() -> None:
         time.sleep(10)
 
 
+def _reindex_loop(stop_event: threading.Event) -> None:
+    """Background thread: drain kex:reindex every 10 seconds.
+
+    Runs independently of the kex:jobs worker pool so a large reindex
+    does not starve incoming extraction jobs.
+    """
+    logger.info("KEX reindex loop started")
+    while _worker_running and not stop_event.is_set():
+        try:
+            r = get_redis()
+            if r is not None:
+                count = drain_reindex_queue(
+                    redis_client=r,
+                    pg_url=config.PG_URL,
+                    qdrant_url=config.QDRANT_URL,
+                    collection=config.QDRANT_COLLECTION,
+                )
+                if count > 0:
+                    logger.info(f"KEX reindex: processed {count} KB(s) this pass")
+        except Exception as exc:
+            logger.warning(f"KEX reindex loop error (non-fatal): {exc}")
+        stop_event.wait(10)
+    logger.info("KEX reindex loop stopped")
+
+
 def start_worker() -> None:
     global _worker_running
     _worker_running = True
@@ -663,6 +689,17 @@ def start_worker() -> None:
     # Start config watcher
     watcher = threading.Thread(target=_config_watcher, name="kex-config-watcher", daemon=True)
     watcher.start()
+
+    # Start reindex loop (drains kex:reindex, runs independently of extraction workers)
+    reindex_stop = threading.Event()
+    reindex_thread = threading.Thread(
+        target=_reindex_loop,
+        args=(reindex_stop,),
+        name="kex-reindex-loop",
+        daemon=True,
+    )
+    reindex_thread.start()
+    _worker_threads.append((reindex_thread, reindex_stop))
 
 
 def stop_worker() -> None:
