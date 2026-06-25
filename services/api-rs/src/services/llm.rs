@@ -510,6 +510,46 @@ pub async fn inject_ollama_overrides(
         // ── Generation runtime (openai_compatible → inject generation_* fields)
         let gen = resolve_for_user(db, user_id, None, None).await;
         apply_generation_overrides(&gen, map);
+
+        // ── Part 6.1: Pinned embedding override ───────────────────────────────
+        // When the active runtime is the bundled llama.cpp (gctrl-llamacpp:8080)
+        // in 'pinned' mode, redirect embeddings to its embed sidecar (port 8081,
+        // nomic-embed-text, dim 768). This keeps existing vectors valid — no
+        // reindex needed. For external openai_compatible endpoints: do nothing
+        // (we can't assume they serve nomic; safe fallback keeps Ollama).
+        // For ollama / advanced mode: do nothing either.
+        let runtime_row: Option<(Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT provider, base_url, embedding_mode FROM runtime_config WHERE id = 1",
+            )
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some((Some(rt_provider), Some(rt_base), em)) = runtime_row {
+            let emb_mode = em.as_deref().unwrap_or("pinned");
+            if let Some((embed_prov, embed_base, embed_model)) =
+                pinned_embedding_override(&rt_provider, &rt_base, emb_mode)
+            {
+                // Override embeddings to sidecar — only if the caller didn't
+                // already set a per-user embedding override (respect explicit prefs).
+                // We insert AFTER the prefs block so per-user base/model/provider
+                // always win over the runtime-level pinned sidecar default.
+                // But ONLY inject when the map does NOT already have an
+                // embedding_provider that differs from "ollama" — meaning no
+                // explicit per-user embedding pref was set above.
+                let already_has_pref = map.get("embedding_provider")
+                    .and_then(|v| v.as_str())
+                    .map(|p| !p.is_empty() && p != "ollama")
+                    .unwrap_or(false);
+                if !already_has_pref {
+                    map.insert("embedding_provider".into(), json!(embed_prov));
+                    map.insert("embedding_base_url".into(), json!(embed_base));
+                    map.insert("embedding_model".into(), json!(embed_model));
+                }
+            }
+        }
     }
 }
 
