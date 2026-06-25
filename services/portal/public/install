@@ -291,6 +291,9 @@ generate_config() {
     NEO4J_PASSWORD="${neo_prev:-$(openssl rand -hex 24)}"
   fi
 
+  # Preserve VLLM_MODEL on re-install if already set
+  local vllm_model_prev; vllm_model_prev="$(read_prev VLLM_MODEL)"
+
   cat > "${INSTALL_DIR}/.env" <<EOF
 GCTRL_API_URL=https://api.gctrl.tech
 GCTRL_DATA_DIR=${INSTALL_DIR}/data
@@ -303,6 +306,7 @@ OLLAMA_BASE=${OLLAMA_BASE}
 RELEX_MODEL=${CHAT_MODEL:-qwen2.5:7b}
 AUTO_CLASSIFY_MODEL=${CHAT_MODEL:-llama3.2}
 POSTGRES_PASSWORD=${pg_pw}
+VLLM_MODEL=${vllm_model_prev:-Qwen/Qwen2.5-3B-Instruct}
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
 
@@ -570,6 +574,77 @@ JSON
   info "Hardware profile written to ${INSTALL_DIR}/hardware.json (cpu=${cpu_cores}, ram=${ram_gb}GB, gpu='${gpu_name}', vram=${vram_gb}GB, toolkit=${nvidia_toolkit}, arch=${arch_name}, os=${os_name})"
 }
 
+# ── Runtime Picker ────────────────────────────────────────────────────────────
+# Gate: only offered when nvidia_toolkit=true AND vram_gb >= 8 in hardware.json.
+# Reads the file detect_hardware() just wrote. On non-interactive / no-GPU hosts
+# this is a no-op. If selected, adds bundled-vllm to PROFILES and writes
+# VLLM_MODEL into .env so the compose service picks the right HuggingFace repo.
+#
+# The bash-side gate (toolkit && vram >= 8) mirrors vllm_available() in infra.rs.
+VLLM_SELECTED=false
+
+choose_runtime() {
+  local hw_file="${INSTALL_DIR}/hardware.json"
+  [ -f "$hw_file" ] || return 0
+
+  # Read nvidia_toolkit and vram_gb from hardware.json
+  local toolkit vram
+  toolkit="$(grep -o '"nvidia_toolkit":[^,}]*' "$hw_file" | awk -F: '{print $2}' | tr -d ' \r\n')"
+  vram="$(grep -o '"vram_gb":[^,}]*' "$hw_file" | awk -F: '{print $2}' | tr -d ' \r\n')"
+
+  # Default to not-available if parse failed
+  toolkit="${toolkit:-false}"
+  vram="${vram:-0}"
+
+  # Gate: toolkit must be true AND vram_gb >= 8
+  if [ "$toolkit" != "true" ]; then
+    return 0
+  fi
+  # awk for float comparison (bash can only compare integers)
+  local gpu_ok
+  gpu_ok="$(awk "BEGIN{print ($vram >= 8) ? \"yes\" : \"no\"}")"
+  if [ "$gpu_ok" != "yes" ]; then
+    warn "NVIDIA GPU detected but VRAM ${vram} GB < 8 GB — vLLM requires ≥8 GB VRAM; skipping vLLM offer"
+    return 0
+  fi
+
+  # Non-interactive: check env override
+  if [ -n "${GCTRL_RUNTIME:-}" ]; then
+    if [ "$GCTRL_RUNTIME" = "vllm" ]; then
+      VLLM_SELECTED=true
+      PROFILES+=("bundled-vllm")
+      info "Runtime (from GCTRL_RUNTIME): vLLM selected"
+    fi
+    return 0
+  fi
+
+  # No interactive terminal → skip silently (safe default: don't pull 10+ GB vLLM image)
+  if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  info "NVIDIA GPU with ${vram} GB VRAM detected (nvidia-container-toolkit present)"
+  echo "  Optional: enable vLLM for maximum GPU throughput"
+  echo "    1) No  — use bundled Ollama (default, always works)"
+  echo "    2) Yes — enable vLLM (pulls vllm/vllm-openai:latest, ~10 GB)"
+  local rt_choice=""
+  read -rp "  Enable vLLM? [1]: " rt_choice </dev/tty || rt_choice=""
+  case "${rt_choice:-1}" in
+    2)
+      VLLM_SELECTED=true
+      PROFILES+=("bundled-vllm")
+      success "vLLM selected — will deploy gctrl-vllm container"
+      ;;
+    *)
+      info "Keeping bundled Ollama (vLLM can be enabled later in Settings → Infrastructure)"
+      ;;
+  esac
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+}
+
 # Pull the local models KEX requires into the bundled Ollama container. Idempotent
 # (Ollama skips already-present models). Keeps the platform zero-cost-local.
 pull_ollama_models() {
@@ -590,6 +665,7 @@ main() {
   detect_services      # auto-decides Ollama (native if reachable, else bundled — never conflicts)
   generate_config      # .env written with a sensible default model placeholder; INSTALL_DIR created
   detect_hardware      # writes hardware.json to INSTALL_DIR for Settings → Infrastructure
+  choose_runtime       # GPU-gate: offer vLLM only when nvidia_toolkit=true AND vram_gb >= 8
   start_stack          # bring the stack up FIRST → web UI live at :3001
   choose_model         # ask the model question only NOW, after the UI is up
   finalize             # apply the chosen model (restart kex/fuse) + pull local models

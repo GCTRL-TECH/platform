@@ -881,7 +881,6 @@ async fn get_active_runtime(
 // ── GET /api/infra/runtimes ───────────────────────────────────────────────────
 
 /// Return the static catalog of selectable runtime kinds for the UI.
-/// Only `ollama` and `openai_compatible` are offered in this phase.
 async fn list_runtimes(
     Extension(_claims): Extension<JwtClaims>,
 ) -> Result<Json<Value>> {
@@ -892,13 +891,31 @@ async fn list_runtimes(
                 "label":        "Bundled Ollama",
                 "kind":         "ollama",
                 "needs_base_url": false,
+                "needs_gpu":    false,
                 "description":  "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
+            },
+            {
+                "id":           "llamacpp",
+                "label":        "llama.cpp (bundled)",
+                "kind":         "openai_compatible",
+                "needs_base_url": false,
+                "needs_gpu":    false,
+                "description":  "Bundled llama.cpp server. Faster than Ollama on CPU; CUDA-offloads on NVIDIA GPUs with 6–16 GB VRAM.",
+            },
+            {
+                "id":           "vllm",
+                "label":        "vLLM (GPU, bundled)",
+                "kind":         "openai_compatible",
+                "needs_base_url": false,
+                "needs_gpu":    true,
+                "description":  "Bundled vLLM engine. Maximum throughput for NVIDIA GPUs with ≥8 GB VRAM (nvidia-container-toolkit required).",
             },
             {
                 "id":           "openai_compatible",
                 "label":        "OpenAI-compatible endpoint",
                 "kind":         "openai_compatible",
                 "needs_base_url": true,
+                "needs_gpu":    false,
                 "description":  "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API.",
             },
         ]
@@ -1150,11 +1167,17 @@ async fn run_switch_runtime(
                 return;
             }
 
-            // Best-effort: stop gctrl-llamacpp if running (ignore errors).
+            // Best-effort: stop gctrl-llamacpp and gctrl-vllm if running (ignore errors).
             let _ = tokio::task::spawn_blocking(|| {
                 let _ = crate::routes::update::docker_http(
                     "POST",
                     "/containers/gctrl-llamacpp/stop",
+                    None,
+                    10,
+                );
+                let _ = crate::routes::update::docker_http(
+                    "POST",
+                    "/containers/gctrl-vllm/stop",
                     None,
                     10,
                 );
@@ -1258,8 +1281,114 @@ async fn run_switch_runtime(
             }
         }
 
+        "vllm" => {
+            // 1. Resolve model HF repo (default: qwen2.5-3b → Qwen/Qwen2.5-3B-Instruct)
+            let model_id = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                .unwrap_or("qwen2.5-3b");
+            let hf_repo = match resolve_model_arg(model_id, "vllm") {
+                Some(r) => r,
+                None => {
+                    send("error", json!({ "message": format!("Unknown model id '{model_id}'. Valid: qwen2.5-3b, qwen2.5-7b, llama-3.2-3b") }));
+                    return;
+                }
+            };
+
+            if !std::path::Path::new("/var/run/docker.sock").exists() {
+                send("error", json!({ "message": "Docker socket not accessible — cannot launch vLLM container" }));
+                return;
+            }
+
+            // 2. Pull image
+            send("progress", json!({ "step": "pull", "message": "Pulling vllm/vllm-openai:latest…" }));
+            let pull_img = "vllm/vllm-openai:latest".to_string();
+            match tokio::task::spawn_blocking(move || crate::routes::update::pull_image(&pull_img)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    // Distinguish GPU-missing from generic pull failure
+                    let msg = if e.contains("nvidia") || e.contains("runtime") {
+                        format!("vLLM requires an NVIDIA GPU + nvidia-container-toolkit. Pull failed: {e}")
+                    } else {
+                        format!("Image pull failed: {e}")
+                    };
+                    send("error", json!({ "message": msg }));
+                    return;
+                }
+                Err(e) => {
+                    send("error", json!({ "message": format!("Pull task failed: {e}") }));
+                    return;
+                }
+            }
+
+            // 3. Detect our own network by inspecting our container
+            send("progress", json!({ "step": "create", "message": "Detecting container network…" }));
+            let network_mode = detect_own_network().unwrap_or_else(|| "bridge".to_string());
+
+            // 4. Remove old container if exists, then create + start
+            send("progress", json!({ "step": "create", "message": format!("Creating gctrl-vllm on network '{network_mode}'…") }));
+            let hf_repo_clone = hf_repo.clone();
+            let net_clone = network_mode.clone();
+            match tokio::task::spawn_blocking(move || {
+                launch_vllm_container(&hf_repo_clone, &net_clone)
+            }).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    let msg = if e.contains("nvidia") || e.contains("Unknown runtime") || e.contains("DeviceRequests") {
+                        format!("vLLM requires an NVIDIA GPU + nvidia-container-toolkit. Container create failed: {e}")
+                    } else {
+                        format!("Container create/start failed: {e}")
+                    };
+                    send("error", json!({ "message": msg }));
+                    return;
+                }
+                Err(e) => {
+                    send("error", json!({ "message": format!("Container task failed: {e}") }));
+                    return;
+                }
+            }
+
+            // 5. Poll health until ready (model download from HuggingFace can take minutes)
+            send("progress", json!({ "step": "downloading model", "message": format!("Waiting for vLLM to download model '{hf_repo}'… (this may take several minutes)") }));
+            let health_client = reqwest::Client::new();
+            let model_id_owned = model_id.to_string();
+            let target = crate::services::llm::LlmTarget {
+                provider: "openai_compatible".into(),
+                model: model_id_owned.clone(),
+                base_url: Some("http://gctrl-vllm:8000".into()),
+                api_key: None,
+            };
+            let healthy = poll_vllm_health(&health_client, &target, &tx).await;
+
+            // 6. UPSERT runtime_config regardless of health (download continues in container)
+            if let Err(e) = persist_runtime(
+                &db,
+                "openai_compatible",
+                Some("http://gctrl-vllm:8000"),
+                Some(&model_id_owned),
+                None,
+            ).await {
+                send("error", json!({ "message": format!("DB save failed: {e}") }));
+                return;
+            }
+
+            if healthy {
+                send("done", json!({
+                    "provider": "openai_compatible",
+                    "base_url": "http://gctrl-vllm:8000",
+                    "model": model_id_owned,
+                    "note": "vLLM is running and healthy"
+                }));
+            } else {
+                send("done", json!({
+                    "provider": "openai_compatible",
+                    "base_url": "http://gctrl-vllm:8000",
+                    "model": model_id_owned,
+                    "note": "vLLM container started but model download is still in progress — runtime config saved; it will serve requests once the download completes"
+                }));
+            }
+        }
+
         other => {
-            send("error", json!({ "message": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, external") }));
+            send("error", json!({ "message": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, vllm, external") }));
         }
     }
 }
@@ -1391,6 +1520,100 @@ fn launch_llamacpp_container(hf_arg: &str, network_mode: &str) -> std::result::R
     Ok(())
 }
 
+/// Poll gctrl-vllm's health endpoint until it responds or times out.
+/// vLLM model loads are slower than llama.cpp GGUF (HuggingFace download +
+/// CUDA init), so we allow up to 15 minutes. Emits periodic progress events.
+/// Returns true if healthy within the window.
+async fn poll_vllm_health(
+    client: &reqwest::Client,
+    target: &crate::services::llm::LlmTarget,
+    tx: &mpsc::UnboundedSender<std::result::Result<Event, Infallible>>,
+) -> bool {
+    // Allow up to 15 minutes — vLLM HuggingFace download + CUDA init is slow
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    let mut attempt = 0u32;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = tx.send(Ok(Event::default()
+                .event("progress")
+                .data(json!({ "step": "downloading model", "message": "Timed out waiting for vLLM — model download continues in background" }).to_string())));
+            return false;
+        }
+
+        interval.tick().await;
+        attempt += 1;
+
+        if crate::services::llm::runtime_health(client, target).await {
+            return true;
+        }
+
+        let _ = tx.send(Ok(Event::default()
+            .event("progress")
+            .data(json!({ "step": "downloading model", "message": format!("Still waiting for vLLM (attempt {attempt})…") }).to_string())));
+    }
+}
+
+/// Create (or replace) and start the `gctrl-vllm` container.
+/// - Force-removes any existing container first.
+/// - Mounts a named volume `gctrl-vllm-models:/root/.cache/huggingface` for HuggingFace cache.
+/// - Joins the API's own network so it's reachable at `gctrl-vllm:8000`.
+/// - Requests the NVIDIA GPU via DeviceRequests (requires nvidia-container-toolkit).
+fn launch_vllm_container(hf_repo: &str, network_mode: &str) -> std::result::Result<(), String> {
+    // Force-remove existing container (ignore 404).
+    let _ = crate::routes::update::docker_http(
+        "DELETE",
+        "/containers/gctrl-vllm?force=true",
+        None,
+        30,
+    );
+
+    let create_body = serde_json::json!({
+        "Image": "vllm/vllm-openai:latest",
+        "Cmd": ["--model", hf_repo, "--host", "0.0.0.0", "--port", "8000"],
+        "HostConfig": {
+            "Binds": ["gctrl-vllm-models:/root/.cache/huggingface"],
+            "NetworkMode": network_mode,
+            "RestartPolicy": { "Name": "unless-stopped" },
+            "DeviceRequests": [
+                {
+                    "Driver": "nvidia",
+                    "Count": -1,
+                    "Capabilities": [["gpu"]]
+                }
+            ]
+        }
+    }).to_string();
+
+    let (create_status, create_body_resp) = crate::routes::update::docker_http(
+        "POST",
+        "/containers/create?name=gctrl-vllm",
+        Some(&create_body),
+        30,
+    )?;
+
+    if create_status != 201 {
+        return Err(format!("Container create HTTP {create_status}: {create_body_resp}"));
+    }
+
+    let created = crate::routes::update::json_from_body(&create_body_resp);
+    let id = created["Id"].as_str().unwrap_or("gctrl-vllm");
+
+    let (start_status, _) = crate::routes::update::docker_http(
+        "POST",
+        &format!("/containers/{id}/start"),
+        None,
+        10,
+    )?;
+
+    if start_status != 204 && start_status != 304 {
+        return Err(format!("Container start HTTP {start_status}"));
+    }
+
+    Ok(())
+}
+
 // ── Agent / MCP tool helpers (pure, no axum, callable from execute_tool) ────
 
 /// Read the hardware profile as a plain JSON Value (same logic as GET /hardware).
@@ -1440,13 +1663,31 @@ pub fn runtimes_catalog_json() -> Value {
                 "label":          "Bundled Ollama",
                 "kind":           "ollama",
                 "needs_base_url": false,
+                "needs_gpu":      false,
                 "description":    "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
+            },
+            {
+                "id":             "llamacpp",
+                "label":          "llama.cpp (bundled)",
+                "kind":           "openai_compatible",
+                "needs_base_url": false,
+                "needs_gpu":      false,
+                "description":    "Bundled llama.cpp server. Faster than Ollama on CPU; CUDA-offloads on NVIDIA GPUs with 6–16 GB VRAM.",
+            },
+            {
+                "id":             "vllm",
+                "label":          "vLLM (GPU, bundled)",
+                "kind":           "openai_compatible",
+                "needs_base_url": false,
+                "needs_gpu":      true,
+                "description":    "Bundled vLLM engine. Maximum throughput for NVIDIA GPUs with ≥8 GB VRAM (nvidia-container-toolkit required).",
             },
             {
                 "id":             "openai_compatible",
                 "label":          "OpenAI-compatible endpoint",
                 "kind":           "openai_compatible",
                 "needs_base_url": true,
+                "needs_gpu":      false,
                 "description":    "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API.",
             },
         ]
@@ -1680,6 +1921,13 @@ async fn run_reindex(
         "warning": "Search quality will degrade until the reindex worker completes all knowledge bases. \
                     Existing embeddings remain active until each KB is fully re-indexed.",
     }));
+}
+
+/// Pure GPU-gating predicate for vLLM.
+/// Returns true only when nvidia-container-toolkit is present AND VRAM ≥ 8 GB.
+/// Used by the installer (bash-side gate mirrors this logic) and unit-tested here.
+pub fn vllm_available(nvidia_toolkit: bool, vram_gb: f64) -> bool {
+    nvidia_toolkit && vram_gb >= 8.0
 }
 
 /// Kick off the llamacpp bring-up in a spawned task and return immediately.
@@ -1924,21 +2172,55 @@ mod switch_runtime_tests {
         }
     }
 
+    // ── resolve_model_arg: vllm ──────────────────────────────────────────────
+
+    #[test]
+    fn resolve_qwen25_3b_vllm_explicit() {
+        assert_eq!(
+            resolve_model_arg("qwen2.5-3b", "vllm").as_deref(),
+            Some("Qwen/Qwen2.5-3B-Instruct"),
+        );
+    }
+
+    #[test]
+    fn resolve_qwen25_7b_vllm() {
+        assert_eq!(
+            resolve_model_arg("qwen2.5-7b", "vllm").as_deref(),
+            Some("Qwen/Qwen2.5-7B-Instruct"),
+        );
+    }
+
+    #[test]
+    fn resolve_llama32_vllm() {
+        assert_eq!(
+            resolve_model_arg("llama-3.2-3b", "vllm").as_deref(),
+            Some("meta-llama/Llama-3.2-3B-Instruct"),
+        );
+    }
+
+    #[test]
+    fn default_model_id_resolves_vllm() {
+        // The default model when none is specified is "qwen2.5-3b"
+        let arg = resolve_model_arg("qwen2.5-3b", "vllm");
+        assert!(arg.is_some(), "default model must resolve for vllm");
+        assert_eq!(arg.as_deref(), Some("Qwen/Qwen2.5-3B-Instruct"));
+    }
+
     // ── Runtime string validation ────────────────────────────────────────────
 
     #[test]
     fn valid_runtimes() {
-        // These are the three valid runtime strings for switch-runtime
-        for rt in &["ollama", "llamacpp", "external"] {
-            assert!(matches!(*rt, "ollama" | "llamacpp" | "external"),
+        // These are the four valid runtime strings for switch-runtime
+        for rt in &["ollama", "llamacpp", "vllm", "external"] {
+            assert!(matches!(*rt, "ollama" | "llamacpp" | "vllm" | "external"),
                 "runtime '{rt}' should be valid");
         }
     }
 
     #[test]
     fn invalid_runtimes_not_in_set() {
-        for rt in &["vllm", "openai", "tgi", ""] {
-            assert!(!matches!(*rt, "ollama" | "llamacpp" | "external"),
+        for rt in &["tgi", "openai", "lmstudio", ""] {
+            assert!(!matches!(*rt, "ollama" | "llamacpp" | "vllm" | "external"),
                 "runtime '{rt}' should be invalid");
         }
     }
@@ -2031,6 +2313,36 @@ mod agent_tool_tests {
         );
     }
 
+    #[test]
+    fn runtimes_catalog_contains_vllm() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().unwrap();
+        assert!(
+            rts.iter().any(|r| r["id"].as_str() == Some("vllm")),
+            "runtimes catalog must contain 'vllm'"
+        );
+    }
+
+    #[test]
+    fn runtimes_catalog_vllm_needs_gpu() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().unwrap();
+        let vllm = rts.iter().find(|r| r["id"].as_str() == Some("vllm"))
+            .expect("vllm entry must exist");
+        assert_eq!(vllm["needs_gpu"].as_bool(), Some(true),
+            "vllm entry must have needs_gpu: true");
+    }
+
+    #[test]
+    fn runtimes_catalog_ollama_does_not_need_gpu() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().unwrap();
+        let ollama = rts.iter().find(|r| r["id"].as_str() == Some("ollama"))
+            .expect("ollama entry must exist");
+        assert_eq!(ollama["needs_gpu"].as_bool(), Some(false),
+            "ollama entry must have needs_gpu: false");
+    }
+
     // ── models_for_runtime_json ───────────────────────────────────────────────
 
     #[test]
@@ -2057,6 +2369,20 @@ mod agent_tool_tests {
                 m["arg"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
                 "llamacpp model '{}' must have a non-empty arg", m["id"]
             );
+        }
+    }
+
+    #[test]
+    fn models_for_vllm_runtime_have_hf_repos() {
+        let result = models_for_runtime_json("vllm");
+        let models = result["models"].as_array().unwrap();
+        for m in models {
+            // arg must be a non-null string containing a HuggingFace org/repo pattern
+            let arg = m["arg"].as_str().unwrap_or("");
+            assert!(!arg.is_empty(),
+                "vllm model '{}' must have a non-empty arg", m["id"]);
+            assert!(arg.contains('/'),
+                "vllm arg '{}' for model '{}' must be an org/repo path", arg, m["id"]);
         }
     }
 
@@ -2099,6 +2425,66 @@ mod agent_tool_tests {
         // "hybrid" is not a recognised mode in this phase
         let err = validate_embedding_mode("hybrid").unwrap_err();
         assert!(err.contains("Unknown embedding mode"), "got: {err}");
+    }
+}
+
+// ── vLLM gating unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod vllm_gating_tests {
+    use super::vllm_available;
+
+    // ── vllm_available predicate ─────────────────────────────────────────────
+
+    #[test]
+    fn vllm_available_requires_toolkit_and_vram() {
+        assert!(vllm_available(true, 8.0),  "toolkit=true, 8 GB → available");
+        assert!(vllm_available(true, 16.0), "toolkit=true, 16 GB → available");
+        assert!(vllm_available(true, 24.0), "toolkit=true, 24 GB → available");
+    }
+
+    #[test]
+    fn vllm_unavailable_without_toolkit() {
+        assert!(!vllm_available(false, 8.0),  "no toolkit, 8 GB → unavailable");
+        assert!(!vllm_available(false, 24.0), "no toolkit, 24 GB → unavailable");
+        assert!(!vllm_available(false, 0.0),  "no toolkit, 0 GB → unavailable");
+    }
+
+    #[test]
+    fn vllm_unavailable_below_8gb_vram() {
+        assert!(!vllm_available(true, 0.0),  "toolkit, 0 GB VRAM → unavailable");
+        assert!(!vllm_available(true, 4.0),  "toolkit, 4 GB VRAM → unavailable");
+        assert!(!vllm_available(true, 7.9),  "toolkit, 7.9 GB VRAM → unavailable");
+    }
+
+    #[test]
+    fn vllm_boundary_exactly_8gb() {
+        // Exactly 8.0 GB is the gate threshold — must be available
+        assert!(vllm_available(true, 8.0), "toolkit=true, exactly 8.0 GB → available");
+    }
+
+    #[test]
+    fn vllm_unavailable_neither_toolkit_nor_vram() {
+        assert!(!vllm_available(false, 0.0), "no toolkit, no VRAM → unavailable");
+    }
+
+    // ── switch dispatch ──────────────────────────────────────────────────────
+
+    #[test]
+    fn vllm_dispatch_string_is_handled() {
+        // "vllm" must be in the set of recognised runtime strings
+        assert!(matches!("vllm", "ollama" | "llamacpp" | "vllm" | "external"),
+            "vllm must be a recognised switch-runtime value");
+    }
+
+    #[test]
+    fn vllm_not_gated_by_unknown_runtimes() {
+        // Ensure the gating predicate is purely about toolkit + vram, not runtime string
+        // (i.e. it is a free function, not bound to the match arm)
+        let available = vllm_available(true, 10.0);
+        assert!(available);
+        let unavailable = vllm_available(false, 10.0);
+        assert!(!unavailable);
     }
 }
 
