@@ -1936,46 +1936,64 @@ pub fn spawn_llamacpp_startup(db: sqlx::PgPool, model_id: String) {
     tokio::spawn(async move {
         let hf_arg = match resolve_model_arg(&model_id, "llamacpp") {
             Some(a) => a,
-            None => return, // unknown model — silently drop (caller validated already)
+            None => {
+                tracing::warn!(%model_id, "llamacpp startup: unknown model id, no llamacpp arg");
+                return;
+            }
         };
 
         if !std::path::Path::new("/var/run/docker.sock").exists() {
+            tracing::warn!("llamacpp startup: /var/run/docker.sock not present — cannot bring up bundled runtime");
             return;
         }
 
-        // Pull image
+        // Pull image (surface the real error so the bundled bring-up is diagnosable).
         let pull_img = "ghcr.io/ggml-org/llama.cpp:server".to_string();
-        let pull_ok = tokio::task::spawn_blocking(move || crate::routes::update::pull_image(&pull_img))
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-        if !pull_ok {
-            return;
+        match tokio::task::spawn_blocking(move || crate::routes::update::pull_image(&pull_img)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "llamacpp startup: image pull failed");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "llamacpp startup: pull task panicked");
+                return;
+            }
         }
 
         // Detect network
         let network_mode = detect_own_network().unwrap_or_else(|| "bridge".to_string());
+        tracing::info!(%network_mode, %hf_arg, "llamacpp startup: creating gctrl-llamacpp");
 
         // Create + start container
         let hf_arg_clone = hf_arg.clone();
         let net_clone = network_mode.clone();
-        let launch_ok = tokio::task::spawn_blocking(move || launch_llamacpp_container(&hf_arg_clone, &net_clone))
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-        if !launch_ok {
-            return;
+        match tokio::task::spawn_blocking(move || launch_llamacpp_container(&hf_arg_clone, &net_clone)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "llamacpp startup: container launch failed");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "llamacpp startup: launch task panicked");
+                return;
+            }
         }
 
         // Persist runtime config (download is happening in container)
-        let _ = persist_runtime(
+        if let Err(e) = persist_runtime(
             &db,
             "openai_compatible",
             Some("http://gctrl-llamacpp:8080"),
             Some(&model_id),
             None,
         )
-        .await;
+        .await
+        {
+            tracing::error!(error = %e, "llamacpp startup: persist_runtime failed");
+        } else {
+            tracing::info!(%model_id, "llamacpp startup: gctrl-llamacpp created; model downloading in background");
+        }
     });
 }
 
