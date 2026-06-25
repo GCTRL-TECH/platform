@@ -193,6 +193,286 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/models", get(list_gen_models))
         // ── Runtime switch (SSE, admin-only) ────────────────────────────────
         .route("/switch-runtime", post(switch_runtime))
+        // ── Hardware detection + recommendation ──────────────────────────────
+        .route("/hardware", get(get_hardware))
+        .route("/rescan-hardware", post(rescan_hardware))
+        .route("/recommend", get(get_recommend))
+}
+
+// ── Hardware struct ───────────────────────────────────────────────────────────
+
+/// Host hardware profile, written by the installer to `hardware.json` and
+/// augmented at request time from `/proc` (Linux) so stale values self-correct.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct Hardware {
+    #[serde(default)] pub cpu_cores:      u32,
+    #[serde(default)] pub ram_gb:         f64,
+    #[serde(default)] pub gpu_name:       String,
+    #[serde(default)] pub vram_gb:        f64,
+    #[serde(default)] pub nvidia_toolkit: bool,
+    #[serde(default)] pub arch:           String,
+    #[serde(default)] pub os:             String,
+}
+
+impl Default for Hardware {
+    fn default() -> Self {
+        Self {
+            cpu_cores:      0,
+            ram_gb:         0.0,
+            gpu_name:       String::new(),
+            vram_gb:        0.0,
+            nvidia_toolkit: false,
+            arch:           String::new(),
+            os:             String::new(),
+        }
+    }
+}
+
+/// Path probe order for `hardware.json`:
+/// 1. `$GCTRL_DIR/hardware.json`       — operator-set install dir
+/// 2. `/app/hardware.json`             — container-mounted install dir
+/// 3. `./hardware.json`                — working directory fallback
+///
+/// Returns the first path that exists, or `None` if none is found.
+fn hardware_json_path() -> Option<std::path::PathBuf> {
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut v = Vec::new();
+        if let Ok(dir) = std::env::var("GCTRL_DIR") {
+            v.push(std::path::PathBuf::from(dir).join("hardware.json"));
+        }
+        v.push(std::path::PathBuf::from("/app/hardware.json"));
+        v.push(std::path::PathBuf::from("./hardware.json"));
+        v
+    };
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Read Linux `/proc` for live CPU core count and RAM (GB, 1-decimal).
+/// Returns `(cores, ram_gb)` — both `None` on non-Linux or unreadable proc.
+fn proc_hardware() -> (Option<u32>, Option<f64>) {
+    // cpu_cores: count "processor" lines in /proc/cpuinfo
+    let cores = std::fs::read_to_string("/proc/cpuinfo").ok().map(|s| {
+        s.lines()
+            .filter(|l| l.starts_with("processor"))
+            .count() as u32
+    });
+    // ram_gb: MemTotal kB → GB
+    let ram = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| {
+                let gb = kb as f64 / 1_048_576.0;
+                // round to 1 decimal
+                (gb * 10.0).round() / 10.0
+            })
+    });
+    (cores, ram)
+}
+
+// ── GET /api/infra/hardware ───────────────────────────────────────────────────
+
+/// `GET /api/infra/hardware` — any authenticated user.
+///
+/// Reads `hardware.json` (installer-written) and OVERLAYS live `/proc` values
+/// for `cpu_cores` and `ram_gb` so stale file values self-correct. Returns the
+/// merged object. When no file is found, builds a best-effort object from
+/// `/proc` alone (gpu fields empty).
+async fn get_hardware(
+    Extension(_claims): Extension<JwtClaims>,
+) -> Result<Json<Value>> {
+    let mut hw: Hardware = match hardware_json_path() {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| AppError::Internal(format!("read hardware.json: {e}")))?;
+            serde_json::from_str(&text).unwrap_or_default()
+        }
+        None => Hardware::default(),
+    };
+
+    // Overlay live /proc values so stale file values self-correct.
+    let (live_cores, live_ram) = proc_hardware();
+    if let Some(c) = live_cores { hw.cpu_cores = c; }
+    if let Some(r) = live_ram   { hw.ram_gb    = r; }
+
+    Ok(Json(serde_json::to_value(&hw).unwrap_or(json!({}))))
+}
+
+// ── POST /api/infra/rescan-hardware ──────────────────────────────────────────
+
+/// `POST /api/infra/rescan-hardware` — admin only.
+///
+/// Probes the Docker daemon via the socket for live container-visible values:
+/// - `NCPU`     → cpu_cores
+/// - `MemTotal` → ram_gb  (bytes → GB)
+/// - `Runtimes` → nvidia_toolkit (contains "nvidia" key)
+///
+/// GPU name and VRAM can only be detected at install time (nvidia-smi is host-
+/// native, not container-visible without passthrough). File values are preserved
+/// for those fields. Returns the merged object + a `gpu_rescan` note.
+async fn rescan_hardware(
+    Extension(claims): Extension<JwtClaims>,
+) -> Result<Json<Value>> {
+    require_role(&claims, "admin")?;
+
+    // Load the file baseline (best-effort; default if missing).
+    let mut hw: Hardware = match hardware_json_path() {
+        Some(path) => {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        }
+        None => Hardware::default(),
+    };
+
+    // Probe Docker daemon.
+    let docker_result = tokio::task::spawn_blocking(|| {
+        crate::routes::update::docker_http("GET", "/info", None, 10)
+    }).await;
+
+    match docker_result {
+        Ok(Ok((status, body))) if status == 200 => {
+            let info = crate::routes::update::json_from_body(&body);
+
+            if let Some(ncpu) = info["NCPU"].as_u64() {
+                hw.cpu_cores = ncpu as u32;
+            }
+            if let Some(mem_bytes) = info["MemTotal"].as_u64() {
+                hw.ram_gb = ((mem_bytes as f64 / 1_073_741_824.0) * 10.0).round() / 10.0;
+            }
+            if let Some(runtimes) = info["Runtimes"].as_object() {
+                hw.nvidia_toolkit = runtimes.contains_key("nvidia");
+            }
+        }
+        Ok(Ok((status, _))) => {
+            return Err(AppError::Internal(format!("Docker /info returned HTTP {status}")));
+        }
+        Ok(Err(e)) => {
+            return Err(AppError::Internal(format!("Docker socket error: {e}")));
+        }
+        Err(e) => {
+            return Err(AppError::Internal(format!("spawn_blocking error: {e}")));
+        }
+    }
+
+    let mut resp = serde_json::to_value(&hw).unwrap_or(json!({}));
+    resp["gpu_rescan"] = json!("install-time only");
+    Ok(Json(resp))
+}
+
+// ── GET /api/infra/recommend ─────────────────────────────────────────────────
+
+/// `GET /api/infra/recommend` — any authenticated user.
+///
+/// Reads the hardware profile and returns a `Recommendation` with the best
+/// runtime + model for the machine. Logic is pure (`recommend` / `pick_model_for_budget`
+/// take no IO) so it can be unit-tested without any infrastructure.
+async fn get_recommend(
+    Extension(_claims): Extension<JwtClaims>,
+) -> Result<Json<Value>> {
+    let mut hw: Hardware = match hardware_json_path() {
+        Some(path) => {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        }
+        None => Hardware::default(),
+    };
+
+    // Overlay live /proc so the recommendation uses up-to-date RAM.
+    let (live_cores, live_ram) = proc_hardware();
+    if let Some(c) = live_cores { hw.cpu_cores = c; }
+    if let Some(r) = live_ram   { hw.ram_gb    = r; }
+
+    let rec = recommend(&hw);
+    Ok(Json(json!({
+        "hardware":        serde_json::to_value(&hw).unwrap_or(json!({})),
+        "recommendation":  {
+            "runtime":          rec.runtime,
+            "model":            rec.model,
+            "rationale":        rec.rationale,
+            "speedup_estimate": rec.speedup_estimate,
+        }
+    })))
+}
+
+// ── Pure recommendation logic (unit-testable, no IO) ─────────────────────────
+
+pub struct Recommendation {
+    pub runtime:          &'static str,
+    pub model:            &'static str,
+    pub rationale:        &'static str,
+    pub speedup_estimate: &'static str,
+}
+
+/// Select the model with the highest `ram_gb` that still fits within `budget_gb`.
+/// Falls back to the catalog entry with the smallest `ram_gb` when nothing fits.
+pub fn pick_model_for_budget(budget_gb: f64) -> &'static str {
+    // Find the entry with the largest ram_gb that is ≤ budget_gb.
+    let best = RUNTIME_GEN_MODELS
+        .iter()
+        .filter(|e| (e.ram_gb as f64) <= budget_gb)
+        .max_by(|a, b| a.ram_gb.partial_cmp(&b.ram_gb).unwrap_or(std::cmp::Ordering::Equal));
+    match best {
+        Some(e) => e.id,
+        None => {
+            // Nothing fits: return the first catalog entry (smallest by convention).
+            RUNTIME_GEN_MODELS
+                .first()
+                .map(|e| e.id)
+                .unwrap_or("qwen2.5-3b")
+        }
+    }
+}
+
+/// Return the best runtime + model for the given hardware. Pure — no IO.
+pub fn recommend(hw: &Hardware) -> Recommendation {
+    // Rule 1: Apple Silicon — Metal-accelerated llama.cpp
+    if hw.os == "darwin" && hw.arch == "arm64" {
+        let model = pick_model_for_budget(hw.ram_gb * 0.6);
+        return Recommendation {
+            runtime:          "llamacpp",
+            model,
+            rationale:        "Apple Silicon runs llama.cpp with Metal acceleration, delivering \
+                                significantly higher throughput than bundled Ollama on CPU.",
+            speedup_estimate: "~2–4× vs CPU Ollama (estimate)",
+        };
+    }
+
+    // Rule 2: NVIDIA with ≥16 GB VRAM — vLLM for maximum GPU throughput
+    if hw.nvidia_toolkit && hw.vram_gb >= 16.0 {
+        return Recommendation {
+            runtime:          "vllm",
+            model:            "qwen2.5-7b",
+            rationale:        "16 GB+ VRAM is sufficient for vLLM's continuous-batching engine, \
+                                which delivers the highest throughput for concurrent requests.",
+            speedup_estimate: "~5–10× (estimate)",
+        };
+    }
+
+    // Rule 3: NVIDIA with ≥6 GB VRAM — llama.cpp with CUDA offload
+    if hw.nvidia_toolkit && hw.vram_gb >= 6.0 {
+        return Recommendation {
+            runtime:          "llamacpp",
+            model:            "qwen2.5-7b",
+            rationale:        "6–16 GB VRAM is enough for llama.cpp CUDA offload, which \
+                                accelerates inference without the overhead of vLLM's batch engine.",
+            speedup_estimate: "~3–6× (estimate)",
+        };
+    }
+
+    // Rule 4: CPU-only fallback — llama.cpp is faster than bundled Ollama on CPU
+    let model = pick_model_for_budget(hw.ram_gb * 0.6);
+    Recommendation {
+        runtime:          "llamacpp",
+        model,
+        rationale:        "llama.cpp is faster than Ollama on CPU due to lower overhead and \
+                            better SIMD utilisation.",
+        speedup_estimate: "~1.3–2× (estimate)",
+    }
 }
 
 // ── GET /overrides ──────────────────────────────────────────────────────────
@@ -1289,5 +1569,115 @@ mod switch_runtime_tests {
             assert!(!matches!(*rt, "ollama" | "llamacpp" | "external"),
                 "runtime '{rt}' should be invalid");
         }
+    }
+}
+
+// ── Hardware / recommend unit tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::{pick_model_for_budget, recommend, Hardware};
+
+    fn hw(
+        os: &str, arch: &str,
+        nvidia_toolkit: bool, vram_gb: f64,
+        ram_gb: f64,
+    ) -> Hardware {
+        Hardware {
+            cpu_cores: 8,
+            ram_gb,
+            gpu_name: String::new(),
+            vram_gb,
+            nvidia_toolkit,
+            arch: arch.to_string(),
+            os: os.to_string(),
+        }
+    }
+
+    // ── recommend() — four branches ──────────────────────────────────────────
+
+    #[test]
+    fn recommend_apple_silicon() {
+        let rec = recommend(&hw("darwin", "arm64", false, 0.0, 16.0));
+        assert_eq!(rec.runtime, "llamacpp", "Apple Silicon must use llamacpp");
+        assert!(rec.rationale.contains("Metal"), "rationale must mention Metal");
+        assert!(rec.speedup_estimate.contains("estimate"), "must be labelled as estimate");
+    }
+
+    #[test]
+    fn recommend_nvidia_high_vram() {
+        // ≥16 GB VRAM → vllm
+        let rec = recommend(&hw("linux", "x86_64", true, 24.0, 32.0));
+        assert_eq!(rec.runtime, "vllm", "≥16 GB VRAM must use vllm");
+        assert_eq!(rec.model, "qwen2.5-7b");
+        assert!(rec.speedup_estimate.contains("estimate"));
+    }
+
+    #[test]
+    fn recommend_nvidia_mid_vram() {
+        // 6–16 GB VRAM → llamacpp (CUDA offload)
+        let rec = recommend(&hw("linux", "x86_64", true, 8.0, 16.0));
+        assert_eq!(rec.runtime, "llamacpp", "6–16 GB VRAM must use llamacpp");
+        assert_eq!(rec.model, "qwen2.5-7b");
+        assert!(rec.rationale.contains("CUDA") || rec.rationale.contains("offload"),
+            "rationale must mention CUDA/offload: {}", rec.rationale);
+        assert!(rec.speedup_estimate.contains("estimate"));
+    }
+
+    #[test]
+    fn recommend_cpu_only() {
+        // No GPU toolkit → llamacpp CPU
+        let rec = recommend(&hw("linux", "x86_64", false, 0.0, 16.0));
+        assert_eq!(rec.runtime, "llamacpp");
+        assert!(rec.rationale.contains("CPU") || rec.rationale.contains("Ollama"),
+            "rationale must mention CPU/Ollama: {}", rec.rationale);
+        assert!(rec.speedup_estimate.contains("estimate"));
+    }
+
+    // Edge: nvidia_toolkit=true but VRAM below 6 GB → CPU-only branch
+    #[test]
+    fn recommend_nvidia_tiny_vram_falls_to_cpu() {
+        let rec = recommend(&hw("linux", "x86_64", true, 2.0, 8.0));
+        assert_eq!(rec.runtime, "llamacpp");
+        // vllm must NOT be selected
+        assert_ne!(rec.runtime, "vllm");
+    }
+
+    // ── pick_model_for_budget() ───────────────────────────────────────────────
+
+    #[test]
+    fn budget_fits_7b() {
+        // 7 GB budget fits qwen2.5-7b (ram_gb=6.0) and not a bigger model
+        let model = pick_model_for_budget(7.0);
+        // Should pick the largest that fits — qwen2.5-7b or llama-3.2-3b
+        // (catalog has 3b@3GB and 7b@6GB; 7b is the largest that fits 7GB budget)
+        assert_eq!(model, "qwen2.5-7b", "7 GB budget must pick qwen2.5-7b");
+    }
+
+    #[test]
+    fn budget_only_fits_3b() {
+        // 4 GB budget fits 3b (ram_gb=3.0) but not 7b (ram_gb=6.0)
+        let model = pick_model_for_budget(4.0);
+        // Both qwen2.5-3b and llama-3.2-3b have ram_gb=3.0; pick_model_for_budget
+        // returns the LAST entry in reverse iteration that fits — check it's a 3b.
+        assert!(
+            model.contains("3b"),
+            "4 GB budget must pick a 3b model, got: {model}"
+        );
+    }
+
+    #[test]
+    fn tiny_budget_returns_smallest() {
+        // Budget smaller than any model → fallback to smallest catalog entry
+        let model = pick_model_for_budget(0.5);
+        // The smallest (first) entry is qwen2.5-3b
+        assert_eq!(model, "qwen2.5-3b",
+            "tiny budget must return the smallest catalog entry, got: {model}");
+    }
+
+    #[test]
+    fn zero_budget_returns_smallest() {
+        let model = pick_model_for_budget(0.0);
+        assert_eq!(model, "qwen2.5-3b");
     }
 }

@@ -458,6 +458,118 @@ finalize() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
+# ── Hardware Detection ────────────────────────────────────────────────────────
+# Detects host hardware natively and writes <INSTALL_DIR>/hardware.json.
+# Never fails the install — defaults to 0/"" on any detection error.
+# Idempotent: overwrites on re-run.
+detect_hardware() {
+  local cpu_cores=0 ram_gb=0 gpu_name="" vram_gb=0 nvidia_toolkit=false
+  local os_name="" arch_name=""
+
+  # ── OS ──────────────────────────────────────────────────────────────────────
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null || echo "")"
+  case "$uname_s" in
+    Darwin) os_name="darwin" ;;
+    *)      os_name="linux"  ;;
+  esac
+
+  # ── Arch ────────────────────────────────────────────────────────────────────
+  local uname_m
+  uname_m="$(uname -m 2>/dev/null || echo "")"
+  case "$uname_m" in
+    aarch64) arch_name="arm64"   ;;
+    arm64)   arch_name="arm64"   ;;
+    x86_64)  arch_name="x86_64"  ;;
+    *)       arch_name="$uname_m" ;;
+  esac
+
+  # ── CPU cores + RAM ──────────────────────────────────────────────────────────
+  if [ "$os_name" = "darwin" ]; then
+    cpu_cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 0)"
+    local mem_bytes
+    mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    # bytes → GB (1 decimal), guard divide-by-zero
+    if [ "$mem_bytes" -gt 0 ] 2>/dev/null; then
+      ram_gb="$(awk "BEGIN{printf \"%.1f\", $mem_bytes/1073741824}")"
+    else
+      ram_gb=0
+    fi
+  else
+    # Linux
+    cpu_cores="$(nproc 2>/dev/null || echo 0)"
+    if [ -r /proc/meminfo ]; then
+      local mem_kb
+      mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+      if [ "$mem_kb" -gt 0 ] 2>/dev/null; then
+        ram_gb="$(awk "BEGIN{printf \"%.1f\", $mem_kb/1048576}")"
+      else
+        ram_gb=0
+      fi
+    fi
+  fi
+
+  # ── GPU (NVIDIA via nvidia-smi) ──────────────────────────────────────────────
+  if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    local smi_line
+    smi_line="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "")"
+    if [ -n "$smi_line" ]; then
+      # name is everything before the last comma; memory.total is last field (MiB)
+      gpu_name="$(echo "$smi_line" | awk -F',' '{$NF=""; sub(/,[^,]*$/,"",$0); print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      local vram_mib
+      vram_mib="$(echo "$smi_line" | awk -F',' '{print $NF}' | tr -d ' \r' | tr -d '\n')"
+      if [ -n "$vram_mib" ] && [ "$vram_mib" -gt 0 ] 2>/dev/null; then
+        vram_gb="$(awk "BEGIN{printf \"%.1f\", $vram_mib/1024}")"
+      else
+        vram_gb=0
+      fi
+    fi
+  fi
+
+  # ── Apple Silicon GPU name (macOS only) ──────────────────────────────────────
+  if [ "$os_name" = "darwin" ] && [ -z "$gpu_name" ]; then
+    local apple_gpu
+    apple_gpu="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -i "Chipset Model" | head -1 | awk -F': ' '{print $2}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "")"
+    gpu_name="${apple_gpu:-}"
+    # Apple Silicon VRAM is shared; not reliably queryable — leave at 0
+    vram_gb=0
+    nvidia_toolkit=false
+  fi
+
+  # ── nvidia-container-toolkit ─────────────────────────────────────────────────
+  if [ "$os_name" != "darwin" ]; then
+    if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi "nvidia"; then
+      nvidia_toolkit=true
+    elif command -v nvidia-ctk &>/dev/null; then
+      nvidia_toolkit=true
+    fi
+  fi
+
+  # ── Write hardware.json ───────────────────────────────────────────────────────
+  # Guard: ensure numeric fields are actual numbers, not empty strings
+  [ -z "$cpu_cores" ]  && cpu_cores=0
+  [ -z "$ram_gb" ]     && ram_gb=0
+  [ -z "$vram_gb" ]    && vram_gb=0
+  [ -z "$gpu_name" ]   && gpu_name=""
+  [ -z "$arch_name" ]  && arch_name="unknown"
+  [ -z "$os_name" ]    && os_name="linux"
+
+  # Emit strict JSON — numbers unquoted, strings quoted
+  cat > "${INSTALL_DIR}/hardware.json" <<JSON
+{
+  "cpu_cores": ${cpu_cores},
+  "ram_gb": ${ram_gb},
+  "gpu_name": "${gpu_name}",
+  "vram_gb": ${vram_gb},
+  "nvidia_toolkit": ${nvidia_toolkit},
+  "arch": "${arch_name}",
+  "os": "${os_name}"
+}
+JSON
+
+  info "Hardware profile written to ${INSTALL_DIR}/hardware.json (cpu=${cpu_cores}, ram=${ram_gb}GB, gpu='${gpu_name}', vram=${vram_gb}GB, toolkit=${nvidia_toolkit}, arch=${arch_name}, os=${os_name})"
+}
+
 # Pull the local models KEX requires into the bundled Ollama container. Idempotent
 # (Ollama skips already-present models). Keeps the platform zero-cost-local.
 pull_ollama_models() {
@@ -476,7 +588,8 @@ main() {
   check_prereqs
   detect_gpu
   detect_services      # auto-decides Ollama (native if reachable, else bundled — never conflicts)
-  generate_config      # .env written with a sensible default model placeholder
+  generate_config      # .env written with a sensible default model placeholder; INSTALL_DIR created
+  detect_hardware      # writes hardware.json to INSTALL_DIR for Settings → Infrastructure
   start_stack          # bring the stack up FIRST → web UI live at :3001
   choose_model         # ask the model question only NOW, after the UI is up
   finalize             # apply the chosen model (restart kex/fuse) + pull local models
