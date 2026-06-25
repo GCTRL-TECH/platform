@@ -816,6 +816,47 @@ pub async fn chat_stream(
     }
 }
 
+/// Pure helper: given the active runtime's provider, base URL, and the configured
+/// embedding mode, decide whether to redirect embeddings to the bundled llama.cpp
+/// embed sidecar.
+///
+/// Returns `Some((provider, base_url, model))` ONLY when:
+///   - runtime is `openai_compatible`
+///   - the runtime base points at the bundled `gctrl-llamacpp` (host `gctrl-llamacpp`)
+///   - embedding_mode is `"pinned"`
+///
+/// In that case embeddings are redirected to the embed sidecar at port 8081
+/// (nomic-embed-text, dim 768 — same as the Ollama default, so existing vectors
+/// remain valid and no reindex is needed).
+///
+/// Returns `None` for all other cases:
+///   - external openai_compatible endpoints: no guarantee they serve nomic-embed-text
+///   - ollama runtime: embeddings stay on Ollama as today
+///   - advanced mode: caller handles this via the admin reindex path
+pub fn pinned_embedding_override(
+    runtime_provider: &str,
+    runtime_base: &str,
+    embedding_mode: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if embedding_mode != "pinned" {
+        return None;
+    }
+    if runtime_provider != "openai_compatible" {
+        return None;
+    }
+    // Detect the bundled llama.cpp by hostname: the base must be
+    // http://gctrl-llamacpp:8080 (exact host, any trailing slash).
+    let base = runtime_base.trim_end_matches('/');
+    let is_bundled = url::Url::parse(base)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h == "gctrl-llamacpp"))
+        .unwrap_or(false);
+    if !is_bundled {
+        return None;
+    }
+    Some(("openai", "http://gctrl-llamacpp-embed:8081", "nomic-embed-text"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,5 +1299,60 @@ mod tests {
         let mut map = serde_json::Map::new();
         apply_generation_overrides(&t, &mut map);
         assert!(!map.contains_key("generation_api_key"));
+    }
+
+    // ── pinned_embedding_override ────────────────────────────────────────────
+
+    #[test]
+    fn pinned_embed_bundled_llamacpp_returns_sidecar() {
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://gctrl-llamacpp:8080",
+            "pinned",
+        );
+        assert!(result.is_some(), "bundled llamacpp should redirect embeddings to sidecar");
+        let (prov, base, model) = result.unwrap();
+        assert_eq!(prov, "openai");
+        assert_eq!(base, "http://gctrl-llamacpp-embed:8081");
+        assert_eq!(model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn pinned_embed_external_endpoint_returns_none() {
+        // External openai_compatible endpoint: don't assume it serves nomic-embed-text
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://myserver.example.com:8080",
+            "pinned",
+        );
+        assert!(result.is_none(), "external endpoint must return None (safe fallback)");
+    }
+
+    #[test]
+    fn pinned_embed_ollama_runtime_returns_none() {
+        let result = pinned_embedding_override("ollama", "http://ollama:11434", "pinned");
+        assert!(result.is_none(), "ollama runtime never redirects embeddings");
+    }
+
+    #[test]
+    fn pinned_embed_advanced_mode_returns_none() {
+        // advanced mode is handled by the admin re-index path, not this helper
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://gctrl-llamacpp:8080",
+            "advanced",
+        );
+        assert!(result.is_none(), "advanced mode must return None from this helper");
+    }
+
+    #[test]
+    fn pinned_embed_llamacpp_trailing_slash_also_matches() {
+        // base may arrive with trailing slash from DB
+        let result = pinned_embedding_override(
+            "openai_compatible",
+            "http://gctrl-llamacpp:8080/",
+            "pinned",
+        );
+        assert!(result.is_some(), "trailing slash should still match bundled llamacpp");
     }
 }
