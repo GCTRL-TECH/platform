@@ -55,6 +55,9 @@ import ObsidianVaultManager from '@/components/connectors/ObsidianVaultManager'
 import SSOPage from './SSOPage'
 import WebhooksPage from './WebhooksPage'
 import { NativeOllamaGuide } from './NativeOllamaGuide'
+import { HardwareCard, type HardwareInfo, type Recommendation } from './HardwareCard'
+import { RuntimeSwitcher, type ActiveRuntime } from './RuntimeSwitcher'
+import { AdvancedEmbeddingModal } from './AdvancedEmbeddingModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -3215,7 +3218,112 @@ function InfrastructureTab() {
       </section>
 
       {showUpdateModal && <UpdateModal onClose={() => setShowUpdateModal(false)} />}
+
+      {/* AI Runtime section — inline, below infra/update */}
+      <AiRuntimeSection />
     </div>
+  )
+}
+
+// ─── AI Runtime section (sub-component of InfrastructureTab) ─────────────────
+
+function AiRuntimeSection() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
+
+  const [hardware, setHardware] = useState<HardwareInfo | null>(null)
+  const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
+  const [activeRuntime, setActiveRuntime] = useState<ActiveRuntime | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [showEmbeddingModal, setShowEmbeddingModal] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const [hwRes, recRes, rtRes] = await Promise.allSettled([
+        api.get<HardwareInfo>('/infra/hardware'),
+        api.get<Recommendation>('/infra/recommend'),
+        api.get<ActiveRuntime>('/infra/active-runtime'),
+      ])
+      if (hwRes.status === 'fulfilled') setHardware(hwRes.value.data)
+      if (recRes.status === 'fulfilled') setRecommendation(recRes.value.data)
+      if (rtRes.status === 'fulfilled') setActiveRuntime(rtRes.value.data)
+    } catch { /* non-fatal */ } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  return (
+    <section className="space-y-6">
+      <div className="flex items-center justify-between">
+        <SectionHeader>AI Runtime</SectionHeader>
+        {loading && <Loader2 size={13} className="animate-spin text-slate-500" />}
+      </div>
+      <p className="mb-4 text-xs text-slate-500">
+        Choose which local or remote LLM runtime GCTRL uses for knowledge extraction and inference.
+        Switching takes effect immediately for new jobs. Re-embedding is needed only when you change the embedding model.
+      </p>
+
+      {/* Hardware card + recommendation */}
+      <div>
+        <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Hardware</p>
+        <HardwareCard
+          hardware={hardware}
+          recommendation={recommendation}
+          isAdmin={isAdmin}
+          onHardwareRescan={(updated) => setHardware(updated)}
+          onSwitchToRecommended={(runtime, model) => {
+            setActiveRuntime((prev) => prev ? { ...prev, provider: runtime, model } : prev)
+          }}
+        />
+      </div>
+
+      {/* Runtime switcher */}
+      <div>
+        <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Runtime</p>
+        <RuntimeSwitcher
+          hardware={hardware}
+          isAdmin={isAdmin}
+          activeRuntime={activeRuntime}
+          onSwitched={() => void load()}
+        />
+      </div>
+
+      {/* Advanced: re-embed */}
+      {isAdmin && (
+        <div>
+          <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Advanced</p>
+          <div className="rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3 flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-200">Re-embed all knowledge bases</p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Re-runs the embedding pipeline over every document with the current embedding model.
+                Use after switching to a new embedding model, or to recover from index corruption.
+                Search is degraded while this runs.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowEmbeddingModal(true)}
+              className="shrink-0 flex items-center gap-1.5 rounded-md border border-amber-700/50 bg-amber-950/20 px-3 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-950/40 transition-colors"
+            >
+              <Gauge size={12} />
+              Re-embed…
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showEmbeddingModal && (
+        <AdvancedEmbeddingModal
+          embeddingModel={activeRuntime?.model ?? ''}
+          embeddingProvider={activeRuntime?.provider ?? ''}
+          embeddingBase={activeRuntime?.base_url ?? ''}
+          onClose={() => setShowEmbeddingModal(false)}
+        />
+      )}
+    </section>
   )
 }
 
