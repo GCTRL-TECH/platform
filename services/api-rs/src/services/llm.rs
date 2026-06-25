@@ -152,6 +152,48 @@ fn official_cloud_host(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// Check whether a host string refers to a cloud-metadata endpoint that must
+/// never be reached server-side (SSRF denylist).
+///
+/// Blocked:
+///   - `169.254.169.254` and the whole `169.254.0.0/16` link-local range
+///     (AWS, GCP, Azure, DigitalOcean metadata)
+///   - `100.100.100.200` (Alibaba Cloud ECS metadata)
+///   - `fd00:ec2::254` (AWS EC2 IPv6 metadata)
+///
+/// Intentionally NOT blocked (these are normal local/LAN use-cases):
+///   - `127.x.x.x` loopback, `localhost`
+///   - `192.168.x.x`, `10.x.x.x`, `172.16-31.x.x` RFC1918
+///   - Docker service names (`gctrl-*`, `host.docker.internal`, etc.)
+fn is_metadata_host(host: &str) -> bool {
+    // Exact well-known metadata IPs.
+    if host == "169.254.169.254" || host == "100.100.100.200" {
+        return true;
+    }
+    // Whole 169.254.0.0/16 link-local range (covers all cloud IMDSv1/v2 variants:
+    // AWS/GCP/Azure/DigitalOcean). Parse as IPv4 and check the first two octets.
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        let octets = addr.octets();
+        if octets[0] == 169 && octets[1] == 254 {
+            return true;
+        }
+    }
+    // AWS EC2 IPv6 metadata address fd00:ec2::254.
+    // url::Url::host_str() returns IPv6 addresses WITH brackets (e.g. "[fd00:ec2::254]"),
+    // so strip the brackets before parsing. We match on the parsed Ipv6Addr so we're
+    // robust to abbreviation differences (fd00:ec2::254 vs fd00:0ec2:0:0:0:0:0:254).
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(addr) = bare.parse::<std::net::Ipv6Addr>() {
+        // fd00:ec2::254 = fd00:0ec2:0000:0000:0000:0000:0000:0254
+        let target: std::net::Ipv6Addr =
+            "fd00:ec2::254".parse().expect("fd00:ec2::254 is a valid IPv6 address");
+        if addr == target {
+            return true;
+        }
+    }
+    false
+}
+
 /// SSRF guard for user-supplied LLM `base_url`s. Centralized so the PUT upsert
 /// (write time) and every server-side fetch (request time) enforce identical
 /// rules — a row that somehow bypassed write validation still can't be used.
@@ -213,6 +255,15 @@ pub fn validate_llm_base(provider: &str, base: Option<&str>) -> Result<url::Url,
         }
         if !u.username().is_empty() || u.password().is_some() {
             return Err("base_url must not contain embedded credentials".to_string());
+        }
+        // SSRF denylist: block cloud-metadata endpoints.
+        // 169.254.0.0/16 (link-local, covers AWS/GCP/Azure 169.254.169.254),
+        // 100.100.100.200 (Alibaba Cloud metadata), fd00:ec2::254 (AWS IPv6 metadata).
+        // Normal localhost/LAN (127.x, 192.168.x, 10.x, service names) are ALLOWED.
+        if let Some(host) = u.host_str() {
+            if is_metadata_host(host) {
+                return Err("metadata endpoint not allowed".to_string());
+            }
         }
         Ok(u)
     }
@@ -429,7 +480,12 @@ pub async fn resolve_ollama_base_for_user(
 ///   - generation_kind = "openai_compatible"
 ///   - generation_base = target.base() (canonical, no /v1)
 ///   - generation_model = target.model
-///   - generation_api_key = target.api_key (only when Some+non-empty)
+///
+/// `generation_api_key` is intentionally NOT injected. Worker-side generation
+/// against an external authenticated endpoint is intentionally not supported
+/// (no plaintext secret in Redis). Local/bundled runtimes are keyless; the
+/// interactive chat/agent/RAG path runs in-process and still supports authed
+/// external endpoints.
 ///
 /// For all other providers (ollama, cloud, anthropic) — does nothing, so
 /// generation stays on Ollama as today (backward compatible).
@@ -440,12 +496,7 @@ pub fn apply_generation_overrides(target: &LlmTarget, map: &mut serde_json::Map<
     map.insert("generation_kind".into(), json!("openai_compatible"));
     map.insert("generation_base".into(), json!(target.base()));
     map.insert("generation_model".into(), json!(target.model));
-    if let Some(ref k) = target.api_key {
-        let k = k.trim();
-        if !k.is_empty() {
-            map.insert("generation_api_key".into(), json!(k));
-        }
-    }
+    // generation_api_key is NOT inserted — no plaintext secret in Redis.
 }
 
 /// Inject the owner's runtime Ollama endpoint into a KEX `kex:jobs` payload so the
@@ -894,7 +945,7 @@ pub fn pinned_embedding_override(
     if !is_bundled {
         return None;
     }
-    Some(("openai", "http://gctrl-llamacpp-embed:8081", "nomic-embed-text"))
+    Some(("openai_compatible", "http://gctrl-llamacpp-embed:8081", "nomic-embed-text"))
 }
 
 #[cfg(test)]
@@ -1025,6 +1076,73 @@ mod tests {
     fn validate_openai_compatible_rejects_bad_scheme() {
         assert!(validate_llm_base("openai_compatible", Some("file:///etc/passwd")).is_err());
         assert!(validate_llm_base("openai_compatible", Some("gopher://localhost")).is_err());
+    }
+
+    // ── SSRF metadata denylist tests ─────────────────────────────────────────
+
+    /// 169.254.169.254 (AWS/GCP/Azure metadata) must be blocked for openai_compatible.
+    #[test]
+    fn validate_metadata_ip_blocked_openai_compatible() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://169.254.169.254")).is_err(),
+            "169.254.169.254 must be blocked"
+        );
+    }
+
+    /// Any address in 169.254.0.0/16 link-local range must be blocked.
+    #[test]
+    fn validate_metadata_link_local_range_blocked() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://169.254.10.5")).is_err(),
+            "169.254.10.5 (link-local range) must be blocked"
+        );
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://169.254.0.1")).is_err(),
+            "169.254.0.1 (link-local range) must be blocked"
+        );
+    }
+
+    /// 100.100.100.200 (Alibaba Cloud metadata) must be blocked.
+    #[test]
+    fn validate_metadata_alibaba_blocked() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://100.100.100.200")).is_err(),
+            "100.100.100.200 (Alibaba metadata) must be blocked"
+        );
+    }
+
+    /// IPv6 AWS metadata endpoint must be blocked.
+    #[test]
+    fn validate_metadata_ipv6_aws_blocked() {
+        // URL parsing of bare IPv6 requires brackets per RFC 2732.
+        // Note: url::Url::host_str() returns IPv6 with brackets ("[fd00:ec2::254]")
+        // which is handled by is_metadata_host stripping them before Ipv6Addr parsing.
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://[fd00:ec2::254]")).is_err(),
+            "fd00:ec2::254 (AWS IPv6 metadata) must be blocked"
+        );
+    }
+
+    /// Normal localhost and LAN addresses must continue to work (not blocked by denylist).
+    #[test]
+    fn validate_metadata_allows_normal_local_lan() {
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://localhost:8080/v1")).is_ok(),
+            "localhost must be allowed"
+        );
+        assert!(
+            validate_llm_base("openai_compatible", Some("http://192.168.1.50:11434")).is_ok(),
+            "192.168.x (LAN) must be allowed"
+        );
+        assert!(
+            validate_llm_base("ollama", Some("http://192.168.1.50:11434")).is_ok(),
+            "ollama on LAN must be allowed"
+        );
+        // Also test same for ollama provider
+        assert!(
+            validate_llm_base("ollama", Some("http://169.254.169.254")).is_err(),
+            "ollama provider must also block 169.254.169.254"
+        );
     }
 
     /// build() for openai_compatible must POST to {base}/v1/chat/completions.
@@ -1244,7 +1362,8 @@ mod tests {
 
     // ── apply_generation_overrides (pure, no DB) ─────────────────────────────
 
-    /// openai_compatible → all four generation_* fields injected.
+    /// openai_compatible → generation_kind, generation_base, generation_model injected;
+    /// generation_api_key must NOT be present (no plaintext secrets in Redis).
     #[test]
     fn apply_gen_overrides_injects_for_openai_compatible() {
         let t = LlmTarget {
@@ -1258,7 +1377,11 @@ mod tests {
         assert_eq!(map["generation_kind"], json!("openai_compatible"));
         assert_eq!(map["generation_model"], json!("qwen2.5:7b"));
         assert!(map.contains_key("generation_base"), "generation_base must be set");
-        assert_eq!(map["generation_api_key"], json!("mykey"));
+        // Security: decrypted API key must never enter the Redis worker payload.
+        assert!(
+            !map.contains_key("generation_api_key"),
+            "generation_api_key must NOT be in worker payload; got: {:?}", map.get("generation_api_key")
+        );
     }
 
     /// ollama → no generation_* fields injected (backward compatible).
@@ -1309,25 +1432,29 @@ mod tests {
         assert!(!map.contains_key("generation_kind"));
     }
 
-    /// Empty api_key → generation_api_key NOT injected.
+    /// generation_api_key is never injected regardless of the key value —
+    /// security policy: no plaintext secret in Redis worker payload.
     #[test]
-    fn apply_gen_overrides_omits_empty_api_key() {
+    fn apply_gen_overrides_never_injects_api_key_even_when_set() {
         let t = LlmTarget {
             provider: "openai_compatible".into(),
             model: "m".into(),
             base_url: Some("http://x:9".into()),
-            api_key: Some("  ".into()), // whitespace-only
+            api_key: Some("real-key".into()),
         };
         let mut map = serde_json::Map::new();
         apply_generation_overrides(&t, &mut map);
-        assert!(!map.contains_key("generation_api_key"), "empty/whitespace api_key must not be injected");
-        // But the other three fields ARE there.
+        assert!(
+            !map.contains_key("generation_api_key"),
+            "generation_api_key must NEVER enter the Redis payload; got: {:?}", map.get("generation_api_key")
+        );
+        // The non-secret fields ARE there.
         assert!(map.contains_key("generation_kind"));
         assert!(map.contains_key("generation_base"));
         assert!(map.contains_key("generation_model"));
     }
 
-    /// None api_key → generation_api_key NOT injected.
+    /// generation_api_key is never injected when api_key is None.
     #[test]
     fn apply_gen_overrides_omits_none_api_key() {
         let t = LlmTarget {
@@ -1352,7 +1479,8 @@ mod tests {
         );
         assert!(result.is_some(), "bundled llamacpp should redirect embeddings to sidecar");
         let (prov, base, model) = result.unwrap();
-        assert_eq!(prov, "openai");
+        // Provider string is "openai_compatible" for consistency with the LLM runtime.
+        assert_eq!(prov, "openai_compatible");
         assert_eq!(base, "http://gctrl-llamacpp-embed:8081");
         assert_eq!(model, "nomic-embed-text");
     }

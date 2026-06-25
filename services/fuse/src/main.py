@@ -470,6 +470,7 @@ class DistillRequest(BaseModel):
     ollama_base: Optional[str] = None
     # LLM runtime selection. Default "ollama" → zero behaviour change.
     generation_kind: str = "ollama"
+    generation_base: Optional[str] = None
     generation_api_key: Optional[str] = None
 
 
@@ -516,9 +517,12 @@ async def merge_endpoint(req: MergeRequest):
 async def distill_endpoint(req: DistillRequest):
     """Distil a WIKI compilation into wiki pages synchronously (M1 sync path)."""
     try:
+        # Mirror the worker path: prefer generation_base for the distiller's
+        # LLM step; fall back to ollama_base so the default install is unchanged.
+        distill_base = req.generation_base if req.generation_base else req.ollama_base
         return distiller.distill(
             req.compilation_id, req.user_id, limit=req.limit,
-            model=req.distill_model, ollama_base=req.ollama_base,
+            model=req.distill_model, ollama_base=distill_base,
             kind=req.generation_kind, api_key=req.generation_api_key,
         )
     except ValueError as exc:
