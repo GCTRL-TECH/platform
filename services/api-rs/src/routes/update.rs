@@ -445,8 +445,11 @@ pub(crate) fn pull_image(image: &str) -> Result<(), String> {
         Some(p) => (&image[..p], &image[p + 1..]),
         None => (image, "latest"),
     };
-    let encoded = name.replace('/', "%2F");
-    let path = format!("/images/create?fromImage={encoded}&tag={tag}");
+    // The Docker Engine API `fromImage` takes the registry path with RAW slashes
+    // (e.g. `ghcr.io/ggml-org/llama.cpp`). Percent-encoding the slashes makes the
+    // daemon reject it (HTTP 500) — it was the cause of the bundled-llamacpp /
+    // updater pull failing on a registry-qualified image.
+    let path = format!("/images/create?fromImage={name}&tag={tag}");
     let (status, _) = docker_http("POST", &path, None, 300)?;
     if status == 200 {
         Ok(())
