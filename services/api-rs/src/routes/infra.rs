@@ -197,6 +197,8 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/hardware", get(get_hardware))
         .route("/rescan-hardware", post(rescan_hardware))
         .route("/recommend", get(get_recommend))
+        // ── Embedding reindex (SSE, admin-only, double-opt-in) ───────────────
+        .route("/reindex", post(reindex))
 }
 
 // ── Hardware struct ───────────────────────────────────────────────────────────
@@ -1022,6 +1024,36 @@ struct SwitchRuntimeReq {
     api_key:  Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct ReindexReq {
+    confirm:            bool,
+    confirm_text:       String,
+    embedding_model:    String,
+    embedding_base:     Option<String>,
+    embedding_provider: Option<String>,
+}
+
+/// Pure validation for the double-opt-in reindex gate.
+/// Returns Ok(()) when both fields are correctly set, Err(message) otherwise.
+pub fn validate_reindex_request(
+    confirm: bool,
+    confirm_text: &str,
+    embedding_model: &str,
+    _embedding_base: Option<&str>,
+    _embedding_provider: Option<&str>,
+) -> std::result::Result<(), String> {
+    if !confirm || confirm_text != "REINDEX" {
+        return Err(
+            "double-opt-in required: set confirm=true and confirm_text=\"REINDEX\"".into()
+        );
+    }
+    let model = embedding_model.trim();
+    if model.is_empty() {
+        return Err("embedding_model must not be empty".into());
+    }
+    Ok(())
+}
+
 /// `POST /api/infra/switch-runtime` — SSE stream, admin-only.
 /// Body: `{ runtime, model?, base_url?, api_key? }`
 /// runtime ∈ "ollama" | "llamacpp" | "external"
@@ -1486,6 +1518,168 @@ pub fn validate_embedding_mode(mode: &str) -> std::result::Result<(), String> {
             "Unknown embedding mode '{other}'. Valid values: pinned, advanced"
         )),
     }
+}
+
+// ── POST /api/infra/reindex ───────────────────────────────────────────────────
+
+/// `POST /api/infra/reindex` — SSE stream, admin-only, double-opt-in.
+///
+/// Switches embedding_mode to 'advanced', persists the new embedding config, then
+/// enqueues one reindex job per knowledge base (compilation) onto Redis `kex:reindex`.
+///
+/// Body: { confirm: bool, confirm_text: "REINDEX", embedding_model: str,
+///          embedding_base?: str, embedding_provider?: str }
+///
+/// HONEST: search quality will degrade until the reindex worker completes all KBs.
+async fn reindex(
+    Extension(claims): Extension<crate::middleware::auth::JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<ReindexReq>,
+) -> axum::response::Response {
+    if let Err(e) = crate::middleware::auth::require_role(&claims, "admin") {
+        return axum::response::IntoResponse::into_response(e);
+    }
+
+    // Double-opt-in gate — reject immediately (non-SSE) before doing anything.
+    let model = req.embedding_model.trim().to_string();
+    let base_opt = req.embedding_base.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let provider_opt = req.embedding_provider.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+
+    if let Err(e) = validate_reindex_request(
+        req.confirm,
+        req.confirm_text.as_str(),
+        &model,
+        base_opt.as_deref(),
+        provider_opt.as_deref(),
+    ) {
+        return axum::response::IntoResponse::into_response(
+            (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "error": e })))
+        );
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<std::result::Result<Event, Infallible>>();
+
+    let db = state.db.clone();
+    let redis_url = state.cfg.redis_url.clone();
+    tokio::spawn(async move {
+        run_reindex(tx, db, redis_url, model, base_opt, provider_opt).await;
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(item) = rx.recv().await {
+            yield item;
+        }
+    };
+
+    let sse = Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    );
+    axum::response::IntoResponse::into_response(sse)
+}
+
+async fn run_reindex(
+    tx: mpsc::UnboundedSender<std::result::Result<Event, Infallible>>,
+    db: sqlx::PgPool,
+    redis_url: String,
+    embedding_model: String,
+    embedding_base: Option<String>,
+    embedding_provider: Option<String>,
+) {
+    let send = |event: &str, data: serde_json::Value| {
+        let _ = tx.send(Ok(Event::default().event(event).data(data.to_string())));
+    };
+
+    // 1. Persist advanced embedding config into runtime_config.
+    send("progress", serde_json::json!({ "step": "persist", "message": "Persisting advanced embedding config…" }));
+
+    let upsert_result = sqlx::query(
+        "INSERT INTO runtime_config (id, embedding_mode, embedding_model, embedding_base, embedding_provider, updated_at)
+         VALUES (1, 'advanced', $1, $2, $3, now())
+         ON CONFLICT (id) DO UPDATE SET
+             embedding_mode     = 'advanced',
+             embedding_model    = $1,
+             embedding_base     = $2,
+             embedding_provider = $3,
+             updated_at         = now()",
+    )
+    .bind(&embedding_model)
+    .bind(&embedding_base)
+    .bind(&embedding_provider)
+    .execute(&db)
+    .await;
+
+    if let Err(e) = upsert_result {
+        send("error", serde_json::json!({ "message": format!("DB upsert failed: {e}") }));
+        return;
+    }
+
+    // 2. Query all compilation IDs.
+    send("progress", serde_json::json!({ "step": "query", "message": "Querying knowledge bases…" }));
+
+    let compilation_ids: Vec<uuid::Uuid> = match sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM compilations ORDER BY created_at",
+    )
+    .fetch_all(&db)
+    .await {
+        Ok(ids) => ids,
+        Err(e) => {
+            send("error", serde_json::json!({ "message": format!("Failed to query compilations: {e}") }));
+            return;
+        }
+    };
+
+    let count = compilation_ids.len();
+    send("progress", serde_json::json!({
+        "step": "enqueue",
+        "message": format!("Scheduling reindex for {} knowledge base(s)…", count)
+    }));
+
+    // 3. Push one job per compilation onto Redis kex:reindex.
+    let redis_client = match redis::Client::open(redis_url.as_str()) {
+        Ok(c) => c,
+        Err(e) => {
+            send("error", serde_json::json!({ "message": format!("Redis connect failed: {e}") }));
+            return;
+        }
+    };
+    let mut con = match redis_client.get_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            send("error", serde_json::json!({ "message": format!("Redis connection failed: {e}") }));
+            return;
+        }
+    };
+
+    let mut enqueued = 0usize;
+    for cid in &compilation_ids {
+        let job = serde_json::json!({
+            "compilationId": cid.to_string(),
+            "embedding_model": &embedding_model,
+            "embedding_base":  &embedding_base,
+            "embedding_provider": &embedding_provider,
+        });
+        let payload = job.to_string();
+        use redis::Commands;
+        match con.rpush::<_, _, i64>("kex:reindex", &payload) {
+            Ok(_) => enqueued += 1,
+            Err(e) => {
+                send("progress", serde_json::json!({
+                    "step": "enqueue",
+                    "message": format!("Warning: failed to enqueue KB {cid}: {e}")
+                }));
+            }
+        }
+    }
+
+    send("done", serde_json::json!({
+        "scheduled": enqueued,
+        "total": count,
+        "embedding_model": &embedding_model,
+        "warning": "Search quality will degrade until the reindex worker completes all knowledge bases. \
+                    Existing embeddings remain active until each KB is fully re-indexed.",
+    }));
 }
 
 /// Kick off the llamacpp bring-up in a spawned task and return immediately.
@@ -2015,5 +2209,50 @@ mod hardware_tests {
     fn zero_budget_returns_smallest() {
         let model = pick_model_for_budget(0.0);
         assert_eq!(model, "qwen2.5-3b");
+    }
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::validate_reindex_request;
+
+    #[test]
+    fn reindex_gate_rejects_confirm_false() {
+        let err = validate_reindex_request(false, "REINDEX", "nomic-embed-text", None, None);
+        assert!(err.is_err(), "confirm=false must be rejected");
+        assert!(err.unwrap_err().contains("double-opt-in"), "error must mention double-opt-in");
+    }
+
+    #[test]
+    fn reindex_gate_rejects_wrong_confirm_text() {
+        let err = validate_reindex_request(true, "reindex", "nomic-embed-text", None, None);
+        assert!(err.is_err(), "wrong confirm_text must be rejected");
+        assert!(err.unwrap_err().contains("double-opt-in"), "error must mention double-opt-in");
+    }
+
+    #[test]
+    fn reindex_gate_rejects_empty_confirm_text() {
+        let err = validate_reindex_request(true, "", "nomic-embed-text", None, None);
+        assert!(err.is_err(), "empty confirm_text must be rejected");
+    }
+
+    #[test]
+    fn reindex_gate_rejects_confirm_true_with_lowercase_reindex() {
+        // Must be EXACT uppercase "REINDEX"
+        let err = validate_reindex_request(true, "Reindex", "nomic-embed-text", None, None);
+        assert!(err.is_err(), "mixed-case confirm_text must be rejected");
+    }
+
+    #[test]
+    fn reindex_gate_accepts_valid_double_opt_in() {
+        let ok = validate_reindex_request(true, "REINDEX", "nomic-embed-text", None, None);
+        assert!(ok.is_ok(), "valid double opt-in must be accepted; got: {:?}", ok);
+    }
+
+    #[test]
+    fn reindex_gate_rejects_empty_embedding_model() {
+        let err = validate_reindex_request(true, "REINDEX", "", None, None);
+        assert!(err.is_err(), "empty embedding_model must be rejected");
+        assert!(err.unwrap_err().contains("embedding_model"), "error must mention embedding_model");
     }
 }
