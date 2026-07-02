@@ -69,9 +69,9 @@ export GCTRL_GATEWAY_URL="https://your-gctrl-host/api/agent/mcp"
 {
   "mcpServers": {
     "gctrl": {
-      "transport": "http",
+      "type": "http",
       "url": "https://your-gctrl-host/api/agent/mcp",
-      "headers": { "Authorization": "Bearer ${GCTRL_API_TOKEN}" }
+      "headers": { "Authorization": "ApiKey ${GCTRL_API_TOKEN}" }
     }
   }
 }
@@ -83,6 +83,41 @@ export GCTRL_GATEWAY_URL="https://your-gctrl-host/api/agent/mcp"
 | Location | `services/mcp` (local) | `POST /api/agent/mcp` |
 | Default | On | **Off** (enable per deployment) |
 | Auth | `GCTRL_API_TOKEN` | `GCTRL_API_TOKEN` + `GCTRL_GATEWAY_URL` |
+
+## Install the skill
+
+The skill teaches the agent _when_ to retrieve, how to descend the tool ladder without flooding context, and how to write conclusions back so memory compounds. Without it the tools are available but the agent has no discipline about using them.
+
+### Create a scoped access token
+
+In the GCTRL portal: **Settings → Access Control → New Token**. Pick a clearance ceiling, grant the knowledge bases the agent may use, and toggle **KB-scoped** mode. The token is sent as:
+
+```
+Authorization: ApiKey gctrl_your_scoped_token
+```
+
+### Claude Code
+
+```bash
+mkdir -p .claude/skills/gctrl
+cp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md
+# user-level alternative (all projects): ~/.claude/skills/gctrl/SKILL.md
+```
+
+Claude Code loads the skill's trigger description automatically; the body is pulled in when it fires.
+
+### Cursor
+
+```bash
+mkdir -p .cursor/rules
+cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc
+```
+
+### Codex / other CLIs
+
+Append `sdk/claude-skill/codex/AGENTS-snippet.md` to the project's `AGENTS.md`. See `sdk/claude-skill/README.md` for the full setup guide and a 5-question smoke-test protocol.
+
+> **Settings shortcut** — the [Connect an Agent](settings?tab=connect-agent) tab in Settings generates ready-to-copy config snippets for all transports with your instance URL pre-filled.
 
 ## GCTRL as a memory node
 
