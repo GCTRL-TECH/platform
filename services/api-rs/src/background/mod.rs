@@ -93,11 +93,11 @@ pub fn spawn_all(state: Arc<AppState>) {
 // Returns the number of triggers that were executed (success or handled error).
 
 pub async fn run_cron_tick(state: &AppState) -> usize {
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, Value)>(
-        "SELECT id, user_id, type::text, cron_schedule, config
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>, Value)>(
+        "SELECT id, user_id, module::text, type::text, cron_schedule, config
          FROM triggers
          WHERE status = 'active'
-           AND module = 'obsidian'
+           AND module::text IN ('obsidian', 'google_drive', 'microsoft')
            AND (next_run_at IS NULL OR next_run_at <= NOW())",
     )
     .fetch_all(&state.db)
@@ -105,9 +105,16 @@ pub async fn run_cron_tick(state: &AppState) -> usize {
     .unwrap_or_default();
 
     let mut executed = 0usize;
-    for (trigger_id, user_id, kind, cron_schedule, config) in rows {
-        // Wrap each run so a single failure never aborts the whole tick.
-        let res = run_one_obsidian_trigger(state, trigger_id, user_id, &config).await;
+    for (trigger_id, user_id, module, kind, cron_schedule, config) in rows {
+        // Wrap each run so a single failure never aborts the whole tick. Each
+        // module dispatches to its own executor; all share the same success/
+        // error bookkeeping on the trigger row below.
+        let res = match module.as_str() {
+            "obsidian"     => run_one_obsidian_trigger(state, trigger_id, user_id, &config).await,
+            "google_drive" => run_one_drive_trigger(state, user_id, &config).await,
+            "microsoft"    => run_one_sharepoint_trigger(state, user_id, &config).await,
+            other          => Err(format!("unsupported trigger module '{other}'")),
+        };
         match res {
             Ok(synced) => {
                 let next = compute_next_run(&kind, cron_schedule.as_deref());
@@ -474,6 +481,103 @@ async fn run_one_obsidian_trigger(
     .await?;
 
     Ok(res.synced)
+}
+
+/// Scheduled Google Drive re-sync: config carries `connectorId` + optional
+/// `folderId` (default "root"), `maxDepth`, and the same extraction options the
+/// manual sync accepts (ontologyId / discoveryMode / compilationId /
+/// classificationLevelId — parsed straight into DriveExtractReqOpts). Runs the
+/// SAME core the POST /google/drive/sync/folder handler uses, so scheduled and
+/// manual syncs behave identically (incl. opt-in file-asset capture).
+async fn run_one_drive_trigger(
+    state: &AppState,
+    user_id: Uuid,
+    config: &Value,
+) -> std::result::Result<u32, String> {
+    let connector_id = config
+        .get("connectorId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .ok_or_else(|| "trigger config missing/invalid connectorId".to_string())?;
+
+    let folder_id = config
+        .get("folderId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("root")
+        .to_string();
+    let max_depth = config
+        .get("maxDepth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .min(10) as u32;
+
+    // Extraction options use the same camelCase keys as the HTTP sync request.
+    let opts: crate::routes::connectors::DriveExtractReqOpts =
+        serde_json::from_value(config.clone()).unwrap_or_default();
+
+    // Ownership is enforced inside the core (fetch_connector is user-scoped).
+    let outcome = crate::routes::connectors::run_drive_folder_sync(
+        state, user_id, connector_id, &folder_id, max_depth, &opts,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if outcome.failed > 0 {
+        tracing::warn!(
+            "drive trigger: {} of {} file(s) failed to enqueue for connector {connector_id}",
+            outcome.failed, outcome.total
+        );
+    }
+    Ok(outcome.synced)
+}
+
+/// Scheduled SharePoint re-sync: config carries `tenantConfigId` + `siteId` +
+/// `driveId`, optional `folderId` (default: drive root), `maxDepth` and
+/// `classificationLevelId`. Walks the drive tree and enqueues every extractable
+/// file via the same enqueue path as the manual sync handler.
+async fn run_one_sharepoint_trigger(
+    state: &AppState,
+    user_id: Uuid,
+    config: &Value,
+) -> std::result::Result<u32, String> {
+    let get_uuid = |key: &str| {
+        config.get(key).and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok())
+    };
+    let tenant_config_id =
+        get_uuid("tenantConfigId").ok_or_else(|| "trigger config missing/invalid tenantConfigId".to_string())?;
+    let site_id = config
+        .get("siteId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "trigger config missing siteId".to_string())?;
+    let drive_id = config
+        .get("driveId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "trigger config missing driveId".to_string())?;
+    let folder_id = config.get("folderId").and_then(|v| v.as_str());
+    let max_depth = config
+        .get("maxDepth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .min(10) as u32;
+    let classification_level_id = get_uuid("classificationLevelId");
+
+    let (synced, failed) = crate::routes::connectors::run_sharepoint_folder_sync(
+        state,
+        user_id,
+        tenant_config_id,
+        site_id,
+        drive_id,
+        folder_id,
+        max_depth,
+        classification_level_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if failed > 0 {
+        tracing::warn!("sharepoint trigger: {failed} file(s) failed to enqueue for tenant {tenant_config_id}");
+    }
+    Ok(synced)
 }
 
 async fn subscribe_results(state: Arc<AppState>) {

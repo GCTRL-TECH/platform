@@ -41,6 +41,53 @@ interface SyncResult {
   results: Array<{ fileId?: string; name?: string; jobId?: string; error?: string }>
 }
 
+interface ConnectorSyncStatus {
+  connectorId: string
+  provider: string
+  label: string
+  lastSyncAt?: string | null
+  jobCounts?: Record<string, number>
+}
+
+/** Compact sync-health badge fed by GET /connectors/sync-status. */
+function SyncStatusBadge({ connectorId }: { connectorId: string | null }) {
+  const [status, setStatus] = useState<ConnectorSyncStatus | null>(null)
+
+  useEffect(() => {
+    if (!connectorId) return
+    void (async () => {
+      try {
+        const { data } = await api.get('/connectors/sync-status')
+        const mine = (data.connectors || []).find(
+          (c: ConnectorSyncStatus) => c.connectorId === connectorId,
+        )
+        setStatus(mine ?? null)
+      } catch { /* non-fatal */ }
+    })()
+  }, [connectorId])
+
+  if (!status) return null
+  const counts = status.jobCounts ?? {}
+  const failedCount = counts['failed'] ?? 0
+  const completedCount = counts['completed'] ?? 0
+  const lastSync = status.lastSyncAt ? new Date(status.lastSyncAt).toLocaleString() : 'never'
+  return (
+    <span className="flex items-center gap-2 text-[10px] text-slate-500">
+      <span>Last sync: {lastSync}</span>
+      {completedCount > 0 && (
+        <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-400">
+          {completedCount} extracted
+        </span>
+      )}
+      {failedCount > 0 && (
+        <span className="rounded-full bg-red-500/10 px-2 py-0.5 font-medium text-red-400">
+          {failedCount} failed
+        </span>
+      )}
+    </span>
+  )
+}
+
 function getFileIcon(mimeType: string, isFolder: boolean) {
   if (isFolder) return FolderOpen
   if (mimeType.includes('pdf') || mimeType.includes('document') || mimeType.includes('word')) return FileText
@@ -190,6 +237,9 @@ export default function GoogleDrivePage() {
           <p className="text-xs text-slate-500">
             Browse files and folders. Select files or entire folders to extract knowledge.
           </p>
+          <div className="mt-1">
+            <SyncStatusBadge connectorId={connectorId} />
+          </div>
         </div>
         {connectors.length > 1 && (
           <select
