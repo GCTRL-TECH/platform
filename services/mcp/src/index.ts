@@ -543,6 +543,88 @@ registerToolWithAlias<{ compilationId: string; slug?: string; query?: string }>(
   },
 );
 
+// ── Tool: Search Chunks (RAG retrieval — mirrors HTTP gateway search_chunks) ──
+
+const searchChunksSchema = {
+  query: z.string().describe('The question or topic to retrieve source text passages for'),
+  compilationId: z.string().optional().describe('Optional: scope to a specific knowledge graph compilation'),
+};
+
+registerToolWithAlias<{ query: string; compilationId?: string }>(
+  'gctrl_search_chunks',
+  'borghive_search_chunks',
+  'Retrieve source text passages (warm vector + keyword) for a question — the raw evidence layer. Limit is fixed at 5 passages. Use this to back up an answer with citations; prefer gctrl_query for a composed blended answer.',
+  searchChunksSchema,
+  async ({ query, compilationId }) => {
+    const r = await apiCall('POST', '/agent/tools/search_chunks', { query, compilationId }) as {
+      chunks?: Array<{ chunkId?: string; text?: string; score?: number; source?: string }>;
+      error?: string;
+    };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    const chunks = r.chunks ?? [];
+    const lines = chunks.map((c, i) => {
+      const score = typeof c.score === 'number' ? ` (${Math.round(c.score * 100)}%)` : '';
+      const src = c.source ? ` [${c.source}]` : '';
+      return `[${i + 1}]${src}${score}\n${c.text ?? ''}`;
+    });
+    return {
+      content: [{
+        type: 'text' as const,
+        text: lines.length > 0
+          ? `**Source passages (${lines.length}):**\n\n${lines.join('\n\n---\n\n')}`
+          : 'No passages found for this query.',
+      }],
+    };
+  },
+);
+
+// ── Tool: Get Entity (provenance — mirrors HTTP gateway get_entity) ────────────
+
+const getEntitySchema = {
+  name: z.string().describe('Entity name to look up (exact or close match)'),
+};
+
+registerToolWithAlias<{ name: string }>(
+  'gctrl_get_entity',
+  'borghive_get_entity',
+  'Read one entity: its type, connections (up to 20 relation strings), and full provenance — origin file, sourceRef, extraction job + timestamp. Use this to answer "where does X come from / which file / what is the source of X". Prefer gctrl_get_dossier for a compiled authoritative summary.',
+  getEntitySchema,
+  async ({ name }) => {
+    const r = await apiCall('POST', '/agent/tools/get_entity', { name }) as {
+      name?: string;
+      type?: string;
+      classification?: string;
+      connections?: string[];
+      provenance?: {
+        jobId?: string;
+        jobType?: string;
+        originFile?: string;
+        sourceRef?: string;
+        extractedAt?: string;
+      };
+      error?: string;
+    };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    const provLines: string[] = [];
+    if (r.provenance?.originFile) provLines.push(`Origin file: ${r.provenance.originFile}`);
+    if (r.provenance?.sourceRef) provLines.push(`Source ref: ${r.provenance.sourceRef}`);
+    if (r.provenance?.extractedAt) provLines.push(`Extracted at: ${r.provenance.extractedAt}`);
+    if (r.provenance?.jobId) provLines.push(`Job ID: ${r.provenance.jobId}`);
+    const connLines = (r.connections ?? []).map((c) => `- ${c}`);
+    return {
+      content: [{
+        type: 'text' as const,
+        text:
+          `**Entity: ${r.name ?? name}** (${r.type ?? 'unknown type'})` +
+          (r.classification ? ` [${r.classification}]` : '') +
+          '\n\n' +
+          (connLines.length ? `**Connections:**\n${connLines.join('\n')}\n\n` : '') +
+          (provLines.length ? `**Provenance:**\n${provLines.join('\n')}` : '(no provenance on record)'),
+      }],
+    };
+  },
+);
+
 // ── Tool: Graph neighbours (dependency tracing) ──────────────────────────────
 
 registerToolWithAlias<{ name: string; depth?: number }>(

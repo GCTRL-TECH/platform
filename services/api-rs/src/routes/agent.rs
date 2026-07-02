@@ -288,10 +288,12 @@ pub(crate) fn tool_schema() -> Value {
     json!({
         "tools": [
             { "name": "list_graphs",        "description": "List knowledge graphs the caller can access", "args": {} },
-            { "name": "get_graph",          "description": "Read a compilation's entities and relationships", "args": { "compilationId": "string", "limit": "number?" } },
-            { "name": "search_entities",    "description": "Find entities by name (clearance-filtered)", "args": { "query": "string", "limit": "number?" } },
+            { "name": "get_graph",          "description": "Read a compilation's entities and relationships. Start with response_format='summary' (default) — returns {name,type,degree} + relation-type counts, much cheaper than 'full'. Only use 'full' if you need the complete edge list. Default limit 100; max 500.", "args": { "compilationId": "string", "limit": "number?", "response_format": "string?" } },
+            { "name": "query",              "description": "Blended answer over graph + chunks + dossiers (RAG). Preferred first read tool for open questions — blends all memory tiers automatically and returns a grounded answer with sources + confidence. Args: { message: string, compilationId?: string }", "args": { "message": "string", "compilationId": "string?" } },
+            { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call after ANY substantive task to persist conclusions. Always pass compilationId (find via list_graphs). Args: { text: string, compilationId?: string }", "args": { "text": "string", "compilationId": "string?" } },
+            { "name": "search_entities",    "description": "Find entities by name (clearance-filtered). Use limit to page through results (default 10, max 50).", "args": { "query": "string", "limit": "number?" } },
             { "name": "get_entity",         "description": "Read one entity, its connections, and its provenance (origin file / sourceRef / extraction job) — use for 'where does X come from / which file'", "args": { "name": "string" } },
-            { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?)", "args": { "name": "string", "depth": "number?" } },
+            { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?). Use depth 1 first; increase only if needed. Limit is fixed at 100.", "args": { "name": "string", "depth": "number?" } },
             { "name": "shortest_path",      "description": "Find the shortest path between two entities (how is A connected to B / does X depend on Y)", "args": { "from": "string", "to": "string" } },
             { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
             { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval)", "args": { "query": "string", "compilationId": "string?" } },
@@ -661,7 +663,11 @@ pub(crate) async fn execute_tool(
             let Some(cid) = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
                 return json!({ "error": "compilationId is required" });
             };
+            // Default 100, max 500. Agents should start small and page if needed.
             let limit = args["limit"].as_i64().unwrap_or(100).clamp(1, 500);
+            // "summary" (default) = {name,type,degree} + relation-type counts only.
+            // "full" = today's shape with the complete edge list. Always try summary first.
+            let full_mode = args["response_format"].as_str().unwrap_or("summary") == "full";
             let rank = crate::routes::kg::effective_rank_for_compilation(&state.db, claims, cid).await;
             // Resolve the compilation's source jobs (owner-scoped).
             let row: Option<(Vec<uuid::Uuid>,)> = sqlx::query_as(
@@ -671,28 +677,165 @@ pub(crate) async fn execute_tool(
             let uid = claims.sub.to_string();
             let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
             let scope = if jobs.is_empty() { "n._owner = $uid" } else { "n._source_job IN $jobIds" };
-            let cypher = format!(
-                "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
-                 OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
-                 RETURN n.name AS n, type(r) AS rel, m.name AS m LIMIT $limit"
-            );
-            let mut entities = std::collections::BTreeSet::<String>::new();
-            let mut rels: Vec<Value> = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(&cypher).param("uid", uid).param("jobIds", job_strs)
-                    .param("rank", rank as i64).param("limit", limit),
-            ).await {
-                while let Ok(Some(row)) = stream.next().await {
-                    if let Ok(n) = row.get::<String>("n") { entities.insert(n.clone());
-                        if let (Ok(rel), Ok(m)) = (row.get::<String>("rel"), row.get::<String>("m")) {
-                            entities.insert(m.clone());
-                            rels.push(json!({ "head": n, "relType": rel, "tail": m }));
+
+            crate::services::audit::log_access(&state.db, claims, "agent.get_graph", "compilation", &cid.to_string(), rank, None, true, None).await;
+
+            if full_mode {
+                // Full mode: return all nodes + edges (expensive for large graphs).
+                let cypher = format!(
+                    "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+                     OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
+                     RETURN n.name AS n, type(r) AS rel, m.name AS m LIMIT $limit"
+                );
+                let mut entities = std::collections::BTreeSet::<String>::new();
+                let mut rels: Vec<Value> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(
+                    neo4rs::query(&cypher).param("uid", uid).param("jobIds", job_strs)
+                        .param("rank", rank as i64).param("limit", limit),
+                ).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        if let Ok(n) = row.get::<String>("n") { entities.insert(n.clone());
+                            if let (Ok(rel), Ok(m)) = (row.get::<String>("rel"), row.get::<String>("m")) {
+                                entities.insert(m.clone());
+                                rels.push(json!({ "head": n, "relType": rel, "tail": m }));
+                            }
                         }
                     }
                 }
+                json!({ "response_format": "full", "entities": entities.into_iter().collect::<Vec<_>>(), "relationships": rels })
+            } else {
+                // Summary mode (default): per-entity {name,type,degree} + relation-type counts.
+                // Much cheaper — start here, switch to "full" only if you need the edge list.
+                let cypher_nodes = format!(
+                    "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+                     OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+                     RETURN n.name AS name, coalesce(n.coarse_type, n.label, n.type, '') AS type, \
+                            count(r) AS degree LIMIT $limit"
+                );
+                let cypher_rel_types = format!(
+                    "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+                     MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+                     RETURN type(r) AS relType, count(r) AS cnt LIMIT 50"
+                );
+                let uid2 = uid.clone();
+                let job_strs2 = job_strs.clone();
+                let mut node_rows: Vec<Value> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(
+                    neo4rs::query(&cypher_nodes).param("uid", uid).param("jobIds", job_strs)
+                        .param("rank", rank as i64).param("limit", limit),
+                ).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        node_rows.push(json!({
+                            "name": row.get::<String>("name").unwrap_or_default(),
+                            "type": row.get::<String>("type").unwrap_or_default(),
+                            "degree": row.get::<i64>("degree").unwrap_or(0),
+                        }));
+                    }
+                }
+                let mut rel_type_counts: Vec<Value> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(
+                    neo4rs::query(&cypher_rel_types).param("uid", uid2).param("jobIds", job_strs2)
+                        .param("rank", rank as i64),
+                ).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        rel_type_counts.push(json!({
+                            "relType": row.get::<String>("relType").unwrap_or_default(),
+                            "count": row.get::<i64>("cnt").unwrap_or(0),
+                        }));
+                    }
+                }
+                json!({
+                    "response_format": "summary",
+                    "hint": "This is a summary. Pass response_format='full' to get the complete edge list (more tokens).",
+                    "entityCount": node_rows.len(),
+                    "entities": node_rows,
+                    "relationTypeCounts": rel_type_counts,
+                })
             }
-            crate::services::audit::log_access(&state.db, claims, "agent.get_graph", "compilation", &cid.to_string(), rank, None, true, None).await;
-            json!({ "entities": entities.into_iter().collect::<Vec<_>>(), "relationships": rels })
+        }
+
+        // ── Read: blended RAG answer (mirrors stdio gctrl_query) ──────────────
+        "query" => {
+            let message = args["message"].as_str().unwrap_or("").trim().to_string();
+            if message.is_empty() { return json!({ "error": "message is required" }); }
+            let compilation_id = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
+            // Call the same POST /api/rag/query endpoint the stdio gctrl_query tool uses
+            // (incognito mode = no server-side conversation persistence).
+            // We generate a short-lived JWT for the loopback call so the RAG handler
+            // enforces the same clearance the caller's claims carry.
+            let jwt = crate::middleware::auth::sign_access(&state.cfg, claims);
+            let client = reqwest::Client::new();
+            let api_base = format!("http://127.0.0.1:{}/api", state.cfg.port);
+            let mut body = json!({ "message": message, "mode": "incognito" });
+            if let Some(cid) = compilation_id {
+                body["compilationId"] = json!(cid);
+            }
+            match client.post(format!("{api_base}/rag/query"))
+                .bearer_auth(&jwt)
+                .json(&body)
+                .timeout(Duration::from_secs(30))
+                .send().await
+            {
+                Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "error": "parse error" })),
+                Err(e) => json!({ "error": format!("RAG query failed: {e}") }),
+            }
+        }
+
+        // ── Write: extract + link to compilation (mirrors stdio gctrl_store) ──
+        "store" => {
+            let text = args["text"].as_str().unwrap_or("");
+            if text.trim().len() < 10 { return json!({ "error": "text too short (min 10 chars)" }); }
+            let compilation_id = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
+            // Inline the extraction logic from create_extraction to avoid recursive async fn.
+            if let (Some(key_rank), Some(c)) = (claims.api_key_rank, Option::<uuid::Uuid>::None) {
+                // No classificationLevelId for store — this path is only reached if we add one later.
+                let lvl_rank: Option<i32> = sqlx::query_scalar(
+                    "SELECT rank FROM classification_levels WHERE id = $1"
+                ).bind(c).fetch_optional(&state.db).await.ok().flatten();
+                if lvl_rank.map_or(false, |r| r > key_rank) {
+                    return json!({ "error": "classification exceeds this access token's clearance" });
+                }
+            }
+            let job_id = uuid::Uuid::new_v4();
+            let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
+                .bind(claims.sub).execute(&state.db).await;
+            let _ = sqlx::query(
+                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
+                 VALUES ($1, $2, 'kex_extract', 'pending', $3, NULL)"
+            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent_store" })).execute(&state.db).await;
+            crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
+            let mut payload = json!({
+                "job_id": job_id, "user_id": claims.sub, "type": "text",
+                "input": text, "classification": null, "classification_level_id": null
+            });
+            crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
+            let _ = crate::services::redis::lpush(&state.redis, "kex:jobs", &payload.to_string()).await;
+            // Link to compilation if provided.
+            let mut linked = false;
+            if let Some(cid) = compilation_id {
+                if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                    return json!({ "error": e.to_string() });
+                }
+                let existing: Option<(Vec<uuid::Uuid>,)> = sqlx::query_as(
+                    "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
+                ).bind(cid).bind(claims.sub).fetch_optional(&state.db).await.ok().flatten();
+                if let Some((mut jobs,)) = existing {
+                    if !jobs.contains(&job_id) {
+                        jobs.push(job_id);
+                        let _ = sqlx::query("UPDATE compilations SET source_job_ids=$1 WHERE id=$2 AND user_id=$3")
+                            .bind(&jobs).bind(cid).bind(claims.sub).execute(&state.db).await;
+                    }
+                    linked = true;
+                }
+            }
+            json!({
+                "ok": true,
+                "jobId": job_id,
+                "compilationId": compilation_id,
+                "linked": linked,
+                "status": "pending",
+                "note": "Extraction enqueued. Use query() once complete to verify the knowledge was stored."
+            })
         }
 
         // ── Read: KEX extraction jobs ─────────────────────────────────────────
@@ -1494,6 +1637,35 @@ mod agent_tool_registration_tests {
             assert!(names.contains(&expected.to_string()),
                 "pre-existing tool '{expected}' must still be registered");
         }
+    }
+
+    // ── New unified surface tools ─────────────────────────────────────────────
+
+    #[test]
+    fn tool_schema_contains_query() {
+        assert!(tool_names().contains(&"query".to_string()),
+            "tool_schema() must include 'query' (blended RAG, mirrors stdio gctrl_query)");
+    }
+
+    #[test]
+    fn tool_schema_contains_store() {
+        assert!(tool_names().contains(&"store".to_string()),
+            "tool_schema() must include 'store' (write-back, mirrors stdio gctrl_store)");
+    }
+
+    // ── get_graph summary mode ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_graph_descriptor_has_response_format_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("get_graph"))
+            .expect("get_graph must be in tool_schema");
+        assert!(tool["args"].get("response_format").is_some(),
+            "get_graph descriptor must declare a 'response_format' arg");
     }
 
     // ── Admin-gate logic (pure, no DB needed) ─────────────────────────────────
