@@ -28,6 +28,18 @@ RELEX_FALLBACK_MODEL: str = os.environ.get("RELEX_FALLBACK_MODEL", "qwen2.5:3b")
 RELEX_GAPFILL_ENABLED: bool = os.environ.get("RELEX_GAPFILL_ENABLED", "true").lower() in ("1", "true", "yes")
 RELEX_GAPFILL_MAX_PASSES: int = int(os.environ.get("RELEX_GAPFILL_MAX_PASSES", "2"))
 
+# Windowed relation extraction: instead of hard-truncating at RELEX_WINDOW_CHARS,
+# the extractor slides a sentence-snapped window over the FULL document text so
+# relations in the second half of a long CV, contract, or report are not silently
+# dropped. RELEX_MAX_WINDOWS caps the total number of LLM calls per document
+# (first N windows kept; a warning is logged for the skipped tail fraction).
+# RELEX_MIN_CONFIDENCE: triples below this score are dropped after validation
+# (0.0 = off; a value like 0.5 rejects triples that needed both a direction-flip
+# and a normalization repair).
+RELEX_WINDOW_CHARS: int = int(os.environ.get("KEX_RELEX_WINDOW", "6000"))
+RELEX_MAX_WINDOWS: int = int(os.environ.get("KEX_RELEX_MAX_WINDOWS", "8"))
+RELEX_MIN_CONFIDENCE: float = float(os.environ.get("KEX_MIN_RELATION_CONFIDENCE", "0.0"))
+
 # Graph pruning: GLiNER over-extracts — it promotes emotions ("Cool"), generic nouns
 # ("software", "box"), and sentence fragments to entities, which become thousands of
 # ORPHAN graph nodes that add nothing (they stay searchable in the vector store either

@@ -192,18 +192,25 @@ def run_pipeline(
     # complete the extraction as a successful-but-degraded result (no relations),
     # surfacing a concise human-readable warning the dashboard can show.
     warnings: list[str] = []
+    extraction_report = None
     relex = get_extractor()
     try:
         # Use generation_base for the generation step when provided;
         # otherwise fall through to ollama_base (default install unchanged).
         relex_base = generation_base if generation_base else ollama_base
-        relations = relex.extract_relations(
+        relex_result = relex.extract_relations(
             text, entities,
             ollama_base=relex_base,
             model=relex_model,
             kind=generation_kind,
             api_key=generation_api_key,
         )
+        # extract_relations returns (relations, report) tuple.
+        if isinstance(relex_result, tuple) and len(relex_result) == 2:
+            relations, extraction_report = relex_result
+        else:
+            # Defensive: older cached singleton or unexpected shape.
+            relations = relex_result if isinstance(relex_result, list) else []
         if getattr(relex, "last_degraded", False) and relex.last_degraded_reason:
             warnings.append(relex.last_degraded_reason)
             logger.warning(f"[{job_id}] RelEx degraded: {relex.last_degraded_reason}")
@@ -305,6 +312,8 @@ def run_pipeline(
         },
         "pii_findings": pii_findings,
     }
+    if extraction_report is not None:
+        result["extraction_report"] = extraction_report
     if degraded:
         result["degraded"] = True
         result["warning"] = warning_msg

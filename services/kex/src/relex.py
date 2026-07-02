@@ -32,22 +32,86 @@ import requests
 from . import config
 from . import llm_client
 from . import relvocab
+from .chunking import _split_into_sentences
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters of text to send to Ollama (keep prompt manageable).
-# Raised from 3000 → 6000: a 3000-char cut decapitates a multi-page document
-# (e.g. a CV's Experience/Education sections sit past char 3000), so the relation
-# extractor never saw the facts that matter. 6000 still fits qwen2.5:7b's context
-# comfortably and roughly doubles structured-document recall.
-_MAX_TEXT_CHARS = 6000
-
-# Cap the entity list fed to the LLM. A document can produce hundreds of NER
-# entities (a CV yielded 416); dumping all of them bloats the prompt and buries
-# the few that actually participate in relations, so the model returns almost
-# nothing. The KG builder still stores ALL entities — this cap only bounds the
-# relation-extraction prompt.
+# Cap the entity list fed to the LLM per window. A document can produce hundreds
+# of NER entities (a CV yielded 416); dumping all of them bloats the prompt and
+# buries the few that actually participate in relations, so the model returns
+# almost nothing. The KG builder still stores ALL entities — this cap only bounds
+# the relation-extraction prompt.
 _MAX_ENTITIES = 80
+
+# Window overlap in characters for the windowed relex pass. A small overlap
+# ensures a relation that straddles two window boundaries is still captured.
+_WINDOW_OVERLAP = 200
+
+
+def _split_windows(text: str, window_chars: int, overlap: int = _WINDOW_OVERLAP) -> list[tuple[str, int, int]]:
+    """Split *text* into sentence-snapped windows of at most *window_chars* chars
+    with *overlap* characters of trailing context carried into the next window.
+
+    Returns a list of (window_text, start_offset, end_offset) triples.
+
+    The splitting logic reuses `_split_into_sentences` from chunking.py so the
+    boundary-snap behaviour is identical to the chunker — no new dependency.
+    """
+    if len(text) <= window_chars:
+        return [(text, 0, len(text))]
+
+    sentences = _split_into_sentences(text)
+
+    # Pre-compute absolute byte offsets for each sentence (same approach as TextChunker).
+    sentence_positions = []
+    pos = 0
+    for sent in sentences:
+        idx = text.find(sent, pos)
+        if idx == -1:
+            idx = pos
+        sentence_positions.append((idx, idx + len(sent)))
+        pos = idx + len(sent)
+
+    windows = []
+    i = 0
+    n = len(sentences)
+
+    while i < n:
+        # Build a window starting at sentence i.
+        window_sents = []
+        window_len = 0
+        j = i
+        while j < n:
+            s = sentences[j]
+            if window_len + len(s) > window_chars and window_len > 0:
+                break
+            window_sents.append(s)
+            window_len += len(s)
+            j += 1
+
+        # j now points to the first sentence that didn't fit (or == n).
+        win_start = sentence_positions[i][0]
+        win_end = sentence_positions[j - 1][1]
+        windows.append(("".join(window_sents), win_start, win_end))
+
+        if j >= n:
+            break
+
+        # Advance i by stepping back into the overlap region so ~overlap chars
+        # of context are shared with the next window.
+        overlap_len = 0
+        next_i = j
+        k = j - 1
+        while k >= i and overlap_len < overlap:
+            overlap_len += len(sentences[k])
+            next_i = k
+            k -= 1
+        # Ensure we always advance to avoid an infinite loop on a single huge sentence.
+        if next_i <= i:
+            next_i = j
+        i = next_i
+
+    return windows
 
 
 def _build_prompt(text: str, entity_lines: str) -> str:
@@ -148,16 +212,20 @@ class RelationExtractor:
         model: Optional[str] = None,
         kind: str = "ollama",
         api_key: Optional[str] = None,
-    ) -> list[dict]:
+    ) -> tuple:
         """
         Extract relations from text given a list of entity dicts.
+
+        Returns (relations, extraction_report) where:
+          - relations is a list[dict]: {head, type, tail, confidence}
+          - extraction_report is a plain dict with per-job audit counters
 
         `ollama_base` is an optional per-job override for the Ollama endpoint
         (the owner's Settings → Infrastructure base URL, passed through by the
         API). When None/empty the module-wide `config.OLLAMA_BASE` is used, so the
         default install is unchanged.
 
-        Each output dict: { head: str, type: str, tail: str, confidence: float }
+        Each relation dict: { head: str, type: str, tail: str, confidence: float }
         where `type` is a CANONICAL relation from relvocab.RELATIONS (`type` key
         kept for backward compatibility with the KG builder which reads
         `relation["type"]`). `confidence` is the per-triple trust score (0..1)
@@ -165,9 +233,9 @@ class RelationExtractor:
         type-checked triple; lower (~0.6) when validation had to repair the
         direction or normalize the relation surface form.
 
-        Returns empty list on any failure (graceful degradation). When the
-        failure is the LLM being UNAVAILABLE (connection error / timeout / 5xx),
-        `self.last_degraded` is set True with a human-readable
+        On any failure, returns ([], report) — never raises (graceful degradation).
+        When the failure is the LLM being UNAVAILABLE (connection error / timeout /
+        5xx), `self.last_degraded` is set True with a human-readable
         `self.last_degraded_reason` so the pipeline can mark the job as a
         successful-but-degraded extraction (entities only, no relations) instead
         of failing the whole job.
@@ -176,49 +244,176 @@ class RelationExtractor:
         self.last_degraded = False
         self.last_degraded_reason = None
 
+        # Report skeleton — all counters start at 0.
+        window_chars = getattr(config, "RELEX_WINDOW_CHARS", 6000)
+        max_windows = getattr(config, "RELEX_MAX_WINDOWS", 8)
+        min_confidence = getattr(config, "RELEX_MIN_CONFIDENCE", 0.0)
+
+        report_windows = 0
+        report_truncated = False
+        report_entities_prompted = 0
+        report_relations_raw = 0
+        report_relations_after_validation = 0
+        report_dropped_out_of_vocab = 0
+        report_dropped_type_incompatible = 0
+        report_dropped_below_confidence = 0
+        report_repaired_direction_flipped = 0
+        report_repaired_normalized = 0
+        report_gapfill_added = 0
+
+        def _make_report(rels_after_conf):
+            return {
+                "windows": report_windows,
+                "window_chars": window_chars,
+                "text_chars": len(text),
+                "truncated_windows": report_truncated,
+                "entities_total": len(entities),
+                "entities_prompted": report_entities_prompted,
+                "relations_raw": report_relations_raw,
+                "relations_after_validation": report_relations_after_validation,
+                "dropped": {
+                    "out_of_vocab": report_dropped_out_of_vocab,
+                    "type_incompatible": report_dropped_type_incompatible,
+                    "below_confidence": report_dropped_below_confidence,
+                },
+                "repaired": {
+                    "direction_flipped": report_repaired_direction_flipped,
+                    "normalized": report_repaired_normalized,
+                },
+                "gapfill_added": report_gapfill_added,
+            }
+
         if not entities or len(entities) < 2:
-            return []
+            return ([], _make_report([]))
 
-        truncated_text = text[:_MAX_TEXT_CHARS]
-        if len(text) > _MAX_TEXT_CHARS:
-            truncated_text += " ..."
-
-        # Prefer entities that actually appear in the (truncated) text window we
-        # send, then cap the list. This keeps the prompt focused on entities the
-        # model can relate, instead of burying them under hundreds of stray NER
-        # hits. Validation still runs against the FULL entity set, so a relation
-        # whose surface form is in the doc is never dropped for being off-list.
-        prompt_entities = self._select_prompt_entities(entities, truncated_text)
-        entity_lines = self._format_entity_list(prompt_entities)
-        prompt = _build_prompt(truncated_text, entity_lines)
-
-        raw_response = self._call_ollama(
-            prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key
-        )
-        if raw_response is None:
-            # _call_ollama already recorded the reason on self.last_degraded_*.
-            return []
-
-        try:
-            parsed = self._parse_json_array(raw_response)
-            relations = self._validate(parsed, entities)
-        except Exception as exc:
-            # A parsing / validation defect must never fail the whole job.
-            logger.warning(f"Relation parse/validation failed (non-fatal): {exc}")
-            self.last_degraded = True
-            self.last_degraded_reason = (
-                "Relation extraction skipped (LLM response could not be parsed)."
+        # Split the FULL text into sentence-snapped windows.
+        windows = _split_windows(text, window_chars)
+        if len(windows) > max_windows:
+            n_total = len(windows)
+            windows = windows[:max_windows]
+            report_truncated = True
+            skipped_frac = (n_total - max_windows) / n_total
+            logger.warning(
+                "RelEx: doc needs %d windows but cap is %d — keeping first %d "
+                "(%.0f%% of text skipped). Raise KEX_RELEX_MAX_WINDOWS to cover more.",
+                n_total, max_windows, max_windows, skipped_frac * 100,
             )
-            return []
 
-        # ── Recursive gap-fill: re-target entities the first pass left ISOLATED ──
-        # so the per-document graph comes out connected, not a cloud of orphans.
+        report_windows = len(windows)
+
+        # Per-window extraction: merge triples across windows keeping MAX confidence.
+        merged = {}  # key (head_lower, type, tail_lower) -> relation dict
+
+        first_window_text = windows[0][0] if windows else ""
+
+        for win_text, win_start, win_end in windows:
+            # Filter entities to those whose span falls inside this window.
+            # Entities without offsets (no start/end) go to every window.
+            win_entities = []
+            for ent in entities:
+                ent_start = ent.get("start")
+                ent_end = ent.get("end")
+                if ent_start is None or ent_end is None:
+                    win_entities.append(ent)
+                elif ent_start < win_end and ent_end > win_start:
+                    win_entities.append(ent)
+
+            if len(win_entities) < 2:
+                continue
+
+            prompt_entities = self._select_prompt_entities(win_entities, win_text)
+            report_entities_prompted += len(prompt_entities)
+            entity_lines = self._format_entity_list(prompt_entities)
+            prompt = _build_prompt(win_text, entity_lines)
+
+            raw_response = self._call_ollama(
+                prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key
+            )
+            if raw_response is None:
+                # _call_ollama already recorded the reason on self.last_degraded_*.
+                # Continue to next window rather than aborting completely.
+                if report_windows == 1:
+                    # Single-window, can't recover.
+                    return ([], _make_report([]))
+                continue
+
+            try:
+                parsed = self._parse_json_array(raw_response)
+                report_relations_raw += len(parsed)
+                validated, cnt_oov, cnt_type, cnt_flip, cnt_norm = self._validate_counted(
+                    parsed, entities
+                )
+                report_dropped_out_of_vocab += cnt_oov
+                report_dropped_type_incompatible += cnt_type
+                report_repaired_direction_flipped += cnt_flip
+                report_repaired_normalized += cnt_norm
+            except Exception as exc:
+                logger.warning(f"Relation parse/validation failed (non-fatal): {exc}")
+                if report_windows == 1:
+                    self.last_degraded = True
+                    self.last_degraded_reason = (
+                        "Relation extraction skipped (LLM response could not be parsed)."
+                    )
+                    return ([], _make_report([]))
+                continue
+
+            # Merge: keep the triple with MAX confidence on collision.
+            for r in validated:
+                key = (r["head"].lower(), r["type"], r["tail"].lower())
+                existing = merged.get(key)
+                if existing is None or r["confidence"] > existing["confidence"]:
+                    merged[key] = r
+
+        relations = list(merged.values())
+        report_relations_after_validation = len(relations)
+
+        # ── Recursive gap-fill over the first window's text (isolated entities) ──
         if getattr(config, "RELEX_GAPFILL_ENABLED", False):
-            relations = self._gap_fill(
-                truncated_text, entities, prompt_entities, relations,
-                ollama_base, model, kind, api_key,
-            )
-        return relations
+            # For gap-fill, use the first window text for global isolated entities.
+            # For entities whose span lies in a later window, run gap-fill against
+            # that window's text. Keep it simple: one gap-fill pass per window
+            # for isolated entities in that window.
+            before_gapfill = len(relations)
+            for win_text, win_start, win_end in windows:
+                win_entities = []
+                for ent in entities:
+                    ent_start = ent.get("start")
+                    ent_end = ent.get("end")
+                    if ent_start is None or ent_end is None:
+                        win_entities.append(ent)
+                    elif ent_start < win_end and ent_end > win_start:
+                        win_entities.append(ent)
+                if len(win_entities) < 2:
+                    continue
+                prompt_entities_gf = self._select_prompt_entities(win_entities, win_text)
+                new_rels = self._gap_fill(
+                    win_text, entities, prompt_entities_gf, relations,
+                    ollama_base, model, kind, api_key,
+                )
+                # Merge any new gap-fill triples into `relations`.
+                existing_keys = {(r["head"].lower(), r["type"], r["tail"].lower()) for r in relations}
+                added = 0
+                for r in new_rels:
+                    key = (r["head"].lower(), r["type"], r["tail"].lower())
+                    if key not in existing_keys:
+                        existing_keys.add(key)
+                        relations.append(r)
+                        added += 1
+                if added > 0:
+                    logger.info("RelEx gap-fill window [%d:%d]: +%d relations", win_start, win_end, added)
+            report_gapfill_added = len(relations) - before_gapfill
+
+        # Apply min-confidence gate.
+        if min_confidence > 0.0:
+            kept = []
+            for r in relations:
+                if r.get("confidence", 0.0) >= min_confidence:
+                    kept.append(r)
+                else:
+                    report_dropped_below_confidence += 1
+            relations = kept
+
+        return (relations, _make_report(relations))
 
     # ── internal helpers ──────────────────────────────────────────────
 
@@ -589,6 +784,99 @@ class RelationExtractor:
             )
 
         return relations
+
+    def _validate_counted(
+        self,
+        triples: list[dict],
+        entities: list[dict],
+    ) -> tuple:
+        """Like _validate but also returns drop/repair counters for the report.
+
+        Returns (relations, cnt_oov, cnt_type, cnt_direction_flipped, cnt_normalized)
+        where:
+          cnt_oov              — triples dropped because relation was out-of-vocab
+          cnt_type             — triples dropped because neither direction was type-compatible
+          cnt_direction_flipped — triples where head<->tail was swapped to repair direction
+          cnt_normalized       — triples where relation surface was normalized to canonical
+
+        NOTE: A triple can only be in ONE drop bucket, but can have BOTH a
+        normalization repair AND a direction flip (both counters are incremented).
+        """
+        # Map normalized surface -> (canonical surface, coarse_type) for lookup.
+        surface_map = {}
+        for e in entities:
+            surf = (e.get("text") or "").strip()
+            if not surf:
+                continue
+            coarse = e.get("coarse_type") or config.coarse_for(
+                e.get("gliner_label", ""), e.get("label", "")
+            )
+            surface_map.setdefault(surf.lower(), (surf, coarse))
+
+        relations = []
+        seen = set()
+        cnt_oov = 0
+        cnt_type = 0
+        cnt_direction_flipped = 0
+        cnt_normalized = 0
+
+        for item in triples:
+            head_raw = str(item.get("head", "")).strip()
+            tail_raw = str(item.get("tail", "")).strip()
+            rel_raw = str(item.get("relation") or item.get("type") or "").strip()
+
+            if not head_raw or not tail_raw or not rel_raw:
+                continue
+
+            head_entry = surface_map.get(head_raw.lower())
+            tail_entry = surface_map.get(tail_raw.lower())
+            if head_entry is None or tail_entry is None:
+                continue  # both ends must be known entities
+
+            head, head_coarse = head_entry
+            tail, tail_coarse = tail_entry
+            if head.lower() == tail.lower():
+                continue  # no self/circular
+
+            canon = relvocab.normalize_relation(rel_raw)
+            if canon is None:
+                cnt_oov += 1
+                continue  # drop out-of-vocab garbage
+
+            confidence = 0.9
+            was_normalized = False
+            was_flipped = False
+
+            if canon != rel_raw.strip().lower():
+                confidence -= 0.1
+                was_normalized = True
+
+            if not relvocab.type_ok(canon, head_coarse, tail_coarse):
+                if relvocab.type_ok(canon, tail_coarse, head_coarse):
+                    head, tail = tail, head
+                    head_coarse, tail_coarse = tail_coarse, head_coarse
+                    confidence -= 0.2
+                    was_flipped = True
+                else:
+                    cnt_type += 1
+                    continue  # neither orientation valid -> drop
+
+            if was_normalized:
+                cnt_normalized += 1
+            if was_flipped:
+                cnt_direction_flipped += 1
+
+            confidence = round(max(0.0, min(1.0, confidence)), 3)
+
+            key = (head.lower(), canon, tail.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            relations.append(
+                {"head": head, "type": canon, "tail": tail, "confidence": confidence}
+            )
+
+        return (relations, cnt_oov, cnt_type, cnt_direction_flipped, cnt_normalized)
 
 
 # One-time, process-wide guard so concurrent workers / repeated jobs never

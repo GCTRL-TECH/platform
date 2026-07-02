@@ -62,7 +62,8 @@ class TestRelexOpenAICompatible:
                 )
 
     def test_openai_compatible_returns_parsed_relations(self):
-        """Relations are parsed correctly when llm_client returns a JSON array."""
+        """Relations are parsed correctly when llm_client returns a JSON array.
+        extract_relations now returns (relations, report) — unpack accordingly."""
         from src.relex import RelationExtractor
 
         fake_response = '[{"head": "Alice", "relation": "ceo_of", "tail": "Acme"}]'
@@ -71,13 +72,16 @@ class TestRelexOpenAICompatible:
             mock_client.complete.return_value = fake_response
 
             ext = RelationExtractor()
-            relations = ext.extract_relations(
+            result = ext.extract_relations(
                 _text(), _entities(),
                 kind="openai_compatible",
                 ollama_base="http://openai-compat:8080",
                 model="gpt-4o-mini",
             )
 
+        # extract_relations returns (relations, report) tuple.
+        assert isinstance(result, tuple) and len(result) == 2
+        relations, report = result
         # Should get at least the ceo_of triple back (validation may transform it)
         assert isinstance(relations, list)
 
