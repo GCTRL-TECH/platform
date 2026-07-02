@@ -907,6 +907,7 @@ interface ProviderConfig {
   redirectUri: string
   scopes: string[]
   configured: boolean
+  indexUnsupportedFiles?: boolean
 }
 
 function IntegrationsTab() {
@@ -1015,6 +1016,13 @@ function IntegrationsTab() {
       await api.delete(`/connectors/config/${providerId}`)
       await loadProviderConfigs()
     } catch { alert('Failed to remove') }
+  }
+
+  const handleToggleIndexing = async (providerId: string, enabled: boolean) => {
+    try {
+      await api.put(`/connectors/config/${providerId}/indexing`, { enabled })
+      await loadProviderConfigs()
+    } catch { alert('Failed to update file indexing setting') }
   }
 
   const handleAddSource = (sourceId: string) => {
@@ -1165,6 +1173,21 @@ function IntegrationsTab() {
                           />
                         </div>
                       </div>
+                      {/* File-asset indexing (Google Drive / SharePoint syncs) */}
+                      {(p.id === 'google' || p.id === 'microsoft') && (
+                        <label className="flex items-center gap-2 text-[10px] text-slate-400">
+                          <input
+                            type="checkbox"
+                            checked={p.cfg?.indexUnsupportedFiles ?? false}
+                            onChange={(e) => void handleToggleIndexing(p.id, e.target.checked)}
+                            className="h-3 w-3 accent-indigo-500"
+                          />
+                          <span>
+                            Index unsupported files (metadata only) — makes CAD drawings, images and
+                            archives findable by name/path via the agent, without extracting them.
+                          </span>
+                        </label>
+                      )}
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3 text-[10px] text-slate-500">
                           <span>

@@ -23,7 +23,7 @@
 
 use axum::{
     extract::{Extension, Path, State},
-    routing::{get},
+    routing::{get, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -101,8 +101,20 @@ struct ConfigRow {
     provider:      String,
     client_id:     String,
     client_secret: String,
+    extra:         Option<Value>,
     is_active:     bool,
     updated_at:    chrono::DateTime<chrono::Utc>,
+}
+
+impl ConfigRow {
+    /// Read the per-provider `index_unsupported_files` flag from `extra`.
+    fn index_unsupported(&self) -> bool {
+        self.extra
+            .as_ref()
+            .and_then(|e| e.get("index_unsupported_files"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
 }
 
 /// Public helper used by `connectors.rs`: returns `(client_id, client_secret)`
@@ -129,12 +141,35 @@ pub async fn lookup_credentials(
     }))
 }
 
+/// Is the "index unsupported files" (metadata-only asset capture) flag enabled
+/// for this provider? Stored per provider in `connector_configs.extra` so the
+/// admin surface that already manages provider settings owns it. Default: false
+/// (strictly opt-in — with the flag off, sync behaviour is unchanged).
+pub async fn index_unsupported_enabled(db: &sqlx::PgPool, provider: &str) -> bool {
+    sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT (extra->>'index_unsupported_files')::boolean
+         FROM connector_configs WHERE provider = $1",
+    )
+    .bind(provider)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or(false)
+}
+
 // ─── Request / response types ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct UpsertConfigReq {
     #[serde(rename = "clientId")]     client_id:     String,
     #[serde(rename = "clientSecret")] client_secret: String,
+}
+
+#[derive(Deserialize)]
+struct SetIndexingReq {
+    enabled: bool,
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
@@ -144,6 +179,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         // Frontend-expected shape (already wired in SettingsPage.tsx).
         .route("/config/providers", get(list_providers))
         .route("/config/:provider", get(get_provider).put(upsert_provider).delete(delete_provider))
+        .route("/config/:provider/indexing", put(set_indexing))
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -159,7 +195,7 @@ async fn list_providers(
     require_role(&claims, "admin")?;
 
     let rows: Vec<ConfigRow> = sqlx::query_as(
-        "SELECT provider, client_id, client_secret, is_active, updated_at
+        "SELECT provider, client_id, client_secret, extra, is_active, updated_at
          FROM connector_configs",
     )
     .fetch_all(&state.db)
@@ -183,6 +219,7 @@ async fn list_providers(
                 // Mask the secret if present
                 "clientId":     row.map(|r| r.client_id.clone()).unwrap_or_default(),
                 "clientSecretMasked": row.map(|r| mask_secret(&crate::services::crypto::open(&r.client_secret))).unwrap_or_default(),
+                "indexUnsupportedFiles": row.map(|r| r.index_unsupported()).unwrap_or(false),
                 "updatedAt":    row.map(|r| r.updated_at.to_rfc3339()),
             })
         })
@@ -209,7 +246,7 @@ async fn get_provider(
     }
 
     let row: Option<ConfigRow> = sqlx::query_as(
-        "SELECT provider, client_id, client_secret, is_active, updated_at
+        "SELECT provider, client_id, client_secret, extra, is_active, updated_at
          FROM connector_configs WHERE provider = $1",
     )
     .bind(&provider)
@@ -222,6 +259,7 @@ async fn get_provider(
             "clientId":           "",
             "clientSecretMasked": "",
             "configured":         false,
+            "indexUnsupportedFiles": false,
         })));
     };
 
@@ -230,6 +268,7 @@ async fn get_provider(
         "clientId":           row.client_id,
         "clientSecretMasked": mask_secret(&crate::services::crypto::open(&row.client_secret)),
         "configured":         row.is_active && !row.client_secret.is_empty(),
+        "indexUnsupportedFiles": row.index_unsupported(),
         "updatedAt":          row.updated_at.to_rfc3339(),
     })))
 }
@@ -282,6 +321,54 @@ async fn upsert_provider(
     Ok(Json(json!({
         "ok":       true,
         "provider": provider,
+    })))
+}
+
+/// PUT /api/connectors/config/:provider/indexing  { enabled }
+///
+/// Toggle the per-provider `index_unsupported_files` flag (stored in
+/// `connector_configs.extra`). When ON, connector syncs upsert a `file_assets`
+/// metadata row for EVERY listed file — including non-extractable ones (CAD,
+/// images, archives) — so agents can find them via `find_file`. When OFF
+/// (default), sync behaviour is exactly as before.
+///
+/// Works even when no OAuth credentials are saved yet (SharePoint uses tenant
+/// configs, not connector_configs creds): a credential-less row is inserted so
+/// the flag has somewhere to live. `lookup_credentials` ignores rows with empty
+/// client_id/client_secret, so this never affects the OAuth flow.
+async fn set_indexing(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(provider): Path<String>,
+    Json(req): Json<SetIndexingReq>,
+) -> Result<Json<Value>> {
+    require_role(&claims, "admin")?;
+
+    if provider_info(&provider).is_none() {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported provider '{provider}'"
+        )));
+    }
+
+    sqlx::query(
+        "INSERT INTO connector_configs (provider, client_id, client_secret, extra, updated_by)
+         VALUES ($1, '', '', jsonb_build_object('index_unsupported_files', $2::boolean), $3)
+         ON CONFLICT (provider) DO UPDATE
+            SET extra      = jsonb_set(COALESCE(connector_configs.extra, '{}'::jsonb),
+                                       '{index_unsupported_files}', to_jsonb($2::boolean)),
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW()",
+    )
+    .bind(&provider)
+    .bind(req.enabled)
+    .bind(claims.sub)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "ok":                    true,
+        "provider":              provider,
+        "indexUnsupportedFiles": req.enabled,
     })))
 }
 
