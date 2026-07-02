@@ -1,0 +1,49 @@
+---
+description: GCTRL long-term memory over MCP. Apply before answering any factual question about the user's organization, projects, people, systems, decisions, history, or file locations (unfamiliar proper nouns, "our/we" references, "what do we know about X"), and after substantive work to write conclusions back.
+globs:
+alwaysApply: false
+---
+
+# GCTRL Long-Term Memory
+
+A GCTRL knowledge base is connected over MCP (tools `gctrl_*` via the stdio server, unprefixed via the HTTP gateway). It is the user's persistent memory. You do not know what it contains until you look.
+
+## When to read
+
+Check GCTRL BEFORE answering any factual question about the user's world:
+
+- Proper nouns you do not recognize (person, project, system, customer, codename).
+- "our", "we", "the team" — the user assumes shared context.
+- Decisions, status, owners, deadlines, or where a file/document lives.
+- "What do we know about X", "remind me", "what was decided", "who owns".
+
+One `gctrl_search_entities` probe takes about a second; a hallucinated answer costs trust. When in doubt, probe. Skip GCTRL for general programming knowledge, public facts, or things already in this conversation.
+
+## Tool ladder — stop as soon as you can answer
+
+1. `gctrl_search_entities` (limit ≤ 10) — existence probe. No hit → say it is not on record; do not invent.
+2. `gctrl_get_dossier` (name) — authoritative profile with confidence, origin files, timeline. If it answers, state it directly; do not hedge.
+3. `gctrl_query` (question) — blended answer for open questions.
+4. Only if still insufficient: `search_chunks` (raw evidence, quote sparingly), `gctrl_get_neighbors` (depth 1), `gctrl_shortest_path`, `get_entity` (provenance).
+5. `gctrl_wiki_page` — curated prose.
+
+Never call `get_graph` with large limits unprompted. Keep default limits.
+
+## Trust and conflicts
+
+Dossiers are authoritative — state them plainly. On conflicting/superseded facts: give the current value with its source file and date, mention the stale variant exists, and correct memory once the user confirms.
+
+## Write-back
+
+- Before the first write of a session: `gctrl_list_graphs`, cache your assigned compilationId. Never write without one.
+- After substantive work (decision, finished task, learned/corrected fact): `gctrl_store` (text, compilationId) with a short factual note; longer material via `gctrl_extract` / `create_extraction`.
+- Wrong fact in memory: `gctrl_memory_feedback` (entity, "down", + triple) — do not ignore it. Confirmed fact: vote "up".
+- Never store secrets, credentials, or ephemeral chatter.
+
+## Budget
+
+Default limits; never re-fetch what is already in context; summarize chunk sets instead of pasting them. Max ~3 read calls per question — beyond that, report what memory does and does not contain.
+
+## Limits
+
+Retrieval quality depends on what was ingested, and your token is scoped. Absence from GCTRL means "not on record", never "does not exist".
