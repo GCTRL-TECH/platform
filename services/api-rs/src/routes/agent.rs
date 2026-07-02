@@ -207,6 +207,8 @@ Read tools:
 - list_extractions   : List KEX extraction jobs. No args.
 - list_conflicts     : List open classification conflicts. No args.
 - list_sources       : List connected data sources. No args.
+- find_file          : Find files by name/path across connected sources — including unsupported files (CAD .dwg/.step, images, archives) indexed as metadata. Returns location, size, modified/last-seen times and related parsed sibling documents from the same folder. Use for "where is file X / when was it last seen / what belongs to it". Args: { query: string, limit?: number }
+- get_sync_status    : Connector sync health: per connector the last sync time, job counts by status, and the last failures. Use for "is my Drive sync working". No args.
 - list_ontologies    : List ontologies. No args.
 - check_balance      : Check token balance. No args.
 
@@ -327,7 +329,10 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "list_models",        "description": "List the built-in model catalog for a given runtime kind. Args: { runtime } where runtime ∈ 'ollama' | 'llamacpp' | 'vllm'. Read-only, any caller", "args": { "runtime": "string" } },
             { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'external', model?: string, base_url?: string, api_key?: string }. ollama/external: synchronous validate+persist. llamacpp: async (spawns pull+create in background, returns immediately with status='starting')", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?" } },
             { "name": "set_model",          "description": "Update the model for the active runtime without changing the provider (admin only). Validates against the built-in catalog for known runtimes; accepts any string for ollama/external. Args: { model: string }", "args": { "model": "string" } },
-            { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } }
+            { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } },
+            // ── File-asset index + connector ops ─────────────────────────────────
+            { "name": "find_file",          "description": "Find files by name/path across connected sources (Google Drive, SharePoint) — including UNSUPPORTED files like CAD drawings (.dwg/.step), images and archives that were indexed as metadata. Fuzzy-ranked (pg_trgm). Each hit includes path, size, modified/last-seen times, source, and up to 3 related parsed sibling documents from the same folder (with their KEX job ids) so you can answer 'what project is this file part of'. Args: { query: string, limit?: number (default 5) }", "args": { "query": "string", "limit": "number?" } },
+            { "name": "get_sync_status",    "description": "Summarize connector sync health for the caller: per connector (Drive/SharePoint) the last sync time and live job counts by status, plus the last 5 failed source files with their errors. Use to answer 'is my Drive sync working / what failed'. No args", "args": {} }
         ]
     })
 }
@@ -1318,6 +1323,23 @@ pub(crate) async fn execute_tool(
             }
         }
 
+        // ── Read: fuzzy file-asset search ("where is the rim CAD file?") ──────
+        "find_file" => {
+            let query = args["query"].as_str().unwrap_or("").trim().to_string();
+            if query.is_empty() {
+                return json!({ "error": "query is required" });
+            }
+            let limit = args["limit"].as_i64().unwrap_or(5).clamp(1, 25);
+            let result = crate::routes::connectors::find_file_json(&state.db, claims.sub, &query, limit).await;
+            crate::services::audit::log_access(&state.db, claims, "agent.find_file", "file_assets", &query, 0, None, true, None).await;
+            result
+        }
+
+        // ── Read: connector sync health summary ───────────────────────────────
+        "get_sync_status" => {
+            crate::routes::connectors::sync_status_json(&state.db, claims.sub).await
+        }
+
         _ => json!({ "error": format!("Unknown tool: {tool_name}") }),
     }
 }
@@ -1651,6 +1673,35 @@ mod agent_tool_registration_tests {
     fn tool_schema_contains_store() {
         assert!(tool_names().contains(&"store".to_string()),
             "tool_schema() must include 'store' (write-back, mirrors stdio gctrl_store)");
+    }
+
+    // ── File-asset index + connector ops tools ────────────────────────────────
+
+    #[test]
+    fn tool_schema_contains_find_file() {
+        assert!(tool_names().contains(&"find_file".to_string()),
+            "tool_schema() must include 'find_file'");
+    }
+
+    #[test]
+    fn tool_schema_contains_get_sync_status() {
+        assert!(tool_names().contains(&"get_sync_status".to_string()),
+            "tool_schema() must include 'get_sync_status'");
+    }
+
+    #[test]
+    fn find_file_descriptor_has_query_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("find_file"))
+            .expect("find_file must be in tool_schema");
+        assert!(tool["args"].get("query").is_some(),
+            "find_file descriptor must declare a 'query' arg");
+        assert!(tool["args"].get("limit").is_some(),
+            "find_file descriptor must declare a 'limit' arg");
     }
 
     // ── get_graph summary mode ─────────────────────────────────────────────────
