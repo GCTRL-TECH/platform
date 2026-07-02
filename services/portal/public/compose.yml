@@ -232,7 +232,7 @@ services:
   # GCTRL runtime is then provider=openai_compatible, base http://gctrl-llamacpp:8080.
   # llama-server self-downloads the GGUF from HuggingFace via `-hf repo:quant`.
   gctrl-llamacpp:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp:server-b9538
     container_name: gctrl-llamacpp
     restart: unless-stopped
     profiles: [bundled-llamacpp]
@@ -247,7 +247,7 @@ services:
   # same runtime while staying vector-compatible with the bundled-Ollama default.
   # Wired into KEX/FUSE in Phase 6; harmless when unused.
   gctrl-llamacpp-embed:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp:server-b9538
     container_name: gctrl-llamacpp-embed
     restart: unless-stopped
     profiles: [bundled-llamacpp]
