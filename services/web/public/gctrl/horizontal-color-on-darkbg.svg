@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="480" height="144">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 416 140" width="624" height="210">
 <title>GCTRL Horizontal — Color (dunkle BGs)</title>
 <defs>
 <linearGradient id="hexG" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -18,7 +18,7 @@
 <stop offset="100%" stop-color="#4A95EE"/>
 </radialGradient>
 </defs>
-<g transform="translate(80, 60)">
+<g transform="translate(70.0, 70.0)">
 <polygon points="0,-48 41.6,-24 41.6,24 0,48 -41.6,24 -41.6,-24" fill="url(#hexG)" stroke="#E8F2FF" stroke-width="2" stroke-linejoin="round"/>
 <g stroke="#E8F2FF" stroke-width="1.5" fill="none" opacity="0.92" stroke-linecap="round">
 <line x1="0" y1="-48" x2="0" y2="0"/><line x1="41.6" y1="-24" x2="0" y2="0"/>
@@ -31,5 +31,10 @@
 <circle cx="-41.6" cy="24" r="4.5"/><circle cx="-41.6" cy="-24" r="4.5"/>
 </g>
 <circle cx="0" cy="0" r="7.5" fill="url(#hubG)" stroke="#FFFFFF" stroke-width="0.6"/>
-</g><text x="152" y="74" text-anchor="start" font-family='"Inter", "Helvetica Neue", -apple-system, sans-serif' font-size="40" font-weight="800" fill="#FFFFFF" letter-spacing="4">GCTRL</text>
+</g>
+<g transform="translate(140, 92.32)"><g transform="translate(0.000, 0) scale(0.06200, -0.06200)"><path d="M204 0Q164 0 130.0 20.0Q96 40 76.0 74.0Q56 108 56 148V572Q56 613 76.0 646.5Q96 680 130.0 700.0Q164 720 204 720H627Q668 720 701.5 700.0Q735 680 755.5 646.5Q776 613 776 572V504H619V564Q619 564 619.0 564.0Q619 564 619 564H211Q211 564 211.0 564.0Q211 564 211 564V156Q211 156 211.0 156.0Q211 156 211 156H619Q619 156 619.0 156.0Q619 156 619 156V264H463V420H776V148Q776 108 755.5 74.0Q735 40 701.5 20.0Q668 0 627 0Z" fill="#FFFFFF"/></g>
+<g transform="translate(53.320, 0) scale(0.06200, -0.06200)"><path d="M204 0Q163 0 129.5 20.0Q96 40 76.0 73.5Q56 107 56 148V572Q56 613 76.0 646.5Q96 680 129.5 700.0Q163 720 204 720H774V564H244Q228 564 219.5 556.0Q211 548 211 531V189Q211 173 219.5 164.5Q228 156 244 156H774V0Z" fill="#FFFFFF"/></g>
+<g transform="translate(106.144, 0) scale(0.06200, -0.06200)"><path d="M302 0V564H20V720H740V564H458V0Z" fill="#FFFFFF"/></g>
+<g transform="translate(155.062, 0) scale(0.06200, -0.06200)"><path d="M615 0 406 249H609L775 53V0ZM56 0V719H627Q668 719 701.5 699.0Q735 679 755.5 645.0Q776 611 776 571V385Q776 345 755.5 311.0Q735 277 701.5 257.0Q668 237 627 237L211 236V0ZM211 393H619Q619 393 619.0 393.0Q619 393 619 393V564Q619 564 619.0 564.0Q619 564 619 564H211Q211 564 211.0 564.0Q211 564 211 564V393Q211 393 211.0 393.0Q211 393 211 393Z" fill="#FFFFFF"/></g>
+<g transform="translate(208.072, 0) scale(0.06200, -0.06200)"><path d="M57 0V721H212V156H777V0Z" fill="#FFFFFF"/></g></g>
 </svg>
