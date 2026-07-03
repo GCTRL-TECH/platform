@@ -130,6 +130,8 @@ Direction examples (study these carefully):
 - "Gamma uses Redis"           -> {{"head":"Gamma","relation":"uses","tail":"Redis"}}
 - "Carol uses a tool"          -> {{"head":"Carol","relation":"uses","tail":"tool"}}
 - "Delta calls a service"      -> {{"head":"Delta","relation":"calls","tail":"service"}}
+- "Acme GmbH / Kaiserstrasse 12 / 60329 Frankfurt" (address block or letterhead) -> {{"head":"Acme GmbH","relation":"located_in","tail":"Frankfurt"}}
+- "Acme Inc. (Austin, TX) announced..." (parenthetical after an org name) -> {{"head":"Acme Inc.","relation":"located_in","tail":"Austin, TX"}}
 
 CV / résumé / profile examples (a document describing ONE person's facts — pull
 out the person's employment, education, role, languages, skills, origin):
@@ -155,6 +157,11 @@ Rules:
 - head and tail must both be in the entity list, and must be different.
 - Use ONLY a relation from the allowed list; if none fits a pair, skip that pair (never invent a name).
 - Keep direction correct.
+- Emit the MOST SPECIFIC relation only: if X is ceo_of, heads, or founded Y, do NOT also emit the generic works_at(X,Y) or uses(X,Y) for the same pair — one relation per fact, the most specific one.
+- Never emit a relation between two names that refer to the SAME thing (e.g. 'VaultSync' and 'VaultSync-Modul', or a product and its version) — they are one entity, not two.
+- A product belongs to its maker via develops(maker, product) — do NOT use part_of between a product and its company.
+- Do NOT emit uses or part_of for a technology that only appears in a requirements/tooling list (e.g. "requires PostgreSQL, Ubuntu 22.04") unless the sentence explicitly states the org or person actually uses/depends on it — a bare requirement or prerequisite is not a stated usage fact.
+- speaks is ONLY for a human speaking a natural language. A product's supported languages are NOT speaks. Programming languages are has_skill, never speaks.
 - Return ONLY a JSON array of objects with keys "head", "relation", "tail". No prose.
 
 JSON array:"""
@@ -203,6 +210,12 @@ class RelationExtractor:
         # human-readable message for the job/dashboard.
         self.last_degraded: bool = False
         self.last_degraded_reason: Optional[str] = None
+        # Set by the most recent _parse_json_array() call: how many triple
+        # objects were recovered via truncated-JSON salvage (0 = clean parse,
+        # no salvage needed). Read by extract_relations() into the per-window
+        # `salvaged_truncated` report counter (R2 — a truncated array must
+        # never silently degrade to zero relations).
+        self.last_salvaged_count: int = 0
 
     def extract_relations(
         self,
@@ -260,6 +273,7 @@ class RelationExtractor:
         report_repaired_direction_flipped = 0
         report_repaired_normalized = 0
         report_gapfill_added = 0
+        report_salvaged_truncated = 0
 
         def _make_report(rels_after_conf):
             return {
@@ -281,6 +295,7 @@ class RelationExtractor:
                     "normalized": report_repaired_normalized,
                 },
                 "gapfill_added": report_gapfill_added,
+                "salvaged_truncated": report_salvaged_truncated,
             }
 
         if not entities or len(entities) < 2:
@@ -339,6 +354,7 @@ class RelationExtractor:
 
             try:
                 parsed = self._parse_json_array(raw_response)
+                report_salvaged_truncated += self.last_salvaged_count
                 report_relations_raw += len(parsed)
                 validated, cnt_oov, cnt_type, cnt_flip, cnt_norm = self._validate_counted(
                     parsed, entities
@@ -614,13 +630,14 @@ class RelationExtractor:
         trigger auto-pull. For other kinds, 404 is treated as a server error.
         """
         try:
+            num_predict = getattr(config, "RELEX_NUM_PREDICT", 2048)
             text = llm_client.complete(
                 prompt,
                 model,
                 base,
                 kind,
                 api_key=api_key,
-                options={"temperature": 0.0, "num_predict": 1024},
+                options={"temperature": 0.0, "num_predict": num_predict},
                 timeout=180,
             )
             return ("ok", text)
@@ -676,7 +693,14 @@ class RelationExtractor:
 
     def _parse_json_array(self, response_text: str) -> list[dict]:
         """Parse a JSON array of relation objects from the model response.
-        Tolerates code fences and surrounding prose."""
+        Tolerates code fences and surrounding prose.
+
+        Resets/sets self.last_salvaged_count as a side effect: 0 for a clean
+        parse, >0 when the array was truncated (e.g. num_predict cut the
+        response mid-object) and complete triple objects were salvaged from
+        the prefix instead of the whole window silently yielding zero
+        relations (R2 / FM-2)."""
+        self.last_salvaged_count = 0
         if not response_text:
             return []
         raw = response_text.strip()
@@ -697,8 +721,71 @@ class RelationExtractor:
                 if isinstance(data, list):
                     return [d for d in data if isinstance(d, dict)]
             except json.JSONDecodeError:
-                logger.warning("Could not parse relations JSON from Ollama response")
+                pass
+
+        # Neither the full response nor a bracket-matched slice parsed as a
+        # JSON array — most likely the model's output was cut off mid-object
+        # by num_predict. Recover whatever COMPLETE {...} objects appear in
+        # the prefix (the trailing partial object, if any, is dropped) rather
+        # than returning nothing for the whole window.
+        salvaged = self._salvage_truncated_objects(raw)
+        if salvaged:
+            self.last_salvaged_count = len(salvaged)
+            logger.warning(
+                "RelEx: array parse failed (likely truncated output) — salvaged "
+                "%d complete triple object(s) from the response prefix instead "
+                "of returning none.",
+                len(salvaged),
+            )
+            return salvaged
+
+        logger.warning("Could not parse relations JSON from Ollama response")
         return []
+
+    def _salvage_truncated_objects(self, raw: str) -> list[dict]:
+        """Scan *raw* for top-level, brace-balanced {...} substrings and parse
+        each as an independent JSON object. Used only when the surrounding
+        array/response is truncated and won't parse as a whole — recovers the
+        complete triples that came before the cut instead of dropping all of
+        them. String contents (including escaped quotes/braces) are tracked so
+        a brace inside a quoted value never confuses the depth count."""
+        candidates = []
+        depth = 0
+        start = None
+        in_string = False
+        escape = False
+        for i, ch in enumerate(raw):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        candidates.append(raw[start:i + 1])
+                        start = None
+
+        salvaged = []
+        for chunk in candidates:
+            try:
+                obj = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                salvaged.append(obj)
+        return salvaged
 
     def _validate(
         self,

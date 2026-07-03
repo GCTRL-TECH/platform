@@ -40,6 +40,14 @@ RELEX_WINDOW_CHARS: int = int(os.environ.get("KEX_RELEX_WINDOW", "6000"))
 RELEX_MAX_WINDOWS: int = int(os.environ.get("KEX_RELEX_MAX_WINDOWS", "8"))
 RELEX_MIN_CONFIDENCE: float = float(os.environ.get("KEX_MIN_RELATION_CONFIDENCE", "0.0"))
 
+# Max tokens the relation model may generate per window (Ollama `num_predict`).
+# A long document (e.g. a dense CV/resume) can legitimately need 20+ relation
+# triples in one window; at 1024 the JSON array was observed to truncate
+# mid-object, which made the parser return an empty list for the ENTIRE window
+# (round-1 error analysis, FM-2). Raised to 2048 as the new default; still
+# overridable per-install for very constrained hosts.
+RELEX_NUM_PREDICT: int = int(os.environ.get("RELEX_NUM_PREDICT", "2048"))
+
 # Graph pruning: GLiNER over-extracts — it promotes emotions ("Cool"), generic nouns
 # ("software", "box"), and sentence fragments to entities, which become thousands of
 # ORPHAN graph nodes that add nothing (they stay searchable in the vector store either
