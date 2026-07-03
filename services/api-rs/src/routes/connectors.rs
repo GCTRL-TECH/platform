@@ -1076,6 +1076,21 @@ async fn sync_selected(
     for file_id in &req.file_ids {
         let name = meta_map.get(file_id).cloned().unwrap_or_else(|| file_id.clone());
 
+        // Selected-file sync has no traversal context; when asset-capture is
+        // enabled we already have parent/modified metadata (reused below for
+        // both file_assets AND the source-document identity). Without it,
+        // `path` falls back to the bare display name.
+        let (doc_path, doc_modified) = match asset_meta.get(file_id) {
+            Some(m) => {
+                let p = match m.parent_name.as_deref() {
+                    Some(parent) => format!("{parent}/{}", m.name),
+                    None => m.name.clone(),
+                };
+                (p, m.modified)
+            }
+            None => (name.clone(), None),
+        };
+
         let mut kex_job_id: Option<Uuid> = None;
         match enqueue_drive_file(
             &state.db,
@@ -1087,6 +1102,8 @@ async fn sync_selected(
             file_id,
             &name,
             &resolved,
+            &doc_path,
+            doc_modified,
         )
         .await
         {
@@ -1203,6 +1220,15 @@ pub(crate) async fn run_drive_folder_sync(
 
     let mut extractable_total = 0usize;
     for f in &all_files {
+        // Full traversal-derived path — always known here (no extra API
+        // calls), so the source-document identity gets the real path even
+        // when index_unsupported_files (file_assets capture) is off.
+        let full_path = if f.folder_path.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{}/{}", f.folder_path, f.name)
+        };
+
         let mut kex_job_id: Option<Uuid> = None;
         if is_extractable(&f.mime) {
             extractable_total += 1;
@@ -1216,6 +1242,8 @@ pub(crate) async fn run_drive_folder_sync(
                 &f.id,
                 &f.name,
                 &resolved,
+                &full_path,
+                f.modified,
             )
             .await
             {
@@ -1233,17 +1261,12 @@ pub(crate) async fn run_drive_folder_sync(
         }
 
         if capture_assets {
-            let path = if f.folder_path.is_empty() {
-                f.name.clone()
-            } else {
-                format!("{}/{}", f.folder_path, f.name)
-            };
             upsert_file_asset(
                 &state.db,
                 user_id,
                 Some(connector.id),
                 "google_drive",
-                &path,
+                &full_path,
                 if f.folder_path.is_empty() { None } else { Some(&f.folder_path) },
                 &f.name,
                 f.size,
@@ -2741,10 +2764,24 @@ async fn sync_obsidian_folder(
         })
         .to_string();
 
+        // P2b: content bytes are already resident (just read from disk), and
+        // `rel_str` is the full vault-relative path — use both directly, plus
+        // the file's real mtime as `modified_at`.
+        let content_hash = crate::services::source_docs::hash_content(&bytes);
+        let modified_at: Option<DateTime<Utc>> = std::fs::metadata(&canon)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from);
+        let source_doc = crate::services::source_docs::resolve_source_document(
+            &state.db, claims.sub, None, &rel_str, Some(&note_name),
+            &content_hash, modified_at,
+        ).await.ok();
+        let source_document_id = source_doc.as_ref().map(|d| d.id);
+
         let job_id = Uuid::new_v4();
         let insert = sqlx::query(
-            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5)",
         )
         .bind(job_id)
         .bind(claims.sub)
@@ -2756,6 +2793,7 @@ async fn sync_obsidian_folder(
             "discoveryMode": resolved.discovery_mode,
         }))
         .bind(resolved.classification_level_id)
+        .bind(source_document_id)
         .execute(&state.db)
         .await;
 
@@ -2777,6 +2815,9 @@ async fn sync_obsidian_folder(
             "ontology_id":             resolved.ontology_id,
             "classification":          resolved.classification_name,
             "classification_level_id": resolved.classification_level_id,
+            "source_document_id":      source_document_id,
+            "source_path":             &rel_str,
+            "source_modified_at":      modified_at,
         });
         crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
 
@@ -2959,6 +3000,13 @@ async fn enqueue_drive_file(
     drive_file_id: &str,
     file_name: &str,
     opts: &DriveExtractResolved,
+    // P2b: full source path (folder-traversal path when known, else just the
+    // file name) + source-side modified time when the caller already fetched
+    // it (folder sync always has both from Drive metadata; selected-file sync
+    // passes None when index_unsupported_files is disabled — no extra API
+    // call is made just for this).
+    full_path: &str,
+    modified_at: Option<DateTime<Utc>>,
 ) -> Result<Uuid> {
     use base64::Engine;
 
@@ -2974,11 +3022,20 @@ async fn enqueue_drive_file(
         "originalFilename": real_name,
     }).to_string();
 
+    // Content is already in hand (just downloaded) — hash it now so the
+    // document identity resolution reflects the real bytes, not just metadata.
+    let content_hash = crate::services::source_docs::hash_content(&bytes);
+    let source_doc = crate::services::source_docs::resolve_source_document(
+        db, user_id, Some(connector_id), full_path, Some(&real_name),
+        &content_hash, modified_at,
+    ).await.ok();
+    let source_document_id = source_doc.as_ref().map(|d| d.id);
+
     let job_id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+         VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5)",
     )
     .bind(job_id)
     .bind(user_id)
@@ -2991,6 +3048,7 @@ async fn enqueue_drive_file(
         "discoveryMode": opts.discovery_mode,
     }))
     .bind(opts.classification_level_id)
+    .bind(source_document_id)
     .execute(db)
     .await?;
 
@@ -3020,6 +3078,9 @@ async fn enqueue_drive_file(
         "ontology_id":             opts.ontology_id,
         "classification":          opts.classification_name,
         "classification_level_id": opts.classification_level_id,
+        "source_document_id":      source_document_id,
+        "source_path":             full_path,
+        "source_modified_at":      modified_at,
     });
     crate::services::llm::inject_ollama_overrides(db, user_id, &mut payload).await;
 

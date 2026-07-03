@@ -158,6 +158,53 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/folders",                              get(list_folders).post(create_folder))
         .route("/folders/:id",                          put(update_folder).delete(delete_folder))
         .route("/folders/move/:compilation_id",         put(move_compilation_to_folder))
+        .route("/source-documents",                     get(list_source_documents))
+}
+
+// ── Source document identity + version chains (P2b) ──────────────────────────
+
+#[derive(Deserialize)]
+struct SourceDocQuery { path: String }
+
+/// GET /api/kg/source-documents?path=... — list the version chain for one
+/// (user, path) source document, newest version first. Returns a hash prefix
+/// (not the full sha256) so the response stays light for display purposes.
+async fn list_source_documents(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<SourceDocQuery>,
+) -> Result<Json<Value>> {
+    let rows = sqlx::query_as::<_, (
+        Uuid, i32, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>,
+        bool, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>,
+    )>(
+        "SELECT id, version, content_hash, name, modified_at,
+                latest, first_ingested_at, last_ingested_at
+           FROM source_documents
+          WHERE user_id = $1 AND path = $2
+          ORDER BY version DESC"
+    )
+    .bind(claims.sub)
+    .bind(&q.path)
+    .fetch_all(&state.db)
+    .await?;
+
+    let versions: Vec<Value> = rows.into_iter().map(|(
+        id, version, hash, name, modified_at, latest, first_ingested_at, last_ingested_at,
+    )| {
+        json!({
+            "id":              id,
+            "version":         version,
+            "hashPrefix":      &hash[..hash.len().min(12)],
+            "name":            name,
+            "modifiedAt":      modified_at,
+            "latest":          latest,
+            "firstIngestedAt": first_ingested_at,
+            "lastIngestedAt":  last_ingested_at,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "path": q.path, "versions": versions })))
 }
 
 // ── Folders (workspace organisation) ──────────────────────────────────────────
