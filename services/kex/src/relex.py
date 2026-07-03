@@ -114,6 +114,22 @@ def _split_windows(text: str, window_chars: int, overlap: int = _WINDOW_OVERLAP)
     return windows
 
 
+# ── Shared relation rules (round-1 hardening) ──────────────────────────────
+# Single source of truth for the five round-1 rules (analysis-round1.md R3/R6)
+# that both the main prompt AND the gap-fill second-pass prompt must render
+# identically. Round 2 (analysis-round2.md P1) found the gap-fill prompt had
+# NONE of these — every gap-fill pass regenerated exactly the FP classes
+# round 1 was meant to suppress. Fix: render this constant into BOTH prompts
+# instead of maintaining two copies that can drift out of sync.
+_SHARED_RELATION_RULES = "\n".join([
+    "- Emit the MOST SPECIFIC relation only: if X is ceo_of, heads, or founded Y, do NOT also emit the generic works_at(X,Y) or uses(X,Y) for the same pair — one relation per fact, the most specific one.",
+    "- Never emit a relation between two names that refer to the SAME thing (e.g. 'VaultSync' and 'VaultSync-Modul', or a product and its version) — they are one entity, not two.",
+    "- A product belongs to its maker via develops(maker, product) — do NOT use part_of between a product and its company.",
+    '- Do NOT emit uses or part_of for a technology that only appears in a requirements/tooling list (e.g. "requires PostgreSQL, Ubuntu 22.04") unless the sentence explicitly states the org or person actually uses/depends on it — a bare requirement or prerequisite is not a stated usage fact.',
+    "- speaks is ONLY for a human speaking a natural language. A product's supported languages are NOT speaks. Programming languages are has_skill, never speaks.",
+])
+
+
 def _build_prompt(text: str, entity_lines: str) -> str:
     """Direction-enforced, closed-vocabulary, thorough prompt (variant 'v4')."""
     vocab_block = relvocab.vocab_prompt_block()
@@ -128,14 +144,13 @@ Direction examples (study these carefully):
 - "Bob founded Acme"           -> {{"head":"Bob","relation":"founded","tail":"Acme"}}
 - "Beta is a module of Gamma"  -> {{"head":"Beta","relation":"part_of","tail":"Gamma"}}
 - "Gamma uses Redis"           -> {{"head":"Gamma","relation":"uses","tail":"Redis"}}
-- "Carol uses a tool"          -> {{"head":"Carol","relation":"uses","tail":"tool"}}
-- "Delta calls a service"      -> {{"head":"Delta","relation":"calls","tail":"service"}}
 - "Acme GmbH / Kaiserstrasse 12 / 60329 Frankfurt" (address block or letterhead) -> {{"head":"Acme GmbH","relation":"located_in","tail":"Frankfurt"}}
 - "Acme Inc. (Austin, TX) announced..." (parenthetical after an org name) -> {{"head":"Acme Inc.","relation":"located_in","tail":"Austin, TX"}}
 
 CV / résumé / profile examples (a document describing ONE person's facts — pull
 out the person's employment, education, role, languages, skills, origin):
 - "Experience: Senior Developer at Acme (2020–2023)" -> [{{"head":"Eve","relation":"worked_at","tail":"Acme"}}, {{"head":"Eve","relation":"has_role","tail":"Senior Developer"}}]
+- Tense contrast: "Acme (June 2023 - present)" -> works_at; "Beta Corp (2019 - 2023)" -> worked_at  (an OPEN range/"present" is CURRENT employment -> works_at; a CLOSED date range is PAST employment -> worked_at, even when the surrounding narrative is past tense)
 - "Education: BSc Computer Science, TU Berlin"        -> [{{"head":"Eve","relation":"studied_at","tail":"TU Berlin"}}, {{"head":"Eve","relation":"has_degree","tail":"BSc Computer Science"}}]
 - "Languages: German, English, Spanish"              -> [{{"head":"Eve","relation":"speaks","tail":"German"}}, {{"head":"Eve","relation":"speaks","tail":"English"}}, {{"head":"Eve","relation":"speaks","tail":"Spanish"}}]
 - "Skills: Python, Kubernetes, leadership"           -> [{{"head":"Eve","relation":"has_skill","tail":"Python"}}, {{"head":"Eve","relation":"has_skill","tail":"Kubernetes"}}, {{"head":"Eve","relation":"has_skill","tail":"leadership"}}]
@@ -157,11 +172,7 @@ Rules:
 - head and tail must both be in the entity list, and must be different.
 - Use ONLY a relation from the allowed list; if none fits a pair, skip that pair (never invent a name).
 - Keep direction correct.
-- Emit the MOST SPECIFIC relation only: if X is ceo_of, heads, or founded Y, do NOT also emit the generic works_at(X,Y) or uses(X,Y) for the same pair — one relation per fact, the most specific one.
-- Never emit a relation between two names that refer to the SAME thing (e.g. 'VaultSync' and 'VaultSync-Modul', or a product and its version) — they are one entity, not two.
-- A product belongs to its maker via develops(maker, product) — do NOT use part_of between a product and its company.
-- Do NOT emit uses or part_of for a technology that only appears in a requirements/tooling list (e.g. "requires PostgreSQL, Ubuntu 22.04") unless the sentence explicitly states the org or person actually uses/depends on it — a bare requirement or prerequisite is not a stated usage fact.
-- speaks is ONLY for a human speaking a natural language. A product's supported languages are NOT speaks. Programming languages are has_skill, never speaks.
+{_SHARED_RELATION_RULES}
 - Return ONLY a JSON array of objects with keys "head", "relation", "tail". No prose.
 
 JSON array:"""
@@ -170,12 +181,17 @@ JSON array:"""
 def _build_gapfill_prompt(text: str, entity_lines: str, isolated_names: list[str]) -> str:
     """Focused SECOND-pass prompt: the first pass left these entities with NO
     relations even though they appear in the text. Concentrate the model's attention
-    on them so the per-document graph comes out connected instead of orphaned."""
+    on them so the per-document graph comes out connected instead of orphaned.
+
+    Renders the SAME `_SHARED_RELATION_RULES` as `_build_prompt` (analysis-round2.md
+    P1) — round 1's anti-variant / most-specific / requirement-list / speaks-only
+    rules previously existed ONLY in the main prompt, so every gap-fill pass
+    silently regenerated the FP classes round 1 was meant to suppress."""
     vocab_block = relvocab.vocab_prompt_block()
     iso = "\n".join(f"  - {n}" for n in isolated_names)
     return f"""You extract directed relationships from text. The HEAD is the subject (the doer); the TAIL is the object. Direction matters.
 
-FOCUS — these entities appear in the text but currently have NO relationship. Re-read the text carefully and extract EVERY relationship that involves each of them (as HEAD or TAIL). Look hard for employment, job role, who-reports-to-whom, team/membership, location, ownership, part-of, who-uses/builds-what, authorship, and family/social ties. Do not stop at the obvious — connect each listed entity to whatever the text says about it.
+FOCUS — these entities appear in the text but currently have NO relationship. Re-read the text carefully and extract EVERY relationship that involves each of them (as HEAD or TAIL). Look hard for employment, job role, who-reports-to-whom, team/membership, location, ownership, part-of, who-uses/builds-what, authorship, and family/social ties. Do not stop at the obvious — connect each listed entity to whatever the text says about it. If the text does not explicitly state a relation for an entity, leave it unconnected — do NOT invent one.
 
 Entities still missing relations:
 {iso}
@@ -195,9 +211,160 @@ Rules:
 - head and tail must both be in the entity list, and must be different.
 - Use ONLY a relation from the allowed list; if none fits a pair, skip it (never invent a name).
 - Keep direction correct (who performs/holds the relation is the HEAD).
+{_SHARED_RELATION_RULES}
 - Return ONLY a JSON array of objects with keys "head", "relation", "tail". No prose.
 
 JSON array:"""
+
+
+# ── Letterhead / address-block located_in pre-pass (analysis-round2.md P3) ──
+# Prompt-only located_in few-shots (round 1) still recovered 0/5 German
+# newline letterheads ("Nexovar GmbH / Kaiserstrasse 47 / 60329 Frankfurt" as
+# separate LINES). Make it deterministic instead: regex-scan the raw document
+# for a postal-code+city (DE) or "City, ST ZIP" (US) line, then look back a
+# few lines for a known org mention. Only known entities on both ends —
+# never invents a head or a tail.
+_DE_POSTAL_CITY_RE = re.compile(
+    r"^\s*\d{5}\s+([A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*(?:\s+[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*)*)\s*$"
+)
+_US_CITY_STATE_ZIP_RE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z .'\-]*?),\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$"
+)
+
+# How many lines to look back from the postal-code/city line for an org
+# mention (covers the typical 3-line block: ORG / street / postal+city).
+_LETTERHEAD_LOOKBACK_LINES = 3
+
+
+def _letterhead_located_in_pairs(text, entities):
+    """Deterministic address-block pre-pass. Returns a list of relation dicts
+    {head, type, tail, confidence} for located_in(org, city) pairs found in
+    letterhead/address blocks, where BOTH org and city are already known NER
+    entities (coarse_type organization / location respectively) — no invented
+    tails. Confidence is fixed at 0.85 (below a clean LLM triple's 0.9, above
+    a repaired one) per the analysis. Caller merges these with LLM output
+    using the same max-confidence dedup as window merging."""
+    org_surfaces = []
+    location_surfaces = []
+    for ent in entities:
+        surf = (ent.get("text") or "").strip()
+        if not surf:
+            continue
+        coarse = ent.get("coarse_type") or config.coarse_for(
+            ent.get("gliner_label", ""), ent.get("label", "")
+        )
+        if coarse == "organization":
+            org_surfaces.append(surf)
+        elif coarse == "location":
+            location_surfaces.append(surf)
+
+    if not org_surfaces or not location_surfaces:
+        return []
+
+    location_by_lower = {}
+    for loc in location_surfaces:
+        location_by_lower[loc.lower()] = loc
+
+    lines = text.splitlines()
+    found = []
+    seen_pairs = set()
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        city_raw = None
+        m_de = _DE_POSTAL_CITY_RE.match(stripped)
+        if m_de:
+            city_raw = m_de.group(1).strip()
+        else:
+            m_us = _US_CITY_STATE_ZIP_RE.match(stripped)
+            if m_us:
+                city_raw = m_us.group(1).strip()
+
+        if not city_raw:
+            continue
+
+        city_match = location_by_lower.get(city_raw.lower())
+        if city_match is None:
+            # Not a known location entity -> never invent a tail, skip.
+            continue
+
+        org_match = None
+        for back in range(1, _LETTERHEAD_LOOKBACK_LINES + 1):
+            j = i - back
+            if j < 0:
+                break
+            back_line = lines[j].strip()
+            if not back_line:
+                continue
+            low_back = back_line.lower()
+            for org in org_surfaces:
+                if org.lower() in low_back:
+                    org_match = org
+                    break
+            if org_match:
+                break
+
+        if org_match is None:
+            continue
+
+        pair_key = (org_match.lower(), city_match.lower())
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        found.append(
+            {"head": org_match, "type": "located_in", "tail": city_match, "confidence": 0.85}
+        )
+
+    return found
+
+
+# ── Deterministic post-validation pruning helpers (analysis-round2.md P2) ──
+# Generic product/legal suffix tokens stripped when computing an entity's
+# "root" for self-link / duplicate-variant detection. NOTE (Cython trap): no
+# dict/list/set type annotations on the locals/params below — the prod kex
+# build is Cython-compiled and a bare `dict`/`list`/`set` annotation enforces
+# an EXACT-type check that rejects subclasses (e.g. defaultdict).
+_GENERIC_SUFFIX_TOKENS = {
+    "modul", "module", "plattform", "platform", "version", "kern",
+    "dashboard", "frontend", "saas", "enterprise", "implementierung",
+    "komponente", "gmbh", "ag", "inc", "ltd", "llc", "corp",
+}
+
+# Relations that, when present for a (head, tail) pair, make the more generic
+# works_at/worked_at/member_of relation for the SAME pair redundant (the
+# prompt already states this rule; 7b compliance is soft, so P2 enforces it
+# deterministically in code).
+_SPECIFICITY_TRIGGER_RELATIONS = {"ceo_of", "co_founder_of", "founded", "heads"}
+_SPECIFICITY_DROP_RELATIONS = {"works_at", "worked_at", "member_of"}
+
+
+def _normalize_root(name):
+    """Normalize an entity surface form to a coarse 'root' for self-link and
+    duplicate-variant detection: casefold, strip digit/version tokens, drop
+    generic product/legal suffix tokens, concatenate what remains."""
+    low = (name or "").lower()
+    low = re.sub(r"\d+(\.\d+)*", " ", low)
+    tokens = re.findall(r"[a-zäöüß]+", low)
+    kept = [t for t in tokens if t not in _GENERIC_SUFFIX_TOKENS]
+    return "".join(kept)
+
+
+def _roots_match(root_a, root_b):
+    """True when two normalized roots refer to the same underlying entity:
+    exact equality, or one contains the other (variant naming, e.g. a
+    Kompositum like 'ScanModule-Dienstes' vs 'ScanModule'). Guarded by a
+    minimum length so short/empty roots never false-positive (a real distinct
+    entity like 'VaultSync' vs 'NeuroGraph' keeps its own root and survives)."""
+    if not root_a or not root_b:
+        return False
+    if len(root_a) < 3 or len(root_b) < 3:
+        return False
+    if root_a == root_b:
+        return True
+    return root_a in root_b or root_b in root_a
 
 
 class RelationExtractor:
@@ -274,6 +441,10 @@ class RelationExtractor:
         report_repaired_normalized = 0
         report_gapfill_added = 0
         report_salvaged_truncated = 0
+        report_letterhead_added = 0
+        report_pruned_self_link = 0
+        report_pruned_dup_variant = 0
+        report_pruned_specificity = 0
 
         def _make_report(rels_after_conf):
             return {
@@ -296,6 +467,10 @@ class RelationExtractor:
                 },
                 "gapfill_added": report_gapfill_added,
                 "salvaged_truncated": report_salvaged_truncated,
+                "letterhead_added": report_letterhead_added,
+                "pruned_self_link": report_pruned_self_link,
+                "pruned_dup_variant": report_pruned_dup_variant,
+                "pruned_specificity": report_pruned_specificity,
             }
 
         if not entities or len(entities) < 2:
@@ -318,6 +493,16 @@ class RelationExtractor:
 
         # Per-window extraction: merge triples across windows keeping MAX confidence.
         merged = {}  # key (head_lower, type, tail_lower) -> relation dict
+
+        # ── Deterministic letterhead/address-block located_in pre-pass (P3) ──
+        # Runs BEFORE the LLM loop over the full document text so its output
+        # seeds `merged` like any other source; a higher-confidence LLM triple
+        # for the same key still wins via the max-confidence merge below.
+        letterhead_pairs = _letterhead_located_in_pairs(text, entities)
+        for r in letterhead_pairs:
+            key = (r["head"].lower(), r["type"], r["tail"].lower())
+            merged[key] = r
+        report_letterhead_added = len(letterhead_pairs)
 
         first_window_text = windows[0][0] if windows else ""
 
@@ -428,6 +613,14 @@ class RelationExtractor:
                 else:
                     report_dropped_below_confidence += 1
             relations = kept
+
+        # ── Deterministic post-validation pruning (P2) — after validation,
+        # BEFORE returning triples. No LLM involved; applied once over the
+        # FULL relation set (main pass + gap-fill + letterhead pre-pass).
+        relations, prune_counts = self._prune_relations(relations)
+        report_pruned_self_link = prune_counts["pruned_self_link"]
+        report_pruned_dup_variant = prune_counts["pruned_dup_variant"]
+        report_pruned_specificity = prune_counts["pruned_specificity"]
 
         return (relations, _make_report(relations))
 
@@ -964,6 +1157,82 @@ class RelationExtractor:
             )
 
         return (relations, cnt_oov, cnt_type, cnt_direction_flipped, cnt_normalized)
+
+    def _prune_relations(self, relations):
+        """Deterministic, LLM-free post-validation pruning (analysis-round2.md P2).
+        Applied once, right before extract_relations() returns, over the FULL
+        relation set (main pass + gap-fill + letterhead pre-pass), in order:
+
+          (a) self-link / variant filter — drop a triple when head and tail
+              normalize to the same root (casefold, strip digit/version
+              tokens and generic product/legal suffixes; exact-or-containment
+              match). Kills variant self-links like "NeuroGraph 5.0" PART_OF
+              "NeuroGraph" or "ScanModule-Dienstes" PART_OF "ScanModule".
+          (b) duplicate-variant dedup — collapse triples identical under
+              (relation, root(head), root(tail)), keeping the max-confidence
+              one. Kills re-emissions of an already-matched fact with a
+              variant end (e.g. "NeuroGraph" and "NeuroGraph Enterprise SaaS"
+              both as the develops(Nexovar, ·) tail).
+          (c) specificity enforcement — if a (head, tail) pair also carries
+              ceo_of/co_founder_of/founded/heads, drop works_at/worked_at/
+              member_of for that SAME pair (the prompt already states this
+              rule; 7b compliance is soft, so it's enforced here in code).
+
+        NOTE (Cython trap): no dict/list/set type annotations on locals or
+        params in this method — see the module-level comment above
+        `_GENERIC_SUFFIX_TOKENS`.
+
+        Returns (pruned_relations, counts) where counts is a plain dict with
+        keys pruned_self_link, pruned_dup_variant, pruned_specificity.
+        """
+        counts = {"pruned_self_link": 0, "pruned_dup_variant": 0, "pruned_specificity": 0}
+
+        # (a) self-link / variant filter.
+        after_self_link = []
+        for r in relations:
+            root_head = _normalize_root(r.get("head", ""))
+            root_tail = _normalize_root(r.get("tail", ""))
+            if _roots_match(root_head, root_tail):
+                counts["pruned_self_link"] += 1
+                continue
+            after_self_link.append(r)
+
+        # (b) duplicate-variant dedup: keep max confidence per
+        # (relation, root(head), root(tail)).
+        best_by_key = {}
+        order = []
+        for r in after_self_link:
+            key = (
+                r.get("type"),
+                _normalize_root(r.get("head", "")),
+                _normalize_root(r.get("tail", "")),
+            )
+            existing = best_by_key.get(key)
+            if existing is None:
+                best_by_key[key] = r
+                order.append(key)
+            else:
+                counts["pruned_dup_variant"] += 1
+                if r.get("confidence", 0.0) > existing.get("confidence", 0.0):
+                    best_by_key[key] = r
+        after_dedup = [best_by_key[k] for k in order]
+
+        # (c) specificity enforcement: ceo_of/co_founder_of/founded/heads
+        # beats works_at/worked_at/member_of on the exact same (head, tail) pair.
+        specific_pairs = set()
+        for r in after_dedup:
+            if r.get("type") in _SPECIFICITY_TRIGGER_RELATIONS:
+                specific_pairs.add((str(r.get("head", "")).lower(), str(r.get("tail", "")).lower()))
+
+        final = []
+        for r in after_dedup:
+            pair = (str(r.get("head", "")).lower(), str(r.get("tail", "")).lower())
+            if r.get("type") in _SPECIFICITY_DROP_RELATIONS and pair in specific_pairs:
+                counts["pruned_specificity"] += 1
+                continue
+            final.append(r)
+
+        return (final, counts)
 
 
 # One-time, process-wide guard so concurrent workers / repeated jobs never

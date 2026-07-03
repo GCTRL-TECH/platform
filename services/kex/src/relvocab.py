@@ -88,7 +88,7 @@ RELATIONS: dict[str, dict] = {
                      "position_at", "role_at"],
         "head_types": {"person"},
         "tail_types": {"organization"},
-        "desc": "X PREVIOUSLY worked at organization Y (PAST employment only: 'previously', 'former', a closed date range; if current, use works_at)",
+        "desc": "X PREVIOUSLY worked at organization Y (PAST employment only: 'previously', 'former', a closed date range; if current, use works_at) — NOT for current employees mentioned in past-tense narration (meeting minutes, memos: 'berichtete', 'presented')",
     },
     "studied_at": {
         "synonyms": ["student_at", "studied", "graduated_from", "alumnus_of",
