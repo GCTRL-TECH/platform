@@ -42,7 +42,7 @@ export function SpeedOfTrustSection() {
 
       <div className="relative mx-auto max-w-6xl">
         <div className="mb-12 text-center reveal">
-          <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-indigo-400">Our moat</p>
+          <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-indigo-400">Trust, built in</p>
           <h2 className="mx-auto max-w-3xl text-4xl font-bold text-white md:text-6xl">
             Running at the{' '}
             <span className="bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent">
@@ -50,8 +50,8 @@ export function SpeedOfTrustSection() {
             </span>
           </h2>
           <p className="mx-auto mt-6 max-w-2xl text-lg leading-relaxed text-slate-300">
-            Anyone can bolt an LLM onto a database. The hard, unglamorous, <span className="font-medium text-white">defensible</span>{' '}
-            part is controlling exactly who — human or agent — can touch which fact, and proving it forever after.
+            Anyone can bolt an LLM onto a database. The hard, unglamorous part is controlling exactly
+            who — human or agent — can touch which fact, and proving it forever after.
             We built GCTRL knowing that in the enterprise, <span className="font-medium text-white">compliance isn’t a feature — it’s the permission to exist.</span>
           </p>
         </div>
