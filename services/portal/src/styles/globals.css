@@ -214,24 +214,24 @@
     55% {
       opacity: 1.00;
       box-shadow:
-        0 0 4px 0  rgba(255,255,255,1.00),
-        0 0 12px 0 rgba(255,255,255,0.90),
-        0 0 26px 0 rgba(255,255,255,0.55),
-        0 0 48px 0 rgba(180,200,255,0.35);
+        0 0 5px 1px  rgba(255,255,255,1.00),
+        0 0 16px 2px rgba(255,255,255,0.95),
+        0 0 36px 4px rgba(255,255,255,0.60),
+        0 0 72px 8px rgba(180,200,255,0.45);
     }
     65% {
       opacity: 1.00;
       box-shadow:
-        0 0 5px 0  rgba(255,255,255,1.00),
-        0 0 16px 0 rgba(255,255,255,0.80),
-        0 0 34px 0 rgba(255,255,255,0.45),
-        0 0 60px 0 rgba(180,200,255,0.28);
+        0 0 6px 1px   rgba(255,255,255,1.00),
+        0 0 22px 3px  rgba(255,255,255,0.85),
+        0 0 48px 6px  rgba(255,255,255,0.50),
+        0 0 92px 10px rgba(180,200,255,0.35);
     }
     78% {
       opacity: 0.70;
       box-shadow:
         0 0 3px 0  rgba(255,255,255,0.70),
-        0 0 8px 0  rgba(255,255,255,0.40);
+        0 0 10px 1px rgba(255,255,255,0.45);
     }
   }
 
@@ -249,32 +249,32 @@
     55% {
       opacity: 1.00;
       box-shadow:
-        0 0 4px 0  rgba(255,255,255,1.00),
-        0 0 12px 0 rgba(255,240,210,0.90),
-        0 0 26px 0 rgba(255,220,170,0.55),
-        0 0 48px 0 rgba(255,200,140,0.30);
+        0 0 5px 1px  rgba(255,255,255,1.00),
+        0 0 16px 2px rgba(255,240,210,0.95),
+        0 0 36px 4px rgba(255,220,170,0.60),
+        0 0 72px 8px rgba(255,200,140,0.40);
     }
     65% {
       opacity: 1.00;
       box-shadow:
-        0 0 5px 0  rgba(255,255,255,1.00),
-        0 0 16px 0 rgba(255,240,210,0.80),
-        0 0 34px 0 rgba(255,220,170,0.45),
-        0 0 60px 0 rgba(255,200,140,0.25);
+        0 0 6px 1px   rgba(255,255,255,1.00),
+        0 0 22px 3px  rgba(255,240,210,0.85),
+        0 0 48px 6px  rgba(255,220,170,0.50),
+        0 0 92px 10px rgba(255,200,140,0.32);
     }
     78% {
       opacity: 0.70;
       box-shadow:
         0 0 3px 0  rgba(255,240,210,0.70),
-        0 0 8px 0  rgba(255,220,170,0.40);
+        0 0 10px 1px rgba(255,220,170,0.45);
     }
   }
 
   .animate-twinkle-a          { animation: twinkle-a          12s ease-in-out infinite; }
   .animate-twinkle-b          { animation: twinkle-b          14s ease-in-out infinite; }
   .animate-twinkle-c          { animation: twinkle-c          10s ease-in-out infinite; }
-  .animate-twinkle-shine      { animation: twinkle-shine      11s ease-in-out infinite; }
-  .animate-twinkle-shine-warm { animation: twinkle-shine-warm 13s ease-in-out infinite; }
+  .animate-twinkle-shine      { animation: twinkle-shine      9s  ease-in-out infinite; }
+  .animate-twinkle-shine-warm { animation: twinkle-shine-warm 11s ease-in-out infinite; }
 
   /* Shooting star — a bright streak with a fading trail. CSS variables
      `--ss-angle` and `--ss-distance` are set inline per-instance for
@@ -309,6 +309,56 @@
       opacity: 0;
       transform: rotate(var(--ss-angle)) translateX(var(--ss-distance));
     }
+  }
+
+  /* Front shooting star — the rare hero-crossing streak that sweeps OVER the
+     image. Longer tail + stronger glow than the edge streaks so the moment
+     reads as an event, not noise. */
+  .shooting-star-front {
+    width: 280px;
+    height: 3px;
+    background: linear-gradient(to right,
+      rgba(255,255,255,0) 0%,
+      rgba(255,255,255,0.30) 45%,
+      rgba(255,255,255,0.85) 82%,
+      rgba(255,255,255,1) 100%);
+    border-radius: 999px;
+    box-shadow:
+      0 0 8px  rgba(255,255,255,1.00),
+      0 0 20px rgba(255,255,255,0.75),
+      0 0 44px rgba(180,200,255,0.5);
+    transform-origin: right center;
+    will-change: transform, opacity;
+  }
+
+  /* Typewriter caret for the hero audience line */
+  @keyframes caret-blink {
+    0%, 45%  { opacity: 1; }
+    50%, 95% { opacity: 0; }
+    100%     { opacity: 1; }
+  }
+  .animate-caret { animation: caret-blink 1.1s steps(1) infinite; }
+
+  /* ─── Fusion story (landing narrative animation) ─────────────────
+     Small particles flowing from the source chips into the graph. Each dot
+     gets its travel vector via --fx/--fy inline vars. */
+  @keyframes story-flow {
+    0%   { transform: translate(0, 0) scale(0.7); opacity: 0; }
+    12%  { opacity: 1; }
+    82%  { opacity: 1; }
+    100% { transform: translate(var(--fx), var(--fy)) scale(1); opacity: 0; }
+  }
+  .story-flow-dot { animation: story-flow var(--fd, 2.6s) ease-in infinite; }
+
+  /* Soft breathing glow for the fused "galaxy" core */
+  @keyframes story-core-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(0.96); }
+    50%      { opacity: 0.95; transform: scale(1.06); }
+  }
+  .story-core-pulse { animation: story-core-pulse 4.5s ease-in-out infinite; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .story-flow-dot, .story-core-pulse { animation: none; }
   }
 
   /* Header baseline — declares the bottom border as transparent so the
@@ -381,7 +431,8 @@
     .animate-float, .animate-bounce,
     .animate-twinkle-a, .animate-twinkle-b, .animate-twinkle-c,
     .animate-twinkle-shine, .animate-twinkle-shine-warm,
-    .arch-flow-down, .arch-flow-up, .arch-glow-pulse {
+    .arch-flow-down, .arch-flow-up, .arch-glow-pulse,
+    .animate-caret {
       animation: none;
     }
   }

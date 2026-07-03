@@ -169,7 +169,7 @@ type ShootingStar = {
  * browsers misbehave when the function list contains a `var()`. Passing
  * the literal transform strings to element.animate() side-steps all of it.
  */
-function ShootingStarEl({ s }: { s: ShootingStar }) {
+function ShootingStarEl({ s, cls = 'shooting-star' }: { s: ShootingStar; cls?: string }) {
   const ref = useRef<HTMLSpanElement>(null)
   useEffect(() => {
     const el = ref.current
@@ -188,10 +188,63 @@ function ShootingStarEl({ s }: { s: ShootingStar }) {
   return (
     <span
       ref={ref}
-      className="shooting-star absolute"
+      className={`${cls} absolute`}
       style={{ left: `${s.x}px`, top: `${s.y}px`, opacity: 0 }}
     />
   )
+}
+
+// ── Hero audience typewriter ─────────────────────────────────────────
+// One line, endlessly retyped: WHO GCTRL is for. Sovereignty-first phrasing —
+// the variable part is typed and deleted like a terminal prompt.
+const TYPED_PHRASES = [
+  'own their knowledge.',
+  'refuse vendor lock-in.',
+  'run on their own infrastructure.',
+  'give every agent one shared memory.',
+  'stay sovereign while tools change.',
+]
+
+function useTypewriter(phrases: string[]) {
+  const [text, setText] = useState('')
+  useEffect(() => {
+    // Reduced motion → static first phrase, no churn.
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setText(phrases[0])
+      return
+    }
+    let phrase = 0
+    let len = 0
+    let deleting = false
+    let timer: number | undefined
+    const tick = () => {
+      const current = phrases[phrase]
+      if (!deleting) {
+        len++
+        setText(current.slice(0, len))
+        if (len === current.length) {
+          deleting = true
+          timer = window.setTimeout(tick, 2100) // hold the finished phrase
+          return
+        }
+        timer = window.setTimeout(tick, 46 + Math.random() * 48) // human-ish typing
+      } else {
+        len--
+        setText(current.slice(0, len))
+        if (len === 0) {
+          deleting = false
+          phrase = (phrase + 1) % phrases.length
+          timer = window.setTimeout(tick, 450)
+          return
+        }
+        timer = window.setTimeout(tick, 24)
+      }
+    }
+    timer = window.setTimeout(tick, 700)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  return text
 }
 
 const INSTALL_CMD = 'curl -fsSL https://gctrl.tech/install | bash'
@@ -199,10 +252,12 @@ const INSTALL_CMD = 'curl -fsSL https://gctrl.tech/install | bash'
 export function HeroSection() {
   const [scrollY, setScrollY] = useState(0)
   const [shooters, setShooters] = useState<ShootingStar[]>([])
+  const [frontShooters, setFrontShooters] = useState<ShootingStar[]>([])
   const [copied, setCopied] = useState(false)
   const rafRef = useRef<number | null>(null)
   const shooterIdRef = useRef(0)
   const copyTimerRef = useRef<number | null>(null)
+  const typed = useTypewriter(TYPED_PHRASES)
 
   useEffect(() => {
     const onScroll = () => {
@@ -274,6 +329,47 @@ export function HeroSection() {
     }
 
     nextTimer = window.setTimeout(spawn, 1200 + Math.random() * 2500)
+    return () => {
+      cancelled = true
+      if (nextTimer) window.clearTimeout(nextTimer)
+      cleanupTimers.forEach((t) => window.clearTimeout(t))
+    }
+  }, [])
+
+  // Rare FRONT shooting star — sweeps across the WHOLE hero, over the image
+  // (z-[5], under the text). Deliberately infrequent (~every 14-26s) so it
+  // stays a small event rather than becoming noise.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
+
+    let cancelled = false
+    let nextTimer: number | undefined
+    const cleanupTimers: number[] = []
+
+    const spawn = () => {
+      if (cancelled) return
+      const id = shooterIdRef.current++
+      const vw = window.innerWidth
+      const vh = window.innerHeight
+      const star: ShootingStar = {
+        id,
+        x: -320,
+        y: vh * 0.06 + Math.random() * vh * 0.30,
+        angle: 14 + Math.random() * 12,          // shallow down-right sweep
+        distance: vw + 750,                       // fully crosses the viewport
+        duration: 2300 + Math.random() * 900,
+      }
+      setFrontShooters((s) => [...s, star])
+      cleanupTimers.push(
+        window.setTimeout(() => {
+          setFrontShooters((s) => s.filter((x) => x.id !== id))
+        }, star.duration + 200),
+      )
+      nextTimer = window.setTimeout(spawn, 14000 + Math.random() * 12000)
+    }
+
+    nextTimer = window.setTimeout(spawn, 5000 + Math.random() * 6000)
     return () => {
       cancelled = true
       if (nextTimer) window.clearTimeout(nextTimer)
@@ -403,6 +499,14 @@ export function HeroSection() {
         ))}
       </div>
 
+      {/* Rare front streak — crosses the entire hero OVER the image (z-[5]
+          sits above image and overlay stars, below the z-10 content). */}
+      <div aria-hidden className="pointer-events-none absolute inset-0 z-[5] overflow-hidden">
+        {frontShooters.map((s) => (
+          <ShootingStarEl key={s.id} s={s} cls="shooting-star-front" />
+        ))}
+      </div>
+
       {/* ── Existing decoration (grid + glow + rings + Mission Control) ──── */}
       <div className="hero-grid-bg pointer-events-none absolute inset-0" />
 
@@ -443,7 +547,7 @@ export function HeroSection() {
       <div className="relative z-10 mx-auto max-w-4xl text-center">
         <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-wider text-indigo-300 backdrop-blur-md">
           <span className="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-pulse" />
-          Enterprise Knowledge Infrastructure
+          Sovereign Knowledge Infrastructure
         </div>
 
         <h1 className="mb-6 text-5xl font-bold leading-tight tracking-tight text-white md:text-6xl lg:text-7xl">
@@ -467,15 +571,25 @@ export function HeroSection() {
           </span>
         </h1>
 
+        {/* Audience typewriter — WHO this is for, retyped like a terminal
+            prompt. Screen readers get one static sentence instead of churn. */}
+        <p className="mb-6 text-lg text-slate-300 md:text-xl" aria-label="Built for teams that own their knowledge.">
+          <span aria-hidden className="text-shadow-hero">
+            Built for teams that{' '}
+            <span className="font-semibold text-indigo-300">{typed}</span>
+            <span className="animate-caret ml-0.5 font-semibold text-indigo-300">_</span>
+          </span>
+        </p>
+
         {/* Glass-card backdrop gives the paragraph solid readability over the
             mission-control imagery without darkening the hero. Mirrors the
             iced-glass language used on the trust signals further down. */}
         <div className="mx-auto mb-10 max-w-2xl rounded-2xl border border-white/10 bg-slate-950/45 px-6 py-4 backdrop-blur-md">
           <p className="text-base leading-relaxed text-slate-200 md:text-lg">
             <strong className="font-semibold text-white">Running at the speed of trust.</strong>{' '}
-            GCTRL is the agent-native knowledge layer that extracts, deduplicates, and harmonises
-            enterprise data — with per-element classification and scoped tokens for users and agents,
-            enforced at <span className="text-indigo-300">zero retrieval latency</span>.
+            Your company's knowledge — every source, every team, every agent session — fused into{' '}
+            <span className="text-indigo-300">one governed graph you own</span>, on your own
+            infrastructure. Agents and tools will come and go. Your knowledge stays yours.
           </p>
         </div>
 
@@ -547,7 +661,7 @@ export function HeroSection() {
         </div>
 
         <div className="mt-14 flex flex-wrap items-center justify-center gap-3">
-          {['GDPR-Ready', 'Fully On-Prem', 'Neo4j + Qdrant Native', 'Open Connectors'].map((tag) => (
+          {['Made in Europe', 'Fully On-Prem', 'GDPR-Ready', 'Open Source · No Lock-in'].map((tag) => (
             <span key={tag} className="glass-pill">
               <svg className="h-3.5 w-3.5 text-emerald-400" fill="currentColor" viewBox="0 0 20 20">
                 <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />

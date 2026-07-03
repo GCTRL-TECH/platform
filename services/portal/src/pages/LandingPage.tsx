@@ -4,6 +4,7 @@ import { SiteFooter } from '@/components/site/SiteFooter'
 import { HeroSection } from './sections/HeroSection'
 import { ArchitectureSection } from './sections/ArchitectureSection'
 import { ProblemSection } from './sections/ProblemSection'
+import { FusionStorySection } from './sections/FusionStorySection'
 import { SpeedOfTrustSection } from './sections/SpeedOfTrustSection'
 import { HowItWorksSection } from './sections/HowItWorksSection'
 import { ExplainabilitySection } from './sections/ExplainabilitySection'
@@ -21,6 +22,7 @@ export function LandingPage() {
         <HeroSection />
         <section id="architecture"><ArchitectureSection /></section>
         <ProblemSection />
+        <FusionStorySection />
         <section id="trust"><SpeedOfTrustSection /></section>
         <section id="how-it-works"><HowItWorksSection /></section>
         <ExplainabilitySection />
