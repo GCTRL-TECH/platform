@@ -34,7 +34,7 @@ from .chunking import get_chunker
 from .classification import resolve_classification
 from .code_parser import parse_python_repo
 from .embedding import get_embedding_client, build_embedding_client
-from .kg_builder import get_kg_builder
+from .kg_builder import get_kg_builder, entity_uri
 from .middleware.license_check import check_credits, report_usage
 from .ner import get_ner_pipeline
 from .pii_detector import detect_pii, redact_pii
@@ -249,6 +249,26 @@ def run_pipeline(
         source_modified_at_ms=source_modified_at_ms,
     )
     logger.info(f"[{job_id}] KG: {stats}")
+
+    # 3b. Annotate each entity mention with its graph URI (P2a — grounded nodes).
+    # Recomputes via the SAME pure fn kg_builder used to write the node, so a
+    # mention's uri always matches the node actually in Neo4j. Entities pruned
+    # from the graph (GRAPH_PRUNE_ISOLATED — isolated non-core concepts) get no
+    # uri here; they're marked `pruned` instead so a grounding lookup never
+    # points at a node that doesn't exist. Additive-only: existing readers of
+    # `entities`/`entity_mentions` that don't know about `uri`/`pruned` are
+    # unaffected.
+    graph_uris = set(stats.get("graph_uris") or [])
+    for mention in entities:
+        mention_name = (mention.get("text") or "").strip()
+        if not mention_name:
+            continue
+        mention_type = mention.get("type") or mention.get("coarse_type") or "other"
+        mention_uri = entity_uri(user_id, mention_type, mention_name)
+        if mention_uri in graph_uris:
+            mention["uri"] = mention_uri
+        else:
+            mention["pruned"] = True
 
     # 4. Chunk text for vector store
     logger.info(f"[{job_id}] Chunker: starting on {len(text)} chars")

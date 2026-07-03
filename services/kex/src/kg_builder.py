@@ -32,6 +32,17 @@ def _make_uri(name: str, entity_type: str, user_id: str = "") -> str:
     return f"databorg:{entity_type}/{slug}"
 
 
+def entity_uri(user_id: str, coarse_type: str, name: str) -> str:
+    """Public, pure wrapper around the internal URI derivation (`_make_uri`).
+
+    Exists so callers OUTSIDE `build_graph` — main.py's per-mention annotation
+    step and the `backfill_mentions` script (P2a — grounded nodes) — can compute
+    the EXACT SAME uri kg_builder writes at graph-build time, without
+    duplicating the slug algorithm. Pure: no I/O, same inputs -> same uri.
+    """
+    return _make_uri(name, coarse_type, user_id)
+
+
 def _safe_rel_type(relation_type: str) -> str:
     """
     Convert an arbitrary relation label to a valid Neo4j relationship type.
@@ -117,7 +128,10 @@ class KGBuilder:
         exactly as before this feature existed.
 
         Returns:
-          { entities_created, relations_created, nodes_total }
+          { entities_created, relations_created, nodes_total, graph_uris }
+          `graph_uris` (P2a) is every entity uri actually written to the graph by
+          THIS call (post-pruning) — the set main.py checks each mention's uri
+          against to decide "grounded" vs "pruned".
         """
         if not self._driver:
             self.connect()
@@ -192,6 +206,10 @@ class KGBuilder:
             "entities_created": entities_created,
             "relations_created": relations_created,
             "nodes_total": nodes_total,
+            # P2a — grounded nodes: every uri actually written to the graph THIS
+            # call (i.e. survived pruning). main.py intersects each mention's
+            # computed uri against this set to decide uri-vs-pruned per mention.
+            "graph_uris": sorted(set(name_to_uri.values())),
         }
 
     @staticmethod

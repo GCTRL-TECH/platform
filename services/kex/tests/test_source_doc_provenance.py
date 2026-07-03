@@ -178,7 +178,7 @@ class TestInsertChunksPgSourceDocumentId:
                 "chunk-1", "job-1", None, "user-1",
                 "some text", 0, 9, 0,
                 None, None, None, 0, "[]",
-                "doc-uuid-789",
+                "doc-uuid-789", [],
             )
             count = store._insert_chunks_pg([row])
 
@@ -186,7 +186,10 @@ class TestInsertChunksPgSourceDocumentId:
         assert mock_execute_values.called
         _cur, sql, rows = mock_execute_values.call_args[0][:3]
         assert "source_document_id" in sql
-        assert rows[0][-1] == "doc-uuid-789"
+        assert "entity_uris" in sql
+        # entity_uris (P2a) is now the trailing column; source_document_id is
+        # second-to-last.
+        assert rows[0][-2] == "doc-uuid-789"
 
     def test_insert_sql_source_document_id_nullable_parity(self):
         """A row with source_document_id=None (old callers / no identity
@@ -198,13 +201,13 @@ class TestInsertChunksPgSourceDocumentId:
                 "chunk-2", "job-1", None, "user-1",
                 "some text", 0, 9, 0,
                 None, None, None, 0, "[]",
-                None,
+                None, [],
             )
             count = store._insert_chunks_pg([row])
 
         assert count == 1
         rows = mock_execute_values.call_args[0][2]
-        assert rows[0][-1] is None
+        assert rows[0][-2] is None
 
     def test_store_chunks_passes_source_document_id_through_to_pg_row(self):
         """End-to-end (mocked): store_chunks(source_document_id=...) must land
@@ -223,7 +226,7 @@ class TestInsertChunksPgSourceDocumentId:
 
         assert mock_execute_values.called
         rows = mock_execute_values.call_args[0][2]
-        assert rows[0][-1] is not None  # _as_uuid() coerces the string, never None here
+        assert rows[0][-2] is not None  # _as_uuid() coerces the string, never None here
 
     def test_store_chunks_absent_source_document_id_parity(self):
         """Parity: omitting source_document_id (every caller before P2b, and
@@ -239,4 +242,4 @@ class TestInsertChunksPgSourceDocumentId:
             store.store_chunks(chunks, embeddings, "job-1", "user-1")
 
         rows = mock_execute_values.call_args[0][2]
-        assert rows[0][-1] is None
+        assert rows[0][-2] is None
