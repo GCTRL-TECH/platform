@@ -227,7 +227,8 @@ class VectorStore:
         Row tuple: (id, job_id, compilation_id, user_id, content,
                     start_char, end_char, chunk_sequence,
                     qdrant_point_id, entity_mentions,
-                    classification_level_id, min_rank, class_labels)
+                    classification_level_id, min_rank, class_labels,
+                    source_document_id)
         Returns count inserted.
         """
         if not rows:
@@ -241,7 +242,8 @@ class VectorStore:
                 id, job_id, compilation_id, user_id,
                 content, start_char, end_char, chunk_sequence,
                 qdrant_point_id, entity_mentions,
-                classification_level_id, min_rank, class_labels
+                classification_level_id, min_rank, class_labels,
+                source_document_id
             ) VALUES %s
             ON CONFLICT (id) DO NOTHING
         """
@@ -407,6 +409,7 @@ class VectorStore:
                 _as_uuid(cls_level_id),         # classification_level_id (nullable UUID)
                 cls_rank,                       # min_rank
                 cls_labels_json,                # class_labels (JSON string)
+                _as_uuid(source_document_id),   # source_document_id (nullable UUID, P2b)
             ))
 
         pg_stored = self._insert_chunks_pg(pg_rows)

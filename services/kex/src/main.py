@@ -44,6 +44,7 @@ from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
 from .sources.obsidian_handler import fetch_note
+from .timeutil import iso_to_ms
 from .vector_store import get_vector_store
 from .reindex_worker import drain_reindex_queue
 
@@ -136,6 +137,8 @@ def run_pipeline(
     classification_level_id: str | None = None,
     classification_name: str | None = None,
     origin: str | None = None,
+    source_document_id: str | None = None,
+    source_modified_at: str | None = None,
     ollama_base: str | None = None,
     embedding_base_url: str | None = None,
     embedding_provider: str | None = None,
@@ -151,6 +154,13 @@ def run_pipeline(
 
     `classification_*` carry the ISO 27001 level chosen at ingest; every graph
     element and chunk is tagged with it for per-element access control.
+
+    `source_document_id` / `source_modified_at` (P2b) are the stable document
+    identity + source-side modified time resolved by the API from (user, path).
+    They are threaded into every relation edge (`_source_doc`,
+    `_source_doc_modified_at`) and every stored chunk (`source_document_id`) so
+    a later phase can rank fact authority by source recency. Both are optional
+    and default to None — absent fields behave exactly as before this feature.
 
     `ollama_base` / `embedding_base_url` / `embedding_provider` are optional
     per-job overrides for the LLM + embedding endpoints (the owner's runtime
@@ -230,10 +240,13 @@ def run_pipeline(
     if not origin:
         preview = " ".join(text[:120].split())
         origin = (preview + "…") if len(text) > 120 else preview
+    source_modified_at_ms = iso_to_ms(source_modified_at)
     kg = get_kg_builder()
     stats = kg.build_graph(
         job_id, user_id, entities, relations,
         classification=classification, origin=origin,
+        source_document_id=source_document_id,
+        source_modified_at_ms=source_modified_at_ms,
     )
     logger.info(f"[{job_id}] KG: {stats}")
 
@@ -283,6 +296,7 @@ def run_pipeline(
             user_id,
             compilation_id=None,  # set later by API result handler
             entity_mentions=chunk_entities,
+            source_document_id=source_document_id,
             classification=classification,
         )
         logger.info(f"[{job_id}] Vector store: {chunks_stored} chunks stored")
@@ -393,6 +407,13 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             generation_kind = payload.get("generation_kind") or "ollama"
             generation_api_key = payload.get("generation_api_key")
             generation_base = payload.get("generation_base")
+            # P2b document identity, resolved by the API from (user, path):
+            # the source_documents row id + the full source path + the
+            # source-side modified time (when known). All optional — absent
+            # (older jobs / direct KEX callers) behaves exactly as before.
+            source_document_id = payload.get("source_document_id")
+            source_path = payload.get("source_path")
+            source_modified_at = payload.get("source_modified_at")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -467,6 +488,12 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
+            # P2b: prefer the FULL source path (resolved server-side by the
+            # API) over the bare file/note name each job_type branch set
+            # above — origin should cite the whole path, not just the name.
+            if source_path:
+                origin = source_path
+
             # A crawl (or any source) that found nothing extractable completes as
             # a clear, successful "no content" result — NOT a hard failure.
             if job_type in ("crawl", "url_crawl") and (not text or not text.strip()):
@@ -492,6 +519,8 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 classification_level_id=classification_level_id,
                 classification_name=classification_name,
                 origin=origin,
+                source_document_id=source_document_id,
+                source_modified_at=source_modified_at,
                 ollama_base=ollama_base,
                 embedding_base_url=embedding_base_url,
                 embedding_provider=embedding_provider,

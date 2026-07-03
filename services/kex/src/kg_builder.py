@@ -83,6 +83,8 @@ class KGBuilder:
         relations: list[dict],
         classification: Optional[dict] = None,
         origin: Optional[str] = None,
+        source_document_id: Optional[str] = None,
+        source_modified_at_ms: Optional[int] = None,
     ) -> dict:
         """
         Write entities and relations to Neo4j.
@@ -106,6 +108,13 @@ class KGBuilder:
         `origin` is an optional human-readable provenance signal (the source file
         name, note path, or a short text preview) recorded on every node so a
         dossier can cite where a fact came from.
+
+        `source_document_id` / `source_modified_at_ms` (P2b) are the stable
+        source_documents identity + the source-side modified time (epoch ms,
+        same unit as `asserted_at`), recorded on every relation edge as
+        `_source_doc` / `_source_doc_modified_at` so a later phase can rank
+        fact authority by source recency. Both optional; absent behaves
+        exactly as before this feature existed.
 
         Returns:
           { entities_created, relations_created, nodes_total }
@@ -175,6 +184,7 @@ class KGBuilder:
             relations_created = session.execute_write(
                 self._write_relations, job_id, relations,
                 label_json, rank, level_name, corrected, name_to_uri,
+                source_document_id, source_modified_at_ms,
             )
             nodes_total = session.execute_read(self._count_nodes)
 
@@ -312,6 +322,8 @@ class KGBuilder:
         level_name: str,
         corrected: Optional[set] = None,
         name_to_uri: Optional[dict] = None,
+        source_document_id: Optional[str] = None,
+        source_modified_at_ms: Optional[int] = None,
     ) -> int:
         """Create relationships between existing Entity nodes; return count created.
 
@@ -322,6 +334,9 @@ class KGBuilder:
           - extraction_method : 'EXTRACTED' (INFERRED/AMBIGUOUS reserved for later)
           - _source_job       : KEX job uuid that produced the edge
           - _source_chunk     : originating chunk id, when the extractor supplies it
+          - _source_doc       : source_documents uuid (P2b), when known
+          - _source_doc_modified_at : that source document's modified time (epoch
+                                ms, same unit as `asserted_at`), when known
         The MERGE stays idempotent (by head_uri, rel_type, tail_uri): re-extraction
         keeps the most-confident reading and never multiplies edges.
 
@@ -333,6 +348,12 @@ class KGBuilder:
         `{name}` cartesian-products over every same-named node, so one fact
         became N×M edges. Matching on the unique uri writes exactly one edge,
         and the MERGE makes re-ingesting the same fact idempotent.
+
+        `source_document_id` / `source_modified_at_ms` are recorded on every
+        edge written by THIS call (ON CREATE and ON MATCH, latest-wins
+        alongside `asserted_at`) — like `asserted_at`, they reflect whichever
+        job most recently asserted the edge, not the edge's original source.
+        Both optional; absent leaves the edge exactly as it was before P2b.
         """
         corrected = corrected or set()
         name_to_uri = name_to_uri or {}
@@ -408,7 +429,9 @@ class KGBuilder:
                     r._min_rank        = $rank,
                     r._class_conflict  = false,
                     r.created_at       = timestamp(),
-                    r.asserted_at      = timestamp()
+                    r.asserted_at      = timestamp(),
+                    r._source_doc      = $source_doc,
+                    r._source_doc_modified_at = $source_doc_modified_at
                 ON MATCH SET
                     r._source_job   = $job_id,
                     r._source_chunk = coalesce($source_chunk, r._source_chunk),
@@ -416,6 +439,11 @@ class KGBuilder:
                     // tell which competing fact about an entity was asserted most
                     // recently (latest-value-wins) — cheap, no LLM, no schema change.
                     r.asserted_at   = timestamp(),
+                    // P2b: latest-wins alongside asserted_at — reflects whichever
+                    // job most recently asserted the edge. Coalesce so a re-run
+                    // without document identity (older caller) never blanks it.
+                    r._source_doc      = coalesce($source_doc, r._source_doc),
+                    r._source_doc_modified_at = coalesce($source_doc_modified_at, r._source_doc_modified_at),
                     // Idempotent re-extraction: keep the most-confident reading,
                     // never multiply edges (MERGE already dedups by h,rel,t).
                     r.confidence    = CASE WHEN $confidence > coalesce(r.confidence, 0.0)
@@ -444,6 +472,8 @@ class KGBuilder:
                 level_name=level_name,
                 label_json=label_json,
                 rank=rank,
+                source_doc=source_document_id,
+                source_doc_modified_at=source_modified_at_ms,
             )
             summary = result.consume()
             created += summary.counters.relationships_created
