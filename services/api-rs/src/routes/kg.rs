@@ -151,6 +151,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/relationship",                         post(add_relationship).delete(delete_relationship))
         .route("/node",                                 axum::routing::delete(delete_node))
         .route("/corrections",                          get(list_corrections))
+        .route("/conflicts/:id/resolve",                post(resolve_fact_conflict))
         .route("/graph/search",                         get(graph_search))
         .route("/graph/entity/:name/neighbors",         get(entity_neighbors))
         .route("/graph/entity/:name/lineage",           get(entity_lineage))
@@ -2422,6 +2423,262 @@ async fn list_corrections(
     Ok(Json(json!({ "corrections": items })))
 }
 
+// ── P3: fact-conflict resolution ──────────────────────────────────────────────
+//
+// A fact conflict (fact_conflicts, detected by KEX write-time / FUSE post-merge
+// scan) is two+ sources asserting DIFFERENT values for a FUNCTIONAL relation of
+// the same entity. Resolution picks the correct value; the losing edges are
+//   1. deleted from Neo4j (source AND merged graphs — name-based, owner-scoped,
+//      same shape as delete_relationship_core), and
+//   2. recorded in knowledge_corrections (action='delete') so re-extraction of
+//      the same sources can never resurrect them ("remember"),
+// then the winner edge is stamped `_authority='current'` and the conflict row
+// is marked resolved. `dismiss` marks the row dismissed and touches nothing.
+
+/// Mirror of the Python `safe_rel_type` (kg_builder / conflicts.py): the
+/// registry stores canonical lowercase relation names (ceo_of); Neo4j edges
+/// carry the sanitised uppercase type (CEO_OF).
+fn neo4j_rel_type(relation: &str) -> String {
+    let upper = relation.to_uppercase();
+    let mut safe = String::with_capacity(upper.len());
+    let mut prev_us = true; // treat leading separators as trimmed
+    for c in upper.chars() {
+        if c.is_ascii_alphanumeric() {
+            safe.push(c);
+            prev_us = false;
+        } else if !prev_us {
+            safe.push('_');
+            prev_us = true;
+        }
+    }
+    let safe = safe.trim_end_matches('_').to_string();
+    if safe.is_empty() {
+        return "RELATED_TO".into();
+    }
+    if safe.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return format!("REL_{safe}");
+    }
+    safe
+}
+
+/// Pure: the distinct competing values in a conflict's `tails` JSONB.
+fn conflict_tail_values(tails: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(arr) = tails.as_array() {
+        for t in arr {
+            if let Some(v) = t.get("value").and_then(|v| v.as_str()) {
+                if !v.is_empty() && !out.iter().any(|x| x == v) {
+                    out.push(v.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pure: validate the request and decide the resolution.
+/// Ok(None) = dismiss; Ok(Some(winner)) = accept that value, delete the rest.
+fn decide_fact_resolution(
+    action: &str,
+    dismiss: bool,
+    picked_tail: Option<&str>,
+    authority_winner: Option<&str>,
+    tail_values: &[String],
+) -> std::result::Result<Option<String>, String> {
+    if dismiss || action == "dismiss" {
+        return Ok(None);
+    }
+    match action {
+        "accept_winner" => {
+            let w = authority_winner.unwrap_or("").trim();
+            if w.is_empty() {
+                return Err("conflict has no computed authority winner".into());
+            }
+            if !tail_values.iter().any(|v| v == w) {
+                return Err("authority winner is no longer among the competing values".into());
+            }
+            Ok(Some(w.to_string()))
+        }
+        "pick" => {
+            let p = picked_tail.unwrap_or("").trim();
+            if p.is_empty() {
+                return Err("pickedTail is required for action 'pick'".into());
+            }
+            if !tail_values.iter().any(|v| v == p) {
+                return Err("pickedTail is not among the competing values".into());
+            }
+            Ok(Some(p.to_string()))
+        }
+        other => Err(format!("unknown action: {other}")),
+    }
+}
+
+/// Pure: (head, tail) of one edge given the conflict's key side.
+/// tail-keyed (e.g. ceo_of): the VALUE is the head, the key entity the tail.
+/// head-keyed (e.g. located_in): the key entity is the head, the VALUE the tail.
+fn conflict_edge_names(key_side: &str, key_name: &str, value: &str) -> (String, String) {
+    if key_side == "tail" {
+        (value.to_string(), key_name.to_string())
+    } else {
+        (key_name.to_string(), value.to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolveFactConflictReq {
+    /// "accept_winner" (take the computed authority winner), "pick"
+    /// (take `pickedTail`), or "dismiss" (not a real conflict — keep all).
+    action: String,
+    #[serde(rename = "pickedTail")]
+    picked_tail: Option<String>,
+    /// Convenience flag: `{ dismiss: true }` behaves like action "dismiss".
+    #[serde(default)]
+    dismiss: Option<bool>,
+    reason: Option<String>,
+}
+
+/// POST /api/kg/conflicts/:id/resolve — resolve one fact conflict.
+/// Gated owner-or-admin (same policy as the graph mutation endpoints: the
+/// owner fixes their own graph; an admin may fix any user's).
+async fn resolve_fact_conflict(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ResolveFactConflictReq>,
+) -> Result<Json<Value>> {
+    let row = sqlx::query_as::<_, (
+        Uuid, Option<Uuid>, String, String, String, Value, Option<String>, String,
+    )>(
+        "SELECT user_id, compilation_id, relation, key_name, key_side,
+                tails, authority_winner, status
+         FROM fact_conflicts WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let (owner, comp_id, relation, key_name, key_side, tails, winner_col, _status) = row;
+
+    // Owner or admin only. Non-admin callers must not even learn the row exists.
+    if owner != claims.sub && claims.role != "admin" {
+        return Err(AppError::NotFound);
+    }
+
+    let tail_values = conflict_tail_values(&tails);
+    let decision = decide_fact_resolution(
+        &req.action,
+        req.dismiss.unwrap_or(false),
+        req.picked_tail.as_deref(),
+        winner_col.as_deref(),
+        &tail_values,
+    )
+    .map_err(AppError::BadRequest)?;
+
+    let Some(winner) = decision else {
+        sqlx::query(
+            "UPDATE fact_conflicts SET status = 'dismissed', last_evaluated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+        crate::services::audit::log_access(&state.db, &claims, "kg.dismiss_fact_conflict",
+            "fact_conflict", &id.to_string(), 0, None, true, None).await;
+        return Ok(Json(json!({ "ok": true, "status": "dismissed" })));
+    };
+
+    let rel_type = neo4j_rel_type(&relation);
+    let owner_str = owner.to_string();
+    let reason = req.reason.clone().unwrap_or_else(|| {
+        format!("fact-conflict resolution: '{winner}' accepted as current for {relation}({key_name})")
+    });
+
+    // 1+2. Delete each LOSING edge from Neo4j (owner-scoped, matches source AND
+    // merged nodes by name) and remember it in knowledge_corrections so
+    // re-extraction is blocked. Same delete shape as delete_relationship_core.
+    let mut deleted_edges: i64 = 0;
+    let mut first_correction: Option<Uuid> = None;
+    for value in tail_values.iter().filter(|v| *v != &winner) {
+        let (head, tail) = conflict_edge_names(&key_side, &key_name, value);
+        let cypher =
+            "MATCH (a {name: $head})-[r]->(b {name: $tail}) \
+             WHERE type(r) = $rel AND a._owner = $uid \
+             WITH collect(r) AS rels \
+             FOREACH (x IN rels | DELETE x) \
+             RETURN size(rels) AS deleted";
+        if let Ok(mut stream) = state.neo.execute(
+            neo_query(cypher)
+                .param("head", head.clone())
+                .param("tail", tail.clone())
+                .param("rel", rel_type.clone())
+                .param("uid", owner_str.clone()),
+        ).await {
+            if let Ok(Some(row)) = stream.next().await {
+                deleted_edges += row.get::<i64>("deleted").unwrap_or(0);
+            }
+        }
+
+        // Store the CANONICAL lowercase relation (like the vocab emits): the
+        // KEX corrections loader sanitises rel_type before comparing, so the
+        // block matches the CEO_OF edge type on every future extraction.
+        let cid: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO knowledge_corrections
+                (user_id, compilation_id, element_kind, head, rel_type, tail, action, reason)
+             VALUES ($1, $2, 'edge', $3, $4, $5, 'delete', $6)
+             RETURNING id",
+        )
+        .bind(owner)
+        .bind(comp_id)
+        .bind(&head)
+        .bind(&relation)
+        .bind(&tail)
+        .bind(&reason)
+        .fetch_optional(&state.db)
+        .await?;
+        if first_correction.is_none() {
+            first_correction = cid;
+        }
+    }
+
+    // 3. Stamp the winner edge current (and clear any stale superseded marker).
+    let (whead, wtail) = conflict_edge_names(&key_side, &key_name, &winner);
+    let _ = state.neo.run(
+        neo_query(
+            "MATCH (a {name: $head})-[r]->(b {name: $tail}) \
+             WHERE type(r) = $rel AND a._owner = $uid \
+             SET r._authority = 'current' REMOVE r._superseded_by_doc",
+        )
+        .param("head", whead)
+        .param("tail", wtail)
+        .param("rel", rel_type.clone())
+        .param("uid", owner_str),
+    ).await;
+
+    // 4. Close the conflict row.
+    sqlx::query(
+        "UPDATE fact_conflicts
+         SET status = 'resolved', authority_winner = $1,
+             resolved_correction_id = $2, last_evaluated_at = now()
+         WHERE id = $3",
+    )
+    .bind(&winner)
+    .bind(first_correction)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    crate::services::audit::log_access(&state.db, &claims, "kg.resolve_fact_conflict",
+        "fact_conflict", &id.to_string(), 0, None, true, None).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "status": "resolved",
+        "winner": winner,
+        "deletedEdges": deleted_edges,
+        "remembered": first_correction.is_some(),
+    })))
+}
+
 // ── Data lineage endpoints ────────────────────────────────────────────────────
 
 /// GET /compilations/:id/lineage
@@ -2747,5 +3004,159 @@ mod grounded_nodes_tests {
     fn grounding_chunk_json_short_content_not_truncated() {
         let v = grounding_chunk_to_json(Uuid::new_v4(), "short text", None, None, Utc::now());
         assert_eq!(v["snippet"], "short text");
+    }
+}
+
+// ── P3 — fact-conflict resolution: pure logic + migration seed tests ─────────
+
+#[cfg(test)]
+mod fact_conflict_tests {
+    use super::{conflict_edge_names, conflict_tail_values, decide_fact_resolution, neo4j_rel_type};
+    use serde_json::json;
+
+    // neo4j_rel_type must mirror the Python safe_rel_type exactly, so that the
+    // relation stored in relation_registry / fact_conflicts (lowercase
+    // canonical) resolves to the edge type kg_builder actually wrote.
+    #[test]
+    fn rel_type_matches_python_sanitiser() {
+        assert_eq!(neo4j_rel_type("ceo_of"), "CEO_OF");
+        assert_eq!(neo4j_rel_type("located_in"), "LOCATED_IN");
+        assert_eq!(neo4j_rel_type("reports_to"), "REPORTS_TO");
+        assert_eq!(neo4j_rel_type("some-rel type!"), "SOME_REL_TYPE");
+        assert_eq!(neo4j_rel_type(""), "RELATED_TO");
+        assert_eq!(neo4j_rel_type("9lives"), "REL_9LIVES");
+    }
+
+    #[test]
+    fn tail_values_dedup_and_skip_empty() {
+        let tails = json!([
+            { "value": "Petra Lausberg", "authority": "current" },
+            { "value": "Karl Mehner",   "authority": "superseded" },
+            { "value": "Karl Mehner" },
+            { "value": "" },
+            { "uri": "no-value-key" },
+        ]);
+        assert_eq!(conflict_tail_values(&tails), vec!["Petra Lausberg", "Karl Mehner"]);
+    }
+
+    #[test]
+    fn dismiss_via_action_or_flag() {
+        let vals = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(decide_fact_resolution("dismiss", false, None, Some("A"), &vals), Ok(None));
+        assert_eq!(decide_fact_resolution("accept_winner", true, None, Some("A"), &vals), Ok(None));
+    }
+
+    #[test]
+    fn accept_winner_takes_computed_winner() {
+        let vals = vec!["Petra".to_string(), "Karl".to_string()];
+        assert_eq!(
+            decide_fact_resolution("accept_winner", false, None, Some("Petra"), &vals),
+            Ok(Some("Petra".to_string()))
+        );
+    }
+
+    #[test]
+    fn accept_winner_requires_a_winner_still_in_tails() {
+        let vals = vec!["Petra".to_string()];
+        assert!(decide_fact_resolution("accept_winner", false, None, None, &vals).is_err());
+        assert!(decide_fact_resolution("accept_winner", false, None, Some(""), &vals).is_err());
+        assert!(decide_fact_resolution("accept_winner", false, None, Some("Gone"), &vals).is_err());
+    }
+
+    #[test]
+    fn pick_validates_membership() {
+        let vals = vec!["Petra".to_string(), "Karl".to_string()];
+        assert_eq!(
+            decide_fact_resolution("pick", false, Some("Karl"), Some("Petra"), &vals),
+            Ok(Some("Karl".to_string()))
+        );
+        assert!(decide_fact_resolution("pick", false, Some("Nobody"), Some("Petra"), &vals).is_err());
+        assert!(decide_fact_resolution("pick", false, None, Some("Petra"), &vals).is_err());
+    }
+
+    #[test]
+    fn unknown_action_rejected() {
+        let vals = vec!["A".to_string()];
+        assert!(decide_fact_resolution("resolve", false, None, Some("A"), &vals).is_err());
+    }
+
+    // Edge direction: tail-keyed relations (ceo_of person->org) put the VALUE
+    // at the head; head-keyed (located_in org->location) at the tail. Getting
+    // this backwards would delete the WRONG edge — pin it.
+    #[test]
+    fn edge_names_respect_key_side() {
+        assert_eq!(
+            conflict_edge_names("tail", "Synthetron GmbH", "Karl Mehner"),
+            ("Karl Mehner".to_string(), "Synthetron GmbH".to_string())
+        );
+        assert_eq!(
+            conflict_edge_names("head", "Synthetron GmbH", "Berlin"),
+            ("Synthetron GmbH".to_string(), "Berlin".to_string())
+        );
+    }
+
+    // ── migration seeds ──────────────────────────────────────────────────────
+
+    const REGISTRY_SQL: &str = include_str!("../../migrations/061_relation_registry.sql");
+    const CONFLICTS_SQL: &str = include_str!("../../migrations/062_fact_conflicts.sql");
+
+    #[test]
+    fn registry_migration_seeds_the_conservative_set() {
+        for rel in [
+            "ceo_of", "heads", "reports_to", "located_in",
+            "headquartered_in", "born_in", "spin_off_of", "version_of",
+        ] {
+            assert!(
+                REGISTRY_SQL.contains(&format!("('{rel}'")),
+                "relation_registry seed must include {rel}"
+            );
+        }
+        // Deliberately EXCLUDED (multi-valued — would create false conflicts).
+        for rel in ["works_at", "founded", "member_of", "has_role", "lived_in"] {
+            assert!(
+                !REGISTRY_SQL.contains(&format!("('{rel}'")),
+                "{rel} must NOT be seeded as functional in round 1"
+            );
+        }
+        assert!(REGISTRY_SQL.contains("key_side   TEXT NOT NULL CHECK (key_side IN ('head', 'tail'))"));
+        assert!(REGISTRY_SQL.contains("ON CONFLICT (relation) DO NOTHING"));
+    }
+
+    #[test]
+    fn registry_seed_key_sides_are_correct() {
+        // ceo_of / heads are keyed by the TAIL org (one head-person per org);
+        // the rest by the HEAD entity. Wrong key_side = conflicts keyed on the
+        // wrong end = false positives, so pin each seeded line.
+        for (rel, side) in [
+            ("ceo_of", "tail"), ("heads", "tail"),
+            ("reports_to", "head"), ("located_in", "head"),
+            ("headquartered_in", "head"), ("born_in", "head"),
+            ("spin_off_of", "head"), ("version_of", "head"),
+        ] {
+            let line = REGISTRY_SQL
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("('{rel}'")))
+                .unwrap_or_else(|| panic!("seed line for {rel} not found"));
+            assert!(
+                line.contains(&format!("'{side}'")),
+                "{rel} must be keyed by {side}: {line}"
+            );
+        }
+        // located_in / headquartered_in are gated to organizations only.
+        for rel in ["located_in", "headquartered_in"] {
+            let line = REGISTRY_SQL
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("('{rel}'")))
+                .unwrap();
+            assert!(line.contains("'organization'"), "{rel} must be org-scoped");
+        }
+    }
+
+    #[test]
+    fn fact_conflicts_migration_has_upsert_key_and_status_check() {
+        assert!(CONFLICTS_SQL.contains("UNIQUE (user_id, relation, key_uri)"));
+        assert!(CONFLICTS_SQL.contains("CHECK (status IN ('open', 'resolved', 'dismissed'))"));
+        assert!(CONFLICTS_SQL.contains("CHECK (key_side IN ('head', 'tail'))"));
+        assert!(CONFLICTS_SQL.contains("resolved_correction_id UUID REFERENCES knowledge_corrections(id)"));
     }
 }

@@ -199,13 +199,13 @@ Read tools:
 - list_graphs        : List knowledge graphs the caller can see. No args.
 - get_graph          : Read a compilation's entities + relationships. Args: { compilationId: string, limit?: number }
 - search_entities    : Find entities by name. Args: { query: string, limit?: number }
-- get_entity         : Read one entity, its connections AND its provenance (origin file / sourceRef / extraction job + timestamp). Use this to answer "where does X come from", "which file", "what's the source/origin of X". Also returns `groundingChunks` (up to 3 verbatim source-text snippets that ground the entity) unless include_chunks=false. Args: { name: string, include_chunks?: boolean }
-- get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files, timeline, AND `groundingChunks` (verbatim source-text snippets) for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Args: { name: string }
+- get_entity         : Read one entity, its connections AND its provenance (origin file / sourceRef / extraction job + timestamp). Use this to answer "where does X come from", "which file", "what's the source/origin of X". Also returns `groundingChunks` (up to 3 verbatim source-text snippets that ground the entity) unless include_chunks=false. Each entry in `relations` may carry `authority` ("current" | "superseded") + `supersededByDoc` — when present, state the CURRENT value and mention that the superseded one comes from an older document. Args: { name: string, include_chunks?: boolean }
+- get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files, timeline, AND `groundingChunks` (verbatim source-text snippets) for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Key facts may carry `authority` ("current" | "superseded") + `supersededByDoc` — prefer the current fact and cite it as "current per <doc>; an older value came from <doc>". Args: { name: string }
 - get_neighbors      : List entities within N hops of a node (dependency tracing; code graphs — what does X touch?). Args: { name: string, depth?: number }
 - shortest_path      : Shortest path between two entities (how A connects to B / does X depend on Y). Args: { from: string, to: string }
 - search_chunks      : Retrieve source text passages for a question (RAG retrieval — use this to ANSWER questions, then cite the passages). Args: { query: string, compilationId?: string }
 - list_extractions   : List KEX extraction jobs. No args.
-- list_conflicts     : List open classification conflicts. No args.
+- list_conflicts     : List open conflicts: classification conflicts AND fact conflicts (kind "fact" — sources assert DIFFERENT values for a functional relation, e.g. two CEOs for one org; competingValues are ranked by source recency, authorityWinner is the current one). No args.
 - list_sources       : List connected data sources. No args.
 - find_file          : Find files by name/path across connected sources — including unsupported files (CAD .dwg/.step, images, archives) indexed as metadata. Returns location, size, modified/last-seen times and related parsed sibling documents from the same folder. Use for "where is file X / when was it last seen / what belongs to it". Args: { query: string, limit?: number }
 - get_sync_status    : Connector sync health: per connector the last sync time, job counts by status, and the last failures. Use for "is my Drive sync working". No args.
@@ -308,7 +308,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "run_maintenance",    "description": "Run one memory governance cycle now (decay → dedup → promote hot → evict stale). Owner-level", "args": {} },
             { "name": "get_user_profile",   "description": "Read the owner's personalization profile (opt-in facts + summary) so answers can be tailored. Owner-level", "args": {} },
             { "name": "list_extractions",   "description": "List KEX extraction jobs", "args": {} },
-            { "name": "list_conflicts",     "description": "List open classification conflicts", "args": {} },
+            { "name": "list_conflicts",     "description": "List open conflicts — classification conflicts AND fact conflicts (competing values for a functional relation, ranked by source recency; authorityWinner = the current value)", "args": {} },
             { "name": "list_sources",       "description": "List connected data sources", "args": {} },
             { "name": "list_ontologies",    "description": "List ontologies", "args": {} },
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
@@ -411,12 +411,19 @@ pub(crate) async fn execute_tool(
             // Pull `_source_job` (+ `uri`, P2a) so we can resolve the origin file/
             // provenance AND precise grounding chunks — this is what lets Pi answer
             // "where does X come from / which file" and show grounded source text.
+            // P3 — relations come back as parallel arrays (type/target/
+            // authority/supersededBy) so Pi can say "current per <doc>, older
+            // value from <doc>" when conflict detection marked an edge.
             let cypher = "MATCH (n {name: $name}) \
                 WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank \
                 OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+                WITH n, [x IN collect(DISTINCT CASE WHEN r IS NULL THEN NULL ELSE \
+                    {t: type(r), m: coalesce(m.name,''), a: coalesce(r._authority,''), \
+                     s: coalesce(r._superseded_by_doc,'')} END)][..20] AS rels \
                 RETURN n.name AS name, n.label AS label, n._classification AS cls, \
                        n._source_job AS sourceJob, n.uri AS uri, \
-                       collect(DISTINCT type(r) + ' → ' + coalesce(m.name,''))[..20] AS rels LIMIT 1";
+                       [x IN rels | x.t] AS relTypes, [x IN rels | x.m] AS relTargets, \
+                       [x IN rels | x.a] AS relAuth, [x IN rels | x.s] AS relSup LIMIT 1";
             let mut result = json!({ "error": "not found or insufficient clearance" });
             if let Ok(mut stream) = state.neo.execute(
                 neo4rs::query(cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64),
@@ -454,11 +461,33 @@ pub(crate) async fn execute_tool(
                     } else {
                         Vec::new()
                     };
+                    // Zip the parallel relation arrays: `connections` keeps the
+                    // pre-P3 "REL → target" strings; `relations` is structured
+                    // and carries authority/supersededByDoc when present.
+                    let rel_types:   Vec<String> = row.get("relTypes").unwrap_or_default();
+                    let rel_targets: Vec<String> = row.get("relTargets").unwrap_or_default();
+                    let rel_auth:    Vec<String> = row.get("relAuth").unwrap_or_default();
+                    let rel_sup:     Vec<String> = row.get("relSup").unwrap_or_default();
+                    let mut connections: Vec<String> = Vec::new();
+                    let mut relations: Vec<Value> = Vec::new();
+                    for (i, t) in rel_types.iter().enumerate() {
+                        let target = rel_targets.get(i).cloned().unwrap_or_default();
+                        connections.push(format!("{t} → {target}"));
+                        let mut rel = json!({ "rel": t, "target": target });
+                        if let Some(a) = rel_auth.get(i).filter(|a| !a.is_empty()) {
+                            rel["authority"] = json!(a);
+                            if let Some(s) = rel_sup.get(i).filter(|s| !s.is_empty()) {
+                                rel["supersededByDoc"] = json!(s);
+                            }
+                        }
+                        relations.push(rel);
+                    }
                     result = json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
                         "type": row.get::<String>("label").unwrap_or_default(),
                         "classification": row.get::<String>("cls").unwrap_or_default(),
-                        "connections": row.get::<Vec<String>>("rels").unwrap_or_default(),
+                        "connections": connections,
+                        "relations": relations,
                         "provenance": provenance,
                         "groundingChunks": grounding_chunks,
                     });
@@ -529,18 +558,33 @@ pub(crate) async fn execute_tool(
             chunks
         }
 
-        // ── Read: open classification conflicts ───────────────────────────────
+        // ── Read: open conflicts (classification + P3 fact conflicts) ─────────
         "list_conflicts" => {
             let rows = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>, String, String)>(
                 "SELECT cc.id, cc.compilation_id, cc.element_kind, cc.element_key
                  FROM classification_conflicts cc JOIN compilations c ON c.id = cc.compilation_id
                  WHERE c.user_id = $1 AND cc.status = 'open' ORDER BY cc.created_at DESC LIMIT 50"
             ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
-            json!({
-                "conflicts": rows.iter().map(|(id, cid, kind, key)| json!({
-                    "id": id, "compilationId": cid, "elementKind": kind, "elementKey": key
-                })).collect::<Vec<_>>()
-            })
+            let mut conflicts: Vec<Value> = rows.iter().map(|(id, cid, kind, key)| json!({
+                "id": id, "kind": "classification",
+                "compilationId": cid, "elementKind": kind, "elementKey": key
+            })).collect();
+            // P3 — fact conflicts: competing values for a functional relation
+            // (e.g. two sources naming different CEOs), ranked by recency.
+            let fact_rows = sqlx::query_as::<_, (
+                uuid::Uuid, Option<uuid::Uuid>, String, String, String, Value, Option<String>,
+            )>(
+                "SELECT id, compilation_id, relation, key_name, key_side, tails, authority_winner
+                 FROM fact_conflicts WHERE user_id = $1 AND status = 'open'
+                 ORDER BY first_detected_at DESC LIMIT 50"
+            ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+            conflicts.extend(fact_rows.iter().map(|(id, cid, relation, key_name, key_side, tails, winner)| json!({
+                "id": id, "kind": "fact",
+                "compilationId": cid, "relation": relation,
+                "entity": key_name, "keySide": key_side,
+                "competingValues": tails, "authorityWinner": winner,
+            })));
+            json!({ "conflicts": conflicts })
         }
 
         // ── Action: ingest text ───────────────────────────────────────────────

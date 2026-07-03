@@ -391,7 +391,12 @@ async fn set_retention(
 // ─── Classification conflict handlers ─────────────────────────────────────────
 
 /// GET /api/classification/conflicts
-/// List OPEN classification conflicts across the caller's compilations.
+/// List OPEN conflicts across the caller's compilations — a unified surface:
+///   kind = "classification" — one element carries two different classification
+///          labels (the pre-P3 rows; response shape unchanged, plus `kind`).
+///   kind = "fact"           — P3: two sources assert DIFFERENT values for a
+///          functional relation of the same entity (fact_conflicts), with the
+///          competing values ranked by recency authority.
 async fn list_conflicts(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -411,12 +416,40 @@ async fn list_conflicts(
     .fetch_all(&state.db)
     .await?;
 
-    let conflicts: Vec<Value> = rows.into_iter().map(
+    let mut conflicts: Vec<Value> = rows.into_iter().map(
         |(id, cid, kind, key, labels, suggestion, status, created)| json!({
-            "id": id, "compilationId": cid, "elementKind": kind, "elementKey": key,
+            "id": id, "kind": "classification",
+            "compilationId": cid, "elementKind": kind, "elementKey": key,
             "labels": labels, "suggestion": suggestion, "status": status, "createdAt": created,
         })
     ).collect();
+
+    // P3 — fact conflicts (owner-scoped directly by user_id; compilation_id is
+    // NULL for write-time detections, so no compilations join here).
+    let fact_rows = sqlx::query_as::<_, (
+        Uuid, Option<Uuid>, String, String, String, String, Value, Option<String>,
+        String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>,
+    )>(
+        "SELECT id, compilation_id, relation, key_uri, key_name, key_side,
+                tails, authority_winner, status, first_detected_at, last_evaluated_at
+         FROM fact_conflicts
+         WHERE user_id = $1 AND status = 'open'
+         ORDER BY first_detected_at DESC LIMIT 200",
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db)
+    .await?;
+
+    conflicts.extend(fact_rows.into_iter().map(
+        |(id, cid, relation, key_uri, key_name, key_side, tails, winner,
+          status, first_detected, last_evaluated)| json!({
+            "id": id, "kind": "fact",
+            "compilationId": cid, "relation": relation,
+            "keyUri": key_uri, "keyName": key_name, "keySide": key_side,
+            "tails": tails, "authorityWinner": winner, "status": status,
+            "createdAt": first_detected, "lastEvaluatedAt": last_evaluated,
+        })
+    ));
 
     Ok(Json(json!({ "conflicts": conflicts })))
 }
