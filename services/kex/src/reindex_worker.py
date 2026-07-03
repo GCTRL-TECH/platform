@@ -16,7 +16,7 @@ import logging
 
 import psycopg2
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PointStruct, PointVectors, VectorParams
 
 from .embedding import EmbeddingClient
 
@@ -50,6 +50,7 @@ def _ensure_collection(client, collection, dim):
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
         logger.info("Reindex: created Qdrant collection '%s' (dim=%d)", collection, dim)
+        return True  # payloads absent — caller must write full payloads
     elif existing_dim != dim:
         # Dimension mismatch — must recreate. This wipes all old vectors.
         logger.warning(
@@ -73,7 +74,9 @@ def _ensure_collection(client, collection, dim):
                 vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
             )
         logger.info("Reindex: recreated '%s' with new dim=%d", collection, dim)
-    # else: existing_dim == dim — collection is already correct, no action needed.
+        return True  # payloads wiped by recreation — caller must write full payloads
+    # existing_dim == dim — collection is already correct; payloads intact.
+    return False
 
 
 def _reindex_compilation(
@@ -90,12 +93,19 @@ def _reindex_compilation(
         "Reindex: starting KB %s with model=%s", compilation_id, embedding_model
     )
 
-    # 1. Read all chunks from Postgres.
+    # 1. Read all chunks from Postgres — including every payload column, so a
+    #    collection recreation (dimension change) can rebuild FULL Qdrant
+    #    payloads instead of stripping them down to compilation_id (which would
+    #    silently destroy the access-control pre-filter fields min_rank /
+    #    classification_level_id plus text/entity_mentions/entity_uris).
     conn = psycopg2.connect(pg_url, connect_timeout=10)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, content FROM text_chunks WHERE compilation_id = %s",
+                "SELECT id, content, job_id, user_id, source_document_id, "
+                "       chunk_sequence, start_char, end_char, entity_mentions, "
+                "       entity_uris, min_rank, classification_level_id "
+                "FROM text_chunks WHERE compilation_id = %s",
                 (compilation_id,),
             )
             rows = cur.fetchall()
@@ -134,36 +144,74 @@ def _reindex_compilation(
         )
         return
 
-    # 4. Ensure Qdrant collection has the right dimension.
+    # 4. Ensure Qdrant collection has the right dimension. When it had to be
+    #    (re)created, all payloads are gone and must be rebuilt from Postgres;
+    #    when the dimension is unchanged we only swap vectors and leave the
+    #    existing payloads untouched.
     client = QdrantClient(url=qdrant_url, timeout=30)
-    _ensure_collection(client, collection, dim)
+    payloads_missing = _ensure_collection(client, collection, dim)
 
-    # 5. Upsert points.
-    points = []
-    for cid, vector in zip(chunk_ids, vectors):
-        if vector is None:
-            continue
-        points.append(
-            PointStruct(
-                id=cid,
-                vector=vector,
-                payload={"compilation_id": compilation_id},
+    if payloads_missing:
+        # 5a. Full upsert with payloads rebuilt from the Postgres row —
+        #     keys mirror vector_store.py's payload shape exactly.
+        points = []
+        for row, vector in zip(rows, vectors):
+            if vector is None:
+                continue
+            job_id = str(row[2]) if row[2] else None
+            points.append(
+                PointStruct(
+                    id=str(row[0]),
+                    vector=vector,
+                    payload={
+                        "text": row[1] or "",
+                        "job_id": job_id,
+                        "source_job": job_id,
+                        "user_id": str(row[3]) if row[3] else None,
+                        "compilation_id": compilation_id,
+                        "source_document_id": str(row[4]) if row[4] else None,
+                        "chunk_sequence": row[5],
+                        "start_char": row[6],
+                        "end_char": row[7],
+                        "entity_mentions": row[8] or [],
+                        "entity_count": len(row[8] or []),
+                        "entity_uris": list(row[9] or []),
+                        "min_rank": row[10],
+                        "classification_level_id": str(row[11]) if row[11] else None,
+                    },
+                )
             )
+        if not points:
+            logger.warning(
+                "Reindex: KB %s — no valid vectors to upsert", compilation_id
+            )
+            return
+        client.upsert(collection_name=collection, points=points)
+        logger.info(
+            "Reindex: KB %s — upserted %d vectors WITH rebuilt payloads (dim=%d)",
+            compilation_id,
+            len(points),
+            dim,
         )
-
-    if not points:
-        logger.warning(
-            "Reindex: KB %s — no valid vectors to upsert", compilation_id
+    else:
+        # 5b. Dimension unchanged — update vectors only, preserving payloads.
+        vector_updates = []
+        for cid, vector in zip(chunk_ids, vectors):
+            if vector is None:
+                continue
+            vector_updates.append(PointVectors(id=cid, vector=vector))
+        if not vector_updates:
+            logger.warning(
+                "Reindex: KB %s — no valid vectors to update", compilation_id
+            )
+            return
+        client.update_vectors(collection_name=collection, points=vector_updates)
+        logger.info(
+            "Reindex: KB %s — updated %d vectors in place (dim=%d, payloads preserved)",
+            compilation_id,
+            len(vector_updates),
+            dim,
         )
-        return
-
-    client.upsert(collection_name=collection, points=points)
-    logger.info(
-        "Reindex: KB %s — upserted %d vectors (dim=%d)",
-        compilation_id,
-        len(points),
-        dim,
-    )
 
 
 def drain_reindex_queue(redis_client, pg_url, qdrant_url, collection):
