@@ -374,6 +374,93 @@ fn relation_to_json(r: &Relation) -> Value {
     })
 }
 
+// ── P2a — grounded nodes: entity URI -> grounding chunks ──────────────────────
+//
+// KEX now writes each chunk's `entity_uris` (the graph URIs of the entities it
+// grounds — see migration 060) alongside the legacy name-based `entity_mentions`.
+// This lets any entity read path answer "show me the source text" precisely,
+// instead of a lossy name/ILIKE search.
+
+/// Fetch up to 3 grounding chunks whose `entity_uris` overlaps the given entity
+/// uri (or a FUSE-merged member's uri, via `SIMILAR_TO` — checked defensively;
+/// no merge pass writes that edge today, so this is a no-op until one does).
+/// Returns `[{id, snippet, sourceDocumentId, jobId, createdAt}]`, newest first.
+pub(crate) async fn fetch_grounding_chunks(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    uri: &str,
+) -> Vec<Value> {
+    let mut uris = vec![uri.to_string()];
+    if let Ok(mut stream) = state.neo.execute(
+        neo_query("MATCH (m)-[:SIMILAR_TO]->(n {uri: $uri}) RETURN DISTINCT m.uri AS u")
+            .param("uri", uri.to_string()),
+    ).await {
+        while let Ok(Some(row)) = stream.next().await {
+            if let Ok(u) = row.get::<String>("u") {
+                if !uris.contains(&u) { uris.push(u); }
+            }
+        }
+    }
+
+    let rows: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT id, content, source_document_id, job_id, created_at
+               FROM text_chunks
+              WHERE user_id = $1 AND entity_uris && $2
+              ORDER BY created_at DESC LIMIT 3"
+        )
+        .bind(user_id)
+        .bind(&uris)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    rows.into_iter()
+        .map(|(id, content, source_document_id, job_id, created_at)| {
+            grounding_chunk_to_json(id, &content, source_document_id, job_id, created_at)
+        })
+        .collect()
+}
+
+/// Pure shape helper: one `text_chunks` row -> the `groundingChunks` entry JSON.
+/// Factored out of `fetch_grounding_chunks` so the snippet-truncation + key
+/// shape is unit-testable without a database.
+fn grounding_chunk_to_json(
+    id: Uuid,
+    content: &str,
+    source_document_id: Option<Uuid>,
+    job_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let snippet: String = content.chars().take(300).collect();
+    json!({
+        "id": id,
+        "snippet": snippet,
+        "sourceDocumentId": source_document_id,
+        "jobId": job_id,
+        "createdAt": created_at,
+    })
+}
+
+/// Resolve the graph `uri` of the canonical (highest-degree) node matching
+/// `name` for `user_id` — used by dossier reads, which only carry a name/
+/// dossier-key (not the graph uri) today.
+pub(crate) async fn resolve_graph_uri(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    name: &str,
+) -> Option<String> {
+    let cypher = "MATCH (n {name: $name}) WHERE n._owner = $uid OR n.user_id = $uid \
+                  OPTIONAL MATCH (n)--() \
+                  WITH n, count(*) AS degree ORDER BY degree DESC, id(n) ASC \
+                  RETURN n.uri AS uri LIMIT 1";
+    let mut stream = state.neo.execute(
+        neo_query(cypher).param("name", name.to_string()).param("uid", user_id.to_string())
+    ).await.ok()?;
+    let row = stream.next().await.ok()??;
+    row.get::<String>("uri").ok()
+}
+
 /// Compute live node + edge counts directly from Neo4j for a compilation.
 ///
 /// Scoping rules:
@@ -1588,14 +1675,25 @@ async fn entity_neighbors(
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
 }
 
+#[derive(Deserialize)]
+struct EntityDetailQuery {
+    #[serde(default = "default_include_chunks")]
+    include_chunks: bool,
+}
+fn default_include_chunks() -> bool { true }
+
 /// GET /compilations/:id/entity/:name
 /// Returns full detail for a single entity within a compilation's scope:
 /// properties, in/out degree, chunk count, and last source-job metadata.
 /// Powers the Obsidian-style Node Detail drawer (Overview + Source tabs).
+///
+/// `include_chunks` (default true) additionally resolves up to 3 precise
+/// grounding chunks (P2a) via the entity's graph `uri` — the "Sources" section.
 async fn entity_detail(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path((id, name)): Path<(Uuid, String)>,
+    Query(q): Query<EntityDetailQuery>,
 ) -> Result<Json<Value>> {
     // 1. Verify compilation ownership AND fetch its source_job_ids.
     //    Same scoping rules as `get_graph` — empty source_job_ids means
@@ -1720,18 +1818,31 @@ async fn entity_detail(
             )"
     ).bind(claims.sub).bind(&name).bind(eff_rank).fetch_one(&state.db).await.unwrap_or(0);
 
-    // 6. Compose the response — reuse fields from node_to_json, add the extras.
+    // 6. P2a — grounded nodes: precise grounding chunks via the node's graph uri
+    //    (falls back to an empty list when the node predates P2a and has no uri,
+    //    or when the caller opts out via ?include_chunks=false).
+    let grounding_chunks: Vec<Value> = if q.include_chunks {
+        match props.get("uri").and_then(|v| v.as_str()) {
+            Some(uri) => fetch_grounding_chunks(&state, claims.sub, uri).await,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 7. Compose the response — reuse fields from node_to_json, add the extras.
     Ok(Json(json!({
         "entity": {
-            "id":            node_json.get("id").cloned().unwrap_or(Value::Null),
-            "name":          name,
-            "label":         node_json.get("label").cloned().unwrap_or(Value::Null),
-            "type":          node_json.get("type").cloned().unwrap_or(Value::Null),
-            "properties":    node_json.get("properties").cloned().unwrap_or(Value::Null),
-            "inDegree":      in_degree,
-            "outDegree":     out_degree,
-            "chunkCount":    chunk_count,
-            "lastSourceJob": last_source_job,
+            "id":              node_json.get("id").cloned().unwrap_or(Value::Null),
+            "name":            name,
+            "label":           node_json.get("label").cloned().unwrap_or(Value::Null),
+            "type":            node_json.get("type").cloned().unwrap_or(Value::Null),
+            "properties":      node_json.get("properties").cloned().unwrap_or(Value::Null),
+            "inDegree":        in_degree,
+            "outDegree":       out_degree,
+            "chunkCount":      chunk_count,
+            "lastSourceJob":   last_source_job,
+            "groundingChunks": grounding_chunks,
         }
     })))
 }
@@ -1848,18 +1959,27 @@ async fn get_dossier(
     crate::services::audit::log_access(&state.db, &claims, "dossier.read",
         "dossier", &d.entity_name, 0, None, true, None).await;
 
+    // P2a — grounded nodes: the dossier's own `entity_uri` is a dossier-scoped
+    // key (name|type|source_job), not the graph uri, so resolve the graph node's
+    // uri by name first, then fetch its precise grounding chunks.
+    let grounding_chunks: Vec<Value> = match resolve_graph_uri(&state, claims.sub, &d.entity_name).await {
+        Some(uri) => fetch_grounding_chunks(&state, claims.sub, &uri).await,
+        None => Vec::new(),
+    };
+
     Ok(Json(json!({
-        "id":           d.id,
-        "entityUri":    d.entity_uri,
-        "entityName":   d.entity_name,
-        "summary":      d.summary,
-        "keyFacts":     d.key_facts,
-        "originFiles":  d.origin_files,
-        "timeline":     d.timeline,
-        "trust":        d.trust,
-        "pinned":       d.pinned,
-        "heat":         d.heat,
-        "accessCount":  d.access_count + 1,
+        "id":              d.id,
+        "entityUri":       d.entity_uri,
+        "entityName":      d.entity_name,
+        "summary":         d.summary,
+        "keyFacts":        d.key_facts,
+        "originFiles":     d.origin_files,
+        "timeline":        d.timeline,
+        "trust":           d.trust,
+        "pinned":          d.pinned,
+        "heat":            d.heat,
+        "accessCount":     d.access_count + 1,
+        "groundingChunks": grounding_chunks,
     })))
 }
 
@@ -2586,4 +2706,46 @@ async fn entity_lineage(
     nodes.extend(comp_nodes);
 
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
+}
+
+// ── P2a — grounded nodes: pure shape tests ────────────────────────────────────
+
+#[cfg(test)]
+mod grounded_nodes_tests {
+    use super::grounding_chunk_to_json;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn grounding_chunk_json_has_expected_keys() {
+        let id = Uuid::new_v4();
+        let src_doc = Uuid::new_v4();
+        let job = Uuid::new_v4();
+        let v = grounding_chunk_to_json(id, "hello world", Some(src_doc), Some(job), Utc::now());
+        assert_eq!(v["id"], serde_json::json!(id));
+        assert_eq!(v["snippet"], "hello world");
+        assert_eq!(v["sourceDocumentId"], serde_json::json!(src_doc));
+        assert_eq!(v["jobId"], serde_json::json!(job));
+        assert!(v["createdAt"].is_string());
+    }
+
+    #[test]
+    fn grounding_chunk_json_snippet_truncated_to_300_chars() {
+        let long_content = "x".repeat(500);
+        let v = grounding_chunk_to_json(Uuid::new_v4(), &long_content, None, None, Utc::now());
+        assert_eq!(v["snippet"].as_str().unwrap().chars().count(), 300);
+    }
+
+    #[test]
+    fn grounding_chunk_json_nulls_when_source_and_job_absent() {
+        let v = grounding_chunk_to_json(Uuid::new_v4(), "short", None, None, Utc::now());
+        assert!(v["sourceDocumentId"].is_null());
+        assert!(v["jobId"].is_null());
+    }
+
+    #[test]
+    fn grounding_chunk_json_short_content_not_truncated() {
+        let v = grounding_chunk_to_json(Uuid::new_v4(), "short text", None, None, Utc::now());
+        assert_eq!(v["snippet"], "short text");
+    }
 }

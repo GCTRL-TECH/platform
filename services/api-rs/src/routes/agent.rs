@@ -199,8 +199,8 @@ Read tools:
 - list_graphs        : List knowledge graphs the caller can see. No args.
 - get_graph          : Read a compilation's entities + relationships. Args: { compilationId: string, limit?: number }
 - search_entities    : Find entities by name. Args: { query: string, limit?: number }
-- get_entity         : Read one entity, its connections AND its provenance (origin file / sourceRef / extraction job + timestamp). Use this to answer "where does X come from", "which file", "what's the source/origin of X". Args: { name: string }
-- get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files and timeline for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Args: { name: string }
+- get_entity         : Read one entity, its connections AND its provenance (origin file / sourceRef / extraction job + timestamp). Use this to answer "where does X come from", "which file", "what's the source/origin of X". Also returns `groundingChunks` (up to 3 verbatim source-text snippets that ground the entity) unless include_chunks=false. Args: { name: string, include_chunks?: boolean }
+- get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files, timeline, AND `groundingChunks` (verbatim source-text snippets) for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Args: { name: string }
 - get_neighbors      : List entities within N hops of a node (dependency tracing; code graphs — what does X touch?). Args: { name: string, depth?: number }
 - shortest_path      : Shortest path between two entities (how A connects to B / does X depend on Y). Args: { from: string, to: string }
 - search_chunks      : Retrieve source text passages for a question (RAG retrieval — use this to ANSWER questions, then cite the passages). Args: { query: string, compilationId?: string }
@@ -294,10 +294,10 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "query",              "description": "Blended answer over graph + chunks + dossiers (RAG). Preferred first read tool for open questions — blends all memory tiers automatically and returns a grounded answer with sources + confidence. Args: { message: string, compilationId?: string }", "args": { "message": "string", "compilationId": "string?" } },
             { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call after ANY substantive task to persist conclusions. Always pass compilationId (find via list_graphs). Args: { text: string, compilationId?: string }", "args": { "text": "string", "compilationId": "string?" } },
             { "name": "search_entities",    "description": "Find entities by name (clearance-filtered). Use limit to page through results (default 10, max 50).", "args": { "query": "string", "limit": "number?" } },
-            { "name": "get_entity",         "description": "Read one entity, its connections, and its provenance (origin file / sourceRef / extraction job) — use for 'where does X come from / which file'", "args": { "name": "string" } },
+            { "name": "get_entity",         "description": "Read one entity, its connections, and its provenance (origin file / sourceRef / extraction job) — use for 'where does X come from / which file'. Also returns groundingChunks (up to 3 verbatim source-text snippets) unless include_chunks=false", "args": { "name": "string", "include_chunks": "boolean?" } },
             { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?). Use depth 1 first; increase only if needed. Limit is fixed at 100.", "args": { "name": "string", "depth": "number?" } },
             { "name": "shortest_path",      "description": "Find the shortest path between two entities (how is A connected to B / does X depend on Y)", "args": { "from": "string", "to": "string" } },
-            { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
+            { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline, groundingChunks — verbatim source-text snippets). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
             { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval)", "args": { "query": "string", "compilationId": "string?" } },
             { "name": "list_wiki_pages",    "description": "List the distilled pages of a WIKI compilation (clearance-filtered — you only see pages you're cleared for)", "args": { "compilationId": "string" } },
             { "name": "get_wiki_page",      "description": "Read one distilled wiki page (markdown body + citations) by slug from a WIKI compilation", "args": { "compilationId": "string", "slug": "string" } },
@@ -406,13 +406,16 @@ pub(crate) async fn execute_tool(
             if name.trim().is_empty() { return json!({ "error": "name is required" }); }
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
-            // Pull `_source_job` too so we can resolve the origin file/provenance —
-            // this is what lets Pi answer "where does X come from / which file".
+            // include_chunks (default true): P2a grounding chunks via the node's uri.
+            let include_chunks = args.get("include_chunks").and_then(|v| v.as_bool()).unwrap_or(true);
+            // Pull `_source_job` (+ `uri`, P2a) so we can resolve the origin file/
+            // provenance AND precise grounding chunks — this is what lets Pi answer
+            // "where does X come from / which file" and show grounded source text.
             let cypher = "MATCH (n {name: $name}) \
                 WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank \
                 OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
                 RETURN n.name AS name, n.label AS label, n._classification AS cls, \
-                       n._source_job AS sourceJob, \
+                       n._source_job AS sourceJob, n.uri AS uri, \
                        collect(DISTINCT type(r) + ' → ' + coalesce(m.name,''))[..20] AS rels LIMIT 1";
             let mut result = json!({ "error": "not found or insufficient clearance" });
             if let Ok(mut stream) = state.neo.execute(
@@ -442,12 +445,22 @@ pub(crate) async fn execute_tool(
                         }
                         None => Value::Null,
                     };
+                    // P2a — grounded nodes: precise grounding chunks via the node's uri.
+                    let grounding_chunks: Vec<Value> = if include_chunks {
+                        match row.get::<String>("uri").ok() {
+                            Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims.sub, &uri).await,
+                            None => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     result = json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
                         "type": row.get::<String>("label").unwrap_or_default(),
                         "classification": row.get::<String>("cls").unwrap_or_default(),
                         "connections": row.get::<Vec<String>>("rels").unwrap_or_default(),
                         "provenance": provenance,
+                        "groundingChunks": grounding_chunks,
                     });
                 }
             }
@@ -469,6 +482,13 @@ pub(crate) async fn execute_tool(
             let result = match row {
                 Some(d) => {
                     crate::routes::kg::bump_dossier_heat(&state.db, d.id).await;
+                    // P2a — grounded nodes: resolve the graph node's uri by name
+                    // (the dossier's own entity_uri is a dossier-scoped key, not
+                    // the graph uri) and fetch its precise grounding chunks.
+                    let grounding_chunks = match crate::routes::kg::resolve_graph_uri(state, claims.sub, &d.entity_name).await {
+                        Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims.sub, &uri).await,
+                        None => Vec::new(),
+                    };
                     json!({
                         "entityName":  d.entity_name,
                         "summary":     d.summary,
@@ -478,6 +498,7 @@ pub(crate) async fn execute_tool(
                         "trust":       d.trust,
                         "pinned":      d.pinned,
                         "authoritative": true,
+                        "groundingChunks": grounding_chunks,
                     })
                 }
                 None => json!({ "error": "no dossier and no owned entity with that name" }),
@@ -1702,6 +1723,21 @@ mod agent_tool_registration_tests {
             "find_file descriptor must declare a 'query' arg");
         assert!(tool["args"].get("limit").is_some(),
             "find_file descriptor must declare a 'limit' arg");
+    }
+
+    // ── P2a: grounded nodes — get_entity include_chunks arg ───────────────────
+
+    #[test]
+    fn get_entity_descriptor_has_include_chunks_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("get_entity"))
+            .expect("get_entity must be in tool_schema");
+        assert!(tool["args"].get("include_chunks").is_some(),
+            "get_entity descriptor must declare an 'include_chunks' arg (P2a grounded nodes)");
     }
 
     // ── get_graph summary mode ─────────────────────────────────────────────────
