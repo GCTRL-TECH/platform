@@ -94,10 +94,14 @@ def _fetch_entity_facts(driver, user_id: str, entity_name: str) -> Optional[dict
          CASE WHEN n._source_job IS NOT NULL THEN 1 ELSE 0 END AS has_prov,
          collect(DISTINCT {dir: 'out', rel: type(ro), name: o.name,
                            type: coalesce(o.coarse_type, o.type),
-                           confidence: ro.confidence})[..40] AS outs,
+                           confidence: ro.confidence,
+                           authority: ro._authority,
+                           superseded_by_doc: ro._superseded_by_doc})[..40] AS outs,
          collect(DISTINCT {dir: 'in', rel: type(ri), name: i.name,
                            type: coalesce(i.coarse_type, i.type),
-                           confidence: ri.confidence})[..40] AS ins
+                           confidence: ri.confidence,
+                           authority: ri._authority,
+                           superseded_by_doc: ri._superseded_by_doc})[..40] AS ins
     ORDER BY has_prov DESC, conf_edges DESC, degree DESC, id(n) ASC
     RETURN n.name AS name,
            coalesce(n.coarse_type, n.type, 'entity') AS type,
@@ -132,13 +136,23 @@ def _fetch_entity_facts(driver, user_id: str, entity_name: str) -> Optional[dict
                 conf = float(conf) if conf is not None else None
             except (TypeError, ValueError):
                 conf = None
-            facts.append({
+            fact = {
                 "rel": rel,
                 "target": tgt,
                 "type": f.get("type") or "entity",
                 "direction": direction,
                 "confidence": conf,
-            })
+            }
+            # P3 — recency authority: when conflict detection marked this edge
+            # ("current" vs "superseded" + the doc that supersedes it), carry
+            # the annotation into key_facts so dossier readers (Pi's
+            # get_dossier, the RAG hot block) can say "current per <doc>,
+            # older value from <doc>" instead of asserting a stale fact.
+            if f.get("authority"):
+                fact["authority"] = f.get("authority")
+                if f.get("superseded_by_doc"):
+                    fact["supersededByDoc"] = f.get("superseded_by_doc")
+            facts.append(fact)
             neighbors.append({
                 "name": tgt, "type": f.get("type"), "rel": rel,
             })

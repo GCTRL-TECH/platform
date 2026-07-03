@@ -202,6 +202,24 @@ class KGBuilder:
             )
             nodes_total = session.execute_read(self._count_nodes)
 
+        # P3 — fact-conflict detection (write-time). The relation MERGE above
+        # dedups by the FULL triple, so a conflicting fact (same head+rel,
+        # different tail) lands as a SEPARATE sibling edge — detect those for
+        # the functional relations registered in relation_registry and rank
+        # them by recency authority. Failure-safe by contract: any error here
+        # logs and NEVER fails the extraction job (detect_for_job catches
+        # everything; the belt-and-braces try covers session creation too).
+        try:
+            from . import conflicts as _conflicts
+            with self._driver.session() as session:
+                found = _conflicts.detect_for_job(
+                    session, config.PG_URL, user_id, relations, name_to_uri,
+                )
+            if found:
+                logger.info(f"KGBuilder: {found} fact conflict(s) detected for job {job_id}")
+        except Exception as exc:  # noqa: BLE001 — never fail the job
+            logger.warning(f"KGBuilder: fact-conflict detection skipped: {exc}")
+
         return {
             "entities_created": entities_created,
             "relations_created": relations_created,

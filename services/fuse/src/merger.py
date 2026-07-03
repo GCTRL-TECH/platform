@@ -792,6 +792,27 @@ class ThreeStageEntityMerger:
         conflicts = list(stats.pop("_conflicts", []))
         conflicts.extend(getattr(self, "_last_relation_conflicts", []))
 
+        # P3 — post-merge fact-conflict scan: merged nodes unify name variants,
+        # so conflicting values for a functional relation (org has two CEOs
+        # from two sources) become visible HERE even when each source graph
+        # was internally consistent. Failure-safe: detect_for_compilation
+        # catches everything; the outer try covers session creation too — a
+        # detection failure must never fail the merge.
+        fact_conflicts_found = 0
+        try:
+            from . import conflicts as _factconflicts
+            with self.driver.session() as session:
+                fact_conflicts_found = _factconflicts.detect_for_compilation(
+                    session, config.PG_URL, user_id, compilation_id,
+                )
+            if fact_conflicts_found:
+                logger.info(
+                    f"[{compilation_id}] Post-merge scan: "
+                    f"{fact_conflicts_found} fact conflict(s)"
+                )
+        except Exception as exc:  # noqa: BLE001 — never fail the merge
+            logger.warning(f"[{compilation_id}] Fact-conflict scan skipped: {exc}")
+
         stats.update({
             "relations_merged": rel_count,
             "stage1_apoc": len(stage1_links),
@@ -803,6 +824,7 @@ class ThreeStageEntityMerger:
             "total_links": len(all_links),
             "_conflicts": conflicts,
             "conflicts_found": len(conflicts),
+            "fact_conflicts_found": fact_conflicts_found,
         })
 
         logger.info(f"[{compilation_id}] Merge complete: {stats}")
@@ -2109,7 +2131,10 @@ class ThreeStageEntityMerger:
                r._source_job AS source_job,
                r._class_labels AS class_labels, r._label_ranks AS label_ranks,
                r._classification AS classification,
-               coalesce(r.asserted_at, r.created_at, 0) AS asserted_at
+               coalesce(r.asserted_at, r.created_at, 0) AS asserted_at,
+               r._source_doc AS source_doc,
+               r._source_doc_modified_at AS source_doc_modified_at,
+               r.confidence AS confidence
         """
         with self.driver.session() as session:
             result = session.run(query, job_ids=source_job_ids)
@@ -2134,6 +2159,25 @@ class ThreeStageEntityMerger:
                 # NEWEST source assertion, so latest-value-wins survives into the
                 # compiled graph (incremental refresh keeps temporal ordering correct).
                 max_asserted = max((m.get("asserted_at") or 0) for m in members)
+                # P3 — carry source-doc provenance + confidence onto the merged
+                # edge so the post-merge fact-conflict scan can rank authority:
+                # provenance follows the NEWEST-asserted member that HAS a
+                # source doc (consistent with asserted_at newest-wins);
+                # confidence keeps the most-confident reading (same rule as
+                # the KEX writer's ON MATCH).
+                newest_first = sorted(
+                    members, key=lambda m: (m.get("asserted_at") or 0), reverse=True
+                )
+                src_doc = None
+                src_doc_modified = None
+                for m in newest_first:
+                    if m.get("source_doc"):
+                        src_doc = m.get("source_doc")
+                        src_doc_modified = m.get("source_doc_modified_at")
+                        break
+                confidences = [m.get("confidence") for m in members
+                               if m.get("confidence") is not None]
+                max_confidence = max(confidences) if confidences else None
                 if conflict:
                     conflicts.append({
                         "element_kind": "edge",
@@ -2154,11 +2198,17 @@ class ThreeStageEntityMerger:
                         r._min_rank = $min_rank,
                         r._class_conflict = $conflict,
                         r._owner = $user_id,
-                        r.asserted_at = $asserted_at
+                        r.asserted_at = $asserted_at,
+                        r._source_doc = $source_doc,
+                        r._source_doc_modified_at = $source_doc_modified_at,
+                        r.confidence = $confidence
                     RETURN count(r) AS cnt
                     """,
                     cid=compilation_id,
                     asserted_at=max_asserted,
+                    source_doc=src_doc,
+                    source_doc_modified_at=src_doc_modified,
+                    confidence=max_confidence,
                     head_name=head_name,
                     head_type=head_type,
                     tail_name=tail_name,
