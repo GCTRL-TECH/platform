@@ -22,6 +22,10 @@ services:
       - GCTRL_API_URL=${GCTRL_API_URL:-https://api.gctrl.tech}
       - GCTRL_COMPOSE_FILE=/app/docker-compose.yml
       - GCTRL_NETWORK=gctrl
+      # Gates POST /recreate (used by the api to swap itself onto its new image
+      # during a self-update — see api-rs update.rs). Same trust boundary as the
+      # api/kex/fuse INTERNAL_API_SECRET pattern; empty = grace (no check).
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
     networks:
       - gctrl
     healthcheck:

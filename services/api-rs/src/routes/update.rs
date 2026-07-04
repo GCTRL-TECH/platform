@@ -170,6 +170,10 @@ struct ServiceDigest {
     image: String,
     local: Option<String>,
     remote: Option<String>,
+    /// Which local lookup produced `local`: `"running-container"` (the honest
+    /// signal — what's actually executing right now) or `"image-tag"` (the
+    /// weaker fallback, used only when the container isn't deployed at all).
+    source: &'static str,
 }
 
 impl ServiceDigest {
@@ -189,6 +193,7 @@ impl ServiceDigest {
             "localDigest": self.local,
             "remoteDigest": self.remote,
             "upToDate": self.up_to_date(),
+            "source": self.source,
         })
     }
 }
@@ -196,14 +201,16 @@ impl ServiceDigest {
 /// Runs the local+remote digest check for every entry in [`SERVICES`], concurrently
 /// across services (each service's own local/remote lookup is sequential).
 async fn collect_service_digests() -> Vec<ServiceDigest> {
-    let checks = SERVICES.iter().map(|(_container, image)| async move {
-        let local = local_image_digest_async((*image).to_string()).await;
+    let checks = SERVICES.iter().map(|(container, image)| async move {
+        let LocalDigest { digest: local, source } =
+            local_digest_async((*container).to_string(), (*image).to_string()).await;
         let remote = fetch_remote_digest(image).await;
         ServiceDigest {
             name: short_name_from_image(image),
             image: image.to_string(),
             local,
             remote,
+            source,
         }
     });
     futures::future::join_all(checks).await
@@ -273,24 +280,76 @@ async fn fetch_remote_digest(image: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Async wrapper around [`local_image_digest`] (which uses the blocking
-/// [`docker_http`] socket helper) so it can be awaited alongside the ghcr lookup.
-async fn local_image_digest_async(image: String) -> Option<String> {
-    tokio::task::spawn_blocking(move || local_image_digest(&image))
+/// Result of a single service's local digest lookup, tagged with which method
+/// produced it (see [`ServiceDigest::source`]).
+struct LocalDigest {
+    digest: Option<String>,
+    source: &'static str,
+}
+
+/// Async wrapper around [`local_image_digest_for_service`] (which uses the
+/// blocking [`docker_http`] socket helper) so it can be awaited alongside the
+/// ghcr lookup.
+async fn local_digest_async(container: String, image: String) -> LocalDigest {
+    tokio::task::spawn_blocking(move || local_image_digest_for_service(&container, &image))
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(LocalDigest { digest: None, source: "image-tag" })
+}
+
+/// The honest local signal: what image is the RUNNING container actually on?
+/// Inspects the container for its current image ID (`.Image`), then inspects
+/// that image by ID for its `RepoDigests`. This is deliberately NOT "what tag
+/// did we last pull" — a `docker restart` (as opposed to a recreate) leaves the
+/// container on its OLD image while the `:latest` tag has already moved on to
+/// the new one, so a tag-based check would report "up to date" while the
+/// running process is stale (the exact bug this replaces).
+///
+/// Falls back to [`local_image_digest`] (tag-based) when the container isn't
+/// deployed at all (404 / inspect failure) — e.g. an optional profile service
+/// (fusion-engine) that was never enabled on this install still gets a sane
+/// comparison instead of silently reporting "unknown".
+fn local_image_digest_for_service(container: &str, image: &str) -> LocalDigest {
+    match docker_http("GET", &format!("/containers/{container}/json"), None, 10) {
+        Ok((200, body)) => {
+            let inspect = json_from_body(&body);
+            let digest = inspect
+                .get("Image")
+                .and_then(|v| v.as_str())
+                .and_then(digest_for_image_id);
+            LocalDigest { digest, source: "running-container" }
+        }
+        _ => LocalDigest { digest: local_image_digest(image), source: "image-tag" },
+    }
+}
+
+/// The digest recorded for image ID `id` (e.g. `sha256:abcd…`, as returned by a
+/// container inspect's `.Image` field). `None` if the image is gone or has no
+/// `RepoDigests` (built locally rather than pulled — never comparable).
+fn digest_for_image_id(id: &str) -> Option<String> {
+    let (status, body) = docker_http("GET", &format!("/images/{id}/json"), None, 10).ok()?;
+    if status != 200 {
+        return None;
+    }
+    first_repo_digest(&json_from_body(&body))
 }
 
 /// The digest Docker recorded locally for `image` the last time it was pulled
 /// (`RepoDigests[0]`, the part after `@`). `None` if the image isn't present
 /// locally (404) or was built locally rather than pulled (no `RepoDigests`).
+/// This is the TAG-based fallback — see [`local_image_digest_for_service`] for
+/// why the container-based check is preferred whenever a container exists.
 fn local_image_digest(image: &str) -> Option<String> {
     let (status, body) = docker_http("GET", &format!("/images/{image}/json"), None, 10).ok()?;
     if status != 200 {
         return None;
     }
-    let inspect = json_from_body(&body);
+    first_repo_digest(&json_from_body(&body))
+}
+
+/// Extracts the first `RepoDigests` entry's digest (the part after `@`) from a
+/// Docker image-inspect JSON body. Shared by the running-container path
+/// ([`digest_for_image_id`]) and the tag-based fallback ([`local_image_digest`]).
+fn first_repo_digest(inspect: &Value) -> Option<String> {
     inspect
         .get("RepoDigests")
         .and_then(|v| v.as_array())
@@ -548,28 +607,104 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
     notify_agent_updated().await;
 
     // Step 2c: Re-run the digest comparison so the client sees a truthful final
-    // state (rather than assuming success) before the stream closes.
+    // state (rather than assuming success) before the stream closes. The api is
+    // deliberately EXCLUDED from this verdict: it hasn't been recreated yet at
+    // this point in the run (that happens next, in Step 3) — a check here would
+    // compare against the api's *previous* image, so including it would
+    // misreport a successful update as "still outdated". Its own outcome is
+    // reported as its own honest, separate, asynchronous step below instead of
+    // folded into this one — never silently lumped in as a false pass or fail.
     let post_services = collect_service_digests().await;
     let still_outdated: Vec<String> = post_services
         .iter()
-        .filter(|s| s.up_to_date() == Some(false))
+        .filter(|s| s.name != "api" && s.up_to_date() == Some(false))
         .map(|s| s.name.clone())
         .collect();
     let verify_message = if still_outdated.is_empty() {
-        "Verified: all services up to date.".to_string()
+        "Verified: all other services up to date.".to_string()
     } else {
         format!("Still outdated after update: {}", still_outdated.join(", "))
     };
     send("progress", json!({ "step": "verify", "message": verify_message }));
 
-    // Step 3: Done — client reloads on receiving this
+    // Step 3: The api cannot delete-and-recreate its own container without
+    // dying mid-operation, so the gctrl-agent does it on the api's behalf — it
+    // mounts docker.sock and was ALREADY recreated onto the new image earlier
+    // in this same run (Step 2). The agent responds 202 immediately and only
+    // performs the actual container swap ~1.5s later (see agent-rs `/recreate`),
+    // safely after this HTTP call returns, so this process survives long enough
+    // to still emit `done` and close the stream cleanly afterward.
+    send("progress", json!({
+        "step": "self_update",
+        "message": "Updating the API itself (the app will briefly disconnect)…"
+    }));
+    let self_recreate_ok = ask_agent_to_recreate_api().await;
+    if self_recreate_ok {
+        send("progress", json!({
+            "step": "self_update_ok",
+            "message": "API updates itself in the background — refresh in ~20s."
+        }));
+    } else {
+        // Never silently lie: the agent couldn't do it, so say so explicitly.
+        // The actual fallback restart happens AFTER `done` below (same reason
+        // the old code delayed it) — restarting now would kill this very
+        // process before the response finishes.
+        send("progress", json!({
+            "step": "self_update_warn",
+            "message": "API container could not self-recreate — it will be restarted on the current image; run the update again or `docker compose up -d gctrl-api` to finish."
+        }));
+    }
+
+    // Step 4: Done — client reloads on receiving this.
     send("done", json!({}));
 
-    // Step 4: After client received done, restart the api container itself.
-    // We use a simple Docker restart (not recreate) to avoid killing the live response
-    // mid-stream. The container will fully recreate on the next docker compose up.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let _ = tokio::task::spawn_blocking(|| docker_restart("gctrl-api")).await;
+    // Step 5: Only the fallback path still touches the api container from here.
+    // A simple restart (not recreate) avoids killing the live response mid-
+    // stream; the container fully recreates on the next successful update run
+    // or manual `docker compose up -d`.
+    if !self_recreate_ok {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tokio::task::spawn_blocking(|| docker_restart("gctrl-api")).await;
+    }
+}
+
+/// Asks the gctrl-agent to recreate the api container from its already-pulled
+/// image (see [`run_update`] Step 3 for why the api can't do this to itself).
+/// Returns `true` only on a genuine `202 Accepted` from the agent — anything
+/// else (unreachable, wrong secret, non-202) is treated as failure so the
+/// caller falls back honestly rather than assuming success.
+async fn ask_agent_to_recreate_api() -> bool {
+    let base = std::env::var("GCTRL_AGENT_INTERNAL_URL")
+        .unwrap_or_else(|_| "http://gctrl-agent:7070".to_string());
+    let base = base.trim_end_matches('/');
+    let secret = std::env::var("INTERNAL_API_SECRET").unwrap_or_default();
+
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("ask_agent_to_recreate_api: client build failed: {e}");
+            return false;
+        }
+    };
+
+    let mut req = client
+        .post(format!("{base}/recreate"))
+        .json(&json!({ "container": "gctrl-api" }));
+    if !secret.is_empty() {
+        req = req.header("X-Internal-Secret", secret);
+    }
+
+    match req.send().await {
+        Ok(resp) if resp.status() == reqwest::StatusCode::ACCEPTED => true,
+        Ok(resp) => {
+            tracing::warn!("ask_agent_to_recreate_api: agent returned {}", resp.status());
+            false
+        }
+        Err(e) => {
+            tracing::warn!("ask_agent_to_recreate_api: request failed: {e}");
+            false
+        }
+    }
 }
 
 /// Tell the agent which version we just installed so it updates its instance
@@ -904,11 +1039,16 @@ mod tests {
     // ── ServiceDigest::up_to_date / to_json (response-shape) ───────────────────
 
     fn digest(local: Option<&str>, remote: Option<&str>) -> ServiceDigest {
+        digest_with_source(local, remote, "running-container")
+    }
+
+    fn digest_with_source(local: Option<&str>, remote: Option<&str>, source: &'static str) -> ServiceDigest {
         ServiceDigest {
             name: "agent".to_string(),
             image: "ghcr.io/gctrl-tech/agent:latest".to_string(),
             local: local.map(str::to_string),
             remote: remote.map(str::to_string),
+            source,
         }
     }
 
@@ -938,6 +1078,7 @@ mod tests {
         assert_eq!(v["localDigest"], "sha256:aaa");
         assert_eq!(v["remoteDigest"], "sha256:bbb");
         assert_eq!(v["upToDate"], false);
+        assert_eq!(v["source"], "running-container");
     }
 
     #[test]
@@ -948,14 +1089,35 @@ mod tests {
         assert!(v["upToDate"].is_null());
     }
 
-    // ── local_image_digest RepoDigests parsing ──────────────────────────────────
-    // (local_image_digest itself talks to /var/run/docker.sock via docker_http, so
-    // only the pure-parsing half is unit-testable here; the digest-extraction logic
-    // — "take the part after @" — is exercised directly.)
+    #[test]
+    fn service_digest_to_json_reports_image_tag_source() {
+        let v = digest_with_source(Some("sha256:aaa"), Some("sha256:aaa"), "image-tag").to_json();
+        assert_eq!(v["source"], "image-tag");
+        assert_eq!(v["upToDate"], true);
+    }
+
+    // ── local_image_digest / local_image_digest_for_service RepoDigests parsing ──
+    // (the docker_http-calling halves talk to /var/run/docker.sock, so only the
+    // pure-parsing logic is unit-testable here.)
 
     #[test]
     fn repo_digest_extracts_hash_after_at() {
         let repo_digest = "ghcr.io/gctrl-tech/agent@sha256:deadbeef";
         assert_eq!(repo_digest.rsplit('@').next(), Some("sha256:deadbeef"));
+    }
+
+    #[test]
+    fn first_repo_digest_extracts_from_inspect_json() {
+        let inspect = json!({
+            "RepoDigests": ["ghcr.io/gctrl-tech/agent@sha256:deadbeef"]
+        });
+        assert_eq!(first_repo_digest(&inspect), Some("sha256:deadbeef".to_string()));
+    }
+
+    #[test]
+    fn first_repo_digest_none_when_missing_or_empty() {
+        assert_eq!(first_repo_digest(&json!({})), None);
+        assert_eq!(first_repo_digest(&json!({ "RepoDigests": [] })), None);
+        assert_eq!(first_repo_digest(&json!({ "RepoDigests": [""] })), None);
     }
 }

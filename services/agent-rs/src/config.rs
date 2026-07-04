@@ -13,6 +13,10 @@ pub struct Config {
     /// steady-state heartbeats carry nothing — we signal a version only when it
     /// actually changes (fresh install / after an update).
     pub reported_version_path: String,
+    /// Shared secret gating `/recreate` (and mirroring the same trust boundary
+    /// api-rs already applies to kex/fuse's `/search`). Empty = grace mode (no
+    /// check) — matches the existing INTERNAL_API_SECRET pattern everywhere else.
+    pub internal_api_secret: String,
 }
 
 impl Config {
@@ -40,6 +44,7 @@ impl Config {
                 .unwrap_or_else(|_| "/app/config/current_version".into()),
             reported_version_path: std::env::var("GCTRL_REPORTED_VERSION_PATH")
                 .unwrap_or_else(|_| "/app/config/reported_version".into()),
+            internal_api_secret: std::env::var("INTERNAL_API_SECRET").unwrap_or_default(),
         }
     }
 }
