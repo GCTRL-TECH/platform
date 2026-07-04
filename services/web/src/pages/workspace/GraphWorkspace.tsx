@@ -14,7 +14,7 @@ import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type P
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ArrowLeft, Search, Network, Hash, Copy, Check, X, PanelRightClose, PanelRightOpen,
-  PanelLeftClose, PanelLeftOpen, Share2,
+  PanelLeftClose, PanelLeftOpen, Share2, ShieldCheck, ShieldOff,
 } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
@@ -29,6 +29,7 @@ import { NodeDetailSource } from '@/components/graph-explorer/NodeDetailSource'
 import { NodeDetailDossier } from '@/components/graph-explorer/NodeDetailDossier'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
 import { EmbedShareDialog } from './EmbedShareDialog'
+import { PrivacyDialog, type PrivacyMode } from './PrivacyDialog'
 
 interface CompilationSummary {
   id: string
@@ -37,6 +38,7 @@ interface CompilationSummary {
   edgeCount: number
   classification: string
   embedPublic?: boolean
+  privacyMode?: PrivacyMode
 }
 
 const CLS_BADGE: Record<string, string> = {
@@ -101,6 +103,7 @@ export function GraphWorkspace() {
   const { nodes, edges, nodeCount, edgeCount, truncated, isLoading, error, mergeNeighbors } = useGraphData(compilationId)
 
   const [shareOpen, setShareOpen] = useState(false)
+  const [privacyOpen, setPrivacyOpen] = useState(false)
 
   const [pickerQuery, setPickerQuery] = useState('')
   const [selectedName, setSelectedName] = useState<string | null>(null)
@@ -219,6 +222,16 @@ export function GraphWorkspace() {
         </button>
         <h1 className="text-sm font-semibold text-slate-100">{current?.name ?? 'Graph Workspace'}</h1>
         {current && <span className={cn(CLS_BADGE[current.classification] ?? 'badge-slate', 'text-[10px]')}>{current.classification}</span>}
+        {current?.privacyMode === 'local_only' && (
+          <span title="Local-only — never leaves this machine" className="flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-amber-500/30">
+            <ShieldOff size={11} /> Local-only
+          </span>
+        )}
+        {current?.privacyMode === 'cloaked' && (
+          <span title="Cloaked — cloud models see pseudonyms, not your entities" className="flex items-center gap-1 rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] font-medium text-indigo-300 ring-1 ring-indigo-500/30">
+            <ShieldCheck size={11} /> Cloaked
+          </span>
+        )}
         {/* True totals from the API. When the canvas shows only the degree-ordered
             core, say so explicitly so differently-sized graphs visibly differ and
             the user knows it's a subset. */}
@@ -242,6 +255,11 @@ export function GraphWorkspace() {
         </span>
         <div className="ml-auto flex items-center gap-1">
           {current && (
+            <button onClick={() => setPrivacyOpen(true)} className="btn-ghost text-slate-500 hover:text-slate-300" title="Private Memory — control what cloud models see">
+              <ShieldCheck size={16} />
+            </button>
+          )}
+          {current && (
             <button onClick={() => setShareOpen(true)} className="btn-ghost text-slate-500 hover:text-slate-300" title="Share / embed this graph">
               <Share2 size={16} />
             </button>
@@ -262,6 +280,21 @@ export function GraphWorkspace() {
           onEmbedPublicChange={(enabled) => {
             queryClient.setQueryData<{ compilations: CompilationSummary[] }>(['kg', 'compilations'], (prev) =>
               prev ? { compilations: prev.compilations.map((c) => (c.id === current.id ? { ...c, embedPublic: enabled } : c)) } : prev,
+            )
+          }}
+        />
+      )}
+
+      {current && (
+        <PrivacyDialog
+          open={privacyOpen}
+          onClose={() => setPrivacyOpen(false)}
+          compilationId={current.id}
+          compilationName={current.name}
+          privacyMode={current.privacyMode ?? 'open'}
+          onPrivacyModeChange={(mode) => {
+            queryClient.setQueryData<{ compilations: CompilationSummary[] }>(['kg', 'compilations'], (prev) =>
+              prev ? { compilations: prev.compilations.map((c) => (c.id === current.id ? { ...c, privacyMode: mode } : c)) } : prev,
             )
           }}
         />

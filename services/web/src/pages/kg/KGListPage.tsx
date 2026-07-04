@@ -17,6 +17,8 @@ import {
   ChevronLeft,
   BookOpenText,
   Lock,
+  ShieldCheck,
+  ShieldOff,
 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
@@ -48,6 +50,8 @@ interface Compilation {
   folderId: string | null
   type?: 'RAW' | 'WIKI'
   isSystem?: boolean
+  // Private Memory — absent on older cached responses, so default to 'open'.
+  privacyMode?: 'open' | 'cloaked' | 'local_only'
 }
 
 interface CompilationsResponse {
@@ -384,6 +388,16 @@ function CompilationCard({
           {isWiki && (
             <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-300 ring-1 ring-violet-500/30">
               WIKI
+            </span>
+          )}
+          {compilation.privacyMode === 'local_only' && (
+            <span title="Local-only — never leaves this machine" className="text-amber-400">
+              <ShieldOff size={13} />
+            </span>
+          )}
+          {compilation.privacyMode === 'cloaked' && (
+            <span title="Cloaked — cloud models see pseudonyms, not your entities" className="text-indigo-400">
+              <ShieldCheck size={13} />
             </span>
           )}
           <span className={cls.badge}>{cls.label}</span>
