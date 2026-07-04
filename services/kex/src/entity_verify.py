@@ -32,9 +32,12 @@ from .relex import get_extractor
 
 logger = logging.getLogger(__name__)
 
-# One prompt per this many candidates — keeps each request's expected JSON
-# response small enough to stay well inside a typical num_predict budget even
-# for a dense document with hundreds of NER hits.
+# One prompt per this many candidates. NOTE (measured): batch size is NOT the
+# recall lever — 12 vs 40 made no consistent difference on the 32-doc gold. The
+# ~5pt recall cost of this tier is inherent 14b-judgment unreliability (it drops
+# unambiguous entities like Java / Dr. Sarah Chen nondeterministically), which is
+# why this tier is opt-in / default-OFF and GRAPH_PRUNE_ISOLATED (deterministic)
+# remains the primary precision mechanism. 40 keeps calls-per-doc low.
 _BATCH_SIZE = 40
 
 # Characters of surrounding context (each side) included per candidate so the
