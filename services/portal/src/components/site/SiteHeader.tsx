@@ -7,6 +7,7 @@ const NAV: [label: string, href: string][] = [
   ['Architecture', '/#architecture'],
   ['Trust', '/#trust'],
   ['Benchmarks', '/#benchmarks'],
+  ['Integrations', '/integrations'],
   ['Pricing', '/pricing'],
   ['Documentation', '/docs'],
 ]
