@@ -4,9 +4,6 @@ import { Link } from 'react-router-dom'
 // Section anchors use `/#id` so they work from any page (docs / use-cases
 // navigate back to the landing page and scroll). Page links are real routes.
 const NAV: [label: string, href: string][] = [
-  ['Architecture', '/#architecture'],
-  ['Trust', '/#trust'],
-  ['Benchmarks', '/#benchmarks'],
   ['Integrations', '/integrations'],
   ['Pricing', '/pricing'],
   ['Documentation', '/docs'],
