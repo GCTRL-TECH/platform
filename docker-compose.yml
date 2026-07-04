@@ -110,6 +110,7 @@ services:
       - PG_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL
       - PORT=4010
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}
+      - KEX_ENTITY_VERIFY=${KEX_ENTITY_VERIFY:-false}
     volumes:
       - kex-models:/app/models
     depends_on:
