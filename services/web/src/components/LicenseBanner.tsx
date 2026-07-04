@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { X, RefreshCw, Copy, Check } from 'lucide-react'
-import { cn, agentHealthUrl } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 import { getToken } from '@/lib/auth'
+import { apiGet } from '@/lib/api'
 
 export interface AgentStatus {
   activated: boolean
@@ -12,6 +13,23 @@ export interface AgentStatus {
   updateRequired: boolean
   latestVersion: string
   currentVersion?: string
+  /** False when the gctrl-agent is unreachable (dev/grace state) — added by the
+   *  `/api/update/agent-status` proxy, not part of the agent's own payload. */
+  reachable?: boolean
+}
+
+/**
+ * Fetches agent status through the API's own origin (`/api/update/agent-status`)
+ * rather than the browser hitting the agent's `:7070` port directly — that port
+ * is published loopback-only on the host, so it's unreachable for any operator
+ * not physically on the box. `reachable: false` (a normal dev/grace state, not an
+ * error) resolves to `null` so callers keep treating "agent absent" as they did
+ * before this fix.
+ */
+async function fetchAgentStatus(): Promise<AgentStatus | null> {
+  const data = await apiGet<AgentStatus>('/update/agent-status')
+  if (data.reachable === false) return null
+  return data
 }
 
 interface ProgressLine {
@@ -287,9 +305,8 @@ export function LicenseBanner() {
   const [showModal, setShowModal] = useState(false)
 
   const fetchStatus = useCallback(() => {
-    fetch(`${agentHealthUrl()}/status`)
-      .then((r) => r.json())
-      .then((d) => setStatus(d as AgentStatus))
+    fetchAgentStatus()
+      .then(setStatus)
       .catch(() => setStatus(null))
   }, [])
 
@@ -355,10 +372,9 @@ export function useLicenseStatus() {
   const [loading, setLoading] = useState(true)
 
   const fetchStatus = useCallback(() => {
-    fetch(`${agentHealthUrl()}/status`)
-      .then((r) => r.json())
+    fetchAgentStatus()
       .then((d) => {
-        setStatus(d as AgentStatus)
+        setStatus(d)
         setLoading(false)
       })
       .catch(() => {

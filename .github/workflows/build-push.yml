@@ -292,6 +292,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Generate the static update-channel manifest that `/api/update/check`'s
+      # semver fallback reads from https://gctrl.tech/version.json. Previously no
+      # such file existed — the SPA's index.html fallback was served instead, so
+      # the version channel never worked. CI-generated only; never committed
+      # (see .gitignore) so a stray local build can't ship a stale one.
+      - name: Generate version.json
+        run: echo "{\"version\": \"${VERSION}\", \"channel\": \"stable\", \"publishedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > services/portal/public/version.json
       - uses: docker/build-push-action@v5
         with:
           context: services/portal

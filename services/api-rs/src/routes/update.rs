@@ -1,4 +1,5 @@
 use axum::{
+    extract::Query,
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
     Json, Router,
@@ -13,11 +14,12 @@ use tokio::sync::mpsc;
 
 // Images to pull + their container names (api last — it hosts this endpoint)
 const SERVICES: &[(&str, &str)] = &[
-    ("gctrl-agent", "ghcr.io/gctrl-tech/agent:latest"),
-    ("gctrl-web",   "ghcr.io/gctrl-tech/web:latest"),
-    ("gctrl-fuse",  "ghcr.io/gctrl-tech/fuse:latest"),
-    ("gctrl-kex",   "ghcr.io/gctrl-tech/kex:latest"),
-    ("gctrl-api",   "ghcr.io/gctrl-tech/api:latest"),
+    ("gctrl-agent",    "ghcr.io/gctrl-tech/agent:latest"),
+    ("gctrl-web",      "ghcr.io/gctrl-tech/web:latest"),
+    ("gctrl-fuse",     "ghcr.io/gctrl-tech/fuse:latest"),
+    ("gctrl-kex",      "ghcr.io/gctrl-tech/kex:latest"),
+    ("gctrl-resolver", "ghcr.io/gctrl-tech/fusion-engine:latest"),
+    ("gctrl-api",      "ghcr.io/gctrl-tech/api:latest"),
 ];
 
 /// Server version. Defaults to the crate version, overridable at build/run time
@@ -56,6 +58,10 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/", get(trigger_update))
         // GET — lightweight version/update-available check (bell polling)
         .route("/check", get(check_update))
+        // GET — server-side proxy to the gctrl-agent's :7070/status, so browsers
+        // that can't reach the agent's internal-network port directly still get a
+        // truthful reachable/unreachable signal via the API's own origin.
+        .route("/agent-status", get(agent_status))
 }
 
 // ─── Version / update-available check ─────────────────────────────────────────
@@ -71,39 +77,80 @@ fn check_cache() -> &'static Mutex<Option<CachedCheck>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// `GET /api/update/check` → `{ current, latest, updateAvailable }`.
+#[derive(serde::Deserialize)]
+struct CheckParams {
+    /// `?force=1` bypasses the read of the cache (a fresh result is still written
+    /// back to it). Used by the Settings "Check now" button.
+    force: Option<String>,
+}
+
+/// `GET /api/update/check[?force=1]` → digest-based update detection (primary),
+/// with the semver channel kept only as display metadata.
 ///
-/// Determines `latest` from a configurable update channel (`GCTRL_UPDATE_CHANNEL_URL`,
-/// default [`DEFAULT_CHANNEL_URL`]). Degrades gracefully: any failure to reach or
-/// parse the channel yields `{ current, latest: current, updateAvailable: false }`
-/// — never a false positive, never an error surfaced to the UI. Results are cached
-/// in-memory for [`CHECK_CACHE_TTL`] so bell polling stays cheap.
-async fn check_update() -> Json<Value> {
+/// Every service ships as `:latest`, so semver is the wrong tool for "is there an
+/// update" — the authoritative signal is whether the locally-pulled image digest
+/// still matches the digest ghcr.io serves for `:latest` (see [`collect_service_digests`]).
+/// The semver channel (`current`/`latest`) is fetched purely for display + changelog
+/// purposes and can never mask or override the digest result. Degrades honestly:
+/// if neither the registry nor the channel is reachable, `method: "unavailable"`
+/// and `note` explain why — never a false "up to date". Results are cached for
+/// [`CHECK_CACHE_TTL`] so bell polling and repeated Settings visits stay cheap.
+async fn check_update(Query(params): Query<CheckParams>) -> Json<Value> {
+    let force = params.force.as_deref() == Some("1");
     let current = current_version();
 
-    // Serve from cache if fresh.
-    if let Ok(guard) = check_cache().lock() {
-        if let Some(c) = guard.as_ref() {
-            if c.fetched_at.elapsed() < CHECK_CACHE_TTL {
-                return Json(c.payload.clone());
+    // Serve from cache if fresh (unless the caller explicitly asked to bypass it).
+    if !force {
+        if let Ok(guard) = check_cache().lock() {
+            if let Some(c) = guard.as_ref() {
+                if c.fetched_at.elapsed() < CHECK_CACHE_TTL {
+                    return Json(c.payload.clone());
+                }
             }
         }
     }
 
-    let latest = fetch_latest_version().await.unwrap_or_else(|| current.clone());
-    let update_available = version_gt(&latest, &current);
+    // 1. Digest pass — the authoritative detector when it yields data for at
+    //    least one service (locally installed + registry reachable).
+    let services = collect_service_digests().await;
+    let any_checked = services
+        .iter()
+        .any(|s| s.local.is_some() && s.remote.is_some());
+    let digest_update_available = services.iter().any(|s| s.up_to_date() == Some(false));
+
+    // 2. Semver channel — metadata only (current/latest for display + changelog).
+    //    A channel failure must never mask a digest result, and vice versa.
+    let latest_opt = fetch_latest_version().await;
+    let channel_ok = latest_opt.is_some();
+    let latest = latest_opt.unwrap_or_else(|| current.clone());
+    let semver_update_available = version_gt(&latest, &current);
+
+    let (method, update_available, note): (&str, bool, Option<&str>) = if any_checked {
+        ("digest", digest_update_available, None)
+    } else if channel_ok {
+        ("semver", semver_update_available, None)
+    } else {
+        (
+            "unavailable",
+            false,
+            Some("Could not reach ghcr.io or the update channel — install state unknown."),
+        )
+    };
 
     // Both naming conventions are emitted so every consumer is satisfied:
     // Header.tsx / SettingsPage.tsx read `current`/`latest`; other clients (and the
     // license banner) read `currentVersion`/`latestVersion`. `updateAvailable` is
-    // always present and false on any upstream failure (never a 5xx, never a false
-    // positive) so the UI can truthfully say "up to date" when the channel is down.
+    // always present and reflects the digest pass whenever one was possible.
     let payload = json!({
         "current": current,
         "latest": latest,
         "currentVersion": current,
         "latestVersion": latest,
         "updateAvailable": update_available,
+        "method": method,
+        "services": services.iter().map(ServiceDigest::to_json).collect::<Vec<_>>(),
+        "checkedAt": chrono::Utc::now().to_rfc3339(),
+        "note": note,
     });
 
     if let Ok(mut guard) = check_cache().lock() {
@@ -111,6 +158,180 @@ async fn check_update() -> Json<Value> {
     }
 
     Json(payload)
+}
+
+// ─── Digest-based detection ─────────────────────────────────────────────────
+
+/// Per-service digest comparison result for the `/check` response and the
+/// post-update verification line.
+#[derive(Clone, Debug)]
+struct ServiceDigest {
+    name: String,
+    image: String,
+    local: Option<String>,
+    remote: Option<String>,
+}
+
+impl ServiceDigest {
+    /// `Some(true)` up to date, `Some(false)` outdated, `None` unknown (not
+    /// installed locally, locally built, or the registry was unreachable).
+    fn up_to_date(&self) -> Option<bool> {
+        match (&self.local, &self.remote) {
+            (Some(l), Some(r)) => Some(l == r),
+            _ => None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "image": self.image,
+            "localDigest": self.local,
+            "remoteDigest": self.remote,
+            "upToDate": self.up_to_date(),
+        })
+    }
+}
+
+/// Runs the local+remote digest check for every entry in [`SERVICES`], concurrently
+/// across services (each service's own local/remote lookup is sequential).
+async fn collect_service_digests() -> Vec<ServiceDigest> {
+    let checks = SERVICES.iter().map(|(_container, image)| async move {
+        let local = local_image_digest_async((*image).to_string()).await;
+        let remote = fetch_remote_digest(image).await;
+        ServiceDigest {
+            name: short_name_from_image(image),
+            image: image.to_string(),
+            local,
+            remote,
+        }
+    });
+    futures::future::join_all(checks).await
+}
+
+/// "ghcr.io/gctrl-tech/agent:latest" → "agent" (last path segment, tag stripped).
+fn short_name_from_image(image: &str) -> String {
+    image
+        .rsplit('/')
+        .next()
+        .unwrap_or(image)
+        .split(':')
+        .next()
+        .unwrap_or(image)
+        .to_string()
+}
+
+/// "ghcr.io/gctrl-tech/agent:latest" → Some("gctrl-tech/agent"). `None` if the
+/// image isn't hosted on ghcr.io (nothing to look up anonymously).
+fn ghcr_repo_from_image(image: &str) -> Option<String> {
+    let rest = image.strip_prefix("ghcr.io/")?;
+    let repo = rest.split(':').next().unwrap_or(rest);
+    if repo.is_empty() { None } else { Some(repo.to_string()) }
+}
+
+/// Anonymous ghcr.io manifest digest for `<repo>:latest`. ghcr.io manifests are
+/// publicly readable even for repos under an org, so this needs no credentials —
+/// verified empirically: `GET /token?scope=repository:<repo>:pull` → bearer token,
+/// then `HEAD /v2/<repo>/manifests/latest` → `docker-content-digest` header. `None`
+/// on any failure (network, non-2xx, missing header) — never surfaced as an error.
+async fn fetch_remote_digest(image: &str) -> Option<String> {
+    let repo = ghcr_repo_from_image(image)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let token_url = format!("https://ghcr.io/token?scope=repository:{repo}:pull");
+    let token_resp = client.get(&token_url).send().await.ok()?;
+    if !token_resp.status().is_success() {
+        return None;
+    }
+    let token_json: Value = token_resp.json().await.ok()?;
+    let token = token_json.get("token").and_then(|v| v.as_str())?;
+
+    let manifest_url = format!("https://ghcr.io/v2/{repo}/manifests/latest");
+    let manifest_resp = client
+        .head(&manifest_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header(
+            "Accept",
+            "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .await
+        .ok()?;
+    if !manifest_resp.status().is_success() {
+        return None;
+    }
+
+    manifest_resp
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Async wrapper around [`local_image_digest`] (which uses the blocking
+/// [`docker_http`] socket helper) so it can be awaited alongside the ghcr lookup.
+async fn local_image_digest_async(image: String) -> Option<String> {
+    tokio::task::spawn_blocking(move || local_image_digest(&image))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The digest Docker recorded locally for `image` the last time it was pulled
+/// (`RepoDigests[0]`, the part after `@`). `None` if the image isn't present
+/// locally (404) or was built locally rather than pulled (no `RepoDigests`).
+fn local_image_digest(image: &str) -> Option<String> {
+    let (status, body) = docker_http("GET", &format!("/images/{image}/json"), None, 10).ok()?;
+    if status != 200 {
+        return None;
+    }
+    let inspect = json_from_body(&body);
+    inspect
+        .get("RepoDigests")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.rsplit('@').next())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// `GET /api/update/agent-status` → proxies the gctrl-agent's internal `:7070/status`
+/// through the API's own origin, since browsers on a different LAN than the agent
+/// host can reach the API but not that agent port directly (it's published
+/// loopback-only). Absence of the agent is a normal dev/grace state, not an error:
+/// on any failure this returns HTTP 200 `{"reachable": false}`, never a 5xx.
+async fn agent_status() -> Json<Value> {
+    let base = std::env::var("GCTRL_AGENT_URL").unwrap_or_else(|_| "http://gctrl-agent:7070".to_string());
+    let base = base.trim_end_matches('/').to_string();
+
+    let fetched: Option<Value> = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let resp = client.get(format!("{base}/status")).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
+    }
+    .await;
+
+    match fetched {
+        Some(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("reachable".to_string(), json!(true));
+            }
+            Json(v)
+        }
+        None => Json(json!({ "reachable": false })),
+    }
 }
 
 /// Fetch the latest version. Tries the configured version channel first, then
@@ -299,14 +520,19 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
         }
     }
 
-    // Step 2: Recreate all non-api containers
+    // Step 2: Recreate all non-api containers. A container that isn't deployed
+    // (e.g. fusion-engine on an install that never enabled FUSE) is skipped, not
+    // failed — absence of an optional service is normal, not an error.
     for (container, _) in SERVICES.iter().filter(|(c, _)| *c != "gctrl-api") {
         send("progress", json!({ "step": "restart", "container": container, "message": format!("Recreating {}…", container) }));
 
         let name = container.to_string();
         match tokio::task::spawn_blocking(move || recreate_container(&name)).await {
-            Ok(Ok(_)) => {
+            Ok(Ok(true)) => {
                 send("progress", json!({ "step": "restarted", "container": container, "message": format!("{} updated", container) }));
+            }
+            Ok(Ok(false)) => {
+                send("progress", json!({ "step": "skipped", "container": container, "message": format!("Skipped {} (not deployed)", container) }));
             }
             Ok(Err(e)) => {
                 tracing::warn!("Recreate {} failed: {}", container, e);
@@ -320,6 +546,21 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
     // flips updateAvailable=false and reports the new version on its next heartbeat.
     // Best-effort: a failure here doesn't fail the update (the agent re-derives it).
     notify_agent_updated().await;
+
+    // Step 2c: Re-run the digest comparison so the client sees a truthful final
+    // state (rather than assuming success) before the stream closes.
+    let post_services = collect_service_digests().await;
+    let still_outdated: Vec<String> = post_services
+        .iter()
+        .filter(|s| s.up_to_date() == Some(false))
+        .map(|s| s.name.clone())
+        .collect();
+    let verify_message = if still_outdated.is_empty() {
+        "Verified: all services up to date.".to_string()
+    } else {
+        format!("Still outdated after update: {}", still_outdated.join(", "))
+    };
+    send("progress", json!({ "step": "verify", "message": verify_message }));
 
     // Step 3: Done — client reloads on receiving this
     send("done", json!({}));
@@ -415,16 +656,114 @@ pub(crate) fn docker_http(method: &str, path: &str, body: Option<&str>, timeout_
     stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
-    stream.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+    // NOTE: deliberately NOT shutting down the write half here (a prior version
+    // did `stream.shutdown(Shutdown::Write)` right after flush). Verified live
+    // against the daemon (raw-socket replay via `socat`): the FIN can land before
+    // dockerd has finished reading the request off the socket, and dockerd reacts
+    // to that half-close with a bare `500 Internal Server Error` / empty body —
+    // a genuine race, not a protocol requirement (the request already carries an
+    // explicit `Content-Length` so the daemon knows exactly when it's complete).
+    // Delaying/removing the shutdown reproducibly fixed it. Since we no longer
+    // rely on the daemon closing the connection, the read loop below detects the
+    // end of the response itself (Content-Length or chunked trailer) instead of
+    // reading to EOF, so a keep-alive connection can't hang us for the full
+    // `timeout_secs` on every call either.
+    read_http_response(&mut stream, timeout_secs)
+}
 
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+#[cfg(unix)]
+fn read_http_response(stream: &mut impl std::io::Read, _timeout_secs: u64) -> Result<(u16, String), String> {
+    let mut raw: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut header_end: Option<usize> = None;
 
-    let status: u16 = raw.split_whitespace().nth(1)
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => break, // daemon closed the connection — whatever we have is final
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // A read error (e.g. our own timeout) after a complete response was
+                // already parsed is harmless; only fatal if we never got one.
+                if header_end.is_some() { break; }
+                return Err(e.to_string());
+            }
+        };
+        raw.extend_from_slice(&chunk[..n]);
+
+        if header_end.is_none() {
+            header_end = find_subslice(&raw, b"\r\n\r\n").map(|p| p + 4);
+        }
+        let Some(head_end) = header_end else { continue }; // still reading headers
+
+        let headers_lower = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+        let received_body = &raw[head_end..];
+
+        if let Some(len) = content_length(&headers_lower) {
+            if received_body.len() >= len { break; }
+        } else if headers_lower.contains("transfer-encoding: chunked") {
+            if find_subslice(received_body, b"\r\n0\r\n\r\n").is_some() || received_body == b"0\r\n\r\n" {
+                break;
+            }
+        } else if headers_lower.contains("http/1.1 1") || headers_lower.contains("http/1.1 204") || headers_lower.contains("http/1.1 304") {
+            break; // 1xx/204/304 never carry a body
+        }
+        // No length signal we recognize yet (or body still incomplete) — keep reading,
+        // bounded by the caller's read timeout on the socket.
+    }
+
+    let raw_str = String::from_utf8_lossy(&raw);
+    let status: u16 = raw_str.split_whitespace().nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = raw.find("\r\n\r\n").map_or("", |i| &raw[i + 4..]).to_string();
+    let head_end = raw_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(raw_str.len());
+    let headers_lower = raw_str[..head_end].to_ascii_lowercase();
+    let raw_body = &raw_str[head_end..];
+    let body = if headers_lower.contains("transfer-encoding: chunked") {
+        dechunk(raw_body)
+    } else {
+        raw_body.to_string()
+    };
     Ok((status, body))
+}
+
+/// Parses `Content-Length: N` out of a lowercased header block.
+#[cfg(unix)]
+fn content_length(headers_lower: &str) -> Option<usize> {
+    headers_lower
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Finds the first occurrence of `needle` in `haystack` (byte search).
+#[cfg(unix)]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Strips HTTP chunked transfer-encoding framing, returning the concatenated
+/// payload. Malformed/truncated input degrades gracefully (returns whatever was
+/// successfully decoded rather than erroring) — callers already treat an
+/// unparseable body as `Value::Null` via [`json_from_body`].
+#[cfg(unix)]
+fn dechunk(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        let Some(nl) = rest.find("\r\n") else { break };
+        let size_str = rest[..nl].split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_str, 16) else { break };
+        rest = &rest[nl + 2..];
+        if size == 0 { break; } // last-chunk marker
+        if rest.len() < size {
+            out.push_str(rest); // truncated (mid-chunk) — best-effort
+            break;
+        }
+        out.push_str(&rest[..size]);
+        rest = rest[size..].strip_prefix("\r\n").unwrap_or(&rest[size..]);
+    }
+    out
 }
 
 #[cfg(not(unix))]
@@ -458,9 +797,15 @@ pub(crate) fn pull_image(image: &str) -> Result<(), String> {
     }
 }
 
-fn recreate_container(name: &str) -> Result<(), String> {
+/// Recreates `name` from its (already-pulled) image, preserving its runtime config.
+/// Returns `Ok(true)` when recreated, `Ok(false)` when the container simply isn't
+/// deployed on this install (404 on inspect) — that's a normal skip, not a failure.
+fn recreate_container(name: &str) -> Result<bool, String> {
     // Inspect existing container for its config
     let (status, body) = docker_http("GET", &format!("/containers/{name}/json"), None, 10)?;
+    if status == 404 {
+        return Ok(false); // not deployed on this install — skip, don't fail the run
+    }
     if status != 200 {
         return Err(format!("Inspect returned HTTP {status}"));
     }
@@ -500,9 +845,117 @@ fn recreate_container(name: &str) -> Result<(), String> {
 
     // Start it
     docker_http("POST", &format!("/containers/{id}/start"), None, 10)?;
-    Ok(())
+    Ok(true)
 }
 
 fn docker_restart(name: &str) {
     let _ = docker_http("POST", &format!("/containers/{name}/restart?t=5"), None, 30);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── version_gt / parse_version (pre-existing behavior, unchanged) ─────────
+
+    #[test]
+    fn version_gt_basic() {
+        assert!(version_gt("1.2.3", "1.2.2"));
+        assert!(!version_gt("1.2.2", "1.2.3"));
+        assert!(!version_gt("1.2.3", "1.2.3"));
+    }
+
+    #[test]
+    fn version_gt_padded_components_are_equal() {
+        assert!(!version_gt("1.2", "1.2.0"));
+        assert!(version_gt("1.3", "1.2.9"));
+    }
+
+    #[test]
+    fn version_gt_unparseable_is_conservative() {
+        assert!(!version_gt("not-a-version", "1.0.0"));
+        assert!(!version_gt("1.0.0", "not-a-version"));
+    }
+
+    // ── short_name_from_image / ghcr_repo_from_image ───────────────────────────
+
+    #[test]
+    fn short_name_strips_registry_and_tag() {
+        assert_eq!(short_name_from_image("ghcr.io/gctrl-tech/agent:latest"), "agent");
+        assert_eq!(
+            short_name_from_image("ghcr.io/gctrl-tech/fusion-engine:latest"),
+            "fusion-engine"
+        );
+    }
+
+    #[test]
+    fn ghcr_repo_extracts_org_and_name() {
+        assert_eq!(
+            ghcr_repo_from_image("ghcr.io/gctrl-tech/agent:latest"),
+            Some("gctrl-tech/agent".to_string())
+        );
+    }
+
+    #[test]
+    fn ghcr_repo_none_for_non_ghcr_image() {
+        assert_eq!(ghcr_repo_from_image("docker.io/library/postgres:16"), None);
+    }
+
+    // ── ServiceDigest::up_to_date / to_json (response-shape) ───────────────────
+
+    fn digest(local: Option<&str>, remote: Option<&str>) -> ServiceDigest {
+        ServiceDigest {
+            name: "agent".to_string(),
+            image: "ghcr.io/gctrl-tech/agent:latest".to_string(),
+            local: local.map(str::to_string),
+            remote: remote.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn up_to_date_true_when_digests_match() {
+        assert_eq!(digest(Some("sha256:aaa"), Some("sha256:aaa")).up_to_date(), Some(true));
+    }
+
+    #[test]
+    fn up_to_date_false_when_digests_differ() {
+        assert_eq!(digest(Some("sha256:aaa"), Some("sha256:bbb")).up_to_date(), Some(false));
+    }
+
+    #[test]
+    fn up_to_date_unknown_when_either_digest_missing() {
+        assert_eq!(digest(None, Some("sha256:aaa")).up_to_date(), None);
+        assert_eq!(digest(Some("sha256:aaa"), None).up_to_date(), None);
+        assert_eq!(digest(None, None).up_to_date(), None);
+    }
+
+    #[test]
+    fn service_digest_to_json_shape() {
+        let d = digest(Some("sha256:aaa"), Some("sha256:bbb"));
+        let v = d.to_json();
+        assert_eq!(v["name"], "agent");
+        assert_eq!(v["image"], "ghcr.io/gctrl-tech/agent:latest");
+        assert_eq!(v["localDigest"], "sha256:aaa");
+        assert_eq!(v["remoteDigest"], "sha256:bbb");
+        assert_eq!(v["upToDate"], false);
+    }
+
+    #[test]
+    fn service_digest_to_json_nulls_when_unknown() {
+        let v = digest(None, None).to_json();
+        assert!(v["localDigest"].is_null());
+        assert!(v["remoteDigest"].is_null());
+        assert!(v["upToDate"].is_null());
+    }
+
+    // ── local_image_digest RepoDigests parsing ──────────────────────────────────
+    // (local_image_digest itself talks to /var/run/docker.sock via docker_http, so
+    // only the pure-parsing half is unit-testable here; the digest-extraction logic
+    // — "take the part after @" — is exercised directly.)
+
+    #[test]
+    fn repo_digest_extracts_hash_after_at() {
+        let repo_digest = "ghcr.io/gctrl-tech/agent@sha256:deadbeef";
+        assert_eq!(repo_digest.rsplit('@').next(), Some("sha256:deadbeef"));
+    }
 }
