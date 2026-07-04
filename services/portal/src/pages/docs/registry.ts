@@ -13,6 +13,8 @@ export const DOC_GROUPS: DocGroup[] = [
       { slug: 'installation', title: 'Installation' },
       { slug: 'windows', title: 'Windows Install' },
       { slug: 'activation', title: 'Activation & Setup' },
+      { slug: 'networking', title: 'Networking & Ports' },
+      { slug: 'tailscale', title: 'Private access with Tailscale' },
     ],
   },
   {

@@ -70,7 +70,7 @@ The last step, and the point of the whole exercise: give an AI agent durable, ac
      }
      ```
 
-     (A local stdio variant for desktop/IDE agents is in [Agents & MCP](agents-mcp.md).) Remote agents need the MCP-over-HTTP gateway enabled (**Settings → Agent** — off by default) and the API port (`:4000`) reachable from where the agent runs.
+     (A local stdio variant for desktop/IDE agents is in [Agents & MCP](agents-mcp.md).) Remote agents need the MCP-over-HTTP gateway enabled (**Settings → Agent** — off by default). No extra port to open — the gateway rides the same origin as the app UI (`:3001`, or your TLS domain / tailnet hostname once you expose it, see [Networking & Ports](networking.md)).
    - **Any other agent framework** (LangChain, LlamaIndex, a custom harness) — drop in `GET /api/agent/skill.md` as the agent's system instructions and call tools directly at `POST /api/agent/tools/<tool>` with the same `Authorization: ApiKey` header. No MCP client required.
 3. Ask your agent: *"Ingest this PDF and show me the knowledge graph."* Agents can call `ingest_file` directly, so they don't need the UI upload step at all.
 
@@ -81,5 +81,9 @@ Your agent now has durable, access-controlled, audited memory — GCTRL becomes 
 ## You're operational
 
 From here: merge multiple sources with **FUSE**, browse the auto-distilled **Wiki**, and ask grounded questions in **Talk-to-Graph** — all over the same graph, all on your machine.
+
+### Expose it (optional)
+
+Everything above runs on `localhost`. If you want to reach your install from another machine — a remote agent, a teammate, a phone — see [Networking & Ports](networking.md) for the one port to open and the recommended way to do it (a TLS reverse proxy, or [Tailscale](tailscale.md) for a VPS you don't want on the public internet).
 
 → Next: [The Four Modules](modules.md) · [Memory Layers](memory-layers.md) · [Performance Guide](performance.md)

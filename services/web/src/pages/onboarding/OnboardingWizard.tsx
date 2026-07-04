@@ -541,7 +541,7 @@ export default function OnboardingWizard() {
                   </div>
 
                   <p className="text-[11px] text-amber-400/80">
-                    For a remote agent, enable the MCP-over-HTTP gateway in Settings → Agent and make sure port :4000 is reachable.
+                    For a remote agent, enable the MCP-over-HTTP gateway in Settings → Agent — it's reachable via the same origin as the app, no extra port to open.
                     You can create more (scoped) tokens any time under Settings → Connect an Agent.
                   </p>
                 </div>

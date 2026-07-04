@@ -1,6 +1,6 @@
 # Integrations
 
-GCTRL connects to any MCP client, agent framework, or system that can make an HTTP call. There is no proprietary protocol to adopt — pick the transport that matches where your agent runs. Full marketplace view: [gctrl.tech/integrations](/integrations).
+GCTRL connects to any MCP client, agent framework, or system that can make an HTTP call. There is no proprietary protocol to adopt — pick the transport that matches where your agent runs. Remote agents only need one thing: the web origin (port `3001`, your TLS domain, or a tailnet hostname) — see [Networking & Ports](networking.md). Full marketplace view: [gctrl.tech/integrations](/integrations).
 
 ## Connection methods
 
@@ -18,7 +18,7 @@ GCTRL connects to any MCP client, agent framework, or system that can make an HT
 }
 ```
 
-Off by default — enable the gateway in **Settings → Agent**, and make sure the API port is reachable from where the agent runs.
+Off by default — enable the gateway in **Settings → Agent**. No separate port to open: the gateway is reachable at `/api/agent/mcp` on the same origin as the app UI.
 
 ### MCP over stdio (local agents)
 
