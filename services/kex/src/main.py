@@ -20,7 +20,7 @@ from typing import Optional
 
 import redis as redis_lib
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
@@ -1542,7 +1542,15 @@ def _rrf_fuse(channels: list[list[dict]], limit: int, k: int = 60) -> list[dict]
 
 
 @app.post("/search")
-async def search_endpoint(req: SearchReq):
+async def search_endpoint(req: SearchReq, request: Request):
+    # Internal trust boundary: /search takes a caller-supplied user_id + max_rank and
+    # has no user auth of its own, so when INTERNAL_API_SECRET is set it MUST be
+    # presented (the api-rs layer sends it). This closes the hole where a host-local
+    # process could hit the raw worker port with user_id=<victim>&max_rank=MAX. Grace:
+    # when the secret is unset (existing installs) the check is skipped.
+    _secret = os.environ.get("INTERNAL_API_SECRET", "").strip()
+    if _secret and request.headers.get("x-internal-secret", "") != _secret:
+        raise HTTPException(status_code=403, detail={"error": "forbidden: internal endpoint"})
     """
     HYBRID retrieval over stored chunks: dense (Qdrant vector) ∪ lexical
     (Postgres BM25-style full-text + exact-substring), fused by reciprocal-rank

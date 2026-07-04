@@ -582,6 +582,7 @@ async fn query(
 
     let mut chunks: Vec<KexChunk> = match client
         .post(&kex_url)
+        .header("X-Internal-Secret", &state.cfg.internal_secret)
         .json(&kex_body)
         .timeout(std::time::Duration::from_secs(10))
         .send()

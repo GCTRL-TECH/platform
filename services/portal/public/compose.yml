@@ -53,6 +53,9 @@ services:
       - AUTO_CLASSIFY_MODEL=${AUTO_CLASSIFY_MODEL:-llama3.2}
       - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - PORT=4010
+      # Internal trust boundary: /search takes a caller-supplied user_id, so when set
+      # it requires this shared secret (api-rs sends it). Empty = grace (no check).
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
     volumes:
       - gctrl-kex-models:/app/models
     depends_on:
@@ -89,6 +92,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-gctrl-neo4j-password}
       - REDIS_URL=redis://gctrl-redis:6379
       - PORT=4020
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
       - SIMILARITY_THRESHOLD=0.85
       - RESOLVER_URL=http://gctrl-resolver:8080
       # Distill needs Postgres (compilations), Qdrant (grounding chunks) and an
@@ -132,6 +136,7 @@ services:
       # Without this the API defaults FUSE to localhost:4020 (= itself, in the
       # container) → "FUSE unreachable" and distill/fuse fail out of the box.
       - FUSE_URL=http://gctrl-fuse:4020
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
     depends_on:

@@ -568,6 +568,7 @@ pub(crate) async fn execute_tool(
             // Scope to the caller's own chunks (grounding + no cross-user leak).
             let body = json!({ "query": query, "limit": 5, "compilation_id": compilation_id, "user_id": claims.sub, "max_rank": rank });
             let chunks = match client.post(format!("{}/search", state.cfg.kex_worker_url))
+                .header("X-Internal-Secret", &state.cfg.internal_secret)
                 .json(&body).timeout(Duration::from_secs(10)).send().await
             {
                 Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "chunks": [] })),
