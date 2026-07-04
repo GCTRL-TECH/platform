@@ -332,7 +332,10 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } },
             // ── File-asset index + connector ops ─────────────────────────────────
             { "name": "find_file",          "description": "Find files by name/path across connected sources (Google Drive, SharePoint) — including UNSUPPORTED files like CAD drawings (.dwg/.step), images and archives that were indexed as metadata. Fuzzy-ranked (pg_trgm). Each hit includes path, size, modified/last-seen times, source, and up to 3 related parsed sibling documents from the same folder (with their KEX job ids) so you can answer 'what project is this file part of'. Args: { query: string, limit?: number (default 5) }", "args": { "query": "string", "limit": "number?" } },
-            { "name": "get_sync_status",    "description": "Summarize connector sync health for the caller: per connector (Drive/SharePoint) the last sync time and live job counts by status, plus the last 5 failed source files with their errors. Use to answer 'is my Drive sync working / what failed'. No args", "args": {} }
+            { "name": "get_sync_status",    "description": "Summarize connector sync health for the caller: per connector (Drive/SharePoint) the last sync time and live job counts by status, plus the last 5 failed source files with their errors. Use to answer 'is my Drive sync working / what failed'. No args", "args": {} },
+            // ── OPERATE / self-repair tier — admin only, NEVER a knowledge/scoped token ──
+            { "name": "platform_health",    "description": "OPERATE tier (admin only). Liveness of the platform's OWN services — Postgres, Neo4j, KEX, FUSE — each up/down with latency. Use to diagnose 'is the stack healthy / which service is down' before a restart. No args", "args": {} },
+            { "name": "restart_service",     "description": "OPERATE tier (admin only). Restart ONE GCTRL service container to self-heal a hung/failed worker. Args: { service: 'gctrl-kex'|'gctrl-fuse'|'gctrl-api'|'gctrl-web'|'gctrl-resolver'|'gctrl-neo4j'|'gctrl-qdrant' }. Only gctrl-* containers are allowed; every call is audited.", "args": { "service": "string" } }
         ]
     })
 }
@@ -1439,6 +1442,67 @@ pub(crate) async fn execute_tool(
         // ── Read: connector sync health summary ───────────────────────────────
         "get_sync_status" => {
             crate::routes::connectors::sync_status_json(&state.db, claims.sub).await
+        }
+
+        // ── OPERATE / self-repair tier ────────────────────────────────────────
+        // Strict tier boundary: admin role AND not a KB-scoped token. A knowledge
+        // token (colleague/agent) can NEVER reach these — so retrieved content
+        // (indirect prompt injection) cannot trigger an infra action.
+        "platform_health" => {
+            if claims.role != "admin"
+                || crate::routes::kg::api_key_scope(&state.db, claims).await.is_some()
+            {
+                return json!({ "error": "OPERATE tier — admin required, not available to a knowledge/scoped token" });
+            }
+            let t0 = std::time::Instant::now();
+            let pg = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.db).await.is_ok();
+            let pg_ms = t0.elapsed().as_millis() as u64;
+            let neo = state.neo.execute(neo4rs::query("RETURN 1 AS x")).await.is_ok();
+            let client = reqwest::Client::new();
+            let probe = |url: String| {
+                let c = client.clone();
+                async move {
+                    c.get(url).timeout(Duration::from_secs(5)).send().await
+                        .map(|r| r.status().is_success()).unwrap_or(false)
+                }
+            };
+            let kex = probe(format!("{}/health", state.cfg.kex_worker_url)).await;
+            let fuse = probe(format!("{}/health", state.cfg.fuse_url)).await;
+            json!({
+                "healthy": pg && neo && kex && fuse,
+                "services": {
+                    "postgres": { "up": pg, "latencyMs": pg_ms },
+                    "neo4j":    { "up": neo },
+                    "kex":      { "up": kex },
+                    "fuse":     { "up": fuse },
+                }
+            })
+        }
+
+        "restart_service" => {
+            if claims.role != "admin"
+                || crate::routes::kg::api_key_scope(&state.db, claims).await.is_some()
+            {
+                return json!({ "error": "OPERATE tier — admin required, not available to a knowledge/scoped token" });
+            }
+            let svc = args["service"].as_str().unwrap_or("").trim().to_string();
+            const ALLOWED: &[&str] = &["gctrl-kex", "gctrl-fuse", "gctrl-api", "gctrl-web",
+                                       "gctrl-resolver", "gctrl-neo4j", "gctrl-qdrant"];
+            if !ALLOWED.contains(&svc.as_str()) {
+                return json!({ "error": format!("service must be one of {ALLOWED:?}") });
+            }
+            crate::services::audit::log_access(&state.db, claims, "agent.restart_service",
+                "service", &svc, i32::MAX, None, true, None).await;
+            let svc2 = svc.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                crate::routes::update::docker_http("POST", &format!("/containers/{svc2}/restart"), None, 30)
+            }).await;
+            match res {
+                Ok(Ok((code, _))) if (200..300).contains(&code) =>
+                    json!({ "ok": true, "service": svc, "restarted": true }),
+                Ok(Ok((code, body))) => json!({ "error": format!("docker returned {code}: {}", body.chars().take(200).collect::<String>()) }),
+                _ => json!({ "error": "restart failed — docker socket unavailable?" }),
+            }
         }
 
         _ => json!({ "error": format!("Unknown tool: {tool_name}") }),

@@ -1,5 +1,6 @@
 pub mod health;
 pub mod config;
+pub mod discovery;
 pub mod auth;
 pub mod users;
 pub mod kex;
