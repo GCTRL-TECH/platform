@@ -298,7 +298,12 @@ jobs:
       # the version channel never worked. CI-generated only; never committed
       # (see .gitignore) so a stray local build can't ship a stale one.
       - name: Generate version.json
-        run: echo "{\"version\": \"${VERSION}\", \"channel\": \"stable\", \"publishedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > services/portal/public/version.json
+        # Block scalar: the inline JSON contains ": " which YAML would parse as
+        # a mapping in a plain scalar (this exact line broke the workflow once).
+        run: |
+          printf '{"version": "%s", "channel": "stable", "publishedAt": "%s"}\n' \
+            "${VERSION}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > services/portal/public/version.json
+          cat services/portal/public/version.json
       - uses: docker/build-push-action@v5
         with:
           context: services/portal
