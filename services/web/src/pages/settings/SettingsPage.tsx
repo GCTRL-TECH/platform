@@ -3084,14 +3084,42 @@ function SwapForm({ swap, override, onChanged }: {
   )
 }
 
+interface UpdateServiceCheck {
+  name: string
+  image: string
+  localDigest?: string | null
+  remoteDigest?: string | null
+  upToDate: boolean | null
+}
+
+interface UpdateCheckResponse {
+  current: string
+  latest: string
+  currentVersion?: string
+  latestVersion?: string
+  updateAvailable: boolean
+  method: 'digest' | 'semver' | 'unavailable'
+  services: UpdateServiceCheck[]
+  checkedAt: string
+  note?: string | null
+}
+
+const UPDATE_METHOD_LABEL: Record<UpdateCheckResponse['method'], string> = {
+  digest: 'Digest check',
+  semver: 'Version channel',
+  unavailable: 'Check unavailable',
+}
+
 function InfrastructureTab() {
   const [status, setStatus] = useState<SetupStatus | null>(null)
   const [overrides, setOverrides] = useState<ServiceOverride[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showUpdateModal, setShowUpdateModal] = useState(false)
+  const [checkingNow, setCheckingNow] = useState(false)
   const { status: agentStatus } = useLicenseStatus()
-  const { data: updateCheck, isError: updateCheckError } = useQuery<{ current: string; latest: string; updateAvailable: boolean }>({
+  const queryClient = useQueryClient()
+  const { data: updateCheck, isError: updateCheckError } = useQuery<UpdateCheckResponse>({
     queryKey: ['update', 'check'],
     queryFn: () => apiGet('/update/check'),
     refetchInterval: 60 * 60 * 1000,
@@ -3099,6 +3127,18 @@ function InfrastructureTab() {
     staleTime: 55 * 60 * 1000,
     retry: false,
   })
+
+  const handleCheckNow = useCallback(async () => {
+    setCheckingNow(true)
+    try {
+      const data = await apiGet<UpdateCheckResponse>('/update/check?force=1')
+      queryClient.setQueryData(['update', 'check'], data)
+    } catch {
+      /* non-fatal — the last known state stays on screen */
+    } finally {
+      setCheckingNow(false)
+    }
+  }, [queryClient])
 
   const loadOverrides = useCallback(async () => {
     try {
@@ -3266,21 +3306,70 @@ function InfrastructureTab() {
                 Pulls latest Docker images and recreates all containers in place. Takes ~1–2 min.
               </p>
             </div>
-            <button
-              onClick={() => setShowUpdateModal(true)}
-              className={cn(
-                'ml-4 flex shrink-0 items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
-                agentStatus?.updateRequired
-                  ? 'bg-red-600 hover:bg-red-500 text-white'
-                  : agentStatus?.updateAvailable
-                  ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
-                  : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
-              )}
-            >
-              <ArrowUpCircle size={15} />
-              Update now
-            </button>
+            <div className="ml-4 flex shrink-0 items-center gap-2">
+              <button
+                onClick={() => void handleCheckNow()}
+                disabled={checkingNow}
+                className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors disabled:opacity-50"
+              >
+                <RefreshCw size={13} className={checkingNow ? 'animate-spin' : ''} />
+                Check now
+              </button>
+              <button
+                onClick={() => setShowUpdateModal(true)}
+                className={cn(
+                  'flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+                  agentStatus?.updateRequired
+                    ? 'bg-red-600 hover:bg-red-500 text-white'
+                    : agentStatus?.updateAvailable
+                    ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
+                    : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
+                )}
+              >
+                <ArrowUpCircle size={15} />
+                Update now
+              </button>
+            </div>
           </div>
+
+          {/* Method badge + last-checked time */}
+          {updateCheck && (
+            <div className="flex items-center gap-2 text-[11px] text-slate-500">
+              <span className="rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 font-medium text-slate-300">
+                {UPDATE_METHOD_LABEL[updateCheck.method]}
+              </span>
+              {updateCheck.checkedAt && (
+                <span>Last checked {new Date(updateCheck.checkedAt).toLocaleString()}</span>
+              )}
+            </div>
+          )}
+
+          {/* Truthful "can't tell" state — never presented as a false "up to date" */}
+          {updateCheck?.method === 'unavailable' && updateCheck.note && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-400">
+              <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+              <span>{updateCheck.note}</span>
+            </div>
+          )}
+
+          {/* Per-service status when an update is available */}
+          {updateCheck?.updateAvailable && updateCheck.services.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {updateCheck.services
+                .filter((s) => s.upToDate !== null)
+                .map((s) => (
+                  <span
+                    key={s.name}
+                    className={cn(
+                      'rounded px-1.5 py-0.5 text-[11px] font-medium',
+                      s.upToDate ? 'bg-emerald-950/40 text-emerald-400' : 'bg-yellow-950/40 text-yellow-400'
+                    )}
+                  >
+                    {s.name}: {s.upToDate ? 'up to date' : 'outdated'}
+                  </span>
+                ))}
+            </div>
+          )}
 
           {/* Manual fallback */}
           <div className="rounded-md bg-slate-950 border border-slate-800 px-3 py-2 font-mono text-xs text-slate-500">

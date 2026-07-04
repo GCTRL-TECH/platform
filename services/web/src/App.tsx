@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
-import { api } from '@/lib/api'
-import { agentHealthUrl } from '@/lib/utils'
+import { api, apiGet } from '@/lib/api'
 import ActivationWizard from '@/pages/onboarding/ActivationWizard'
 import { AppShell } from '@/components/layout/AppShell'
 import { LoginPage } from '@/pages/auth/LoginPage'
@@ -71,12 +70,21 @@ function ActivationGate({ children }: { children: React.ReactNode }) {
       return
     }
 
-    fetch(`${agentHealthUrl()}/status`)
-      .then((r) => r.json())
-      .then((d: { activated?: boolean }) => setActivated(d.activated ?? true))
+    // Proxied through the API's own origin (`/api/update/agent-status`) — the
+    // agent's `:7070` port is published loopback-only on the host, so a direct
+    // browser fetch to it is unreachable for any non-localhost operator.
+    apiGet<{ activated?: boolean; reachable?: boolean }>('/update/agent-status')
+      .then((d) => {
+        if (d.reachable === false) {
+          // Agent unreachable (normal dev/grace state) — fall back to the
+          // localStorage flag so a user who already activated once doesn't
+          // get re-prompted.
+          setActivated(!!localStorage.getItem('gctrl_activated'))
+        } else {
+          setActivated(d.activated ?? true)
+        }
+      })
       .catch(() => {
-        // Agent unreachable in production — fall back to the localStorage flag
-        // so a user who already activated once doesn't get re-prompted.
         setActivated(!!localStorage.getItem('gctrl_activated'))
       })
   }, [])
