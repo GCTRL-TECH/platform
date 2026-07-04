@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod llm;
 pub mod neo4j;
 pub mod obsidian;
+pub mod privacy;
 pub mod redis;
 pub mod source_docs;
 pub mod usage;

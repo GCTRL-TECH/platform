@@ -35,6 +35,7 @@ import {
   ChevronRight,
   Mic,
   MicOff,
+  ShieldCheck,
 } from 'lucide-react'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
@@ -87,6 +88,9 @@ interface ChatMessage {
   imageUrl?: string
   createdAt: string
   feedback?: 'up' | 'down'
+  // Private Memory: present only when this answer's context was routed
+  // through a cloud model with the graph's privacy mode set to "cloaked".
+  privacy?: { mode: string; cloakedEntities?: number }
 }
 
 interface Conversation {
@@ -125,6 +129,7 @@ interface RagQueryResponse {
   }
   tokensUsed?: number
   model?: string
+  privacy?: { mode: string; cloakedEntities?: number }
 }
 
 interface ConversationsResponse {
@@ -811,6 +816,18 @@ const MessageItem = memo(function MessageItem({
             </span>
           )}
 
+          {/* Private Memory: this answer's context was cloaked before it left
+              the machine (cloud model + graph privacy mode = "cloaked"). */}
+          {message.privacy?.mode === 'cloaked' && (
+            <span
+              className="flex items-center gap-1 text-[10px] text-indigo-400"
+              title="Entities and PII were pseudonymized before this request left your machine; the answer shown here has been restored to plain text."
+            >
+              <ShieldCheck size={10} />
+              Cloaked{typeof message.privacy.cloakedEntities === 'number' ? ` · ${message.privacy.cloakedEntities} entities hidden` : ''}
+            </span>
+          )}
+
           {/* Timestamp */}
           <span className="text-[10px] text-slate-700">
             {timeAgo(message.createdAt)}
@@ -1363,7 +1380,14 @@ export function TalkToGraphPage() {
       })
 
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`)
+        // Prefer the server's own message (e.g. the Private Memory local-only
+        // refusal) so it renders cleanly instead of a generic connectivity error.
+        let apiError: string | undefined
+        try {
+          const errBody = (await res.json()) as { error?: string }
+          apiError = typeof errBody?.error === 'string' ? errBody.error : undefined
+        } catch { /* body wasn't JSON */ }
+        throw new Error(apiError ?? `HTTP ${res.status}`)
       }
 
       const data = (await res.json()) as RagQueryResponse
@@ -1418,6 +1442,7 @@ export function TalkToGraphPage() {
         tokensUsed: data.tokensUsed,
         model: data.model,
         imageUrl: (data as unknown as Record<string, unknown>).imageUrl as string | undefined,
+        privacy: data.privacy,
         createdAt: new Date().toISOString(),
       }
 
@@ -1431,10 +1456,17 @@ export function TalkToGraphPage() {
         }
       }
     } catch (err) {
+      const rawMsg = err instanceof Error ? err.message : 'Unknown error'
+      // A message with no "HTTP <code>" prefix came from the server's own JSON
+      // `error` field (e.g. the Private Memory local-only refusal) — render it
+      // as-is instead of wrapping it in the generic connectivity apology.
+      const isServerMessage = !/^HTTP \d/.test(rawMsg)
       const errMsg: ChatMessage = {
         id: nanoid(),
         role: 'ai',
-        content: `Sorry, I encountered an error while querying the knowledge graph. Please check that the API server is running and try again.\n\n\`${err instanceof Error ? err.message : 'Unknown error'}\``,
+        content: isServerMessage
+          ? rawMsg
+          : `Sorry, I encountered an error while querying the knowledge graph. Please check that the API server is running and try again.\n\n\`${rawMsg}\``,
         createdAt: new Date().toISOString(),
       }
       if (mode === 'incognito') {

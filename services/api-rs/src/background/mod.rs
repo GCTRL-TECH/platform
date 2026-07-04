@@ -306,6 +306,47 @@ async fn enqueue_one_distill(
         _ => {}
     }
 
+    // Private Memory: don't distill a local_only/cloaked wiki (or one built
+    // from a local_only/cloaked source graph) through a CLOUD-configured
+    // runtime — the distill LLM call would send graph content off-box. Skips
+    // (not an error) — mirrors the debounce below rather than flipping the
+    // trigger to 'error' status, so it just retries next tick once the
+    // runtime/mode changes. Minimal enforcement: log-only. There is no cheap
+    // field on the wiki page list response to surface "distill paused" today,
+    // so a user won't see WHY a privacy-scoped wiki stopped refreshing except
+    // via server logs — documented gap, not rebuilding the FUSE pipeline to
+    // add one.
+    {
+        let mut privacy_scope: Vec<Uuid> = vec![compilation_id];
+        let sources: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT source_compilation_id FROM wiki_sources WHERE wiki_compilation_id = $1",
+        )
+        .bind(compilation_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        privacy_scope.extend(sources);
+        let decision = crate::services::privacy::resolve_privacy(&state.db, &privacy_scope).await;
+        if decision.mode != crate::services::privacy::PrivacyMode::Open {
+            let runtime_row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT provider, base_url FROM runtime_config WHERE id = 1",
+            )
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+            if let Some((Some(provider), base_url)) = runtime_row {
+                if crate::services::privacy::is_cloud_target(&provider, base_url.as_deref()) {
+                    tracing::warn!(
+                        "distill paused for wiki {compilation_id}: privacy mode {:?} but the active runtime ({provider}) is cloud — distill (privacy: local runtime required)",
+                        decision.mode
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
     // Heartbeat mode (`change_detection`): only distil when there's actually new
     // content since the last distil — otherwise the heartbeat is a silent no-op.
     // Cron triggers always fire on their schedule (the interval is the throttle;
