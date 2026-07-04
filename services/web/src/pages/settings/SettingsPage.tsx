@@ -62,7 +62,9 @@ import { AdvancedEmbeddingModal } from './AdvancedEmbeddingModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'license' | 'models' | 'integrations' | 'skills' | 'agent' | 'connect-agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso'
+type TabId = 'license' | 'models' | 'integrations' | 'agent' | 'connect-agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso'
+
+type AgentSubTabId = 'harness' | 'skills'
 
 interface Tab {
   id: TabId
@@ -99,7 +101,6 @@ interface Connector {
 const TABS: Tab[] = [
   { id: 'license', label: 'License', icon: Shield },
   { id: 'models', label: 'AI Models', icon: Brain },
-  { id: 'skills', label: 'Skills & Plugins', icon: Puzzle },
   { id: 'agent', label: 'Agent', icon: Bot },
   { id: 'connect-agent', label: 'Connect an Agent', icon: Code2 },
   { id: 'integrations', label: 'Integrations', icon: Plug },
@@ -1689,7 +1690,13 @@ function SkillsTab() {
 
 // ─── Tab: Agent ───────────────────────────────────────────────────────────────
 
-function AgentTab() {
+const AGENT_SUB_TABS: { id: AgentSubTabId; label: string; icon: typeof Brain }[] = [
+  { id: 'harness', label: 'Harness', icon: Bot },
+  { id: 'skills', label: 'Skills & Plugins', icon: Puzzle },
+]
+
+function AgentTab({ initialSubTab = 'harness' }: { initialSubTab?: AgentSubTabId }) {
+  const [subTab, setSubTab] = useState<AgentSubTabId>(initialSubTab)
   const [providers, setProviders] = useState<LlmProviderState[]>([])
   const [skills, setSkills] = useState<AgentSkill[]>([])
   const [gatewayEnabled, setGatewayEnabled] = useState<boolean | null>(null)
@@ -1761,158 +1768,188 @@ function AgentTab() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-lg font-semibold text-slate-100">Pi Agent Harness</h2>
-        <p className="mt-1 text-sm text-slate-500">
-          Pi is GCTRL&apos;s built-in knowledge agent. It reasons over your graphs with a
-          connected LLM and a set of clearance-scoped tools. You can expose it to external
-          multi-agent orchestrators over the network via the MCP gateway below.
-        </p>
+      {/* ── Sub-tab bar ──────────────────────────────────────────────── */}
+      <div className="border-b border-slate-800">
+        <div className="flex gap-0.5">
+          {AGENT_SUB_TABS.map((tab) => {
+            const Icon = tab.icon
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setSubTab(tab.id)}
+                className={cn(
+                  'flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px',
+                  subTab === tab.id
+                    ? 'border-blue-500 text-blue-400'
+                    : 'border-transparent text-slate-500 hover:text-slate-300'
+                )}
+              >
+                <Icon size={14} />
+                {tab.label}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
-      {/* ── Harness summary ─────────────────────────────────────────── */}
-      <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-          <div className="flex items-center gap-2">
-            <Brain size={15} className="text-blue-400" />
-            <span className="text-sm font-medium text-slate-200">Connected LLM</span>
-          </div>
-          <p className="mt-2 text-sm text-slate-300 capitalize">
-            {activeProvider ? activeProvider.provider : 'Local Ollama'}
-          </p>
-          <p className="text-xs text-slate-500 font-mono">
-            {activeModel ?? 'default model'}
-          </p>
-        </div>
-        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-          <div className="flex items-center gap-2">
-            <Puzzle size={15} className="text-violet-400" />
-            <span className="text-sm font-medium text-slate-200">Enabled Skills</span>
-          </div>
-          <p className="mt-2 text-2xl font-semibold text-slate-100">{enabledSkills}</p>
-          <p className="text-xs text-slate-500">
-            shaping Pi&apos;s behavior — manage in <span className="text-slate-400">Skills &amp; Plugins</span>
-          </p>
-        </div>
-      </section>
-
-      {/* ── External access (MCP gateway) ───────────────────────────── */}
-      <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
-        <div className="mb-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Server size={16} className="text-slate-300" />
-            <h3 className="text-sm font-semibold text-slate-200">External Access — MCP Gateway</h3>
-          </div>
-          {gatewayEnabled === null ? (
-            <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] text-slate-400">
-              <Loader2 size={10} className="animate-spin" /> Checking…
-            </span>
-          ) : gatewayEnabled ? (
-            <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-400">
-              <Wifi size={11} /> Enabled
-            </span>
-          ) : (
-            <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-400">
-              <WifiOff size={11} /> Disabled
-            </span>
-          )}
-        </div>
-
-        <p className="text-xs text-slate-500">
-          Exposes the Pi harness as a remote{' '}
-          <span className="text-slate-400">MCP-over-HTTP</span> endpoint so external orchestrators
-          (Hermes, OpenClaw, Codex, any MCP client) can drive it over the network. Every call is
-          authenticated with a scoped Access Token, filtered to that token&apos;s clearance and
-          per-graph grants, and written to the access audit log.
-        </p>
-
-        {!gatewayEnabled && gatewayEnabled !== null && (
-          <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2.5">
-            <Lock size={13} className="mt-0.5 shrink-0 text-amber-400" />
-            <div className="text-[11px] text-amber-200/90">
-              <p className="font-medium text-amber-300">Currently disabled.</p>
-              <p className="mt-0.5 text-amber-200/70">
-                The gateway is on by default; it was turned off via{' '}
-                <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">GCTRL_AGENT_GATEWAY_ENABLED=false</code>.
-                Remove that (or set it to <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">true</code>) in the API
-                server environment and restart to re-enable.
-              </p>
-            </div>
-          </div>
-        )}
-
-        {/* Endpoint */}
-        <div className="mt-4">
-          <label className="text-xs text-slate-500">Endpoint URL</label>
-          <div className="mt-1 flex items-center gap-2">
-            <code className="flex-1 rounded-lg bg-slate-800 px-3 py-2 font-mono text-xs text-slate-300 break-all">
-              {endpoint}
-            </code>
-            <button
-              onClick={() => copyText(endpoint, 'endpoint')}
-              className="btn-ghost text-slate-500 hover:text-slate-300"
-            >
-              {copied === 'endpoint' ? <Check size={14} /> : <ChevronRight size={14} />}
-            </button>
-          </div>
-        </div>
-
-        {/* Client config */}
-        <div className="mt-4">
-          <label className="text-xs text-slate-500">MCP client config (remote, HTTP transport)</label>
-          <div className="relative mt-1">
-            <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-4 font-mono text-xs text-slate-300">
-{mcpConfig}
-            </pre>
-            <button
-              onClick={() => copyText(mcpConfig, 'config')}
-              className="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[10px] text-slate-400 hover:text-slate-200 transition-colors"
-            >
-              {copied === 'config' ? 'Copied!' : 'Copy'}
-            </button>
-          </div>
-          {/* Full-access token generator — fills the config above on success */}
-          <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
-            {mcpToken ? (
-              <div>
-                <div className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400">
-                  <Check size={12} /> Full-access token created — copy it now, it won&apos;t be shown again.
-                </div>
-                <div className="mt-2 flex items-center gap-2">
-                  <code className="flex-1 rounded bg-slate-800 px-2.5 py-1.5 font-mono text-xs text-amber-300 break-all">{mcpToken}</code>
-                  <button onClick={() => copyText(mcpToken, 'token')} className="rounded bg-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:text-white">
-                    {copied === 'token' ? 'Copied!' : 'Copy'}
-                  </button>
-                </div>
-                <p className="mt-2 text-[10px] text-slate-500">
-                  It&apos;s now in your API keys (config above is filled in) and can be revoked anytime on the{' '}
-                  <a href="/access" className="text-blue-400 hover:underline">Access Control page</a>.
-                </p>
-              </div>
-            ) : (
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-[11px] text-slate-500">
-                  Need a token fast? Generate a <span className="text-slate-300">full-access</span> one (shown once, revocable).
-                </p>
-                <button
-                  onClick={() => void generateFullAccessToken()}
-                  disabled={genBusy}
-                  className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-                >
-                  {genBusy ? <Loader2 size={12} className="animate-spin" /> : <KeyRound size={12} />}
-                  Generate full-access token
-                </button>
-              </div>
-            )}
-            {genErr && <p className="mt-2 text-[11px] text-red-400">{genErr}</p>}
-            <p className="mt-2 text-[10px] text-slate-600">
-              Or scope a narrower token (clearance + per-graph grants) on the{' '}
-              <a href="/access" className="inline-flex items-center gap-0.5 text-blue-400 hover:underline">
-                Access Control page <ExternalLink size={10} /></a>. All calls are audited and clearance-scoped.
+      {subTab === 'skills' ? (
+        <SkillsTab />
+      ) : (
+        <div className="space-y-6">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-100">Pi Agent Harness</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Pi is GCTRL&apos;s built-in knowledge agent. It reasons over your graphs with a
+              connected LLM and a set of clearance-scoped tools. You can expose it to external
+              multi-agent orchestrators over the network via the MCP gateway below.
             </p>
           </div>
+
+          {/* ── Harness summary ─────────────────────────────────────── */}
+          <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+              <div className="flex items-center gap-2">
+                <Brain size={15} className="text-blue-400" />
+                <span className="text-sm font-medium text-slate-200">Connected LLM</span>
+              </div>
+              <p className="mt-2 text-sm text-slate-300 capitalize">
+                {activeProvider ? activeProvider.provider : 'Local Ollama'}
+              </p>
+              <p className="text-xs text-slate-500 font-mono">
+                {activeModel ?? 'default model'}
+              </p>
+            </div>
+            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+              <div className="flex items-center gap-2">
+                <Puzzle size={15} className="text-violet-400" />
+                <span className="text-sm font-medium text-slate-200">Enabled Skills</span>
+              </div>
+              <p className="mt-2 text-2xl font-semibold text-slate-100">{enabledSkills}</p>
+              <p className="text-xs text-slate-500">
+                shaping Pi&apos;s behavior — manage in <span className="text-slate-400">Skills &amp; Plugins</span>
+              </p>
+            </div>
+          </section>
+
+          {/* ── External access (MCP gateway) ───────────────────────── */}
+          <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Server size={16} className="text-slate-300" />
+                <h3 className="text-sm font-semibold text-slate-200">External Access — MCP Gateway</h3>
+              </div>
+              {gatewayEnabled === null ? (
+                <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] text-slate-400">
+                  <Loader2 size={10} className="animate-spin" /> Checking…
+                </span>
+              ) : gatewayEnabled ? (
+                <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-400">
+                  <Wifi size={11} /> Enabled
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-400">
+                  <WifiOff size={11} /> Disabled
+                </span>
+              )}
+            </div>
+
+            <p className="text-xs text-slate-500">
+              Exposes the Pi harness as a remote{' '}
+              <span className="text-slate-400">MCP-over-HTTP</span> endpoint so external orchestrators
+              (Hermes, OpenClaw, Codex, any MCP client) can drive it over the network. Every call is
+              authenticated with a scoped Access Token, filtered to that token&apos;s clearance and
+              per-graph grants, and written to the access audit log.
+            </p>
+
+            {!gatewayEnabled && gatewayEnabled !== null && (
+              <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-900/40 bg-amber-950/20 px-3 py-2.5">
+                <Lock size={13} className="mt-0.5 shrink-0 text-amber-400" />
+                <div className="text-[11px] text-amber-200/90">
+                  <p className="font-medium text-amber-300">Currently disabled.</p>
+                  <p className="mt-0.5 text-amber-200/70">
+                    The gateway is on by default; it was turned off via{' '}
+                    <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">GCTRL_AGENT_GATEWAY_ENABLED=false</code>.
+                    Remove that (or set it to <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300">true</code>) in the API
+                    server environment and restart to re-enable.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Endpoint */}
+            <div className="mt-4">
+              <label className="text-xs text-slate-500">Endpoint URL</label>
+              <div className="mt-1 flex items-center gap-2">
+                <code className="flex-1 rounded-lg bg-slate-800 px-3 py-2 font-mono text-xs text-slate-300 break-all">
+                  {endpoint}
+                </code>
+                <button
+                  onClick={() => copyText(endpoint, 'endpoint')}
+                  className="btn-ghost text-slate-500 hover:text-slate-300"
+                >
+                  {copied === 'endpoint' ? <Check size={14} /> : <ChevronRight size={14} />}
+                </button>
+              </div>
+            </div>
+
+            {/* Client config */}
+            <div className="mt-4">
+              <label className="text-xs text-slate-500">MCP client config (remote, HTTP transport)</label>
+              <div className="relative mt-1">
+                <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-4 font-mono text-xs text-slate-300">
+{mcpConfig}
+                </pre>
+                <button
+                  onClick={() => copyText(mcpConfig, 'config')}
+                  className="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[10px] text-slate-400 hover:text-slate-200 transition-colors"
+                >
+                  {copied === 'config' ? 'Copied!' : 'Copy'}
+                </button>
+              </div>
+              {/* Full-access token generator — fills the config above on success */}
+              <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                {mcpToken ? (
+                  <div>
+                    <div className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400">
+                      <Check size={12} /> Full-access token created — copy it now, it won&apos;t be shown again.
+                    </div>
+                    <div className="mt-2 flex items-center gap-2">
+                      <code className="flex-1 rounded bg-slate-800 px-2.5 py-1.5 font-mono text-xs text-amber-300 break-all">{mcpToken}</code>
+                      <button onClick={() => copyText(mcpToken, 'token')} className="rounded bg-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:text-white">
+                        {copied === 'token' ? 'Copied!' : 'Copy'}
+                      </button>
+                    </div>
+                    <p className="mt-2 text-[10px] text-slate-500">
+                      It&apos;s now in your API keys (config above is filled in) and can be revoked anytime on the{' '}
+                      <a href="/access" className="text-blue-400 hover:underline">Access Control page</a>.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-[11px] text-slate-500">
+                      Need a token fast? Generate a <span className="text-slate-300">full-access</span> one (shown once, revocable).
+                    </p>
+                    <button
+                      onClick={() => void generateFullAccessToken()}
+                      disabled={genBusy}
+                      className="flex items-center gap-1.5 rounded bg-indigo-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+                    >
+                      {genBusy ? <Loader2 size={12} className="animate-spin" /> : <KeyRound size={12} />}
+                      Generate full-access token
+                    </button>
+                  </div>
+                )}
+                {genErr && <p className="mt-2 text-[11px] text-red-400">{genErr}</p>}
+                <p className="mt-2 text-[10px] text-slate-600">
+                  Or scope a narrower token (clearance + per-graph grants) on the{' '}
+                  <a href="/access" className="inline-flex items-center gap-0.5 text-blue-400 hover:underline">
+                    Access Control page <ExternalLink size={10} /></a>. All calls are audited and clearance-scoped.
+                </p>
+              </div>
+            </div>
+          </section>
         </div>
-      </section>
+      )}
     </div>
   )
 }
@@ -4198,10 +4235,24 @@ export function SettingsPage() {
   // 'models' when the param is missing or unknown — non-breaking.
   const [activeTab, setActiveTab] = useState<TabId>(() => {
     const param = new URLSearchParams(window.location.search).get('tab')
+    // Back-compat: `skills` used to be its own top-level tab; it now lives as
+    // a sub-tab inside `agent`.
+    if (param === 'skills') return 'agent'
     return TABS.some((t) => t.id === param) ? (param as TabId) : 'models'
+  })
+  // Deep-link hint for the Agent tab's internal sub-tab (e.g. old `?tab=skills`
+  // links should land straight on the Skills & Plugins sub-tab).
+  const [agentInitialSubTab] = useState<AgentSubTabId>(() => {
+    const param = new URLSearchParams(window.location.search).get('tab')
+    return param === 'skills' ? 'skills' : 'harness'
   })
 
   const currentTab = TABS.find((t) => t.id === activeTab)!
+
+  function handleTabClick(id: TabId) {
+    setActiveTab(id)
+    window.history.replaceState(null, '', '/settings?tab=' + id)
+  }
 
   return (
     <div className="flex h-full animate-fade-in">
@@ -4216,7 +4267,7 @@ export function SettingsPage() {
             return (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => handleTabClick(tab.id)}
                 className={cn(
                   'flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
                   activeTab === tab.id
@@ -4245,8 +4296,7 @@ export function SettingsPage() {
         {activeTab === 'license' && <LicenseTab />}
         {activeTab === 'models' && <ModelsTab />}
         {activeTab === 'integrations' && <IntegrationsTab />}
-        {activeTab === 'skills' && <SkillsTab />}
-        {activeTab === 'agent' && <AgentTab />}
+        {activeTab === 'agent' && <AgentTab initialSubTab={agentInitialSubTab} />}
         {activeTab === 'connect-agent' && <ConnectAgentTab />}
         {activeTab === 'mcp' && <McpTab />}
         {activeTab === 'n8n' && <N8nTab />}

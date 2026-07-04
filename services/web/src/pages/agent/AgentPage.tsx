@@ -11,7 +11,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Terminal, Send, Trash2, Loader2, ShieldCheck, Cpu, Brain } from 'lucide-react'
+import { Terminal, Send, Trash2, Loader2, ShieldCheck, Cpu, Brain, Settings } from 'lucide-react'
 import { useAgent, FULL_ACCESS_RANK } from '@/components/agent/AgentProvider'
 import { ToolCallCard } from '@/components/agent/ToolCallCard'
 import { useApiQuery } from '@/hooks/useApi'
@@ -247,6 +247,13 @@ export function AgentPage() {
               )}
             </select>
           </div>
+          <button
+            onClick={() => navigate('/settings?tab=agent')}
+            className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-800 hover:text-slate-300 transition-colors"
+            title="Agent settings"
+          >
+            <Settings className="h-4 w-4" />
+          </button>
           <button
             onClick={clearMessages}
             className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-800 hover:text-slate-300 transition-colors"
