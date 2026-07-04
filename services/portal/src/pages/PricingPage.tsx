@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { Check } from 'lucide-react'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
+import { Seo } from '@/components/Seo'
 
 const CONTACT = 'mailto:hello@gctrl.tech'
 
@@ -93,6 +94,11 @@ export function PricingPage() {
 
   return (
     <div className="min-h-screen bg-[#020617]">
+      <Seo
+        title="Pricing — GCTRL"
+        description="GCTRL is free forever for non-commercial private use, fully self-hosted with local inference. Business and Individual tiers add team access control and sovereign deployment."
+        path="/pricing"
+      />
       <SiteHeader />
 
       {/* Hero */}

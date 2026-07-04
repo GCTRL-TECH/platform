@@ -1,6 +1,8 @@
 import { useScrollReveal } from '@/hooks/useScrollReveal'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
+import { Seo } from '@/components/Seo'
+import { landingJsonLd } from '@/lib/seo-schema'
 import { HeroSection } from './sections/HeroSection'
 import { ArchitectureSection } from './sections/ArchitectureSection'
 import { ProblemSection } from './sections/ProblemSection'
@@ -18,6 +20,12 @@ export function LandingPage() {
 
   return (
     <div className="min-h-screen bg-[#020617]">
+      <Seo
+        title="GCTRL — The Enterprise Memory Layer for AI"
+        description="GCTRL (Ground Control) is the self-hosted knowledge graph and governed memory layer for AI agents. On-prem, local inference, no vendor lock-in, no token tax."
+        path="/"
+        jsonLd={landingJsonLd}
+      />
       <SiteHeader />
       <main>
         <HeroSection />

@@ -3,12 +3,14 @@ import { Link, useNavigate, useParams, useLocation } from 'react-router-dom'
 import { Search } from 'lucide-react'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
+import { Seo } from '@/components/Seo'
 import { MarkdownView } from './MarkdownView'
 import {
   DOC_GROUPS,
   ALL_PAGES,
   DEFAULT_SLUG,
   getDocContent,
+  getDocDescription,
   groupForSlug,
   searchDocs,
   type SearchHit,
@@ -128,6 +130,23 @@ export function DocsPage() {
 
   return (
     <div className="min-h-screen bg-[#020617]">
+      {content ? (
+        <Seo
+          title={`${title} — GCTRL Docs`}
+          description={getDocDescription(slug)}
+          path={`/docs/${slug}`}
+          type="article"
+          jsonLd={{
+            '@context': 'https://schema.org',
+            '@type': 'TechArticle',
+            headline: title,
+            description: getDocDescription(slug),
+            url: `https://gctrl.tech/docs/${slug}`,
+          }}
+        />
+      ) : (
+        <Seo title="Page not found — GCTRL Docs" description="No documentation page matches this URL." path={`/docs/${slug}`} noindex />
+      )}
       <SiteHeader />
       <div className="mx-auto max-w-7xl px-6 pt-24">
         <div className="lg:grid lg:grid-cols-[16rem_minmax(0,1fr)] lg:gap-10">

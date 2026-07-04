@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom'
 import { useScrollReveal } from '@/hooks/useScrollReveal'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
+import { Seo } from '@/components/Seo'
 
 function TeamMemoryDiagram() {
   const Token = ({ name, tool, color }: { name: string; tool: string; color: string }) => (
@@ -146,6 +147,11 @@ export function UseCasesPage() {
 
   return (
     <div className="min-h-screen bg-[#020617]">
+      <Seo
+        title="Use Cases — GCTRL"
+        description="Shared agentic team memory, airtight per-project isolation, and activating legacy data — how enterprises use GCTRL's governed knowledge graph day to day."
+        path="/use-cases"
+      />
       <SiteHeader />
 
       {/* Hero */}

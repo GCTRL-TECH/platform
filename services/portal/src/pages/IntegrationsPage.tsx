@@ -8,6 +8,7 @@ import {
 import { useScrollReveal } from '@/hooks/useScrollReveal'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
+import { Seo } from '@/components/Seo'
 
 type Category = 'Coding Agents' | 'IDEs' | 'Agent Frameworks' | 'Copilots' | 'Automation' | 'Knowledge Sources'
 
@@ -149,6 +150,11 @@ export function IntegrationsPage() {
 
   return (
     <div className="min-h-screen bg-[#020617]">
+      <Seo
+        title="Integrations — GCTRL"
+        description="Connect GCTRL's governed memory layer to Claude Code, Cursor, Codex, LangChain, n8n, and more over MCP or HTTP — plus connectors for Google Drive, Obsidian, and SharePoint."
+        path="/integrations"
+      />
       <SiteHeader />
 
       {/* Hero */}
