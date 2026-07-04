@@ -38,10 +38,15 @@ export function useGraphData(compilationId: string): UseGraphDataResult {
 
   const query = useQuery<GraphData, Error>({
     queryKey: key,
-    // Pull the WHOLE graph (degree-ordered; API ceiling 20000). The canvas shows
-    // every node and bounds the on-screen density via zoom/pan rather than a
-    // server truncation, so nothing is hidden from exploration.
-    queryFn: () => apiGet<GraphData>(`/kg/compilations/${compilationId}/graph?limit=20000`),
+    // Pull the WHOLE graph (degree-ordered; API ceiling 50000 — Wave 2 raised
+    // this from 20000 now that the canvas degrades render quality adaptively
+    // instead of leaning on a small server-side cap). The canvas shows every
+    // node and bounds the on-screen density via zoom/pan + the adaptive
+    // quality governor rather than a server truncation, so nothing is hidden
+    // from exploration. A large payload can take a while over a slow
+    // connection, so this call gets its own generous timeout.
+    queryFn: () =>
+      apiGet<GraphData>(`/kg/compilations/${compilationId}/graph?limit=50000`, { timeout: 120_000 }),
     staleTime: 60_000,
   })
 

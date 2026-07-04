@@ -159,6 +159,7 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/auth/sso", routes::sso::public_router())
         .nest("/api/scim",   routes::sso::scim_router())
         .nest("/api/setup",  routes::setup::router())
+        .nest("/api/public", routes::kg::public_router())
         .merge(routes::connectors::public_router())
         .merge(protected)
         .merge(optional)

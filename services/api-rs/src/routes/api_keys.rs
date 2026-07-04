@@ -31,6 +31,11 @@ struct CreateKeyReq {
     /// is invisible. Use for colleague tokens. Default false = full owner access.
     #[serde(rename = "kbScoped", default)]
     kb_scoped: bool,
+    /// Wave 2 — embed tokens: when true, the auth middleware rejects any
+    /// request from this key that isn't GET/HEAD/OPTIONS (enforced in
+    /// middleware/auth.rs, not here — this is just the flag's origin).
+    #[serde(rename = "readOnly", default)]
+    read_only: bool,
 }
 
 /// Resolve a token's clearance to (rank, level_name, level_id) — preferring an
@@ -120,9 +125,9 @@ async fn list_keys(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool)>(
         "SELECT id, name, key_prefix, max_clearance_rank, max_clearance_level, max_clearance_level_id,
-                last_used_at, expires_at, created_at, kb_scoped
+                last_used_at, expires_at, created_at, kb_scoped, read_only
          FROM api_keys WHERE user_id = $1
          ORDER BY created_at DESC"
     )
@@ -132,7 +137,7 @@ async fn list_keys(
     let key_ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     let mut grants = grants_for_keys(&state.db, &key_ids).await;
 
-    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped)| {
+    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only)| {
         json!({
             "id": id,
             "name": name,
@@ -144,6 +149,7 @@ async fn list_keys(
             "expiresAt": exp,
             "createdAt": created,
             "kbScoped": kb_scoped,
+            "readOnly": read_only,
             "grants": grants.remove(&id).unwrap_or_default(),
         })
     }).collect();
@@ -168,8 +174,8 @@ async fn create_key(
 
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys
-           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id"
     )
     .bind(claims.sub)
@@ -181,6 +187,7 @@ async fn create_key(
     .bind(level_id)
     .bind(req.expires_at)
     .bind(req.kb_scoped)
+    .bind(req.read_only)
     .fetch_one(&state.db).await?;
 
     // Per-graph grants — only for compilations the caller actually owns.
@@ -205,6 +212,7 @@ async fn create_key(
         "maxClearanceLevelId": level_id,
         "expiresAt":        req.expires_at,
         "kbScoped":         req.kb_scoped,
+        "readOnly":         req.read_only,
         "grants":           grants_for_keys(&state.db, &[id]).await.remove(&id).unwrap_or_default(),
     })))
 }

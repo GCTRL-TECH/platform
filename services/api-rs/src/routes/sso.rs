@@ -333,6 +333,7 @@ async fn oidc_callback(
         exp: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp() as usize,
         api_key_rank: None,
         api_key_id: None,
+        read_only: false,
         agent_override_rank: None,
     };
 

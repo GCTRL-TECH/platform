@@ -1,4 +1,4 @@
-use axum::{extract::{Request, State}, http::StatusCode, middleware::Next, response::Response};
+use axum::{extract::{Request, State}, http::StatusCode, middleware::Next, response::{IntoResponse, Response}};
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
@@ -19,6 +19,14 @@ pub struct JwtClaims {
     /// Drives per-graph grants and the access audit trail. None for JWT auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_id: Option<uuid::Uuid>,
+    /// True when the API key used for this request is read-only (Wave 2 embed
+    /// tokens). Enforced as a single chokepoint in both auth middlewares below:
+    /// a read-only key gets 403 on anything but GET/HEAD/OPTIONS. Always false
+    /// for JWT auth (a logged-in user is never read-only via this flag).
+    /// `#[serde(default)]` so tokens signed before this field existed still
+    /// decode fine (as non-read-only).
+    #[serde(default)]
+    pub read_only: bool,
     /// In-process-only per-session clearance override (NOT part of the JWT). Set
     /// by the agent chat handler so the onboard CTO agent can run at full access
     /// (i32::MAX) for an admin, or a downgraded rank. `#[serde(skip)]` means it is
@@ -67,8 +75,8 @@ pub async fn require_auth(
 
         // SEC-2: the join also filters out inactive users (api_keys are deleted on
         // deprovision, but the is_active guard is belt-and-suspenders).
-        let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String)>(
-            "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role
+        let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool)>(
+            "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only
              FROM api_keys ak
              JOIN users u ON u.id = ak.user_id
              WHERE ak.key_hash = $1
@@ -81,7 +89,13 @@ pub async fn require_auth(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-        let (key_id, user_id, max_rank, email, role) = row;
+        let (key_id, user_id, max_rank, email, role, read_only) = row;
+
+        // Wave 2 — read-only embed tokens: a single chokepoint blocking any
+        // mutating request before it ever reaches a route handler.
+        if read_only && !matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS) {
+            return Err(StatusCode::FORBIDDEN);
+        }
 
         // Update last_used_at asynchronously — don't wait, best-effort only
         let db = state.db.clone();
@@ -103,6 +117,7 @@ pub async fn require_auth(
             exp: usize::MAX,
             api_key_rank: Some(max_rank),
             api_key_id: Some(key_id),
+            read_only,
             agent_override_rank: None,
         }
     } else {
@@ -122,6 +137,7 @@ pub async fn optional_auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let method = req.method().clone();
 
     let claims: Option<JwtClaims> = match auth_value.as_deref() {
         // JWT path (existing behaviour) — best-effort, never fails the request.
@@ -138,8 +154,8 @@ pub async fn optional_auth(
         Some(v) if v.starts_with("ApiKey ") => {
             let raw_key = v.trim_start_matches("ApiKey ").trim();
             let hash = hex::encode(Sha256::digest(raw_key.as_bytes()));
-            sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String)>(
-                "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role
+            sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool)>(
+                "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only
                  FROM api_keys ak
                  JOIN users u ON u.id = ak.user_id
                  WHERE ak.key_hash = $1
@@ -151,7 +167,7 @@ pub async fn optional_auth(
             .await
             .ok()
             .flatten()
-            .map(|(key_id, user_id, max_rank, email, role)| JwtClaims {
+            .map(|(key_id, user_id, max_rank, email, role, read_only)| JwtClaims {
                 sub: user_id,
                 email,
                 role,
@@ -159,11 +175,23 @@ pub async fn optional_auth(
                 exp: usize::MAX,
                 api_key_rank: Some(max_rank),
                 api_key_id: Some(key_id),
+                read_only,
                 agent_override_rank: None,
             })
         }
         _ => None,
     };
+
+    // Wave 2 — same read-only chokepoint as require_auth. optional_auth never
+    // fails the request for a missing/invalid token, but a VALID read-only
+    // token must not be allowed to mutate through the optional-auth routes
+    // (e.g. RAG) either.
+    if let Some(c) = &claims {
+        if c.read_only && !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     req.extensions_mut().insert(claims);
     next.run(req).await
 }
