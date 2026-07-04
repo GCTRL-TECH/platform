@@ -23,6 +23,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import * as fs from 'node:fs';
+import * as nodePath from 'node:path';
 
 const API_BASE = process.env['GCTRL_API_URL'] || 'http://localhost:4000/api';
 const GCTRL_EMAIL = process.env['GCTRL_EMAIL'] || 'admin@gctrl.tech';
@@ -158,7 +160,7 @@ async function appendJobToCompilation(compilationId: string, jobId: string): Pro
 // Surfaced to the connecting model by MCP clients: how to use the memory layers
 // and the write-back discipline (the point of GCTRL).
 const GCTRL_INSTRUCTIONS =
-  "GCTRL is your long-term memory. READ the right layer (gctrl_get_dossier = HOT/authoritative — state it, don't hedge; gctrl_query = blended answer; gctrl_search_entities/get_neighbors/shortest_path = graph; gctrl_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via gctrl_list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call gctrl_list_graphs first.";
+  "GCTRL is your long-term memory. READ the right layer (gctrl_get_dossier = HOT/authoritative — state it, don't hedge; gctrl_query = blended answer; gctrl_search_entities/get_neighbors/shortest_path = graph; gctrl_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via gctrl_list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call gctrl_list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with gctrl_ingest_file (PDF/DOCX/binary) or gctrl_store/gctrl_extract (text), then retrieve with gctrl_search_chunks or gctrl_query.";
 
 const server = new McpServer(
   {
@@ -1027,6 +1029,55 @@ registerTool<Record<string, never>>(
         text:
           `**Connectors (${conns.length}):**\n${conns.join('\n') || '- none connected'}` +
           (fails.length ? `\n\n**Recent failures:**\n${fails.join('\n')}` : '\n\nNo recent failures.'),
+      }],
+    };
+  },
+);
+
+// ── Tool: Ingest a binary file (PDF/DOCX/etc.) from local disk ───────────────
+// New tool (no legacy borghive_* alias, like gctrl_find_file above). Unlike
+// every other tool here — which just forwards data already in hand to the
+// GCTRL API — this one runs on the USER's machine, so it reads the file off
+// local disk itself, base64-encodes it, and forwards it to the same agent
+// tool endpoint the HTTP gateway's ingest_file uses. Use this whenever the
+// user drops or mentions a PDF/DOCX/binary file that should become knowledge;
+// for plain text, gctrl_extract/gctrl_store are cheaper and don't round-trip
+// through base64.
+
+const MAX_INGEST_FILE_BYTES = 25 * 1024 * 1024; // 25MB, mirrors the API's decoded-size cap
+
+const ingestFileSchema = {
+  path: z.string().describe('Absolute (or cwd-relative) path to the local file to ingest, e.g. a PDF or DOCX'),
+  compilationId: z.string().optional().describe('Optional: target knowledge graph compilation ID. Omit to fall back to your default knowledge base.'),
+  ontologyId: z.string().optional().describe('Optional ontology ID to guide entity type extraction'),
+};
+
+registerTool<{ path: string; compilationId?: string; ontologyId?: string }>(
+  'gctrl_ingest_file',
+  'Ingest a PDF, DOCX, or other binary file into the knowledge graph. Use this whenever the user drops, mentions, or references a file (not raw text) that should become knowledge — reads the file from local disk, uploads it, and starts extraction. For plain text, use gctrl_extract/gctrl_store instead.',
+  ingestFileSchema,
+  async ({ path: filePath, compilationId, ontologyId }) => {
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(filePath);
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error reading file "${filePath}": ${(err as Error).message}` }] };
+    }
+    if (bytes.length > MAX_INGEST_FILE_BYTES) {
+      return { content: [{ type: 'text' as const, text: `File too large (${(bytes.length / 1024 / 1024).toFixed(1)}MB) — max 25MB.` }] };
+    }
+    const fileName = nodePath.basename(filePath);
+    const r = await apiCall('POST', '/agent/tools/ingest_file', {
+      fileName,
+      contentBase64: bytes.toString('base64'),
+      compilationId,
+      ontologyId,
+    }) as { jobId?: string; status?: string; error?: string };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Ingesting "${fileName}" — job ${r.jobId} (${r.status ?? 'pending'}). Poll gctrl_list_extractions or use gctrl_search_chunks/gctrl_query once complete.`,
       }],
     };
   },
