@@ -333,10 +333,12 @@ function CompilationCard({
   const edgeCount = compilation.edgeCount ?? 0
   const isWiki = compilation.type === 'WIKI'
   const isSystem = compilation.isSystem === true
+  // Easy mode has no folder drop targets — dragging would be a dead affordance (W7).
+  const { isExpert } = useUiMode()
 
   return (
     <button
-      draggable={!isSystem}
+      draggable={!isSystem && isExpert}
       onDragStart={(e) => {
         e.dataTransfer.setData('application/x-compilation-id', compilation.id)
         e.dataTransfer.effectAllowed = 'move'

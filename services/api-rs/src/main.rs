@@ -164,6 +164,10 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .merge(protected)
         .merge(optional)
         .layer(tower_http::cors::CorsLayer::permissive())
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        // 40MB: the agent `ingest_file` tool accepts 25MB (decoded) files, which
+        // arrive as base64 inside a JSON body (×4/3 ≈ 33.4MB + envelope). The
+        // previous 10MB limit rejected any file >~7.5MB with a 413 before the
+        // tool's own size check ever ran (bug-hunt W7).
+        .layer(RequestBodyLimitLayer::new(40 * 1024 * 1024))
         .with_state(state)
 }

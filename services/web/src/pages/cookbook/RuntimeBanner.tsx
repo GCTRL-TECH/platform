@@ -126,8 +126,11 @@ export function RuntimeBanner({ activeRuntime, recommendation, isAdmin, onSwitch
           }
         }
       }
-      setPhase('done')
-      onSwitched?.()
+      // Stream closed WITHOUT an explicit `done`/`error` terminal event (W7):
+      // proxy cut, server crash mid-switch. Treat as failure — the backend's
+      // switch state is unknown, reporting success here would be a lie.
+      setError('Stream ended before the switch confirmed — check the active runtime')
+      setPhase('error')
     } catch {
       if (!controller.signal.aborted) {
         setError('Connection lost')

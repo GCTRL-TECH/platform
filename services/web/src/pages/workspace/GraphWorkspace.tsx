@@ -368,7 +368,7 @@ export function GraphWorkspace() {
           {error && (
             <div className="absolute inset-0 z-10 flex items-center justify-center text-sm text-red-400">Failed to load graph: {error.message}</div>
           )}
-          <WorkspaceCanvas nodes={nodes} edges={edges} selectedId={selectedNode?.id ?? null} onSelect={handleSelect} peekNodeId={peekId} />
+          <WorkspaceCanvas nodes={nodes} edges={edges} selectedId={selectedNode?.id ?? null} onSelect={handleSelect} peekNodeId={peekId} datasetKey={compilationId} />
         </div>
 
         {/* Column 3 — node context (resizable) */}

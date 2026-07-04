@@ -13,8 +13,15 @@ export type UiMode = 'easy' | 'expert'
 const KEY = 'gctrl_ui_mode'
 const listeners = new Set<() => void>()
 
+// try/catch: this getter backs useSyncExternalStore for the whole app shell —
+// an environment where localStorage access THROWS (Safari private mode,
+// storage disabled by policy) must fall back to 'easy', not white-screen (W7).
 function get(): UiMode {
-  return (localStorage.getItem(KEY) as UiMode) || 'easy'
+  try {
+    return (localStorage.getItem(KEY) as UiMode) || 'easy'
+  } catch {
+    return 'easy'
+  }
 }
 function subscribe(cb: () => void) {
   listeners.add(cb)
@@ -22,7 +29,7 @@ function subscribe(cb: () => void) {
 }
 
 export function setUiMode(mode: UiMode) {
-  localStorage.setItem(KEY, mode)
+  try { localStorage.setItem(KEY, mode) } catch { /* non-persistent env */ }
   listeners.forEach((cb) => cb())
 }
 

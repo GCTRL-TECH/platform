@@ -40,10 +40,13 @@ Prove the loop end to end before wiring up an agent. Pick whichever path you lik
 - **From the API:**
 
 ```bash
-curl -X POST http://localhost:4000/kex/extract \
+curl -X POST http://localhost:4000/api/kex/extract \
+  -H "Authorization: ApiKey <your-access-token>" \
   -H "Content-Type: application/json" \
   -d '{ "text": "Ada Lovelace worked with Charles Babbage on the Analytical Engine in 1843." }'
 ```
+
+(Create an access token under **Access Control**, or reuse the one from the onboarding's "Connect your agent" step.)
 
 You'll see entities (Ada Lovelace, Charles Babbage, Analytical Engine) and their relations land in the graph — grounded, traceable, and local.
 

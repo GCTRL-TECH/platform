@@ -123,6 +123,7 @@ export default function EmbedGraphPage() {
                               affordance — no side drawer here. */ }}
         theme={themeParam}
         initialLabels={initialLabels}
+        datasetKey={compilationId ?? undefined}
         className="h-full w-full"
       />
       <div className="pointer-events-none absolute bottom-2 right-2 z-30 rounded-md border border-slate-700/60 bg-slate-900/80 px-2 py-1 text-[10px] text-slate-400">

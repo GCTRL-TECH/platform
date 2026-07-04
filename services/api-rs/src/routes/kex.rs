@@ -84,23 +84,72 @@ pub(crate) async fn resolve_default_compilation(db: &sqlx::PgPool, user_id: Uuid
 }
 
 /// Link a job into its target compilation: the caller's explicit choice, or
-/// (when none was given) the user's default knowledge base, so a submission
+/// (when none was given) the caller's default knowledge base, so a submission
 /// never silently orphans. Best-effort/idempotent — see `link_job_to_compilation`.
+///
+/// SCOPE-AWARE (bug-hunt W7): KB-scoped access tokens run under the OWNER's
+/// user_id, so the `user_id` guard alone would let them link into ANY of the
+/// owner's compilations — including ones the token was never granted. This
+/// helper therefore consults `api_key_scope`:
+///   - explicit `compilationId` outside the grant set → never linked (warn);
+///   - no `compilationId` + exactly one grant → that grant IS the default;
+///   - no `compilationId` + zero/many grants → no safe default, left unlinked;
+///   - unscoped caller (owner JWT / full-access key) → owner's default KB.
 pub(crate) async fn link_job_to_target_or_default(
     db: &sqlx::PgPool,
-    user_id: Uuid,
+    claims: &crate::middleware::auth::JwtClaims,
     compilation_id: Option<Uuid>,
     job_id: Uuid,
 ) {
-    match compilation_id {
-        Some(cid) => link_job_to_compilation(db, user_id, cid, job_id).await,
-        None => {
-            if let Some(cid) = resolve_default_compilation(db, user_id).await {
-                tracing::debug!(%job_id, %cid, "linking job to default compilation (no compilationId given)");
-                link_job_to_compilation(db, user_id, cid, job_id).await;
+    let scope = crate::routes::kg::api_key_scope(db, claims).await;
+    let target = match compilation_id {
+        Some(cid) => {
+            if let Some(set) = &scope {
+                if !set.contains(&cid) {
+                    tracing::warn!(%job_id, %cid,
+                        "scoped token tried to link a job outside its granted knowledge bases — job left unlinked");
+                    return;
+                }
             }
+            Some(cid)
+        }
+        None => match &scope {
+            Some(set) if set.len() == 1 => {
+                let cid = set.iter().next().copied();
+                tracing::debug!(%job_id, ?cid, "scoped token: linking job to its single granted knowledge base");
+                cid
+            }
+            Some(_) => {
+                tracing::debug!(%job_id,
+                    "scoped token without explicit compilationId and no single grant — job left unlinked");
+                None
+            }
+            None => resolve_default_compilation(db, claims.sub).await,
+        },
+    };
+    if let Some(cid) = target {
+        link_job_to_compilation(db, claims.sub, cid, job_id).await;
+    }
+}
+
+/// A token may not ingest content classified above its own clearance ceiling.
+/// (bug-hunt W7: this check existed on `ingest_repo` and the agent's
+/// `create_extraction`, but was missing on the two most-used entry points —
+/// `extract` and `upload` — an inconsistent-enforcement gap.)
+pub(crate) async fn enforce_classification_ceiling(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+    classification_level_id: Option<Uuid>,
+) -> Result<()> {
+    if let (Some(key_rank), Some(c)) = (claims.api_key_rank, classification_level_id) {
+        let lvl_rank: Option<i32> = sqlx::query_scalar(
+            "SELECT rank FROM classification_levels WHERE id = $1"
+        ).bind(c).fetch_optional(db).await.ok().flatten();
+        if lvl_rank.map_or(false, |r| r > key_rank) {
+            return Err(AppError::Forbidden("classification exceeds this access token's clearance".into()));
         }
     }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -130,6 +179,7 @@ async fn extract(
     if req.text.len() < 10 {
         return Err(AppError::BadRequest("Text too short (min 10 chars)".into()));
     }
+    enforce_classification_ceiling(&state.db, &claims, req.classification_level_id).await?;
     // GREATEST(0, ...) prevents negative balances if a prior bug or race left them stuck.
     sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
@@ -175,7 +225,7 @@ async fn extract(
 
     // Link into the target compilation: explicit choice, else the user's default
     // knowledge base, so the document is never orphaned.
-    link_job_to_target_or_default(&state.db, claims.sub, req.compilation_id, job_id).await;
+    link_job_to_target_or_default(&state.db, &claims, req.compilation_id, job_id).await;
 
     // Look up classification name to forward to KEX worker for Neo4j tagging.
     let classification_name: Option<String> = if let Some(clf_id) = req.classification_level_id {
@@ -279,7 +329,7 @@ async fn ingest_repo(
         .bind(job_id).bind(&summary).execute(&state.db).await;
     // Link into the target compilation: explicit choice, else the user's default
     // knowledge base, so the repo ingest is never orphaned.
-    link_job_to_target_or_default(&state.db, claims.sub, req.compilation_id, job_id).await;
+    link_job_to_target_or_default(&state.db, &claims, req.compilation_id, job_id).await;
     record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
     let mut out = summary;
@@ -379,6 +429,7 @@ pub(crate) async fn submit_upload(
     classification_level_id: Option<Uuid>,
     compilation_id: Option<Uuid>,
 ) -> Result<Uuid> {
+    enforce_classification_ceiling(&state.db, claims, classification_level_id).await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
 
     let mimetype = match file_name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
@@ -422,7 +473,7 @@ pub(crate) async fn submit_upload(
 
     // Link into the target compilation: explicit choice, else the user's default
     // knowledge base, so the upload is never orphaned.
-    link_job_to_target_or_default(&state.db, claims.sub, compilation_id, job_id).await;
+    link_job_to_target_or_default(&state.db, claims, compilation_id, job_id).await;
 
     let classification_name: Option<String> = if let Some(clf_id) = classification_level_id {
         sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1")

@@ -170,11 +170,16 @@ interface WorkspaceCanvasProps {
   /** Explicit initial labels override (e.g. an embed's ?labels=0 query param).
    *  Bypasses localStorage['gw.showLabels'] when set. */
   initialLabels?: boolean
+  /** Stable identity of the underlying DATASET (e.g. the compilation id).
+   *  Warmup-seeding + the "Show all" override reset only when THIS changes —
+   *  not on every `nodes` array identity change (neighbor-expand merges create
+   *  a new array while it's still the same graph; bug-hunt W7). */
+  datasetKey?: string
 }
 
 export function WorkspaceCanvas({
   nodes, edges, selectedId, onSelect, peekNodeId = null, className,
-  theme: themeProp, initialLabels,
+  theme: themeProp, initialLabels, datasetKey,
 }: WorkspaceCanvasProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('2d')
   // Whether 3D can run here at all (WebGL probe). When false we keep the user in
@@ -327,16 +332,21 @@ export function WorkspaceCanvas({
 
   // Warmup seeding: a very large graph starts pre-degraded instead of visibly
   // "falling" into it after a few slow seconds. Also clears the "show all"
-  // override whenever the underlying data actually changes (new compilation).
+  // override whenever the underlying DATASET changes (new compilation).
+  // Keyed on `datasetKey`, NOT the `nodes` array identity: neighbor-expand
+  // merges produce a fresh array for the same graph, and reseeding there
+  // silently reset the governor + cleared "Show all" mid-exploration (W7).
+  const rawNodesRef = useRef(nodes)
+  rawNodesRef.current = nodes
   useEffect(() => {
-    const total = nodes.length
+    const total = rawNodesRef.current.length
     const seedLevel: QualityLevel = total > 35_000 ? 3 : total > 20_000 ? 2 : 0
     quality.reset(seedLevel)
     setUserForcedFull(false)
-    // quality.reset has a stable identity (useCallback, no deps) — only `nodes`
-    // (fresh data) should re-trigger this.
+    // quality.reset has a stable identity (useCallback, no deps) — only a new
+    // dataset should re-trigger this.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes])
+  }, [datasetKey])
 
   const graphData = useMemo(() => ({ nodes: displayNodes, links: displayLinks }), [displayNodes, displayLinks])
 
@@ -500,7 +510,11 @@ export function WorkspaceCanvas({
   }, [])
   // Glow only at full quality and under the theme's node-count ceiling — it
   // never fights the adaptive quality governor for frame budget.
-  const glowActive = Boolean(theme.glow) && quality.level === 0 && displayNodes.length <= (theme.glow?.maxNodes ?? 0)
+  // "Show all" must also restore the theme glow: while forced-full the governor
+  // is frozen (registerFrame skipped), so quality.level can be stuck >0 (W7).
+  const glowActive = Boolean(theme.glow)
+    && (quality.level === 0 || userForcedFull)
+    && displayNodes.length <= (theme.glow?.maxNodes ?? 0)
   const glowActiveRef = useRef(glowActive)
   glowActiveRef.current = glowActive
 
