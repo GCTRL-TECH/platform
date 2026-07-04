@@ -149,8 +149,8 @@ function makeLayer(raw: string[]): { subs: SubGroup[]; shineStars: ShineStar[] }
 //
 // Spawn region is constrained to the LEFT or RIGHT sky band — the horizontal
 // fade regions of the hero image where the dark background shows through.
-// The streaks sit at -z-10 (behind the image), so they wouldn't be visible
-// in the opaque middle anyway; we just don't waste them there.
+// The streaks sit at -z-[5] (above the starfields, behind the image), so they
+// wouldn't be visible in the opaque middle anyway; we just don't waste them there.
 type ShootingStar = {
   id: number
   x: number        // start position in PIXELS — viewport-aware
@@ -194,28 +194,28 @@ function ShootingStarEl({ s, cls = 'shooting-star' }: { s: ShootingStar; cls?: s
   )
 }
 
-// ── Hero audience typewriter ─────────────────────────────────────────
-// One line, endlessly retyped: WHO GCTRL is for. Sovereignty-first phrasing —
-// the variable part is typed and deleted like a terminal prompt.
+// ── Hero headline typewriter ─────────────────────────────────────────
+// The second headline line is typed and deleted like a terminal prompt —
+// one rotating sovereignty statement in the big gradient type.
 const TYPED_PHRASES = [
-  'own their knowledge.',
-  'refuse vendor lock-in.',
-  'run on their own infrastructure.',
-  'give every agent one shared memory.',
-  'stay sovereign while tools change.',
+  'Command Your Data.',
+  'Stay Sovereign.',
+  'Own Your Data.',
 ]
 
 function useTypewriter(phrases: string[]) {
-  const [text, setText] = useState('')
+  // The first phrase is fully rendered from the very first paint — the page
+  // never loads with an empty headline. Rotation (delete → type next) only
+  // starts after an initial hold.
+  const [text, setText] = useState(phrases[0])
   useEffect(() => {
     // Reduced motion → static first phrase, no churn.
     if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
-      setText(phrases[0])
       return
     }
     let phrase = 0
-    let len = 0
-    let deleting = false
+    let len = phrases[0].length
+    let deleting = true // first tick starts deleting the pre-rendered phrase
     let timer: number | undefined
     const tick = () => {
       const current = phrases[phrase]
@@ -224,7 +224,7 @@ function useTypewriter(phrases: string[]) {
         setText(current.slice(0, len))
         if (len === current.length) {
           deleting = true
-          timer = window.setTimeout(tick, 2100) // hold the finished phrase
+          timer = window.setTimeout(tick, 2600) // hold the finished phrase
           return
         }
         timer = window.setTimeout(tick, 46 + Math.random() * 48) // human-ish typing
@@ -240,7 +240,7 @@ function useTypewriter(phrases: string[]) {
         timer = window.setTimeout(tick, 24)
       }
     }
-    timer = window.setTimeout(tick, 700)
+    timer = window.setTimeout(tick, 2600) // hold the initial phrase first
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -296,28 +296,33 @@ export function HeroSection() {
       const imageW = Math.min(vh * 1.86, vw)
       const bandW = Math.max(120, (vw - imageW) / 2)
 
-      // Distance scales with the band so the streak actually crosses the
-      // visible sky. Bigger band → longer, more graceful sweep.
-      const dist = 280 + Math.random() * Math.min(bandW * 0.7, 500)
+      // Streaks must stay in the hero's upper half — the lower half of the
+      // image reads as "ground", and a meteor passing in front of the ground
+      // looks wrong. Spawn high and cap the travel distance so the head
+      // never sinks below ~48% of the viewport height.
+      const y = 40 + Math.random() * (vh * 0.12)
       const useRight = Math.random() < 0.5
+      const angle = useRight
+        ? 128 + Math.random() * 22 // 128°-150° → down-left
+        : 30 + Math.random() * 22  // 30°-52° → down-right
+      const maxDrop = Math.max(60, vh * 0.48 - y)
+      // Distance scales with the band so the streak actually crosses the
+      // visible sky — clamped by the vertical budget above.
+      const dist = Math.min(
+        280 + Math.random() * Math.min(bandW * 0.7, 500),
+        maxDrop / Math.abs(Math.sin((angle * Math.PI) / 180)),
+      )
 
-      const star: ShootingStar = useRight
-        ? {
-            id,
-            x: vw - 220 + Math.random() * 120,         // head ~150-330px from right edge
-            y: 40 + Math.random() * (vh * 0.22),
-            angle: 128 + Math.random() * 22,           // 128°-150° → down-left
-            distance: dist,
-            duration: 1500 + Math.random() * 700,
-          }
-        : {
-            id,
-            x: -170 + Math.random() * 100,             // head ~0-100px past the left edge
-            y: 40 + Math.random() * (vh * 0.22),
-            angle: 30 + Math.random() * 22,            // 30°-52° → down-right
-            distance: dist,
-            duration: 1500 + Math.random() * 700,
-          }
+      const star: ShootingStar = {
+        id,
+        x: useRight
+          ? vw - 220 + Math.random() * 120 // head ~100-220px from right edge
+          : -170 + Math.random() * 100,    // head ~0-100px past the left edge
+        y,
+        angle,
+        distance: dist,
+        duration: 1500 + Math.random() * 700,
+      }
 
       setShooters((s) => [...s, star])
       const cleanup = window.setTimeout(() => {
@@ -336,9 +341,10 @@ export function HeroSection() {
     }
   }, [])
 
-  // Rare FRONT shooting star — sweeps across the WHOLE hero, over the image
-  // (z-[5], under the text). Deliberately infrequent (~every 14-26s) so it
-  // stays a small event rather than becoming noise.
+  // Rare LONG shooting star — sweeps across the WHOLE hero width, behind the
+  // image (-z-[5]): it disappears behind the building and re-emerges on the
+  // other side. Deliberately infrequent (~every 14-26s) so it stays a small
+  // event rather than becoming noise.
   useEffect(() => {
     if (typeof window === 'undefined') return
     if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
@@ -352,12 +358,19 @@ export function HeroSection() {
       const id = shooterIdRef.current++
       const vw = window.innerWidth
       const vh = window.innerHeight
+      // Same upper-half rule as the edge streaks: spawn high, then flatten
+      // the sweep angle so that even after crossing the full viewport width
+      // the head never sinks below ~45% of the viewport height.
+      const y = vh * 0.05 + Math.random() * vh * 0.15
+      const distance = vw + 750 // fully crosses the viewport
+      const maxDrop = Math.max(40, vh * 0.45 - y)
+      const maxAngle = (Math.asin(Math.min(1, maxDrop / distance)) * 180) / Math.PI
       const star: ShootingStar = {
         id,
         x: -320,
-        y: vh * 0.06 + Math.random() * vh * 0.30,
-        angle: 14 + Math.random() * 12,          // shallow down-right sweep
-        distance: vw + 750,                       // fully crosses the viewport
+        y,
+        angle: Math.max(2, Math.min(6 + Math.random() * 8, maxAngle)), // shallow down-right sweep
+        distance,
         duration: 2300 + Math.random() * 900,
       }
       setFrontShooters((s) => [...s, star])
@@ -490,18 +503,22 @@ export function HeroSection() {
       })}
 
       {/* ── Shooting stars — rare diagonal streaks across the upper sky.
-          Sit at -z-10 (same depth as background stars) so the streak peeks
-          through the faded edges of the hero image instead of crossing over
-          the operators and the control console. */}
-      <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[80vh] overflow-hidden">
+          Sit at -z-[5]: in FRONT of all three starfields (-z-10) but BEHIND
+          the hero image (-z-0), so a streak can never cross the building —
+          it peeks through the faded sky at the image edges. The h-[55vh]
+          overflow clip is a hard backstop for the "upper half only" rule
+          (the lower half of the hero reads as ground). */}
+      <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 -z-[5] h-[55vh] overflow-hidden">
         {shooters.map((s) => (
           <ShootingStarEl key={s.id} s={s} />
         ))}
       </div>
 
-      {/* Rare front streak — crosses the entire hero OVER the image (z-[5]
-          sits above image and overlay stars, below the z-10 content). */}
-      <div aria-hidden className="pointer-events-none absolute inset-0 z-[5] overflow-hidden">
+      {/* Rare long streak — sweeps the whole hero width at the same -z-[5]
+          depth: it vanishes behind the opaque image centre and re-emerges on
+          the far side, which is exactly what a real meteor would do. Same
+          upper-half clip as the edge streaks. */}
+      <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 -z-[5] h-[55vh] overflow-hidden">
         {frontShooters.map((s) => (
           <ShootingStarEl key={s.id} s={s} cls="shooting-star-front" />
         ))}
@@ -550,15 +567,24 @@ export function HeroSection() {
           Sovereign Knowledge Infrastructure
         </div>
 
-        <h1 className="mb-6 text-5xl font-bold leading-tight tracking-tight text-white md:text-6xl lg:text-7xl">
+        <h1
+          className="mb-6 text-5xl font-bold leading-tight tracking-tight text-white md:text-6xl lg:text-7xl"
+          aria-label="Ground Your AI. Command Your Data."
+        >
           <span className="text-shadow-hero">Ground Your AI.</span>
           <br />
-          {/* `bg-clip-text` makes the fill transparent, so a CSS `text-shadow`
+          {/* Typewriter line — rotating sovereignty statements, typed and
+              deleted like a terminal prompt. Screen readers get the static
+              aria-label above instead of the churn.
+              `bg-clip-text` makes the fill transparent, so a CSS `text-shadow`
               would render the shadow THROUGH the transparent letters and read
               as a shadow inside the glyphs. `filter: drop-shadow(...)` instead
               traces the shape of the rendered (gradient-filled) glyphs and
-              drops the shadow behind them — which is what we want. */}
+              drops the shadow behind them — which is what we want. The caret
+              lives inside the gradient span (so it's gradient-tinted too) and
+              is always rendered, which keeps the line from ever collapsing. */}
           <span
+            aria-hidden
             className="bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent"
             style={{
               filter:
@@ -567,19 +593,10 @@ export function HeroSection() {
                 'drop-shadow(0 4px 18px rgba(0,0,0,0.35))',
             }}
           >
-            Command Your Data.
+            {typed}
+            <span className="animate-caret">_</span>
           </span>
         </h1>
-
-        {/* Audience typewriter — WHO this is for, retyped like a terminal
-            prompt. Screen readers get one static sentence instead of churn. */}
-        <p className="mb-6 text-lg text-slate-300 md:text-xl" aria-label="Built for teams that own their knowledge.">
-          <span aria-hidden className="text-shadow-hero">
-            Built for teams that{' '}
-            <span className="font-semibold text-indigo-300">{typed}</span>
-            <span className="animate-caret ml-0.5 font-semibold text-indigo-300">_</span>
-          </span>
-        </p>
 
         {/* Glass-card backdrop gives the paragraph solid readability over the
             mission-control imagery without darkening the hero. Mirrors the
@@ -588,8 +605,12 @@ export function HeroSection() {
           <p className="text-base leading-relaxed text-slate-200 md:text-lg">
             <strong className="font-semibold text-white">Running at the speed of trust.</strong>{' '}
             Your company's knowledge — every source, every team, every agent session — fused into{' '}
-            <span className="text-indigo-300">one governed graph you own</span>, on your own
-            infrastructure. Agents and tools will come and go. Your knowledge stays yours.
+            <span className="text-indigo-300">one governed knowledge fabric you own</span>, on your own
+            infrastructure. Agents and tools will come and go. Your knowledge infrastructure stays.{' '}
+            <span className="font-semibold text-white">
+              <span className="whitespace-nowrap">No vendor lock-in.</span>{' '}
+              <span className="whitespace-nowrap">No token tax.</span>
+            </span>
           </p>
         </div>
 
