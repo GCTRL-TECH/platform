@@ -1446,10 +1446,12 @@ async fn get_graph(
     }
 
     // Return the WHOLE graph by default (degree-ordered) so the explorer can show
-    // every node — the client bounds what's drawn per viewport via zoom, not a
-    // server-side truncation. A high hard ceiling (20000) protects the payload
-    // against pathological graphs; only then does `truncated` flip true.
-    let limit = q.limit.unwrap_or(20000).clamp(1, 20000);
+    // every node — the client bounds what's drawn per viewport via zoom/pan and
+    // the adaptive quality governor, not a server-side truncation. Default page
+    // size stays 20000 (most graphs fit comfortably); the hard ceiling is raised
+    // to 50000 (Wave 2) now that the canvas degrades render quality instead of
+    // silently dropping data — only then does `truncated` flip true.
+    let limit = q.limit.unwrap_or(20000).clamp(1, 50000);
     let user_id_str = claims.sub.to_string();
     let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
