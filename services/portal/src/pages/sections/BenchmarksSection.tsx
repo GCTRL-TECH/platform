@@ -5,6 +5,7 @@ const STATS = [
   { value: '<50', unit: 'ms p95', label: 'Memory retrieval latency', sub: '7–27 ms median' },
   { value: '≈0', unit: 'ms', label: 'Access-control overhead', sub: 'compliance is effectively free' },
   { value: '2,750', unit: '/s', label: 'Matching-engine throughput', sub: 'sub-quadratic ~O(n^1.5)' },
+  { value: '0.978', unit: '', label: 'NER detection-recall', sub: 'Bilingual 32-doc business gold · zero-shot GLiNER + format pre-pass' },
 ]
 
 // Competitor figures are CITED from published papers on the same public datasets —

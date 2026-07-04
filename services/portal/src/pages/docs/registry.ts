@@ -22,6 +22,7 @@ export const DOC_GROUPS: DocGroup[] = [
       { slug: 'infrastructure', title: 'Infrastructure & Ollama' },
       { slug: 'gpu', title: 'Use Your GPU (native Ollama)' },
       { slug: 'performance', title: 'Performance Guide' },
+      { slug: 'cookbook', title: 'Cookbook: Model Tuning' },
     ],
   },
   {
@@ -36,6 +37,7 @@ export const DOC_GROUPS: DocGroup[] = [
     group: 'Agents & integration',
     pages: [
       { slug: 'agents-mcp', title: 'Agents & MCP' },
+      { slug: 'integrations', title: 'Integrations' },
       { slug: 'memory-skill', title: 'The GCTRL Memory Skill' },
     ],
   },
@@ -51,6 +53,7 @@ export const DOC_GROUPS: DocGroup[] = [
     group: 'Reference',
     pages: [
       { slug: 'benchmarks', title: 'Benchmarks' },
+      { slug: 'graph-embed', title: 'Embedding the Graph' },
       { slug: 'faq', title: 'FAQ & Troubleshooting' },
     ],
   },

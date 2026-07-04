@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 import { Plug2 } from 'lucide-react'
 
 // simpleicons CDN supports a /COLOR suffix that recolours the SVG server-side,
@@ -64,6 +65,12 @@ export function IntegrationsSection() {
         <p className="mt-8 text-center text-sm text-slate-500 reveal">
           Plus REST API, webhooks, and a connector SDK for any custom source.
         </p>
+
+        <div className="mt-6 text-center reveal">
+          <Link to="/integrations" className="btn-cta-secondary">
+            Browse all integrations →
+          </Link>
+        </div>
       </div>
     </section>
   )

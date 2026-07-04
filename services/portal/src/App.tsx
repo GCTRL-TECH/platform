@@ -15,6 +15,7 @@ import { AdminPage } from '@/pages/AdminPage'
 // out of the main (landing) bundle.
 const DocsPage = lazy(() => import('@/pages/docs/DocsPage').then((m) => ({ default: m.DocsPage })))
 const UseCasesPage = lazy(() => import('@/pages/UseCasesPage').then((m) => ({ default: m.UseCasesPage })))
+const IntegrationsPage = lazy(() => import('@/pages/IntegrationsPage').then((m) => ({ default: m.IntegrationsPage })))
 const PricingPage = lazy(() => import('@/pages/PricingPage').then((m) => ({ default: m.PricingPage })))
 const ImprintPage = lazy(() => import('@/pages/legal/LegalPages').then((m) => ({ default: m.ImprintPage })))
 const PrivacyPolicyPage = lazy(() => import('@/pages/legal/LegalPages').then((m) => ({ default: m.PrivacyPolicyPage })))
@@ -83,6 +84,7 @@ export function App() {
       <Route path="/docs" element={<DocsPage />} />
       <Route path="/docs/:slug" element={<DocsPage />} />
       <Route path="/use-cases" element={<UseCasesPage />} />
+      <Route path="/integrations" element={<IntegrationsPage />} />
       <Route path="/pricing" element={<PricingPage />} />
       <Route path="/imprint" element={<ImprintPage />} />
       <Route path="/privacy" element={<PrivacyPolicyPage />} />

@@ -32,41 +32,11 @@ Activation is hardware-bound and unlocks the tuned entity-resolution profile for
 
 → Detail: [Activation & Setup](activation.md).
 
-## 4. Create a full-access token for your agent
+## 4. Test ingestion and check the knowledge graph
 
-To let an AI agent operate GCTRL:
-
-1. Go to **Settings → Agent** and click **Generate full-access token**. Copy it — it's shown only once.
-2. **Remote agents:** the MCP-over-HTTP gateway is **off by default**. Enable it for your deployment, and make sure the **API port (`:4000`) is reachable** from where your agent runs (forward/expose the port, or run the agent on the same host).
-
-You can scope tokens per knowledge base or clearance level later in **Access Control**.
-
-→ Detail: [Access Control](access-control.md) · [Agents & MCP](agents-mcp.md).
-
-## 5. Connect your agent (MCP)
-
-Drop the GCTRL MCP server into **Claude Code, Codex, Cursor, Claude Desktop** — anywhere that speaks MCP — using your token. For the HTTP gateway:
-
-```jsonc
-{
-  "mcpServers": {
-    "gctrl": {
-      "type": "http",
-      "url": "http://localhost:4000/api/agent/mcp",
-      "headers": { "Authorization": "ApiKey YOUR_TOKEN" }
-    }
-  }
-}
-```
-
-(A local stdio variant for desktop/IDE agents is in [Agents & MCP](agents-mcp.md).) Your agent now has durable, access-controlled, audited memory — GCTRL becomes a memory node in your agent team.
-
-## 6. Test ingestion and check the knowledge graph
-
-Prove the loop end to end. Pick whichever path you like:
+Prove the loop end to end before wiring up an agent. Pick whichever path you like:
 
 - **In the UI:** use **Upload / Import** to drop a **PDF** (or paste text). KEX extracts entities and relations; open the **Visual Explorer** or **Wiki** to see the graph, then ask questions in **Talk-to-Graph**.
-- **From your agent:** *"Ingest this PDF and show me the knowledge graph."* — the agent runs the same tools and reports back.
 - **From the API:**
 
 ```bash
@@ -76,6 +46,34 @@ curl -X POST http://localhost:4000/kex/extract \
 ```
 
 You'll see entities (Ada Lovelace, Charles Babbage, Analytical Engine) and their relations land in the graph — grounded, traceable, and local.
+
+## 5. Connect your agent
+
+The last step, and the point of the whole exercise: give an AI agent durable, access-controlled memory instead of a blank context window every session.
+
+1. Go to **Settings → Agent** and click **Generate full-access token**. Copy it — it's shown only once. Scope tighter tokens per knowledge base or clearance level in **Access Control**.
+2. Pick a connection method:
+   - **MCP clients** (Claude Code, Codex, Cursor, Claude Desktop, and anywhere else that speaks MCP) — drop this into the client's MCP config:
+
+     ```jsonc
+     {
+       "mcpServers": {
+         "gctrl": {
+           "type": "http",
+           "url": "http://localhost:4000/api/agent/mcp",
+           "headers": { "Authorization": "ApiKey YOUR_TOKEN" }
+         }
+       }
+     }
+     ```
+
+     (A local stdio variant for desktop/IDE agents is in [Agents & MCP](agents-mcp.md).) Remote agents need the MCP-over-HTTP gateway enabled (**Settings → Agent** — off by default) and the API port (`:4000`) reachable from where the agent runs.
+   - **Any other agent framework** (LangChain, LlamaIndex, a custom harness) — drop in `GET /api/agent/skill.md` as the agent's system instructions and call tools directly at `POST /api/agent/tools/<tool>` with the same `Authorization: ApiKey` header. No MCP client required.
+3. Ask your agent: *"Ingest this PDF and show me the knowledge graph."* Agents can call `ingest_file` directly, so they don't need the UI upload step at all.
+
+Your agent now has durable, access-controlled, audited memory — GCTRL becomes a memory node in your agent team.
+
+→ Detail: [Access Control](access-control.md) · [Agents & MCP](agents-mcp.md) · [Integrations](integrations.md).
 
 ## You're operational
 
