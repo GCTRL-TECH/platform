@@ -52,3 +52,32 @@ export function isValidChatSelection(model: string | null | undefined, models: L
   if (!model || isEmbeddingModel(model)) return false
   return models.some((m) => m.model === model && m.available)
 }
+
+// ── Cookbook sync helpers ────────────────────────────────────────────────────
+//
+// The Agent page / Talk-to-Graph keep their own per-device localStorage model
+// selection (`gctrl.agent.llmModel`, `gctrl.rag.model`) so those widgets don't
+// snap back to a default on reload. When the Cookbook applies a new agent/rag
+// model server-side (PUT /llm/model-prefs), it must also sync these keys —
+// otherwise the client picker would keep sending its stale localStorage model
+// on the next chat request, which wins over the server pref in the resolution
+// chain (see services/llm.rs `resolve_purpose_model`).
+
+const LS_AGENT_MODEL = 'gctrl.agent.llmModel'
+const LS_RAG_MODEL = 'gctrl.rag.model'
+
+export function setAgentModelLocal(model: string): void {
+  try {
+    localStorage.setItem(LS_AGENT_MODEL, model)
+  } catch {
+    /* ignore — private mode / storage disabled */
+  }
+}
+
+export function setRagModelLocal(model: string): void {
+  try {
+    localStorage.setItem(LS_RAG_MODEL, model)
+  } catch {
+    /* ignore — private mode / storage disabled */
+  }
+}

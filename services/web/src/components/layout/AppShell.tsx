@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
 import { Header } from './Header'
 import { LicenseBanner } from '@/components/LicenseBanner'
+import { GuardrailBanner } from './GuardrailBanner'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 
@@ -29,6 +30,7 @@ export function AppShell({ children }: AppShellProps) {
       <Sidebar collapsed={immersive} />
       <div className={`flex flex-1 flex-col overflow-hidden transition-all duration-300 ${immersive ? 'ml-16' : 'ml-64'}`}>
         <LicenseBanner />
+        <GuardrailBanner />
         {!immersive && <Header title={title} />}
         <main className={`flex-1 overflow-hidden ${immersive ? '' : 'overflow-y-auto p-6 animate-fade-in'}`}>
           {children}

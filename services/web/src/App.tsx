@@ -24,6 +24,7 @@ import { TalkToGraphPage } from '@/pages/rag/TalkToGraphPage'
 import { WikiPage } from '@/pages/wiki/WikiPage'
 import { AgentPage } from '@/pages/agent/AgentPage'
 import { SettingsPage } from '@/pages/settings/SettingsPage'
+import { CookbookPage } from '@/pages/cookbook/CookbookPage'
 import TokenDashboard from '@/pages/billing/TokenDashboard'
 import AdminPanel from '@/pages/admin/AdminPanel'
 import TriggersPage from '@/pages/triggers/TriggersPage'
@@ -235,6 +236,7 @@ export function App() {
             <Route path="/chat" element={<TalkToGraphPage />} />
             <Route path="/agent" element={<AgentPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/cookbook" element={<CookbookPage />} />
             <Route path="/billing" element={<TokenDashboard />} />
             <Route path="/admin" element={<AdminPanel />} />
             <Route path="/triggers" element={<TriggersPage />} />

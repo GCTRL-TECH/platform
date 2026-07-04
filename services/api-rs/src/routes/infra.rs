@@ -199,6 +199,77 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/recommend", get(get_recommend))
         // ── Embedding reindex (SSE, admin-only, double-opt-in) ───────────────
         .route("/reindex", post(reindex))
+        // ── Runtime guardrail (Cookbook banner) ──────────────────────────────
+        .route("/guardrail", get(get_guardrail))
+        .route("/guardrail/events/:id/dismiss", post(dismiss_guardrail_event))
+}
+
+// ── GET /api/infra/guardrail ─────────────────────────────────────────────────
+
+/// `GET /api/infra/guardrail` — any authenticated user. Returns the guardrail's
+/// current failure-tracking state plus every undismissed event (runtime
+/// reverts, degraded-job notices), newest first. Drives the amber
+/// `GuardrailBanner` in the app shell.
+async fn get_guardrail(
+    Extension(_claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    let state_row: Option<(i32, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<chrono::DateTime<chrono::Utc>>, Option<Value>)> =
+        sqlx::query_as(
+            "SELECT consecutive_failures, last_probe_at, last_error, reverted_at, reverted_from
+             FROM guardrail_state WHERE id = 1",
+        )
+        .fetch_optional(&state.db)
+        .await?;
+
+    let (consecutive_failures, last_probe_at, last_error, reverted_at, reverted_from) =
+        state_row.unwrap_or((0, None, None, None, None));
+
+    #[derive(sqlx::FromRow)]
+    struct EventRow {
+        id: uuid::Uuid,
+        created_at: chrono::DateTime<chrono::Utc>,
+        kind: String,
+        detail: Value,
+    }
+    let events: Vec<EventRow> = sqlx::query_as(
+        "SELECT id, created_at, kind, detail FROM guardrail_events
+          WHERE dismissed = false ORDER BY created_at DESC LIMIT 20",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "state": {
+            "consecutiveFailures": consecutive_failures,
+            "lastProbeAt": last_probe_at.map(|t| t.to_rfc3339()),
+            "lastError": last_error,
+            "revertedAt": reverted_at.map(|t| t.to_rfc3339()),
+            "revertedFrom": reverted_from,
+        },
+        "events": events.into_iter().map(|e| json!({
+            "id": e.id,
+            "createdAt": e.created_at.to_rfc3339(),
+            "kind": e.kind,
+            "detail": e.detail,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+// ── POST /api/infra/guardrail/events/:id/dismiss ─────────────────────────────
+
+/// Dismiss a guardrail event (any authenticated user) — hides it from the
+/// banner. Purely a UI-acknowledgement flag; never affects guardrail logic.
+async fn dismiss_guardrail_event(
+    Extension(_claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<Value>> {
+    sqlx::query("UPDATE guardrail_events SET dismissed = true WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ── Hardware struct ───────────────────────────────────────────────────────────

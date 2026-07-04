@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { Zap, Network, ArrowRight, Clock, Compass, type LucideIcon } from 'lucide-react'
+import { Zap, Network, ArrowRight, Clock, Compass, ChefHat, type LucideIcon } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
@@ -136,6 +136,14 @@ export function DashboardPage() {
         >
           <Compass size={14} />
           Setup guide
+        </button>
+        <button
+          onClick={() => navigate('/cookbook')}
+          className="btn-secondary"
+          title="Hardware-aware model tuning"
+        >
+          <ChefHat size={14} />
+          Cookbook
         </button>
       </div>
 

@@ -532,9 +532,20 @@ async fn query(
     let requested_provider = req.llm_config.as_ref().and_then(|c| c["provider"].as_str());
     let requested_model = req.llm_config.as_ref().and_then(|c| c["model"].as_str());
     let target = match &claims {
-        Some(c) => crate::services::llm::resolve_for_user(
-            &state.db, c.sub, requested_provider, requested_model,
-        ).await,
+        Some(c) => {
+            // Resolution order: explicit llmConfig.model → the user's Cookbook
+            // "rag" purpose pref → resolve_for_user's existing chain (active
+            // provider's default_model → global runtime → Ollama default).
+            let purpose_model = if requested_model.is_none() {
+                crate::services::llm::resolve_purpose_model(&state.db, c.sub, "rag").await
+            } else {
+                None
+            };
+            let effective_model = requested_model.map(str::to_string).or(purpose_model);
+            crate::services::llm::resolve_for_user(
+                &state.db, c.sub, requested_provider, effective_model.as_deref(),
+            ).await
+        }
         None => crate::services::llm::LlmTarget {
             provider: "ollama".into(),
             model: requested_model.unwrap_or("qwen2.5:7b").to_string(),
@@ -1165,7 +1176,15 @@ async fn deep_query(
     // active provider, else local Ollama).
     let requested_provider = req.llm_config.as_ref().and_then(|c| c["provider"].as_str());
     let requested_model = req.llm_config.as_ref().and_then(|c| c["model"].as_str());
-    let target = llm::resolve_for_user(&state.db, claims.sub, requested_provider, requested_model).await;
+    // Resolution order: explicit llmConfig.model → the user's Cookbook "rag"
+    // purpose pref → resolve_for_user's existing chain.
+    let purpose_model = if requested_model.is_none() {
+        llm::resolve_purpose_model(&state.db, claims.sub, "rag").await
+    } else {
+        None
+    };
+    let effective_model = requested_model.map(str::to_string).or(purpose_model);
+    let target = llm::resolve_for_user(&state.db, claims.sub, requested_provider, effective_model.as_deref()).await;
 
     // WORKING MEMORY: contextualize the question against the running conversation so
     // dossier/entity resolution (and the agent's own framing) follow a follow-up's

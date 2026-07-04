@@ -1636,13 +1636,20 @@ async fn chat(
     }
 
     // Resolve the per-user LLM target (provider/model/base_url/decrypted key).
-    // Honours the request's llmProvider/llmModel; falls back to the user's active
-    // provider, else local Ollama. Decryption happens inside resolve_for_user.
+    // Honours the request's llmProvider/llmModel; else the user's Cookbook
+    // "agent" purpose pref; else the user's active provider, else local Ollama.
+    // Decryption happens inside resolve_for_user.
+    let purpose_model = if req.llm_model.is_none() {
+        crate::services::llm::resolve_purpose_model(&state.db, claims.sub, "agent").await
+    } else {
+        None
+    };
+    let effective_model = req.llm_model.clone().or(purpose_model);
     let target = crate::services::llm::resolve_for_user(
         &state.db,
         claims.sub,
         req.llm_provider.as_deref(),
-        req.llm_model.as_deref(),
+        effective_model.as_deref(),
     )
     .await;
 

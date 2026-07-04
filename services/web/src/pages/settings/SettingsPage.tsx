@@ -711,6 +711,7 @@ function ModelChooser() {
 // ─── Tab: AI Models ───────────────────────────────────────────────────────────
 
 function ModelsTab() {
+  const navigate = useNavigate()
   const [providers, setProviders] = useState<LlmProviderState[]>([])
   const [ollamaBase, setOllamaBase] = useState('')
   const [ollamaKey, setOllamaKey] = useState('')
@@ -876,7 +877,15 @@ function ModelsTab() {
       </section>
 
       <section>
-        <SectionHeader>Pipeline models (out-of-the-box)</SectionHeader>
+        <div className="mb-1 flex items-center justify-between">
+          <SectionHeader>Pipeline models (out-of-the-box)</SectionHeader>
+          <button
+            onClick={() => navigate('/cookbook')}
+            className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300"
+          >
+            Open the Cookbook for hardware-aware recommendations →
+          </button>
+        </div>
         <p className="mb-4 -mt-2 text-xs text-slate-500">
           Choose the models KEX and FUSE use for embedding, relation extraction, and wiki
           distillation. Recommended defaults run locally on your Ollama for speed and GDPR
