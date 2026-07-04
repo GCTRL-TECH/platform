@@ -35,6 +35,21 @@ Noisy e-commerce product matching — a deliberately hard benchmark (messy title
 
 ---
 
+## Entity Detection (NER)
+
+Detection-recall — did GCTRL find the entity at all, independent of getting its type exactly right — measured against a hand-adjudicated gold set.
+
+| Metric | Value | Setup |
+|--------|------:|-------|
+| **Detection-recall** | **0.978** | Bilingual (DE/EN) 32-document business-document gold set, zero-shot GLiNER + format pre-pass |
+| Typing accuracy | 0.95 | Same gold set, entities the pipeline actually detected |
+
+**Setup:** 32 adjudicated business documents, German and English, scored against GCTRL's faithful NER output (`entity_mentions`) — not the post-fusion canonical graph. Zero-shot: no per-customer or per-domain training. For context, frontier cloud LLMs score **~0.85 recall** on comparable public NER benchmarks (per the GLiNER2 EMNLP 2025 comparison and CrossNER).
+
+**Honest methodology note:** 32 documents is a lean gold set — treat this as a directional result, not a large-sample guarantee. Detection-recall is scored as the primary NER gate because a missed entity can never be recovered downstream (typing and relation extraction only operate on what NER detected); typing accuracy is the secondary metric, scored only on entities that were actually found.
+
+---
+
 ## Retrieval Latency (Agent Memory Access)
 
 How fast an agent can read from GCTRL's memory.
@@ -89,6 +104,7 @@ See **FAQ / Troubleshooting** for how to point GCTRL at your own vector store vi
 |------|--------|---------|
 | DBLP-ACM EL | F1 **0.97**, zero training | vs published supervised SOTA ≈ 0.985–0.989 |
 | Abt-Buy EL | F1 **0.866**, zero training, local | vs published baseline ≈ 0.48, DeepMatcher ≈ 0.628, Ditto ≈ 0.891 |
+| Entity detection (NER) | detection-recall **0.978**, typing 0.95, zero-shot | vs ~0.85 recall for frontier cloud LLMs on comparable public NER benchmarks |
 | Retrieval latency | p50 **7–27 ms**, p95 **< 50 ms** | graph ~7 ms, vector ~44 ms |
 | Access-control overhead | **~0.1 ms** p50 | compliance is effectively free |
 | Matching throughput | **~2,750 entities/sec** candidates | sub-quadratic ~O(n^1.5) |
