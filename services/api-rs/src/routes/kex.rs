@@ -95,10 +95,26 @@ async fn extract(
 
     let (ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, req.ontology_id).await;
 
+    // P2b: resolve a stable document identity for (user, path). Re-ingesting
+    // the SAME text just bumps last_ingested_at; CHANGED text creates a new
+    // version in the chain. `path` falls back to a short text preview when
+    // the caller gave no sourceRef (direct API text ingest has no path/mtime
+    // to offer, so modified_at is left unknown — first_ingested_at stands in).
+    let source_path = req.source_ref.clone().unwrap_or_else(|| {
+        let preview: String = req.text.chars().take(60).collect();
+        format!("text:{preview}")
+    });
+    let content_hash = crate::services::source_docs::hash_content(req.text.as_bytes());
+    let source_doc = crate::services::source_docs::resolve_source_document(
+        &state.db, claims.sub, None, &source_path, req.source_ref.as_deref(),
+        &content_hash, None,
+    ).await.ok();
+    let source_document_id = source_doc.as_ref().map(|d| d.id);
+
     let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({
@@ -110,6 +126,7 @@ async fn extract(
         "sourceRef": req.source_ref,
     }))
     .bind(req.classification_level_id)
+    .bind(source_document_id)
     .execute(&state.db).await?;
 
     // Record the spend locally so the heartbeat task can ship it upstream.
@@ -134,6 +151,10 @@ async fn extract(
         "ontology_id": ontology_id,
         "classification": classification_name,
         "classification_level_id": req.classification_level_id,
+        "source_document_id": source_document_id,
+        "source_path": source_path,
+        // No source-side mtime for direct text ingest.
+        "source_modified_at": Value::Null,
     });
     crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
@@ -314,13 +335,24 @@ async fn upload(
 
     let (resolved_ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, ontology_id).await;
 
+    // P2b: identity keyed on (user, path). Direct multipart upload has no
+    // folder path — `path` is the file name, and there is no source-side
+    // mtime (browser doesn't send one), so modified_at is left unknown.
+    let content_hash = crate::services::source_docs::hash_content(&bytes);
+    let source_doc = crate::services::source_docs::resolve_source_document(
+        &state.db, claims.sub, None, &file_name, Some(&file_name),
+        &content_hash, None,
+    ).await.ok();
+    let source_document_id = source_doc.as_ref().map(|d| d.id);
+
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_upload', 'pending', $3, $4)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+         VALUES ($1, $2, 'kex_upload', 'pending', $3, $4, $5)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({ "fileName": file_name, "ontologyId": resolved_ontology_id }))
     .bind(classification_level_id)
+    .bind(source_document_id)
     .execute(&state.db).await?;
 
     record_usage(&state.db, claims.sub, "kex_upload", 5, Some(job_id)).await;
@@ -350,6 +382,9 @@ async fn upload(
         "ontology_id": resolved_ontology_id,
         "classification": classification_name,
         "classification_level_id": classification_level_id,
+        "source_document_id": source_document_id,
+        "source_path": file_name,
+        "source_modified_at": Value::Null,
     });
     crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await

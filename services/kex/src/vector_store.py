@@ -227,7 +227,8 @@ class VectorStore:
         Row tuple: (id, job_id, compilation_id, user_id, content,
                     start_char, end_char, chunk_sequence,
                     qdrant_point_id, entity_mentions,
-                    classification_level_id, min_rank, class_labels)
+                    classification_level_id, min_rank, class_labels,
+                    source_document_id, entity_uris)
         Returns count inserted.
         """
         if not rows:
@@ -241,7 +242,8 @@ class VectorStore:
                 id, job_id, compilation_id, user_id,
                 content, start_char, end_char, chunk_sequence,
                 qdrant_point_id, entity_mentions,
-                classification_level_id, min_rank, class_labels
+                classification_level_id, min_rank, class_labels,
+                source_document_id, entity_uris
             ) VALUES %s
             ON CONFLICT (id) DO NOTHING
         """
@@ -332,6 +334,19 @@ class VectorStore:
         # Generate one UUID per chunk — shared between Qdrant and PostgreSQL
         point_ids = [str(uuid_lib.uuid4()) for _ in chunks]
 
+        # P2a — grounded nodes: per-chunk list of entity uris (deduped, pruned
+        # mentions excluded) — the column/payload key a grounding lookup filters
+        # on (`entity_uris @> ARRAY[uri]`). Computed once, shared by the Qdrant
+        # payload below and the PostgreSQL row.
+        entity_uris_per_chunk = []
+        for mentions in entity_mentions:
+            chunk_uris = []
+            for e in mentions:
+                uri = e.get("uri")
+                if uri and not e.get("pruned") and uri not in chunk_uris:
+                    chunk_uris.append(uri)
+            entity_uris_per_chunk.append(chunk_uris)
+
         # Build Qdrant points (only for chunks with valid embeddings)
         qdrant_points: list[PointStruct] = []
         for i, (chunk, vector, pid) in enumerate(zip(chunks, embeddings, point_ids)):
@@ -340,11 +355,16 @@ class VectorStore:
             # Build entity_mentions payload for the Qdrant point
             mentions_payload = []
             for e in entity_mentions[i]:
-                mentions_payload.append({
+                mp = {
                     "name": e.get("text", e.get("name", "")),
                     "type": e.get("type", ""),
                     "label": e.get("label", ""),
-                })
+                }
+                if e.get("uri"):
+                    mp["uri"] = e["uri"]
+                if e.get("pruned"):
+                    mp["pruned"] = True
+                mentions_payload.append(mp)
 
             payload = {
                 "text": chunk["content"],  # full text for RAG retrieval
@@ -362,6 +382,7 @@ class VectorStore:
                 "end_char": chunk["end_char"],
                 "entity_mentions": mentions_payload,
                 "entity_count": len(entity_mentions[i]),
+                "entity_uris": entity_uris_per_chunk[i],     # P2a — grounded nodes
                 "min_rank": cls_rank,                       # vector-search clearance pre-filter
                 "classification_level_id": cls_level_id,
             }
@@ -381,14 +402,18 @@ class VectorStore:
             # Normalize entity mentions to {name,type,label} so the api-rs queries
             # (`entity_mentions @> [{"name":…}]`, chunkCount) match — raw NER dicts
             # use "text" not "name", which silently broke structured chunk lookup.
-            norm_mentions = [
-                {
+            norm_mentions = []
+            for e in entity_mentions[i]:
+                nm = {
                     "name": e.get("text", e.get("name", "")),
                     "type": e.get("type", ""),
                     "label": e.get("label", ""),
                 }
-                for e in entity_mentions[i]
-            ]
+                if e.get("uri"):
+                    nm["uri"] = e["uri"]
+                if e.get("pruned"):
+                    nm["pruned"] = True
+                norm_mentions.append(nm)
             mentions_json = json.dumps(norm_mentions) if norm_mentions else None
             # Coerce id-typed columns to valid UUIDs so a non-UUID job_id /
             # compilation_id / user_id can never abort the insert batch (the bug
@@ -407,6 +432,8 @@ class VectorStore:
                 _as_uuid(cls_level_id),         # classification_level_id (nullable UUID)
                 cls_rank,                       # min_rank
                 cls_labels_json,                # class_labels (JSON string)
+                _as_uuid(source_document_id),   # source_document_id (nullable UUID, P2b)
+                entity_uris_per_chunk[i],       # entity_uris (TEXT[], P2a)
             ))
 
         pg_stored = self._insert_chunks_pg(pg_rows)

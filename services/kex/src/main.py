@@ -20,7 +20,7 @@ from typing import Optional
 
 import redis as redis_lib
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
@@ -34,7 +34,7 @@ from .chunking import get_chunker
 from .classification import resolve_classification
 from .code_parser import parse_python_repo
 from .embedding import get_embedding_client, build_embedding_client
-from .kg_builder import get_kg_builder
+from .kg_builder import get_kg_builder, entity_uri
 from .middleware.license_check import check_credits, report_usage
 from .ner import get_ner_pipeline
 from .pii_detector import detect_pii, redact_pii
@@ -44,6 +44,7 @@ from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
 from .sources.obsidian_handler import fetch_note
+from .timeutil import iso_to_ms
 from .vector_store import get_vector_store
 from .reindex_worker import drain_reindex_queue
 
@@ -136,6 +137,8 @@ def run_pipeline(
     classification_level_id: str | None = None,
     classification_name: str | None = None,
     origin: str | None = None,
+    source_document_id: str | None = None,
+    source_modified_at: str | None = None,
     ollama_base: str | None = None,
     embedding_base_url: str | None = None,
     embedding_provider: str | None = None,
@@ -151,6 +154,13 @@ def run_pipeline(
 
     `classification_*` carry the ISO 27001 level chosen at ingest; every graph
     element and chunk is tagged with it for per-element access control.
+
+    `source_document_id` / `source_modified_at` (P2b) are the stable document
+    identity + source-side modified time resolved by the API from (user, path).
+    They are threaded into every relation edge (`_source_doc`,
+    `_source_doc_modified_at`) and every stored chunk (`source_document_id`) so
+    a later phase can rank fact authority by source recency. Both are optional
+    and default to None — absent fields behave exactly as before this feature.
 
     `ollama_base` / `embedding_base_url` / `embedding_provider` are optional
     per-job overrides for the LLM + embedding endpoints (the owner's runtime
@@ -192,18 +202,25 @@ def run_pipeline(
     # complete the extraction as a successful-but-degraded result (no relations),
     # surfacing a concise human-readable warning the dashboard can show.
     warnings: list[str] = []
+    extraction_report = None
     relex = get_extractor()
     try:
         # Use generation_base for the generation step when provided;
         # otherwise fall through to ollama_base (default install unchanged).
         relex_base = generation_base if generation_base else ollama_base
-        relations = relex.extract_relations(
+        relex_result = relex.extract_relations(
             text, entities,
             ollama_base=relex_base,
             model=relex_model,
             kind=generation_kind,
             api_key=generation_api_key,
         )
+        # extract_relations returns (relations, report) tuple.
+        if isinstance(relex_result, tuple) and len(relex_result) == 2:
+            relations, extraction_report = relex_result
+        else:
+            # Defensive: older cached singleton or unexpected shape.
+            relations = relex_result if isinstance(relex_result, list) else []
         if getattr(relex, "last_degraded", False) and relex.last_degraded_reason:
             warnings.append(relex.last_degraded_reason)
             logger.warning(f"[{job_id}] RelEx degraded: {relex.last_degraded_reason}")
@@ -223,12 +240,35 @@ def run_pipeline(
     if not origin:
         preview = " ".join(text[:120].split())
         origin = (preview + "…") if len(text) > 120 else preview
+    source_modified_at_ms = iso_to_ms(source_modified_at)
     kg = get_kg_builder()
     stats = kg.build_graph(
         job_id, user_id, entities, relations,
         classification=classification, origin=origin,
+        source_document_id=source_document_id,
+        source_modified_at_ms=source_modified_at_ms,
     )
     logger.info(f"[{job_id}] KG: {stats}")
+
+    # 3b. Annotate each entity mention with its graph URI (P2a — grounded nodes).
+    # Recomputes via the SAME pure fn kg_builder used to write the node, so a
+    # mention's uri always matches the node actually in Neo4j. Entities pruned
+    # from the graph (GRAPH_PRUNE_ISOLATED — isolated non-core concepts) get no
+    # uri here; they're marked `pruned` instead so a grounding lookup never
+    # points at a node that doesn't exist. Additive-only: existing readers of
+    # `entities`/`entity_mentions` that don't know about `uri`/`pruned` are
+    # unaffected.
+    graph_uris = set(stats.get("graph_uris") or [])
+    for mention in entities:
+        mention_name = (mention.get("text") or "").strip()
+        if not mention_name:
+            continue
+        mention_type = mention.get("type") or mention.get("coarse_type") or "other"
+        mention_uri = entity_uri(user_id, mention_type, mention_name)
+        if mention_uri in graph_uris:
+            mention["uri"] = mention_uri
+        else:
+            mention["pruned"] = True
 
     # 4. Chunk text for vector store
     logger.info(f"[{job_id}] Chunker: starting on {len(text)} chars")
@@ -276,6 +316,7 @@ def run_pipeline(
             user_id,
             compilation_id=None,  # set later by API result handler
             entity_mentions=chunk_entities,
+            source_document_id=source_document_id,
             classification=classification,
         )
         logger.info(f"[{job_id}] Vector store: {chunks_stored} chunks stored")
@@ -305,6 +346,8 @@ def run_pipeline(
         },
         "pii_findings": pii_findings,
     }
+    if extraction_report is not None:
+        result["extraction_report"] = extraction_report
     if degraded:
         result["degraded"] = True
         result["warning"] = warning_msg
@@ -384,6 +427,13 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             generation_kind = payload.get("generation_kind") or "ollama"
             generation_api_key = payload.get("generation_api_key")
             generation_base = payload.get("generation_base")
+            # P2b document identity, resolved by the API from (user, path):
+            # the source_documents row id + the full source path + the
+            # source-side modified time (when known). All optional — absent
+            # (older jobs / direct KEX callers) behaves exactly as before.
+            source_document_id = payload.get("source_document_id")
+            source_path = payload.get("source_path")
+            source_modified_at = payload.get("source_modified_at")
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
@@ -458,6 +508,12 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
+            # P2b: prefer the FULL source path (resolved server-side by the
+            # API) over the bare file/note name each job_type branch set
+            # above — origin should cite the whole path, not just the name.
+            if source_path:
+                origin = source_path
+
             # A crawl (or any source) that found nothing extractable completes as
             # a clear, successful "no content" result — NOT a hard failure.
             if job_type in ("crawl", "url_crawl") and (not text or not text.strip()):
@@ -483,6 +539,8 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 classification_level_id=classification_level_id,
                 classification_name=classification_name,
                 origin=origin,
+                source_document_id=source_document_id,
+                source_modified_at=source_modified_at,
                 ollama_base=ollama_base,
                 embedding_base_url=embedding_base_url,
                 embedding_provider=embedding_provider,
@@ -1484,7 +1542,15 @@ def _rrf_fuse(channels: list[list[dict]], limit: int, k: int = 60) -> list[dict]
 
 
 @app.post("/search")
-async def search_endpoint(req: SearchReq):
+async def search_endpoint(req: SearchReq, request: Request):
+    # Internal trust boundary: /search takes a caller-supplied user_id + max_rank and
+    # has no user auth of its own, so when INTERNAL_API_SECRET is set it MUST be
+    # presented (the api-rs layer sends it). This closes the hole where a host-local
+    # process could hit the raw worker port with user_id=<victim>&max_rank=MAX. Grace:
+    # when the secret is unset (existing installs) the check is skipped.
+    _secret = os.environ.get("INTERNAL_API_SECRET", "").strip()
+    if _secret and request.headers.get("x-internal-secret", "") != _secret:
+        raise HTTPException(status_code=403, detail={"error": "forbidden: internal endpoint"})
     """
     HYBRID retrieval over stored chunks: dense (Qdrant vector) ∪ lexical
     (Postgres BM25-style full-text + exact-substring), fused by reciprocal-rank

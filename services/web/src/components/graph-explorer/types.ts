@@ -64,6 +64,17 @@ export type ViewMode = '2d' | '3d'
 export type ColorBy = 'type' | 'wikidata' | 'source'
 export type SizeBy = 'degree' | 'uniform'
 
+// A precise, entity-uri-grounded source chunk (P2a — grounded nodes). Unlike
+// the broad name/ILIKE-matched `ChunkRecord` list below, each of these is
+// guaranteed to actually mention this specific graph node (not just its name).
+export interface GroundingChunk {
+  id: string
+  snippet: string
+  sourceDocumentId?: string | null
+  jobId?: string | null
+  createdAt?: string | null
+}
+
 // Endpoint B response: GET /kg/compilations/:id/entity/:name
 export interface EntityDetail {
   id: string
@@ -80,6 +91,7 @@ export interface EntityDetail {
     source?: string
     createdAt?: string
   } | null
+  groundingChunks?: GroundingChunk[]
 }
 
 export interface EntityDetailResponse {

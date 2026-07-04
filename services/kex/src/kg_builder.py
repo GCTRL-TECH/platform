@@ -32,6 +32,17 @@ def _make_uri(name: str, entity_type: str, user_id: str = "") -> str:
     return f"databorg:{entity_type}/{slug}"
 
 
+def entity_uri(user_id: str, coarse_type: str, name: str) -> str:
+    """Public, pure wrapper around the internal URI derivation (`_make_uri`).
+
+    Exists so callers OUTSIDE `build_graph` — main.py's per-mention annotation
+    step and the `backfill_mentions` script (P2a — grounded nodes) — can compute
+    the EXACT SAME uri kg_builder writes at graph-build time, without
+    duplicating the slug algorithm. Pure: no I/O, same inputs -> same uri.
+    """
+    return _make_uri(name, coarse_type, user_id)
+
+
 def _safe_rel_type(relation_type: str) -> str:
     """
     Convert an arbitrary relation label to a valid Neo4j relationship type.
@@ -83,6 +94,8 @@ class KGBuilder:
         relations: list[dict],
         classification: Optional[dict] = None,
         origin: Optional[str] = None,
+        source_document_id: Optional[str] = None,
+        source_modified_at_ms: Optional[int] = None,
     ) -> dict:
         """
         Write entities and relations to Neo4j.
@@ -107,8 +120,18 @@ class KGBuilder:
         name, note path, or a short text preview) recorded on every node so a
         dossier can cite where a fact came from.
 
+        `source_document_id` / `source_modified_at_ms` (P2b) are the stable
+        source_documents identity + the source-side modified time (epoch ms,
+        same unit as `asserted_at`), recorded on every relation edge as
+        `_source_doc` / `_source_doc_modified_at` so a later phase can rank
+        fact authority by source recency. Both optional; absent behaves
+        exactly as before this feature existed.
+
         Returns:
-          { entities_created, relations_created, nodes_total }
+          { entities_created, relations_created, nodes_total, graph_uris }
+          `graph_uris` (P2a) is every entity uri actually written to the graph by
+          THIS call (post-pruning) — the set main.py checks each mention's uri
+          against to decide "grounded" vs "pruned".
         """
         if not self._driver:
             self.connect()
@@ -175,13 +198,36 @@ class KGBuilder:
             relations_created = session.execute_write(
                 self._write_relations, job_id, relations,
                 label_json, rank, level_name, corrected, name_to_uri,
+                source_document_id, source_modified_at_ms,
             )
             nodes_total = session.execute_read(self._count_nodes)
+
+        # P3 — fact-conflict detection (write-time). The relation MERGE above
+        # dedups by the FULL triple, so a conflicting fact (same head+rel,
+        # different tail) lands as a SEPARATE sibling edge — detect those for
+        # the functional relations registered in relation_registry and rank
+        # them by recency authority. Failure-safe by contract: any error here
+        # logs and NEVER fails the extraction job (detect_for_job catches
+        # everything; the belt-and-braces try covers session creation too).
+        try:
+            from . import conflicts as _conflicts
+            with self._driver.session() as session:
+                found = _conflicts.detect_for_job(
+                    session, config.PG_URL, user_id, relations, name_to_uri,
+                )
+            if found:
+                logger.info(f"KGBuilder: {found} fact conflict(s) detected for job {job_id}")
+        except Exception as exc:  # noqa: BLE001 — never fail the job
+            logger.warning(f"KGBuilder: fact-conflict detection skipped: {exc}")
 
         return {
             "entities_created": entities_created,
             "relations_created": relations_created,
             "nodes_total": nodes_total,
+            # P2a — grounded nodes: every uri actually written to the graph THIS
+            # call (i.e. survived pruning). main.py intersects each mention's
+            # computed uri against this set to decide uri-vs-pruned per mention.
+            "graph_uris": sorted(set(name_to_uri.values())),
         }
 
     @staticmethod
@@ -312,6 +358,8 @@ class KGBuilder:
         level_name: str,
         corrected: Optional[set] = None,
         name_to_uri: Optional[dict] = None,
+        source_document_id: Optional[str] = None,
+        source_modified_at_ms: Optional[int] = None,
     ) -> int:
         """Create relationships between existing Entity nodes; return count created.
 
@@ -322,6 +370,9 @@ class KGBuilder:
           - extraction_method : 'EXTRACTED' (INFERRED/AMBIGUOUS reserved for later)
           - _source_job       : KEX job uuid that produced the edge
           - _source_chunk     : originating chunk id, when the extractor supplies it
+          - _source_doc       : source_documents uuid (P2b), when known
+          - _source_doc_modified_at : that source document's modified time (epoch
+                                ms, same unit as `asserted_at`), when known
         The MERGE stays idempotent (by head_uri, rel_type, tail_uri): re-extraction
         keeps the most-confident reading and never multiplies edges.
 
@@ -333,6 +384,12 @@ class KGBuilder:
         `{name}` cartesian-products over every same-named node, so one fact
         became N×M edges. Matching on the unique uri writes exactly one edge,
         and the MERGE makes re-ingesting the same fact idempotent.
+
+        `source_document_id` / `source_modified_at_ms` are recorded on every
+        edge written by THIS call (ON CREATE and ON MATCH, latest-wins
+        alongside `asserted_at`) — like `asserted_at`, they reflect whichever
+        job most recently asserted the edge, not the edge's original source.
+        Both optional; absent leaves the edge exactly as it was before P2b.
         """
         corrected = corrected or set()
         name_to_uri = name_to_uri or {}
@@ -408,7 +465,9 @@ class KGBuilder:
                     r._min_rank        = $rank,
                     r._class_conflict  = false,
                     r.created_at       = timestamp(),
-                    r.asserted_at      = timestamp()
+                    r.asserted_at      = timestamp(),
+                    r._source_doc      = $source_doc,
+                    r._source_doc_modified_at = $source_doc_modified_at
                 ON MATCH SET
                     r._source_job   = $job_id,
                     r._source_chunk = coalesce($source_chunk, r._source_chunk),
@@ -416,6 +475,11 @@ class KGBuilder:
                     // tell which competing fact about an entity was asserted most
                     // recently (latest-value-wins) — cheap, no LLM, no schema change.
                     r.asserted_at   = timestamp(),
+                    // P2b: latest-wins alongside asserted_at — reflects whichever
+                    // job most recently asserted the edge. Coalesce so a re-run
+                    // without document identity (older caller) never blanks it.
+                    r._source_doc      = coalesce($source_doc, r._source_doc),
+                    r._source_doc_modified_at = coalesce($source_doc_modified_at, r._source_doc_modified_at),
                     // Idempotent re-extraction: keep the most-confident reading,
                     // never multiply edges (MERGE already dedups by h,rel,t).
                     r.confidence    = CASE WHEN $confidence > coalesce(r.confidence, 0.0)
@@ -444,6 +508,8 @@ class KGBuilder:
                 level_name=level_name,
                 label_json=label_json,
                 rank=rank,
+                source_doc=source_document_id,
+                source_doc_modified_at=source_modified_at_ms,
             )
             summary = result.consume()
             created += summary.counters.relationships_created

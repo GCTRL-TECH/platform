@@ -20,6 +20,7 @@ import {
   Globe,
   Mic,
   Code2,
+  Copy,
   Search,
   Server,
   RefreshCw,
@@ -61,7 +62,7 @@ import { AdvancedEmbeddingModal } from './AdvancedEmbeddingModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'license' | 'models' | 'integrations' | 'skills' | 'agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso'
+type TabId = 'license' | 'models' | 'integrations' | 'skills' | 'agent' | 'connect-agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso'
 
 interface Tab {
   id: TabId
@@ -100,6 +101,7 @@ const TABS: Tab[] = [
   { id: 'models', label: 'AI Models', icon: Brain },
   { id: 'skills', label: 'Skills & Plugins', icon: Puzzle },
   { id: 'agent', label: 'Agent', icon: Bot },
+  { id: 'connect-agent', label: 'Connect an Agent', icon: Code2 },
   { id: 'integrations', label: 'Integrations', icon: Plug },
   { id: 'mcp', label: 'MCP Server', icon: Code2 },
   { id: 'n8n', label: 'n8n', icon: Plug },
@@ -905,6 +907,7 @@ interface ProviderConfig {
   redirectUri: string
   scopes: string[]
   configured: boolean
+  indexUnsupportedFiles?: boolean
 }
 
 function IntegrationsTab() {
@@ -1013,6 +1016,13 @@ function IntegrationsTab() {
       await api.delete(`/connectors/config/${providerId}`)
       await loadProviderConfigs()
     } catch { alert('Failed to remove') }
+  }
+
+  const handleToggleIndexing = async (providerId: string, enabled: boolean) => {
+    try {
+      await api.put(`/connectors/config/${providerId}/indexing`, { enabled })
+      await loadProviderConfigs()
+    } catch { alert('Failed to update file indexing setting') }
   }
 
   const handleAddSource = (sourceId: string) => {
@@ -1163,6 +1173,21 @@ function IntegrationsTab() {
                           />
                         </div>
                       </div>
+                      {/* File-asset indexing (Google Drive / SharePoint syncs) */}
+                      {(p.id === 'google' || p.id === 'microsoft') && (
+                        <label className="flex items-center gap-2 text-[10px] text-slate-400">
+                          <input
+                            type="checkbox"
+                            checked={p.cfg?.indexUnsupportedFiles ?? false}
+                            onChange={(e) => void handleToggleIndexing(p.id, e.target.checked)}
+                            className="h-3 w-3 accent-indigo-500"
+                          />
+                          <span>
+                            Index unsupported files (metadata only) — makes CAD drawings, images and
+                            archives findable by name/path via the agent, without extracting them.
+                          </span>
+                        </label>
+                      )}
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3 text-[10px] text-slate-500">
                           <span>
@@ -3861,6 +3886,311 @@ function LicenseTab() {
   )
 }
 
+// ─── Tab: Connect an Agent ────────────────────────────────────────────────────
+
+function ConnectAgentTab() {
+  const [copied, setCopied] = useState('')
+  const [gatewayEnabled, setGatewayEnabled] = useState<boolean | null>(null)
+
+  const origin = window.location.origin
+  const httpEndpoint = `${origin}/api/agent/mcp`
+  const apiBase = `${origin}/api`
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const { data } = await api.get('/agent/gateway/status')
+        setGatewayEnabled(!!data.enabled)
+      } catch { setGatewayEnabled(false) }
+    })()
+  }, [])
+
+  function copyText(text: string, id: string) {
+    void navigator.clipboard.writeText(text)
+    setCopied(id)
+    setTimeout(() => setCopied(''), 2000)
+  }
+
+  const httpConfig = JSON.stringify({
+    mcpServers: {
+      gctrl: {
+        type: 'http',
+        url: httpEndpoint,
+        headers: { Authorization: 'ApiKey <your-access-token>' },
+      },
+    },
+  }, null, 2)
+
+  const stdioConfig = JSON.stringify({
+    mcpServers: {
+      gctrl: {
+        command: 'node',
+        args: ['/path/to/borghive/services/mcp/dist/index.js'],
+        env: {
+          GCTRL_API_URL: apiBase,
+          GCTRL_API_TOKEN: '<your-access-token>',
+        },
+      },
+    },
+  }, null, 2)
+
+  const stdioGatewayConfig = JSON.stringify({
+    mcpServers: {
+      gctrl: {
+        command: 'node',
+        args: ['/path/to/borghive/services/mcp/dist/index.js'],
+        env: {
+          GCTRL_GATEWAY_URL: httpEndpoint,
+          GCTRL_API_TOKEN: '<your-access-token>',
+        },
+      },
+    },
+  }, null, 2)
+
+  const cursorConfig = JSON.stringify({
+    mcpServers: {
+      gctrl: {
+        type: 'http',
+        url: httpEndpoint,
+        headers: { Authorization: 'ApiKey <your-access-token>' },
+      },
+    },
+  }, null, 2)
+
+  const CodeBlock = ({ code, id }: { code: string; id: string }) => (
+    <div className="relative mt-1">
+      <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-4 font-mono text-xs text-slate-300">
+        {code}
+      </pre>
+      <button
+        onClick={() => copyText(code, id)}
+        className="absolute right-2 top-2 flex items-center gap-1.5 rounded-lg bg-slate-700 px-2 py-1 text-[10px] text-slate-400 transition-colors hover:text-slate-200"
+      >
+        {copied === id ? <Check size={11} /> : <Copy size={11} />}
+        {copied === id ? 'Copied!' : 'Copy'}
+      </button>
+    </div>
+  )
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h2 className="text-lg font-semibold text-slate-100">Connect an Agent</h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Connect Claude Code, Cursor, Codex, or any MCP-capable agent to GCTRL as a
+          clearance-scoped, audited memory node. Every call is filtered to the access token&apos;s
+          clearance and per-graph grants.
+        </p>
+      </div>
+
+      {/* ── Step 1: Token ──────────────────────────────────────────── */}
+      <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+        <div className="mb-3 flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-500/20 text-xs font-bold text-indigo-300">1</div>
+          <h3 className="text-sm font-semibold text-slate-200">Create a scoped access token</h3>
+        </div>
+        <p className="mb-4 text-xs text-slate-500">
+          Go to{' '}
+          <a href="/access" className="inline-flex items-center gap-0.5 text-indigo-400 hover:underline">
+            Access Control <ExternalLink size={10} />
+          </a>{' '}
+          and create a new token. Pick a clearance ceiling and grant the knowledge bases the agent
+          may read or write. The token looks like <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-amber-300 text-[11px]">gctrl_…</code> and is
+          sent as <code className="rounded bg-slate-800 px-1 py-0.5 font-mono text-slate-300 text-[11px]">Authorization: ApiKey gctrl_…</code>.
+        </p>
+        <div className="rounded-md border border-slate-700 bg-slate-950/40 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <KeyRound size={13} className="text-indigo-400" />
+              <p className="text-[11px] text-slate-400">
+                Want a full-access token fast? Use the <strong className="text-slate-300">Generate full-access token</strong> button in{' '}
+                <a href="/settings?tab=agent" className="text-indigo-400 hover:underline">Settings → Agent</a>.
+              </p>
+            </div>
+          </div>
+          <p className="mt-2 text-[10px] text-slate-600">
+            All calls are audited. Tokens are revocable anytime from the Access Control page.
+          </p>
+        </div>
+      </section>
+
+      {/* ── Step 2: Gateway check ──────────────────────────────────── */}
+      <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+        <div className="mb-3 flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-500/20 text-xs font-bold text-indigo-300">2</div>
+          <h3 className="text-sm font-semibold text-slate-200">Ensure the MCP gateway is enabled</h3>
+        </div>
+        <div className="flex items-center gap-3">
+          {gatewayEnabled === null ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-1 text-[11px] text-slate-400">
+              <Loader2 size={10} className="animate-spin" /> Checking…
+            </span>
+          ) : gatewayEnabled ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-400">
+              <Wifi size={11} /> Gateway enabled
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] font-medium text-amber-400">
+              <WifiOff size={11} /> Gateway disabled
+            </span>
+          )}
+          <a href="/settings?tab=agent" className="inline-flex items-center gap-0.5 text-xs text-indigo-400 hover:underline">
+            Settings → Agent <ExternalLink size={10} />
+          </a>
+        </div>
+        {gatewayEnabled === false && (
+          <p className="mt-2 text-[11px] text-amber-300/80">
+            Set <code className="rounded bg-slate-800 px-1 font-mono text-amber-300">GCTRL_AGENT_GATEWAY_ENABLED=true</code> in the API
+            server environment and restart to enable the HTTP gateway.
+          </p>
+        )}
+        <p className="mt-2 text-[11px] text-slate-600">
+          Required for HTTP transport. The stdio server connects directly to the API instead and does not need the gateway.
+        </p>
+      </section>
+
+      {/* ── Step 3: Config snippets ───────────────────────────────── */}
+      <section>
+        <div className="mb-4 flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-500/20 text-xs font-bold text-indigo-300">3</div>
+          <h3 className="text-sm font-semibold text-slate-200">Add to your agent config</h3>
+        </div>
+
+        <div className="space-y-5">
+          {/* Claude Code – HTTP */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Code2 size={14} className="text-indigo-400" />
+              <span className="text-sm font-medium text-slate-200">Claude Code — HTTP transport</span>
+              <span className="rounded-full bg-indigo-500/10 px-2 py-0.5 text-[10px] font-medium text-indigo-300">Recommended</span>
+            </div>
+            <p className="mb-2 text-[11px] text-slate-500">
+              Add to <code className="text-slate-400">.mcp.json</code> in your project root (or <code className="text-slate-400">~/.claude/mcp.json</code> for all projects):
+            </p>
+            <CodeBlock code={httpConfig} id="cc-http" />
+          </div>
+
+          {/* Claude Code – stdio */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Server size={14} className="text-cyan-400" />
+              <span className="text-sm font-medium text-slate-200">Claude Code — stdio transport</span>
+            </div>
+            <p className="mb-2 text-[11px] text-slate-500">
+              Build once: <code className="rounded bg-slate-800 px-1 text-slate-300">cd services/mcp {'&&'} npm install {'&&'} npm run build</code>.
+              Then add to <code className="text-slate-400">.mcp.json</code>:
+            </p>
+            <CodeBlock code={stdioConfig} id="cc-stdio" />
+            <p className="mt-2 text-[11px] text-slate-600">
+              Or use <code className="text-slate-500">GCTRL_GATEWAY_URL</code> instead of <code className="text-slate-500">GCTRL_API_URL</code> to proxy through the HTTP gateway:
+            </p>
+            <CodeBlock code={stdioGatewayConfig} id="cc-stdio-gw" />
+          </div>
+
+          {/* Cursor */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Globe size={14} className="text-violet-400" />
+              <span className="text-sm font-medium text-slate-200">Cursor</span>
+            </div>
+            <p className="mb-2 text-[11px] text-slate-500">
+              Add to <code className="text-slate-400">.cursor/mcp.json</code>:
+            </p>
+            <CodeBlock code={cursorConfig} id="cursor" />
+          </div>
+
+          {/* Endpoint info */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Wifi size={14} className="text-emerald-400" />
+              <span className="text-sm font-medium text-slate-200">HTTP Gateway endpoint</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 rounded-lg bg-slate-800 px-3 py-2 font-mono text-xs text-slate-300 break-all">
+                {httpEndpoint}
+              </code>
+              <button
+                onClick={() => copyText(httpEndpoint, 'endpoint')}
+                className="flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-700 px-2 py-1.5 text-[10px] text-slate-400 transition-colors hover:text-slate-200"
+              >
+                {copied === 'endpoint' ? <Check size={11} /> : <Copy size={11} />}
+                Copy
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Step 4: Install the skill ──────────────────────────────── */}
+      <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+        <div className="mb-3 flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-500/20 text-xs font-bold text-indigo-300">4</div>
+          <h3 className="text-sm font-semibold text-slate-200">Install the GCTRL skill</h3>
+        </div>
+        <p className="mb-3 text-xs text-slate-500">
+          The skill teaches the agent <em>when to retrieve</em>, how to work through the tool
+          ladder without flooding its context, and how to write conclusions back. Without the skill
+          the agent has the tools but no discipline.
+        </p>
+
+        <div className="space-y-3">
+          <div>
+            <p className="mb-1 text-[11px] font-medium text-slate-400">Claude Code</p>
+            <div className="relative">
+              <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-3 font-mono text-[11px] text-slate-300">
+{`mkdir -p .claude/skills/gctrl
+cp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md`}
+              </pre>
+              <button
+                onClick={() => copyText('mkdir -p .claude/skills/gctrl\ncp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md', 'skill-cc')}
+                className="absolute right-2 top-2 flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-[10px] text-slate-400 hover:text-slate-200"
+              >
+                {copied === 'skill-cc' ? <Check size={10} /> : <Copy size={10} />}
+                Copy
+              </button>
+            </div>
+            <p className="mt-1 text-[10px] text-slate-600">Or user-level for all projects: <code className="text-slate-500">~/.claude/skills/gctrl/SKILL.md</code></p>
+          </div>
+
+          <div>
+            <p className="mb-1 text-[11px] font-medium text-slate-400">Cursor</p>
+            <div className="relative">
+              <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-3 font-mono text-[11px] text-slate-300">
+{`mkdir -p .cursor/rules
+cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc`}
+              </pre>
+              <button
+                onClick={() => copyText('mkdir -p .cursor/rules\ncp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc', 'skill-cursor')}
+                className="absolute right-2 top-2 flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-[10px] text-slate-400 hover:text-slate-200"
+              >
+                {copied === 'skill-cursor' ? <Check size={10} /> : <Copy size={10} />}
+                Copy
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <p className="mb-1 text-[11px] font-medium text-slate-400">Codex / other CLIs</p>
+            <p className="text-[11px] text-slate-500">
+              Append <code className="text-slate-400">sdk/claude-skill/codex/AGENTS-snippet.md</code> to your project&apos;s <code className="text-slate-400">AGENTS.md</code>.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 flex items-start gap-2 rounded-md border border-slate-700 bg-slate-950/40 px-3 py-2.5">
+          <ExternalLink size={12} className="mt-0.5 shrink-0 text-indigo-400" />
+          <p className="text-[11px] text-slate-400">
+            Full setup guide and smoke-test protocol:{' '}
+            <a href="/docs/agents-mcp" className="text-indigo-400 hover:underline">Agents &amp; MCP docs</a>
+            {' '}· Skill source:{' '}
+            <code className="text-slate-500">sdk/claude-skill/README.md</code>
+          </p>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export function SettingsPage() {
@@ -3917,6 +4247,7 @@ export function SettingsPage() {
         {activeTab === 'integrations' && <IntegrationsTab />}
         {activeTab === 'skills' && <SkillsTab />}
         {activeTab === 'agent' && <AgentTab />}
+        {activeTab === 'connect-agent' && <ConnectAgentTab />}
         {activeTab === 'mcp' && <McpTab />}
         {activeTab === 'n8n' && <N8nTab />}
         {activeTab === 'webhooks' && <WebhooksPage />}

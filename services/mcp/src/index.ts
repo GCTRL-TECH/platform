@@ -543,6 +543,88 @@ registerToolWithAlias<{ compilationId: string; slug?: string; query?: string }>(
   },
 );
 
+// ── Tool: Search Chunks (RAG retrieval — mirrors HTTP gateway search_chunks) ──
+
+const searchChunksSchema = {
+  query: z.string().describe('The question or topic to retrieve source text passages for'),
+  compilationId: z.string().optional().describe('Optional: scope to a specific knowledge graph compilation'),
+};
+
+registerToolWithAlias<{ query: string; compilationId?: string }>(
+  'gctrl_search_chunks',
+  'borghive_search_chunks',
+  'Retrieve source text passages (warm vector + keyword) for a question — the raw evidence layer. Limit is fixed at 5 passages. Use this to back up an answer with citations; prefer gctrl_query for a composed blended answer.',
+  searchChunksSchema,
+  async ({ query, compilationId }) => {
+    const r = await apiCall('POST', '/agent/tools/search_chunks', { query, compilationId }) as {
+      chunks?: Array<{ chunkId?: string; text?: string; score?: number; source?: string }>;
+      error?: string;
+    };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    const chunks = r.chunks ?? [];
+    const lines = chunks.map((c, i) => {
+      const score = typeof c.score === 'number' ? ` (${Math.round(c.score * 100)}%)` : '';
+      const src = c.source ? ` [${c.source}]` : '';
+      return `[${i + 1}]${src}${score}\n${c.text ?? ''}`;
+    });
+    return {
+      content: [{
+        type: 'text' as const,
+        text: lines.length > 0
+          ? `**Source passages (${lines.length}):**\n\n${lines.join('\n\n---\n\n')}`
+          : 'No passages found for this query.',
+      }],
+    };
+  },
+);
+
+// ── Tool: Get Entity (provenance — mirrors HTTP gateway get_entity) ────────────
+
+const getEntitySchema = {
+  name: z.string().describe('Entity name to look up (exact or close match)'),
+};
+
+registerToolWithAlias<{ name: string }>(
+  'gctrl_get_entity',
+  'borghive_get_entity',
+  'Read one entity: its type, connections (up to 20 relation strings), and full provenance — origin file, sourceRef, extraction job + timestamp. Use this to answer "where does X come from / which file / what is the source of X". Prefer gctrl_get_dossier for a compiled authoritative summary.',
+  getEntitySchema,
+  async ({ name }) => {
+    const r = await apiCall('POST', '/agent/tools/get_entity', { name }) as {
+      name?: string;
+      type?: string;
+      classification?: string;
+      connections?: string[];
+      provenance?: {
+        jobId?: string;
+        jobType?: string;
+        originFile?: string;
+        sourceRef?: string;
+        extractedAt?: string;
+      };
+      error?: string;
+    };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    const provLines: string[] = [];
+    if (r.provenance?.originFile) provLines.push(`Origin file: ${r.provenance.originFile}`);
+    if (r.provenance?.sourceRef) provLines.push(`Source ref: ${r.provenance.sourceRef}`);
+    if (r.provenance?.extractedAt) provLines.push(`Extracted at: ${r.provenance.extractedAt}`);
+    if (r.provenance?.jobId) provLines.push(`Job ID: ${r.provenance.jobId}`);
+    const connLines = (r.connections ?? []).map((c) => `- ${c}`);
+    return {
+      content: [{
+        type: 'text' as const,
+        text:
+          `**Entity: ${r.name ?? name}** (${r.type ?? 'unknown type'})` +
+          (r.classification ? ` [${r.classification}]` : '') +
+          '\n\n' +
+          (connLines.length ? `**Connections:**\n${connLines.join('\n')}\n\n` : '') +
+          (provLines.length ? `**Provenance:**\n${provLines.join('\n')}` : '(no provenance on record)'),
+      }],
+    };
+  },
+);
+
 // ── Tool: Graph neighbours (dependency tracing) ──────────────────────────────
 
 registerToolWithAlias<{ name: string; depth?: number }>(
@@ -866,6 +948,85 @@ registerToolWithAlias<Record<string, never>>(
       content: [{
         type: 'text' as const,
         text: result.answer,
+      }],
+    };
+  },
+);
+
+// ── Tool: Find File (file-asset metadata index) ──────────────────────────────
+// New tools (no legacy borghive_* alias): registered directly, skipped in
+// remote/gateway mode where the gateway's own tool list is proxied instead.
+
+function registerTool<TArgs>(
+  name: string,
+  description: string,
+  schema: z.ZodRawShape,
+  handler: ToolHandler<TArgs>,
+): void {
+  if (GATEWAY_URL) {
+    return;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server.tool as any)(name, description, schema, handler);
+}
+
+const findFileSchema = {
+  query: z.string().describe('File name or path fragment to search for (fuzzy), e.g. "rim cad" or "felge.dwg"'),
+  limit: z.number().optional().describe('Maximum hits to return (default 5, max 25)'),
+};
+
+registerTool<{ query: string; limit?: number }>(
+  'gctrl_find_file',
+  'Find files by name/path across connected sources (Google Drive, SharePoint) — including UNSUPPORTED files like CAD drawings (.dwg/.step), images and archives indexed as metadata. Fuzzy-ranked. Each hit includes path, size, modified/last-seen times, source, and up to 3 related parsed sibling documents from the same folder, so you can answer "where is file X, when was it seen last, and what project is it related to".',
+  findFileSchema,
+  async ({ query, limit }) => {
+    const r = await apiCall('POST', '/agent/tools/find_file', { query, limit }) as {
+      files?: Array<{
+        path: string; name: string; ext?: string | null; sizeBytes?: number | null;
+        modifiedAt?: string | null; lastSeenAt?: string; source?: string | null;
+        related?: Array<{ name: string; kexJobId?: string | null; modifiedAt?: string | null }>;
+      }>;
+      error?: string;
+    };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    const files = r.files ?? [];
+    if (files.length === 0) {
+      return { content: [{ type: 'text' as const, text: `No files found matching "${query}". File-asset indexing may be off (Settings → Integrations → "Index unsupported files").` }] };
+    }
+    const lines = files.map((f) => {
+      const size = f.sizeBytes != null ? ` · ${(f.sizeBytes / 1024).toFixed(0)} KB` : '';
+      const rel = (f.related ?? []).map((d) => `    ↳ related: ${d.name}${d.kexJobId ? ` (job ${d.kexJobId})` : ''}`).join('\n');
+      return `- **${f.name}** [${f.source ?? '?'}]${size}\n  path: ${f.path}\n  modified: ${f.modifiedAt ?? '—'} · last seen: ${f.lastSeenAt ?? '—'}${rel ? `\n${rel}` : ''}`;
+    });
+    return { content: [{ type: 'text' as const, text: `**Files (${files.length}):**\n\n${lines.join('\n')}` }] };
+  },
+);
+
+// ── Tool: Connector Sync Status ───────────────────────────────────────────────
+
+registerTool<Record<string, never>>(
+  'gctrl_get_sync_status',
+  'Summarize connector sync health: per connector (Google Drive / SharePoint) the last sync time and live job counts by status, plus the last 5 failed source files with their errors. Use to answer "is my Drive sync working / what failed last".',
+  {},
+  async () => {
+    const r = await apiCall('POST', '/agent/tools/get_sync_status', {}) as {
+      connectors?: Array<{ connectorId: string; provider: string; label: string; lastSyncAt?: string | null; jobCounts?: Record<string, number> }>;
+      recentFailures?: Array<{ sourceName?: string | null; sourceType?: string; error?: string | null; failedAt?: string | null }>;
+      error?: string;
+    };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    const conns = (r.connectors ?? []).map((c) => {
+      const counts = Object.entries(c.jobCounts ?? {}).map(([s, n]) => `${s}: ${n}`).join(', ') || 'no sync jobs yet';
+      return `- **${c.label}** (${c.provider}) — last sync: ${c.lastSyncAt ?? 'never'} — ${counts}`;
+    });
+    const fails = (r.recentFailures ?? []).map((f) =>
+      `- ${f.sourceName ?? '?'} [${f.sourceType ?? '?'}] at ${f.failedAt ?? '—'}: ${f.error ?? 'unknown error'}`);
+    return {
+      content: [{
+        type: 'text' as const,
+        text:
+          `**Connectors (${conns.length}):**\n${conns.join('\n') || '- none connected'}` +
+          (fails.length ? `\n\n**Recent failures:**\n${fails.join('\n')}` : '\n\nNo recent failures.'),
       }],
     };
   },

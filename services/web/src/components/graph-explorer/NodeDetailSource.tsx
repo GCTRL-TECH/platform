@@ -11,7 +11,7 @@
  * multiple sources.
  */
 
-import { ExternalLink, FileWarning, Layers, MapPin } from 'lucide-react'
+import { ExternalLink, FileWarning, Layers, MapPin, Quote } from 'lucide-react'
 import { NodeDetailChunks } from './NodeDetailChunks'
 import type { EntityDetail } from './types'
 
@@ -55,9 +55,52 @@ export function NodeDetailSource({
   }
 
   const job = detail?.lastSourceJob
+  const groundingChunks = detail?.groundingChunks ?? []
 
   return (
     <div className="space-y-4">
+      {/* Precise, entity-grounded source text (P2a) — every snippet here is
+          guaranteed to actually mention THIS node, via its graph URI, not just
+          a name/substring match (see the broader "Source text" list below). */}
+      {groundingChunks.length > 0 && (
+        <div className="space-y-2">
+          <p className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-slate-500">
+            <Quote size={11} className="text-indigo-400" />
+            Sources
+          </p>
+          <div className="space-y-2">
+            {groundingChunks.map((chunk) => (
+              <div
+                key={chunk.id}
+                className="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2.5"
+              >
+                <p className="whitespace-pre-wrap text-xs leading-relaxed text-slate-300">
+                  {chunk.snippet}
+                </p>
+                {(chunk.jobId || chunk.createdAt) && (
+                  <div className="mt-2 flex items-center justify-between border-t border-slate-800 pt-1.5">
+                    {chunk.createdAt && (
+                      <span className="text-[10px] text-slate-500">{chunk.createdAt}</span>
+                    )}
+                    {chunk.jobId && (
+                      <a
+                        href={`/kex/${chunk.jobId}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-[10px] font-medium text-indigo-300 hover:text-indigo-200 transition-colors"
+                      >
+                        Open source job
+                        <ExternalLink size={10} />
+                      </a>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {!job?.id ? (
         <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
           <FileWarning size={22} className="text-slate-700" />

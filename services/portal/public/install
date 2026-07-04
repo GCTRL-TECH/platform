@@ -279,9 +279,13 @@ generate_config() {
   local prev_env="${INSTALL_DIR}/.env"
   read_prev() { [ -f "$prev_env" ] && sed -n "s/^$1=//p" "$prev_env" | head -1 || true; }
 
-  local jwt_secret pg_pw
+  local jwt_secret pg_pw internal_secret
   jwt_secret="$(read_prev JWT_SECRET)";  [ -n "$jwt_secret" ] || jwt_secret="$(openssl rand -hex 32)"
   pg_pw="$(read_prev POSTGRES_PASSWORD)"; [ -n "$pg_pw" ]     || pg_pw="$(openssl rand -hex 24)"
+  # Shared secret that gates the internal KEX/FUSE worker ports (they take a
+  # caller-supplied user_id and have no user auth of their own). Generated once,
+  # preserved on re-install.
+  internal_secret="$(read_prev INTERNAL_API_SECRET)"; [ -n "$internal_secret" ] || internal_secret="$(openssl rand -hex 32)"
 
   # Bundled Neo4j → unique generated password (the fresh container initialises
   # with it). A reused/external Neo4j keeps its own configured auth (we can't
@@ -298,6 +302,7 @@ generate_config() {
 GCTRL_API_URL=https://api.gctrl.tech
 GCTRL_DATA_DIR=${INSTALL_DIR}/data
 JWT_SECRET=${jwt_secret}
+INTERNAL_API_SECRET=${internal_secret}
 NEO4J_URI=${NEO4J_URI}
 NEO4J_USER=${NEO4J_USER}
 NEO4J_PASSWORD=${NEO4J_PASSWORD}

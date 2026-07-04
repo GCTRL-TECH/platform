@@ -94,15 +94,20 @@ def _fetch_entity_facts(driver, user_id: str, entity_name: str) -> Optional[dict
          CASE WHEN n._source_job IS NOT NULL THEN 1 ELSE 0 END AS has_prov,
          collect(DISTINCT {dir: 'out', rel: type(ro), name: o.name,
                            type: coalesce(o.coarse_type, o.type),
-                           confidence: ro.confidence})[..40] AS outs,
+                           confidence: ro.confidence,
+                           authority: ro._authority,
+                           superseded_by_doc: ro._superseded_by_doc})[..40] AS outs,
          collect(DISTINCT {dir: 'in', rel: type(ri), name: i.name,
                            type: coalesce(i.coarse_type, i.type),
-                           confidence: ri.confidence})[..40] AS ins
+                           confidence: ri.confidence,
+                           authority: ri._authority,
+                           superseded_by_doc: ri._superseded_by_doc})[..40] AS ins
     ORDER BY has_prov DESC, conf_edges DESC, degree DESC, id(n) ASC
     RETURN n.name AS name,
            coalesce(n.coarse_type, n.type, 'entity') AS type,
            n._source_job AS source_job,
            n._origin AS origin,
+           n.uri AS uri,
            outs, ins
     LIMIT 1
     """
@@ -131,13 +136,23 @@ def _fetch_entity_facts(driver, user_id: str, entity_name: str) -> Optional[dict
                 conf = float(conf) if conf is not None else None
             except (TypeError, ValueError):
                 conf = None
-            facts.append({
+            fact = {
                 "rel": rel,
                 "target": tgt,
                 "type": f.get("type") or "entity",
                 "direction": direction,
                 "confidence": conf,
-            })
+            }
+            # P3 — recency authority: when conflict detection marked this edge
+            # ("current" vs "superseded" + the doc that supersedes it), carry
+            # the annotation into key_facts so dossier readers (Pi's
+            # get_dossier, the RAG hot block) can say "current per <doc>,
+            # older value from <doc>" instead of asserting a stale fact.
+            if f.get("authority"):
+                fact["authority"] = f.get("authority")
+                if f.get("superseded_by_doc"):
+                    fact["supersededByDoc"] = f.get("superseded_by_doc")
+            facts.append(fact)
             neighbors.append({
                 "name": tgt, "type": f.get("type"), "rel": rel,
             })
@@ -150,6 +165,7 @@ def _fetch_entity_facts(driver, user_id: str, entity_name: str) -> Optional[dict
         "type": rec["type"] or "entity",
         "source_job": str(rec["source_job"]) if rec["source_job"] else None,
         "origin": rec["origin"],
+        "uri": rec["uri"],
         "source_jobs": sorted(source_jobs),
         "facts": facts,
         "neighbors": neighbors,
@@ -207,6 +223,48 @@ def _resolve_origin_files(conn, user_id: str, source_jobs: list[str]) -> list[st
     return files
 
 
+# ── P2a: precise grounding chunks via the node's graph uri ──────────────────────
+
+def _fetch_grounding_chunks_by_uri(conn, entity_uri_val: Optional[str], max_chunks: int = 3) -> list[dict]:
+    """Fetch grounding chunks for an entity via its stable graph uri (P2a).
+
+    Precise: matches `text_chunks.entity_uris` (written at KEX ingest time), no
+    name-substring false positives. Returns [] when the entity has no uri (older
+    extraction predating P2a, or pruned from the graph) so the caller falls back
+    to the legacy name-based Qdrant lookup — same shape as
+    `distiller._fetch_grounding_chunks` ([{chunkId, source, text_snippet,
+    min_rank, class_labels}])."""
+    if not entity_uri_val:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, source_document_id, content, min_rank, class_labels "
+                "FROM text_chunks WHERE entity_uris @> ARRAY[%s]::text[] "
+                "ORDER BY created_at DESC LIMIT %s",
+                (entity_uri_val, max_chunks),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"dossier: entity_uris chunk lookup failed for {entity_uri_val}: {exc}")
+        return []
+
+    matches: list[dict] = []
+    for chunk_id, source_doc, content, min_rank, class_labels in rows:
+        snippet = (content or "").strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400].rsplit(" ", 1)[0] + "…"
+        matches.append({
+            "chunkId": str(chunk_id),
+            "source": str(source_doc) if source_doc else "",
+            "text_snippet": snippet,
+            "min_rank": int(min_rank) if min_rank is not None else 0,
+            "class_labels": class_labels or [],
+        })
+    return matches
+
+
 # ── Timeline extraction (dated facts) ───────────────────────────────────────────
 
 def _build_timeline(facts: list[dict]) -> list[dict]:
@@ -235,14 +293,21 @@ def _build_timeline(facts: list[dict]) -> list[dict]:
 
 # ── Summary synthesis (REUSES the distiller's local-Ollama per-entity pass) ─────
 
-def _build_summary(entity: dict) -> str:
+def _build_summary(entity: dict, conn=None) -> str:
     """One concise paragraph from the distiller's Ollama synthesis. Falls back to
     a deterministic fact list if the LLM is unavailable (graceful, still grounded).
     """
-    # Reuse the distiller's prompt builder + grounding so the synthesis matches the
-    # wiki voice. Grounding chunks are fetched per source job (best-effort).
+    # P2a: prefer the precise entity_uris-based lookup (no name-substring false
+    # positives) when the node has a graph uri; fall back to the legacy
+    # name+source-job Qdrant scroll otherwise (older extraction, or uri absent).
     citations = []
-    if entity.get("source_jobs"):
+    uri = entity.get("uri")
+    if uri and conn is not None:
+        try:
+            citations = _fetch_grounding_chunks_by_uri(conn, uri, max_chunks=3)
+        except Exception as exc:
+            logger.warning(f"dossier: uri-based grounding fetch failed for {entity['name']}: {exc}")
+    if not citations and entity.get("source_jobs"):
         try:
             citations = distiller._fetch_grounding_chunks(
                 entity["source_jobs"], entity["name"], max_chunks=3
@@ -340,7 +405,7 @@ def _compile_one(driver, conn, user_id: str, entity_name: str) -> Optional[dict]
 
     origin_files = _resolve_origin_files(conn, user_id, entity["source_jobs"])
     timeline = _build_timeline(entity["facts"])
-    summary = _build_summary(entity)
+    summary = _build_summary(entity, conn)
     uri = _entity_uri(entity)
 
     with conn:

@@ -186,7 +186,7 @@ struct SyncFolderReq {
 /// which ontology to use, discovery mode, target compilation for auto-fuse, and
 /// the classification to stamp. All optional — absent fields fall back to defaults.
 #[derive(Deserialize, Default)]
-struct DriveExtractReqOpts {
+pub(crate) struct DriveExtractReqOpts {
     #[serde(rename = "ontologyId")]            ontology_id:             Option<Uuid>,
     #[serde(rename = "discoveryMode")]         discovery_mode:          Option<String>,
     #[serde(rename = "compilationId")]         compilation_id:          Option<Uuid>,
@@ -288,12 +288,289 @@ fn is_folder(mime: &str) -> bool {
     mime == "application/vnd.google-apps.folder"
 }
 
+// ─── File-asset index (P6) ───────────────────────────────────────────────────
+//
+// When the operator enables `index_unsupported_files` for a provider, connector
+// syncs upsert a `file_assets` metadata row for EVERY listed file — including
+// non-extractable ones (CAD, images, archives) — so an agent can answer "where
+// is the rim CAD file, and when was it seen last?". Strictly opt-in: with the
+// flag off (default), no rows are written and sync behaviour is unchanged.
+
+/// Lowercased file extension from a name ("rim.DWG" → "dwg"). None when there
+/// is no dot, the name starts with the only dot, or the tail is implausibly long.
+fn file_ext(name: &str) -> Option<String> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() || ext.len() > 20 {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// Extract the human folder path from a Microsoft Graph `parentReference.path`
+/// (shape: "/drives/{id}/root:/Projects/CAD"). Returns None for the drive root.
+fn sharepoint_folder_path(parent_ref_path: &str) -> Option<String> {
+    let (_, tail) = parent_ref_path.split_once("root:")?;
+    let tail = tail.trim_start_matches('/');
+    if tail.is_empty() { None } else { Some(tail.to_string()) }
+}
+
+/// Upsert one `file_assets` row keyed by (user_id, path). On re-sight: bump
+/// last_seen_at, refresh mutable metadata, keep extractable sticky, and only
+/// overwrite kex_job_id when a new one is provided.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_file_asset(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    connector_id: Option<Uuid>,
+    source: &str,
+    path: &str,
+    folder_path: Option<&str>,
+    name: &str,
+    size_bytes: Option<i64>,
+    modified_at: Option<DateTime<Utc>>,
+    extractable: bool,
+    kex_job_id: Option<Uuid>,
+) {
+    let res = sqlx::query(
+        "INSERT INTO file_assets
+             (user_id, connector_id, source, path, folder_path, name, ext,
+              size_bytes, modified_at, extractable, kex_job_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (user_id, path) DO UPDATE SET
+             last_seen_at = NOW(),
+             connector_id = EXCLUDED.connector_id,
+             source       = EXCLUDED.source,
+             folder_path  = EXCLUDED.folder_path,
+             name         = EXCLUDED.name,
+             ext          = EXCLUDED.ext,
+             size_bytes   = EXCLUDED.size_bytes,
+             modified_at  = EXCLUDED.modified_at,
+             extractable  = file_assets.extractable OR EXCLUDED.extractable,
+             kex_job_id   = COALESCE(EXCLUDED.kex_job_id, file_assets.kex_job_id)",
+    )
+    .bind(user_id)
+    .bind(connector_id)
+    .bind(source)
+    .bind(path)
+    .bind(folder_path)
+    .bind(name)
+    .bind(file_ext(name))
+    .bind(size_bytes)
+    .bind(modified_at)
+    .bind(extractable)
+    .bind(kex_job_id)
+    .execute(db)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!("file_assets upsert failed for '{path}': {e}");
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct FileAssetHit {
+    path:         String,
+    folder_path:  Option<String>,
+    name:         String,
+    ext:          Option<String>,
+    size_bytes:   Option<i64>,
+    modified_at:  Option<DateTime<Utc>>,
+    last_seen_at: DateTime<Utc>,
+    source:       Option<String>,
+}
+
+/// Fuzzy file search over the caller's `file_assets` (name + path), similarity
+/// ranked via pg_trgm with an ILIKE fallback when the extension is unavailable.
+/// Each hit carries up to 3 "related" parsed sibling documents: extractable
+/// assets in the SAME folder whose modified time is within 30 days of the hit
+/// (query-time join — relatedness is never stored). Used by the agent
+/// `find_file` tool and shares its shape with the MCP mirror.
+pub(crate) async fn find_file_json(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    query: &str,
+    limit: i64,
+) -> Value {
+    // Preferred: trigram similarity ranking (uses the GIN trgm indexes).
+    let trgm = sqlx::query_as::<_, FileAssetHit>(
+        "SELECT path, folder_path, name, ext, size_bytes, modified_at, last_seen_at, source
+         FROM file_assets
+         WHERE user_id = $1
+           AND (name % $2 OR path % $2
+                OR name ILIKE '%' || $2 || '%' OR path ILIKE '%' || $2 || '%')
+         ORDER BY GREATEST(similarity(name, $2), similarity(path, $2)) DESC,
+                  last_seen_at DESC
+         LIMIT $3",
+    )
+    .bind(user_id)
+    .bind(query)
+    .bind(limit)
+    .fetch_all(db)
+    .await;
+
+    let hits = match trgm {
+        Ok(rows) => rows,
+        // pg_trgm missing (guarded migration) → plain ILIKE, recency-ordered.
+        Err(_) => sqlx::query_as::<_, FileAssetHit>(
+            "SELECT path, folder_path, name, ext, size_bytes, modified_at, last_seen_at, source
+             FROM file_assets
+             WHERE user_id = $1
+               AND (name ILIKE '%' || $2 || '%' OR path ILIKE '%' || $2 || '%')
+             ORDER BY last_seen_at DESC
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(query)
+        .bind(limit)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default(),
+    };
+
+    let mut out: Vec<Value> = Vec::with_capacity(hits.len());
+    for h in &hits {
+        // Related parsed docs: same folder, |modified delta| ≤ 30 days, and a
+        // resolvable KEX job — either the asset row's own kex_job_id or (for
+        // docs parsed before asset capture was enabled) the newest kex_* job
+        // whose input fileName matches the sibling's name.
+        let mut related: Vec<Value> = Vec::new();
+        if let Some(folder) = h.folder_path.as_deref() {
+            let rows = sqlx::query_as::<_, (String, Option<Uuid>, Option<DateTime<Utc>>)>(
+                "SELECT f.name, COALESCE(f.kex_job_id, j.id), f.modified_at
+                 FROM file_assets f
+                 LEFT JOIN LATERAL (
+                     SELECT id FROM jobs
+                      WHERE user_id = f.user_id AND type LIKE 'kex_%'
+                        AND input->>'fileName' = f.name
+                      ORDER BY created_at DESC LIMIT 1
+                 ) j ON true
+                 WHERE f.user_id = $1 AND f.folder_path = $2 AND f.path <> $3
+                   AND (f.extractable = true OR j.id IS NOT NULL)
+                   AND COALESCE(f.kex_job_id, j.id) IS NOT NULL
+                   AND ($4::timestamptz IS NULL OR f.modified_at IS NULL
+                        OR ABS(EXTRACT(EPOCH FROM (f.modified_at - $4::timestamptz))) <= 2592000)
+                 ORDER BY f.modified_at DESC NULLS LAST
+                 LIMIT 3",
+            )
+            .bind(user_id)
+            .bind(folder)
+            .bind(&h.path)
+            .bind(h.modified_at)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+            related = rows
+                .into_iter()
+                .map(|(name, job_id, modified)| {
+                    json!({ "name": name, "kexJobId": job_id, "modifiedAt": modified })
+                })
+                .collect();
+        }
+        out.push(json!({
+            "path":        h.path,
+            "name":        h.name,
+            "ext":         h.ext,
+            "sizeBytes":   h.size_bytes,
+            "modifiedAt":  h.modified_at,
+            "lastSeenAt":  h.last_seen_at,
+            "source":      h.source,
+            "folderPath":  h.folder_path,
+            "related":     related,
+        }));
+    }
+    json!({ "files": out })
+}
+
+/// Per-connector sync health for the caller: last sync time, live status counts
+/// (connector_sync_jobs joined onto the authoritative jobs table), and the last
+/// 5 failures with their source names. Shared by GET /api/connectors/sync-status
+/// and the agent `get_sync_status` tool.
+pub(crate) async fn sync_status_json(db: &sqlx::PgPool, user_id: Uuid) -> Value {
+    let connectors = sqlx::query_as::<_, (Uuid, String, String, Option<DateTime<Utc>>)>(
+        "SELECT id, provider::text, label, last_sync_at
+         FROM oauth_connectors
+         WHERE user_id = $1 AND is_active = true
+         ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    // Live per-status counts: prefer the KEX job's status (authoritative) over
+    // the sync-job row's own snapshot.
+    let counts = sqlx::query_as::<_, (Uuid, String, i64)>(
+        "SELECT csj.connector_id, COALESCE(j.status, csj.status), COUNT(*)
+         FROM connector_sync_jobs csj
+         LEFT JOIN jobs j ON j.id = csj.kex_job_id
+         WHERE csj.user_id = $1
+         GROUP BY 1, 2",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let failures = sqlx::query_as::<_, (Option<String>, Option<String>, Option<DateTime<Utc>>, String)>(
+        "SELECT csj.source_name, j.error, j.completed_at, csj.source_type
+         FROM connector_sync_jobs csj
+         JOIN jobs j ON j.id = csj.kex_job_id
+         WHERE csj.user_id = $1 AND j.status = 'failed'
+         ORDER BY j.completed_at DESC NULLS LAST
+         LIMIT 5",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let connectors_json: Vec<Value> = connectors
+        .iter()
+        .map(|(id, provider, label, last_sync)| {
+            let by_status: serde_json::Map<String, Value> = counts
+                .iter()
+                .filter(|(cid, ..)| cid == id)
+                .map(|(_, status, n)| (status.clone(), json!(n)))
+                .collect();
+            json!({
+                "connectorId": id,
+                "provider":    provider,
+                "label":       label,
+                "lastSyncAt":  last_sync,
+                "jobCounts":   by_status,
+            })
+        })
+        .collect();
+
+    let failures_json: Vec<Value> = failures
+        .into_iter()
+        .map(|(source_name, error, failed_at, source_type)| {
+            json!({
+                "sourceName": source_name,
+                "sourceType": source_type,
+                "error":      error,
+                "failedAt":   failed_at,
+            })
+        })
+        .collect();
+
+    json!({ "connectors": connectors_json, "recentFailures": failures_json })
+}
+
+/// GET /api/connectors/sync-status
+async fn sync_status(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    Ok(Json(sync_status_json(&state.db, claims.sub).await))
+}
+
 // ─── Routers ─────────────────────────────────────────────────────────────────
 
 /// Protected routes — require valid JWT (attached as Extension by require_auth middleware).
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
         .route("/",                        get(list_connectors))
+        .route("/sync-status",             get(sync_status))
         .route("/:id",                     delete(disconnect_connector))
         .route("/google/drive/files",      get(drive_files))
         .route("/google/drive/sync",       post(sync_selected))
@@ -782,6 +1059,16 @@ async fn sync_selected(
     // Fetch file metadata for names
     let meta_map = fetch_file_metadata(&req.file_ids, &token, &http).await;
 
+    // Opt-in asset capture: richer metadata (mime/size/modified/parent) is only
+    // fetched when the operator enabled index_unsupported_files for Google.
+    let capture_assets =
+        crate::routes::connector_configs::index_unsupported_enabled(&state.db, "google").await;
+    let asset_meta = if capture_assets {
+        fetch_file_asset_meta(&req.file_ids, &token, &http).await
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut results: Vec<Value> = Vec::new();
 
     let resolved = resolve_drive_opts(&state.db, claims.sub, &req.opts).await;
@@ -789,6 +1076,22 @@ async fn sync_selected(
     for file_id in &req.file_ids {
         let name = meta_map.get(file_id).cloned().unwrap_or_else(|| file_id.clone());
 
+        // Selected-file sync has no traversal context; when asset-capture is
+        // enabled we already have parent/modified metadata (reused below for
+        // both file_assets AND the source-document identity). Without it,
+        // `path` falls back to the bare display name.
+        let (doc_path, doc_modified) = match asset_meta.get(file_id) {
+            Some(m) => {
+                let p = match m.parent_name.as_deref() {
+                    Some(parent) => format!("{parent}/{}", m.name),
+                    None => m.name.clone(),
+                };
+                (p, m.modified)
+            }
+            None => (name.clone(), None),
+        };
+
+        let mut kex_job_id: Option<Uuid> = None;
         match enqueue_drive_file(
             &state.db,
             &state.redis,
@@ -799,15 +1102,43 @@ async fn sync_selected(
             file_id,
             &name,
             &resolved,
+            &doc_path,
+            doc_modified,
         )
         .await
         {
             Ok(job_id) => {
+                kex_job_id = Some(job_id);
                 results.push(json!({ "fileId": file_id, "name": name, "jobId": job_id }));
             }
             Err(e) => {
                 tracing::warn!("Failed to enqueue drive file {file_id}: {e}");
                 results.push(json!({ "fileId": file_id, "name": name, "error": e.to_string() }));
+            }
+        }
+
+        if capture_assets {
+            if let Some(m) = asset_meta.get(file_id) {
+                // Selected-file sync has no traversal context — the folder path
+                // is the (best-effort resolved) name of the file's first parent.
+                let path = match m.parent_name.as_deref() {
+                    Some(p) => format!("{p}/{}", m.name),
+                    None => m.name.clone(),
+                };
+                upsert_file_asset(
+                    &state.db,
+                    claims.sub,
+                    Some(connector.id),
+                    "google_drive",
+                    &path,
+                    m.parent_name.as_deref(),
+                    &m.name,
+                    m.size,
+                    m.modified,
+                    is_extractable(&m.mime),
+                    kex_job_id,
+                )
+                .await;
             }
         }
     }
@@ -822,65 +1153,138 @@ async fn sync_folder(
     State(state): State<Arc<crate::models::AppState>>,
     Json(req): Json<SyncFolderReq>,
 ) -> Result<Json<Value>> {
-    let connector = fetch_connector(&state.db, req.connector_id, claims.sub).await?;
+    let outcome = run_drive_folder_sync(
+        &state,
+        claims.sub,
+        req.connector_id,
+        &req.folder_id,
+        req.max_depth.unwrap_or(5).min(10),
+        &req.opts,
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "folder":     outcome.folder,
+        "totalFiles": outcome.total,
+        "synced":     outcome.synced,
+        "failed":     outcome.failed,
+        "results":    outcome.results,
+    })))
+}
+
+/// Outcome of one Drive folder sync run (shared by the HTTP handler and the
+/// scheduled `google_drive` trigger executor in `background`).
+pub(crate) struct DriveFolderSyncOutcome {
+    pub folder:  Option<String>,
+    pub total:   usize,
+    pub synced:  u32,
+    pub failed:  u32,
+    pub results: Vec<Value>,
+}
+
+/// Core of the Drive folder sync: recursively lists the folder tree (with
+/// metadata), enqueues every EXTRACTABLE file for KEX, and — when the operator
+/// has enabled `index_unsupported_files` for Google — upserts a `file_assets`
+/// metadata row for EVERY listed file (extractable or not). Flag off = the
+/// pre-P6 behaviour: only extractable files are touched, nothing is recorded.
+pub(crate) async fn run_drive_folder_sync(
+    state: &crate::models::AppState,
+    user_id: Uuid,
+    connector_id: Uuid,
+    folder_id: &str,
+    max_depth: u32,
+    opts: &DriveExtractReqOpts,
+) -> Result<DriveFolderSyncOutcome> {
+    let connector = fetch_connector(&state.db, connector_id, user_id).await?;
     let http = reqwest::Client::new();
     let token = ensure_valid_token(&connector, &http, &state.cfg, &state.db).await?;
 
-    let max_depth = req.max_depth.unwrap_or(5).min(10);
-    let folder_name = get_folder_name(&req.folder_id, &token, &http).await;
+    let folder_name = get_folder_name(folder_id, &token, &http).await;
 
-    // Recursively collect all extractable files in the folder tree
-    let mut all_files: Vec<(String, String)> = Vec::new(); // (file_id, name)
-    collect_folder_files(
-        &req.folder_id,
-        &token,
-        &http,
-        &mut all_files,
-        0,
-        max_depth,
-    )
-    .await;
+    // Recursively collect ALL files (extractable or not) with metadata. The
+    // folder path is built from the traversal itself: it is rooted at the
+    // synced folder's display name and extended with each subfolder's name —
+    // Drive files.list already returns child names, so no extra API calls.
+    let root_path = folder_name.clone().unwrap_or_default();
+    let mut all_files: Vec<DriveFileMeta> = Vec::new();
+    collect_folder_tree(folder_id, &root_path, &token, &http, &mut all_files, 0, max_depth).await;
 
-    let total = all_files.len();
+    let capture_assets =
+        crate::routes::connector_configs::index_unsupported_enabled(&state.db, "google").await;
+
     let mut synced = 0u32;
     let mut failed = 0u32;
     let mut results: Vec<Value> = Vec::new();
 
-    let resolved = resolve_drive_opts(&state.db, claims.sub, &req.opts).await;
+    let resolved = resolve_drive_opts(&state.db, user_id, opts).await;
 
-    for (file_id, name) in &all_files {
-        match enqueue_drive_file(
-            &state.db,
-            &state.redis,
-            &http,
-            &token,
-            claims.sub,
-            connector.id,
-            file_id,
-            name,
-            &resolved,
-        )
-        .await
-        {
-            Ok(job_id) => {
-                synced += 1;
-                results.push(json!({ "fileId": file_id, "name": name, "jobId": job_id }));
+    let mut extractable_total = 0usize;
+    for f in &all_files {
+        // Full traversal-derived path — always known here (no extra API
+        // calls), so the source-document identity gets the real path even
+        // when index_unsupported_files (file_assets capture) is off.
+        let full_path = if f.folder_path.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{}/{}", f.folder_path, f.name)
+        };
+
+        let mut kex_job_id: Option<Uuid> = None;
+        if is_extractable(&f.mime) {
+            extractable_total += 1;
+            match enqueue_drive_file(
+                &state.db,
+                &state.redis,
+                &http,
+                &token,
+                user_id,
+                connector.id,
+                &f.id,
+                &f.name,
+                &resolved,
+                &full_path,
+                f.modified,
+            )
+            .await
+            {
+                Ok(job_id) => {
+                    synced += 1;
+                    kex_job_id = Some(job_id);
+                    results.push(json!({ "fileId": f.id, "name": f.name, "jobId": job_id }));
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("Failed to enqueue {}: {e}", f.id);
+                    results.push(json!({ "fileId": f.id, "name": f.name, "error": e.to_string() }));
+                }
             }
-            Err(e) => {
-                failed += 1;
-                tracing::warn!("Failed to enqueue {file_id}: {e}");
-                results.push(json!({ "fileId": file_id, "name": name, "error": e.to_string() }));
-            }
+        }
+
+        if capture_assets {
+            upsert_file_asset(
+                &state.db,
+                user_id,
+                Some(connector.id),
+                "google_drive",
+                &full_path,
+                if f.folder_path.is_empty() { None } else { Some(&f.folder_path) },
+                &f.name,
+                f.size,
+                f.modified,
+                is_extractable(&f.mime),
+                kex_job_id,
+            )
+            .await;
         }
     }
 
-    Ok(Json(json!({
-        "folder":     folder_name,
-        "totalFiles": total,
-        "synced":     synced,
-        "failed":     failed,
-        "results":    results,
-    })))
+    Ok(DriveFolderSyncOutcome {
+        folder: folder_name,
+        total: extractable_total,
+        synced,
+        failed,
+        results,
+    })
 }
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
@@ -977,6 +1381,94 @@ async fn fetch_file_metadata(
     map
 }
 
+/// Asset metadata for one explicitly-selected Drive file (used only when the
+/// index_unsupported_files flag is on). `parent_name` is the display name of the
+/// file's first parent folder, resolved best-effort (one lookup per unique
+/// parent id — the Drive files API only carries parent IDs, not names).
+struct DriveSelectedMeta {
+    name:        String,
+    mime:        String,
+    size:        Option<i64>,
+    modified:    Option<DateTime<Utc>>,
+    parent_name: Option<String>,
+}
+
+/// Fetch mime/size/modifiedTime/parents for a set of file IDs, then resolve
+/// each distinct parent folder id to its name (best-effort; failures leave the
+/// parent unset and the asset path falls back to the bare file name).
+async fn fetch_file_asset_meta(
+    file_ids: &[String],
+    token: &str,
+    http: &reqwest::Client,
+) -> std::collections::HashMap<String, DriveSelectedMeta> {
+    let mut map = std::collections::HashMap::new();
+    let mut parent_ids: Vec<String> = Vec::new();
+
+    for file_id in file_ids {
+        let resp = http
+            .get(format!("https://www.googleapis.com/drive/v3/files/{file_id}"))
+            .bearer_auth(token)
+            .query(&[
+                ("fields", "id,name,mimeType,size,modifiedTime,parents"),
+                ("supportsAllDrives", "true"),
+            ])
+            .send()
+            .await;
+        let Ok(r) = resp else { continue };
+        if !r.status().is_success() {
+            continue;
+        }
+        let Ok(v) = r.json::<Value>().await else { continue };
+        let name = v.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let parent = v
+            .get("parents")
+            .and_then(|p| p.as_array())
+            .and_then(|a| a.first())
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        if let Some(ref p) = parent {
+            if !parent_ids.contains(p) {
+                parent_ids.push(p.clone());
+            }
+        }
+        map.insert(
+            file_id.clone(),
+            (
+                DriveSelectedMeta {
+                    name,
+                    mime: v.get("mimeType").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                    size: v.get("size").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()),
+                    modified: v
+                        .get("modifiedTime")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&Utc)),
+                    parent_name: None,
+                },
+                parent,
+            ),
+        );
+    }
+
+    // Resolve each unique parent id → name once.
+    let mut parent_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for pid in &parent_ids {
+        if let Some(name) = get_folder_name(pid, token, http).await {
+            parent_names.insert(pid.clone(), name);
+        }
+    }
+
+    map.into_iter()
+        .map(|(id, (mut meta, parent))| {
+            meta.parent_name = parent.and_then(|p| parent_names.get(&p).cloned());
+            (id, meta)
+        })
+        .collect()
+}
+
 async fn get_folder_name(folder_id: &str, token: &str, http: &reqwest::Client) -> Option<String> {
     let resp = http
         .get(format!("https://www.googleapis.com/drive/v3/files/{folder_id}"))
@@ -993,12 +1485,27 @@ async fn get_folder_name(folder_id: &str, token: &str, http: &reqwest::Client) -
     val.get("name")?.as_str().map(str::to_string)
 }
 
-/// Recursively list all extractable files under a folder, up to max_depth levels.
-async fn collect_folder_files(
+/// One file discovered while walking a Drive folder tree, with the metadata the
+/// file-asset index needs. `folder_path` is the traversal-derived path of the
+/// CONTAINING folder, rooted at the synced folder's name ("" when unnamed).
+struct DriveFileMeta {
+    id:          String,
+    name:        String,
+    mime:        String,
+    size:        Option<i64>,
+    modified:    Option<DateTime<Utc>>,
+    folder_path: String,
+}
+
+/// Recursively list ALL files under a folder (extractable or not), up to
+/// max_depth levels, carrying size/modifiedTime metadata and building each
+/// file's folder path from the traversal (root folder name + subfolder names).
+async fn collect_folder_tree(
     folder_id: &str,
+    folder_path: &str,
     token: &str,
     http: &reqwest::Client,
-    acc: &mut Vec<(String, String)>,
+    acc: &mut Vec<DriveFileMeta>,
     depth: u32,
     max_depth: u32,
 ) {
@@ -1012,7 +1519,7 @@ async fn collect_folder_files(
         .bearer_auth(token)
         .query(&[
             ("q",        q.as_str()),
-            ("fields",   "files(id,name,mimeType)"),
+            ("fields",   "files(id,name,mimeType,size,modifiedTime)"),
             ("pageSize", "1000"),
         ])
         .send()
@@ -1033,10 +1540,28 @@ async fn collect_folder_files(
         let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or_default();
 
         if is_folder(mime) {
-            // Recurse
-            Box::pin(collect_folder_files(id, token, http, acc, depth + 1, max_depth)).await;
-        } else if is_extractable(mime) {
-            acc.push((id.to_string(), name.to_string()));
+            let child_path = if folder_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{folder_path}/{name}")
+            };
+            Box::pin(collect_folder_tree(id, &child_path, token, http, acc, depth + 1, max_depth)).await;
+        } else {
+            // Drive returns `size` as a string; `modifiedTime` as RFC 3339.
+            let size = item.get("size").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok());
+            let modified = item
+                .get("modifiedTime")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            acc.push(DriveFileMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                mime: mime.to_string(),
+                size,
+                modified,
+                folder_path: folder_path.to_string(),
+            });
         }
     }
 }
@@ -1383,54 +1908,339 @@ async fn sync_sharepoint(
     }
 
     // Verify the tenant config belongs to this user
-    fetch_sharepoint_tenant(&state.db, req.tenant_config_id, claims.sub).await?;
+    let tenant = fetch_sharepoint_tenant(&state.db, req.tenant_config_id, claims.sub).await?;
+
+    // Opt-in asset capture (per-item Graph metadata lookups) — only when the
+    // operator enabled index_unsupported_files for Microsoft.
+    let capture_assets =
+        crate::routes::connector_configs::index_unsupported_enabled(&state.db, "microsoft").await;
+    let http = reqwest::Client::new();
+    let graph_token = if capture_assets {
+        sharepoint_access_token(&http, &tenant.tenant_id, &tenant.client_id, &tenant.client_secret)
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     let mut job_ids: Vec<Uuid> = Vec::new();
 
     for file_id in &req.file_ids {
-        let job_id = Uuid::new_v4();
-
-        sqlx::query(
-            "INSERT INTO jobs (id, user_id, type, status, input)
-             VALUES ($1, $2, 'kex_sharepoint', 'pending', $3)",
+        let job_id = enqueue_sharepoint_file(
+            &state.db,
+            &state.redis,
+            claims.sub,
+            req.tenant_config_id,
+            &req.site_id,
+            &req.drive_id,
+            file_id,
+            req.classification_level_id,
         )
-        .bind(job_id)
-        .bind(claims.sub)
-        .bind(json!({
-            "tenantConfigId":       req.tenant_config_id,
-            "siteId":               req.site_id,
-            "driveId":              req.drive_id,
-            "fileId":               file_id,
-            "classificationLevelId": req.classification_level_id,
-        }))
-        .execute(&state.db)
         .await?;
 
-        crate::services::usage::record_usage(
-            &state.db,
-            claims.sub,
-            "kex_extract",
-            5,
-            Some(job_id),
-        )
-        .await;
-
-        let mut payload = json!({
-            "job_id":   job_id,
-            "user_id":  claims.sub,
-            "type":     "sharepoint",
-            "file_id":  file_id,
-        });
-        crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
-
-        lpush(&state.redis, "kex:jobs", &payload.to_string())
-            .await
-            .map_err(|e| AppError::Internal(format!("Redis push failed: {e}")))?;
+        if let Some(ref token) = graph_token {
+            capture_sharepoint_item_asset(
+                &state.db, &http, token, claims.sub, &req.site_id, &req.drive_id, file_id,
+                Some(job_id),
+            )
+            .await;
+        }
 
         job_ids.push(job_id);
     }
 
     Ok(Json(json!({ "jobIds": job_ids })))
+}
+
+/// Create the KEX job row + Redis message for one SharePoint file. Shared by
+/// the HTTP sync handler and the scheduled `microsoft` trigger executor.
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_sharepoint_file(
+    db: &sqlx::PgPool,
+    redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    user_id: Uuid,
+    tenant_config_id: Uuid,
+    site_id: &str,
+    drive_id: &str,
+    file_id: &str,
+    classification_level_id: Option<Uuid>,
+) -> Result<Uuid> {
+    let job_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO jobs (id, user_id, type, status, input)
+         VALUES ($1, $2, 'kex_sharepoint', 'pending', $3)",
+    )
+    .bind(job_id)
+    .bind(user_id)
+    .bind(json!({
+        "tenantConfigId":       tenant_config_id,
+        "siteId":               site_id,
+        "driveId":              drive_id,
+        "fileId":               file_id,
+        "classificationLevelId": classification_level_id,
+    }))
+    .execute(db)
+    .await?;
+
+    crate::services::usage::record_usage(db, user_id, "kex_extract", 5, Some(job_id)).await;
+
+    let mut payload = json!({
+        "job_id":   job_id,
+        "user_id":  user_id,
+        "type":     "sharepoint",
+        "file_id":  file_id,
+    });
+    crate::services::llm::inject_ollama_overrides(db, user_id, &mut payload).await;
+
+    lpush(redis, "kex:jobs", &payload.to_string())
+        .await
+        .map_err(|e| AppError::Internal(format!("Redis push failed: {e}")))?;
+
+    Ok(job_id)
+}
+
+/// Fetch one drive item's metadata from Graph and upsert its `file_assets` row.
+/// The folder path comes from `parentReference.path` ("/drives/{id}/root:/A/B"
+/// → "A/B"), so SharePoint assets carry their REAL server-relative folder.
+/// Best-effort: any Graph/API failure is logged and skipped.
+#[allow(clippy::too_many_arguments)]
+async fn capture_sharepoint_item_asset(
+    db: &sqlx::PgPool,
+    http: &reqwest::Client,
+    token: &str,
+    user_id: Uuid,
+    site_id: &str,
+    drive_id: &str,
+    item_id: &str,
+    kex_job_id: Option<Uuid>,
+) {
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{item_id}\
+         ?$select=id,name,size,file,lastModifiedDateTime,parentReference"
+    );
+    let resp = http.get(&url).bearer_auth(token).send().await;
+    let Ok(r) = resp else { return };
+    if !r.status().is_success() {
+        tracing::debug!("sharepoint asset meta {item_id}: HTTP {}", r.status());
+        return;
+    }
+    let Ok(v) = r.json::<Value>().await else { return };
+
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    if name.is_empty() || v.get("folder").is_some() {
+        return;
+    }
+    let mime = v
+        .get("file")
+        .and_then(|f| f.get("mimeType"))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default();
+    let folder = v
+        .get("parentReference")
+        .and_then(|p| p.get("path"))
+        .and_then(|x| x.as_str())
+        .and_then(sharepoint_folder_path);
+    let path = match folder.as_deref() {
+        Some(f) => format!("{f}/{name}"),
+        None => name.clone(),
+    };
+    let modified = v
+        .get("lastModifiedDateTime")
+        .and_then(|x| x.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    upsert_file_asset(
+        db,
+        user_id,
+        None, // SharePoint uses tenant configs, not oauth_connectors
+        "sharepoint",
+        &path,
+        folder.as_deref(),
+        &name,
+        v.get("size").and_then(|x| x.as_i64()),
+        modified,
+        is_extractable(mime),
+        kex_job_id,
+    )
+    .await;
+}
+
+/// One file discovered while walking a SharePoint drive tree.
+struct SharepointFileMeta {
+    id:          String,
+    name:        String,
+    mime:        String,
+    size:        Option<i64>,
+    modified:    Option<DateTime<Utc>>,
+    folder_path: String,
+}
+
+/// Recursively list ALL files under a SharePoint drive folder (Graph children
+/// endpoint), up to max_depth levels. `folder_path` is traversal-derived, rooted
+/// at "" (drive root) or the starting folder's name.
+#[allow(clippy::too_many_arguments)]
+async fn collect_sharepoint_folder_tree(
+    site_id: &str,
+    drive_id: &str,
+    folder_id: Option<&str>,
+    folder_path: &str,
+    token: &str,
+    http: &reqwest::Client,
+    acc: &mut Vec<SharepointFileMeta>,
+    depth: u32,
+    max_depth: u32,
+) {
+    if depth > max_depth {
+        return;
+    }
+
+    let select = "$select=id,name,size,file,folder,lastModifiedDateTime";
+    let url = match folder_id {
+        None | Some("root") => format!(
+            "https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root/children?{select}"
+        ),
+        Some(fid) => format!(
+            "https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{fid}/children?{select}"
+        ),
+    };
+
+    let resp = http.get(&url).bearer_auth(token).send().await;
+    let items = match resp {
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("value").and_then(|a| a.as_array()).cloned())
+            .unwrap_or_default(),
+        _ => return,
+    };
+
+    for item in &items {
+        let id   = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        if item.get("folder").is_some() {
+            let child_path = if folder_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{folder_path}/{name}")
+            };
+            Box::pin(collect_sharepoint_folder_tree(
+                site_id, drive_id, Some(id), &child_path, token, http, acc, depth + 1, max_depth,
+            ))
+            .await;
+        } else {
+            let mime = item
+                .get("file")
+                .and_then(|f| f.get("mimeType"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let modified = item
+                .get("lastModifiedDateTime")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            acc.push(SharepointFileMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                mime: mime.to_string(),
+                size: item.get("size").and_then(|v| v.as_i64()),
+                modified,
+                folder_path: folder_path.to_string(),
+            });
+        }
+    }
+}
+
+/// Core of a scheduled SharePoint re-sync (the `microsoft` cron trigger):
+/// walks the configured drive/folder, enqueues every extractable file for KEX
+/// (same enqueue path as the manual sync handler), and — when the operator
+/// enabled index_unsupported_files for Microsoft — upserts a `file_assets` row
+/// for EVERY listed file. Returns (synced, failed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_sharepoint_folder_sync(
+    state: &crate::models::AppState,
+    user_id: Uuid,
+    tenant_config_id: Uuid,
+    site_id: &str,
+    drive_id: &str,
+    folder_id: Option<&str>,
+    max_depth: u32,
+    classification_level_id: Option<Uuid>,
+) -> Result<(u32, u32)> {
+    let tenant = fetch_sharepoint_tenant(&state.db, tenant_config_id, user_id).await?;
+    let http = reqwest::Client::new();
+    let token = sharepoint_access_token(
+        &http,
+        &tenant.tenant_id,
+        &tenant.client_id,
+        &tenant.client_secret,
+    )
+    .await?;
+
+    let mut all_files: Vec<SharepointFileMeta> = Vec::new();
+    collect_sharepoint_folder_tree(
+        site_id, drive_id, folder_id, "", &token, &http, &mut all_files, 0, max_depth,
+    )
+    .await;
+
+    let capture_assets =
+        crate::routes::connector_configs::index_unsupported_enabled(&state.db, "microsoft").await;
+
+    let mut synced = 0u32;
+    let mut failed = 0u32;
+
+    for f in &all_files {
+        let mut kex_job_id: Option<Uuid> = None;
+        if is_extractable(&f.mime) {
+            match enqueue_sharepoint_file(
+                &state.db,
+                &state.redis,
+                user_id,
+                tenant_config_id,
+                site_id,
+                drive_id,
+                &f.id,
+                classification_level_id,
+            )
+            .await
+            {
+                Ok(job_id) => {
+                    synced += 1;
+                    kex_job_id = Some(job_id);
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("sharepoint trigger: enqueue {} failed: {e}", f.id);
+                }
+            }
+        }
+
+        if capture_assets {
+            let path = if f.folder_path.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{}/{}", f.folder_path, f.name)
+            };
+            upsert_file_asset(
+                &state.db,
+                user_id,
+                None,
+                "sharepoint",
+                &path,
+                if f.folder_path.is_empty() { None } else { Some(&f.folder_path) },
+                &f.name,
+                f.size,
+                f.modified,
+                is_extractable(&f.mime),
+                kex_job_id,
+            )
+            .await;
+        }
+    }
+
+    Ok((synced, failed))
 }
 
 // ─── Obsidian handlers ────────────────────────────────────────────────────────
@@ -1954,10 +2764,24 @@ async fn sync_obsidian_folder(
         })
         .to_string();
 
+        // P2b: content bytes are already resident (just read from disk), and
+        // `rel_str` is the full vault-relative path — use both directly, plus
+        // the file's real mtime as `modified_at`.
+        let content_hash = crate::services::source_docs::hash_content(&bytes);
+        let modified_at: Option<DateTime<Utc>> = std::fs::metadata(&canon)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from);
+        let source_doc = crate::services::source_docs::resolve_source_document(
+            &state.db, claims.sub, None, &rel_str, Some(&note_name),
+            &content_hash, modified_at,
+        ).await.ok();
+        let source_document_id = source_doc.as_ref().map(|d| d.id);
+
         let job_id = Uuid::new_v4();
         let insert = sqlx::query(
-            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5)",
         )
         .bind(job_id)
         .bind(claims.sub)
@@ -1969,6 +2793,7 @@ async fn sync_obsidian_folder(
             "discoveryMode": resolved.discovery_mode,
         }))
         .bind(resolved.classification_level_id)
+        .bind(source_document_id)
         .execute(&state.db)
         .await;
 
@@ -1990,6 +2815,9 @@ async fn sync_obsidian_folder(
             "ontology_id":             resolved.ontology_id,
             "classification":          resolved.classification_name,
             "classification_level_id": resolved.classification_level_id,
+            "source_document_id":      source_document_id,
+            "source_path":             &rel_str,
+            "source_modified_at":      modified_at,
         });
         crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
 
@@ -2172,6 +3000,13 @@ async fn enqueue_drive_file(
     drive_file_id: &str,
     file_name: &str,
     opts: &DriveExtractResolved,
+    // P2b: full source path (folder-traversal path when known, else just the
+    // file name) + source-side modified time when the caller already fetched
+    // it (folder sync always has both from Drive metadata; selected-file sync
+    // passes None when index_unsupported_files is disabled — no extra API
+    // call is made just for this).
+    full_path: &str,
+    modified_at: Option<DateTime<Utc>>,
 ) -> Result<Uuid> {
     use base64::Engine;
 
@@ -2187,11 +3022,20 @@ async fn enqueue_drive_file(
         "originalFilename": real_name,
     }).to_string();
 
+    // Content is already in hand (just downloaded) — hash it now so the
+    // document identity resolution reflects the real bytes, not just metadata.
+    let content_hash = crate::services::source_docs::hash_content(&bytes);
+    let source_doc = crate::services::source_docs::resolve_source_document(
+        db, user_id, Some(connector_id), full_path, Some(&real_name),
+        &content_hash, modified_at,
+    ).await.ok();
+    let source_document_id = source_doc.as_ref().map(|d| d.id);
+
     let job_id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+         VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5)",
     )
     .bind(job_id)
     .bind(user_id)
@@ -2204,8 +3048,25 @@ async fn enqueue_drive_file(
         "discoveryMode": opts.discovery_mode,
     }))
     .bind(opts.classification_level_id)
+    .bind(source_document_id)
     .execute(db)
     .await?;
+
+    // Record the sync-job row so GET /api/connectors/sync-status (and the agent
+    // get_sync_status tool) can report per-connector sync health. Live status is
+    // derived by joining onto the kex job, so this row is write-once.
+    let _ = sqlx::query(
+        "INSERT INTO connector_sync_jobs
+             (connector_id, user_id, source_type, source_id, source_name, kex_job_id, status)
+         VALUES ($1, $2, 'google_drive', $3, $4, $5, 'queued')",
+    )
+    .bind(connector_id)
+    .bind(user_id)
+    .bind(drive_file_id)
+    .bind(&real_name)
+    .bind(job_id)
+    .execute(db)
+    .await;
 
     let mut payload = json!({
         "job_id":                  job_id,
@@ -2217,6 +3078,9 @@ async fn enqueue_drive_file(
         "ontology_id":             opts.ontology_id,
         "classification":          opts.classification_name,
         "classification_level_id": opts.classification_level_id,
+        "source_document_id":      source_document_id,
+        "source_path":             full_path,
+        "source_modified_at":      modified_at,
     });
     crate::services::llm::inject_ollama_overrides(db, user_id, &mut payload).await;
 
@@ -2225,4 +3089,40 @@ async fn enqueue_drive_file(
         .map_err(|e| AppError::Internal(format!("Redis push failed: {e}")))?;
 
     Ok(job_id)
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod file_asset_tests {
+    use super::{file_ext, sharepoint_folder_path};
+
+    #[test]
+    fn file_ext_basic() {
+        assert_eq!(file_ext("rim.DWG"), Some("dwg".to_string()));
+        assert_eq!(file_ext("assembly.step"), Some("step".to_string()));
+        assert_eq!(file_ext("archive.tar.gz"), Some("gz".to_string()));
+    }
+
+    #[test]
+    fn file_ext_none_cases() {
+        assert_eq!(file_ext("README"), None);          // no dot
+        assert_eq!(file_ext(".env"), None);            // leading-dot only
+        assert_eq!(file_ext("trailing."), None);       // empty tail
+        assert_eq!(file_ext("x.aaaaaaaaaaaaaaaaaaaaaaaaa"), None); // > 20 chars
+    }
+
+    #[test]
+    fn sharepoint_folder_path_parses_root_relative() {
+        assert_eq!(
+            sharepoint_folder_path("/drives/b!abc123/root:/Projects/CAD"),
+            Some("Projects/CAD".to_string())
+        );
+    }
+
+    #[test]
+    fn sharepoint_folder_path_drive_root_is_none() {
+        assert_eq!(sharepoint_folder_path("/drives/b!abc123/root:"), None);
+        assert_eq!(sharepoint_folder_path("no-root-marker"), None);
+    }
 }

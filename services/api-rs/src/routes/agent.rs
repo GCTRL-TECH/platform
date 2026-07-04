@@ -199,14 +199,16 @@ Read tools:
 - list_graphs        : List knowledge graphs the caller can see. No args.
 - get_graph          : Read a compilation's entities + relationships. Args: { compilationId: string, limit?: number }
 - search_entities    : Find entities by name. Args: { query: string, limit?: number }
-- get_entity         : Read one entity, its connections AND its provenance (origin file / sourceRef / extraction job + timestamp). Use this to answer "where does X come from", "which file", "what's the source/origin of X". Args: { name: string }
-- get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files and timeline for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Args: { name: string }
+- get_entity         : Read one entity, its connections AND its provenance (origin file / sourceRef / extraction job + timestamp). Use this to answer "where does X come from", "which file", "what's the source/origin of X". Also returns `groundingChunks` (up to 3 verbatim source-text snippets that ground the entity) unless include_chunks=false. Each entry in `relations` may carry `authority` ("current" | "superseded") + `supersededByDoc` — when present, state the CURRENT value and mention that the superseded one comes from an older document. Args: { name: string, include_chunks?: boolean }
+- get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files, timeline, AND `groundingChunks` (verbatim source-text snippets) for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Key facts may carry `authority` ("current" | "superseded") + `supersededByDoc` — prefer the current fact and cite it as "current per <doc>; an older value came from <doc>". Args: { name: string }
 - get_neighbors      : List entities within N hops of a node (dependency tracing; code graphs — what does X touch?). Args: { name: string, depth?: number }
 - shortest_path      : Shortest path between two entities (how A connects to B / does X depend on Y). Args: { from: string, to: string }
 - search_chunks      : Retrieve source text passages for a question (RAG retrieval — use this to ANSWER questions, then cite the passages). Args: { query: string, compilationId?: string }
 - list_extractions   : List KEX extraction jobs. No args.
-- list_conflicts     : List open classification conflicts. No args.
+- list_conflicts     : List open conflicts: classification conflicts AND fact conflicts (kind "fact" — sources assert DIFFERENT values for a functional relation, e.g. two CEOs for one org; competingValues are ranked by source recency, authorityWinner is the current one). No args.
 - list_sources       : List connected data sources. No args.
+- find_file          : Find files by name/path across connected sources — including unsupported files (CAD .dwg/.step, images, archives) indexed as metadata. Returns location, size, modified/last-seen times and related parsed sibling documents from the same folder. Use for "where is file X / when was it last seen / what belongs to it". Args: { query: string, limit?: number }
+- get_sync_status    : Connector sync health: per connector the last sync time, job counts by status, and the last failures. Use for "is my Drive sync working". No args.
 - list_ontologies    : List ontologies. No args.
 - check_balance      : Check token balance. No args.
 
@@ -288,12 +290,14 @@ pub(crate) fn tool_schema() -> Value {
     json!({
         "tools": [
             { "name": "list_graphs",        "description": "List knowledge graphs the caller can access", "args": {} },
-            { "name": "get_graph",          "description": "Read a compilation's entities and relationships", "args": { "compilationId": "string", "limit": "number?" } },
-            { "name": "search_entities",    "description": "Find entities by name (clearance-filtered)", "args": { "query": "string", "limit": "number?" } },
-            { "name": "get_entity",         "description": "Read one entity, its connections, and its provenance (origin file / sourceRef / extraction job) — use for 'where does X come from / which file'", "args": { "name": "string" } },
-            { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?)", "args": { "name": "string", "depth": "number?" } },
+            { "name": "get_graph",          "description": "Read a compilation's entities and relationships. Start with response_format='summary' (default) — returns {name,type,degree} + relation-type counts, much cheaper than 'full'. Only use 'full' if you need the complete edge list. Default limit 100; max 500.", "args": { "compilationId": "string", "limit": "number?", "response_format": "string?" } },
+            { "name": "query",              "description": "Blended answer over graph + chunks + dossiers (RAG). Preferred first read tool for open questions — blends all memory tiers automatically and returns a grounded answer with sources + confidence. Args: { message: string, compilationId?: string }", "args": { "message": "string", "compilationId": "string?" } },
+            { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call after ANY substantive task to persist conclusions. Always pass compilationId (find via list_graphs). Args: { text: string, compilationId?: string }", "args": { "text": "string", "compilationId": "string?" } },
+            { "name": "search_entities",    "description": "Find entities by name (clearance-filtered). Use limit to page through results (default 10, max 50).", "args": { "query": "string", "limit": "number?" } },
+            { "name": "get_entity",         "description": "Read one entity, its connections, and its provenance (origin file / sourceRef / extraction job) — use for 'where does X come from / which file'. Also returns groundingChunks (up to 3 verbatim source-text snippets) unless include_chunks=false", "args": { "name": "string", "include_chunks": "boolean?" } },
+            { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?). Use depth 1 first; increase only if needed. Limit is fixed at 100.", "args": { "name": "string", "depth": "number?" } },
             { "name": "shortest_path",      "description": "Find the shortest path between two entities (how is A connected to B / does X depend on Y)", "args": { "from": "string", "to": "string" } },
-            { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
+            { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline, groundingChunks — verbatim source-text snippets). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
             { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval)", "args": { "query": "string", "compilationId": "string?" } },
             { "name": "list_wiki_pages",    "description": "List the distilled pages of a WIKI compilation (clearance-filtered — you only see pages you're cleared for)", "args": { "compilationId": "string" } },
             { "name": "get_wiki_page",      "description": "Read one distilled wiki page (markdown body + citations) by slug from a WIKI compilation", "args": { "compilationId": "string", "slug": "string" } },
@@ -304,7 +308,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "run_maintenance",    "description": "Run one memory governance cycle now (decay → dedup → promote hot → evict stale). Owner-level", "args": {} },
             { "name": "get_user_profile",   "description": "Read the owner's personalization profile (opt-in facts + summary) so answers can be tailored. Owner-level", "args": {} },
             { "name": "list_extractions",   "description": "List KEX extraction jobs", "args": {} },
-            { "name": "list_conflicts",     "description": "List open classification conflicts", "args": {} },
+            { "name": "list_conflicts",     "description": "List open conflicts — classification conflicts AND fact conflicts (competing values for a functional relation, ranked by source recency; authorityWinner = the current value)", "args": {} },
             { "name": "list_sources",       "description": "List connected data sources", "args": {} },
             { "name": "list_ontologies",    "description": "List ontologies", "args": {} },
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
@@ -325,7 +329,10 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "list_models",        "description": "List the built-in model catalog for a given runtime kind. Args: { runtime } where runtime ∈ 'ollama' | 'llamacpp' | 'vllm'. Read-only, any caller", "args": { "runtime": "string" } },
             { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'external', model?: string, base_url?: string, api_key?: string }. ollama/external: synchronous validate+persist. llamacpp: async (spawns pull+create in background, returns immediately with status='starting')", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?" } },
             { "name": "set_model",          "description": "Update the model for the active runtime without changing the provider (admin only). Validates against the built-in catalog for known runtimes; accepts any string for ollama/external. Args: { model: string }", "args": { "model": "string" } },
-            { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } }
+            { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } },
+            // ── File-asset index + connector ops ─────────────────────────────────
+            { "name": "find_file",          "description": "Find files by name/path across connected sources (Google Drive, SharePoint) — including UNSUPPORTED files like CAD drawings (.dwg/.step), images and archives that were indexed as metadata. Fuzzy-ranked (pg_trgm). Each hit includes path, size, modified/last-seen times, source, and up to 3 related parsed sibling documents from the same folder (with their KEX job ids) so you can answer 'what project is this file part of'. Args: { query: string, limit?: number (default 5) }", "args": { "query": "string", "limit": "number?" } },
+            { "name": "get_sync_status",    "description": "Summarize connector sync health for the caller: per connector (Drive/SharePoint) the last sync time and live job counts by status, plus the last 5 failed source files with their errors. Use to answer 'is my Drive sync working / what failed'. No args", "args": {} }
         ]
     })
 }
@@ -372,15 +379,20 @@ pub(crate) async fn execute_tool(
             }
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
-            let cypher = "MATCH (n) \
+            // KB-scope: a scoped token may only enumerate entities from its granted
+            // knowledge base(s); scoped-but-ungranted returns nothing.
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entities": [] }); }
+            let job_clause = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let cypher = format!("MATCH (n) \
                 WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
                   AND (n._owner = $uid OR n.user_id = $uid) \
-                  AND coalesce(n._min_rank,0) <= $rank \
-                RETURN n.name AS name, n.label AS label, n._classification AS cls LIMIT $limit";
+                  AND coalesce(n._min_rank,0) <= $rank {job_clause} \
+                RETURN n.name AS name, n.label AS label, n._classification AS cls LIMIT $limit");
+            let mut nq = neo4rs::query(&cypher).param("q", query).param("uid", uid).param("rank", rank as i64).param("limit", limit);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
             let mut out: Vec<Value> = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(cypher).param("q", query).param("uid", uid).param("rank", rank as i64).param("limit", limit),
-            ).await {
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 while let Ok(Some(row)) = stream.next().await {
                     out.push(json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
@@ -399,18 +411,36 @@ pub(crate) async fn execute_tool(
             if name.trim().is_empty() { return json!({ "error": "name is required" }); }
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
-            // Pull `_source_job` too so we can resolve the origin file/provenance —
-            // this is what lets Pi answer "where does X come from / which file".
-            let cypher = "MATCH (n {name: $name}) \
-                WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank \
-                OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+            // include_chunks (default true): P2a grounding chunks via the node's uri.
+            let include_chunks = args.get("include_chunks").and_then(|v| v.as_bool()).unwrap_or(true);
+            // Pull `_source_job` (+ `uri`, P2a) so we can resolve the origin file/
+            // provenance AND precise grounding chunks — this is what lets Pi answer
+            // "where does X come from / which file" and show grounded source text.
+            // P3 — relations come back as parallel arrays (type/target/
+            // authority/supersededBy) so Pi can say "current per <doc>, older
+            // value from <doc>" when conflict detection marked an edge.
+            // KB-scope: confine both the entity AND its shown neighbours to the token's
+            // granted knowledge base(s).
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) {
+                return json!({ "error": "not found or insufficient clearance" });
+            }
+            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            let cypher = format!("MATCH (n {{name: $name}}) \
+                WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank {njob} \
+                OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank {mjob} \
+                WITH n, [x IN collect(DISTINCT CASE WHEN r IS NULL THEN NULL ELSE \
+                    {{t: type(r), m: coalesce(m.name,''), a: coalesce(r._authority,''), \
+                     s: coalesce(r._superseded_by_doc,'')}} END)][..20] AS rels \
                 RETURN n.name AS name, n.label AS label, n._classification AS cls, \
-                       n._source_job AS sourceJob, \
-                       collect(DISTINCT type(r) + ' → ' + coalesce(m.name,''))[..20] AS rels LIMIT 1";
+                       n._source_job AS sourceJob, n.uri AS uri, \
+                       [x IN rels | x.t] AS relTypes, [x IN rels | x.m] AS relTargets, \
+                       [x IN rels | x.a] AS relAuth, [x IN rels | x.s] AS relSup LIMIT 1");
             let mut result = json!({ "error": "not found or insufficient clearance" });
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64),
-            ).await {
+            let mut nq = neo4rs::query(&cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 if let Ok(Some(row)) = stream.next().await {
                     // Resolve the origin file/provenance from the source job (Postgres).
                     let provenance: Value = match row.get::<String>("sourceJob").ok()
@@ -435,12 +465,44 @@ pub(crate) async fn execute_tool(
                         }
                         None => Value::Null,
                     };
+                    // P2a — grounded nodes: precise grounding chunks via the node's uri.
+                    let grounding_chunks: Vec<Value> = if include_chunks {
+                        match row.get::<String>("uri").ok() {
+                            Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims.sub, &uri).await,
+                            None => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    // Zip the parallel relation arrays: `connections` keeps the
+                    // pre-P3 "REL → target" strings; `relations` is structured
+                    // and carries authority/supersededByDoc when present.
+                    let rel_types:   Vec<String> = row.get("relTypes").unwrap_or_default();
+                    let rel_targets: Vec<String> = row.get("relTargets").unwrap_or_default();
+                    let rel_auth:    Vec<String> = row.get("relAuth").unwrap_or_default();
+                    let rel_sup:     Vec<String> = row.get("relSup").unwrap_or_default();
+                    let mut connections: Vec<String> = Vec::new();
+                    let mut relations: Vec<Value> = Vec::new();
+                    for (i, t) in rel_types.iter().enumerate() {
+                        let target = rel_targets.get(i).cloned().unwrap_or_default();
+                        connections.push(format!("{t} → {target}"));
+                        let mut rel = json!({ "rel": t, "target": target });
+                        if let Some(a) = rel_auth.get(i).filter(|a| !a.is_empty()) {
+                            rel["authority"] = json!(a);
+                            if let Some(s) = rel_sup.get(i).filter(|s| !s.is_empty()) {
+                                rel["supersededByDoc"] = json!(s);
+                            }
+                        }
+                        relations.push(rel);
+                    }
                     result = json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
                         "type": row.get::<String>("label").unwrap_or_default(),
                         "classification": row.get::<String>("cls").unwrap_or_default(),
-                        "connections": row.get::<Vec<String>>("rels").unwrap_or_default(),
+                        "connections": connections,
+                        "relations": relations,
                         "provenance": provenance,
+                        "groundingChunks": grounding_chunks,
                     });
                 }
             }
@@ -452,16 +514,29 @@ pub(crate) async fn execute_tool(
         "get_dossier" => {
             let name = args["name"].as_str().unwrap_or("").to_string();
             if name.trim().is_empty() { return json!({ "error": "name is required" }); }
-            // Try the stored dossier; build on-the-fly via FUSE when missing.
-            let mut row = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await;
+            // SCOPED read: KB-scoped tokens get nothing; a dossier whose facts exceed
+            // the caller's clearance is withheld. Build on-the-fly only when TRULY
+            // absent (not merely withheld) and the caller isn't KB-scoped.
+            let mut row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
             if row.is_none() {
-                if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
-                    row = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await;
+                let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+                let kb_scoped = crate::routes::kg::api_key_scope(&state.db, claims).await.is_some();
+                if truly_absent && !kb_scoped {
+                    if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
+                        row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+                    }
                 }
             }
             let result = match row {
                 Some(d) => {
                     crate::routes::kg::bump_dossier_heat(&state.db, d.id).await;
+                    // P2a — grounded nodes: resolve the graph node's uri by name
+                    // (the dossier's own entity_uri is a dossier-scoped key, not
+                    // the graph uri) and fetch its precise grounding chunks.
+                    let grounding_chunks = match crate::routes::kg::resolve_graph_uri(state, claims.sub, &d.entity_name).await {
+                        Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims.sub, &uri).await,
+                        None => Vec::new(),
+                    };
                     json!({
                         "entityName":  d.entity_name,
                         "summary":     d.summary,
@@ -471,6 +546,7 @@ pub(crate) async fn execute_tool(
                         "trust":       d.trust,
                         "pinned":      d.pinned,
                         "authoritative": true,
+                        "groundingChunks": grounding_chunks,
                     })
                 }
                 None => json!({ "error": "no dossier and no owned entity with that name" }),
@@ -492,6 +568,7 @@ pub(crate) async fn execute_tool(
             // Scope to the caller's own chunks (grounding + no cross-user leak).
             let body = json!({ "query": query, "limit": 5, "compilation_id": compilation_id, "user_id": claims.sub, "max_rank": rank });
             let chunks = match client.post(format!("{}/search", state.cfg.kex_worker_url))
+                .header("X-Internal-Secret", &state.cfg.internal_secret)
                 .json(&body).timeout(Duration::from_secs(10)).send().await
             {
                 Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "chunks": [] })),
@@ -501,18 +578,41 @@ pub(crate) async fn execute_tool(
             chunks
         }
 
-        // ── Read: open classification conflicts ───────────────────────────────
+        // ── Read: open conflicts (classification + P3 fact conflicts) ─────────
         "list_conflicts" => {
+            // KB-scope: a scoped token only sees conflicts in its granted knowledge
+            // base(s) (the rows carry competing fact VALUES — must not leak cross-KB).
+            let scoped = crate::routes::kg::api_key_scope(&state.db, claims).await;
+            if matches!(&scoped, Some(s) if s.is_empty()) { return json!({ "conflicts": [] }); }
+            let scoped_comps: Option<Vec<uuid::Uuid>> = scoped.map(|s| s.into_iter().collect());
             let rows = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>, String, String)>(
                 "SELECT cc.id, cc.compilation_id, cc.element_kind, cc.element_key
                  FROM classification_conflicts cc JOIN compilations c ON c.id = cc.compilation_id
-                 WHERE c.user_id = $1 AND cc.status = 'open' ORDER BY cc.created_at DESC LIMIT 50"
-            ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
-            json!({
-                "conflicts": rows.iter().map(|(id, cid, kind, key)| json!({
-                    "id": id, "compilationId": cid, "elementKind": kind, "elementKey": key
-                })).collect::<Vec<_>>()
-            })
+                 WHERE c.user_id = $1 AND cc.status = 'open'
+                   AND ($2::uuid[] IS NULL OR cc.compilation_id = ANY($2))
+                 ORDER BY cc.created_at DESC LIMIT 50"
+            ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await.unwrap_or_default();
+            let mut conflicts: Vec<Value> = rows.iter().map(|(id, cid, kind, key)| json!({
+                "id": id, "kind": "classification",
+                "compilationId": cid, "elementKind": kind, "elementKey": key
+            })).collect();
+            // P3 — fact conflicts: competing values for a functional relation
+            // (e.g. two sources naming different CEOs), ranked by recency.
+            let fact_rows = sqlx::query_as::<_, (
+                uuid::Uuid, Option<uuid::Uuid>, String, String, String, Value, Option<String>,
+            )>(
+                "SELECT id, compilation_id, relation, key_name, key_side, tails, authority_winner
+                 FROM fact_conflicts WHERE user_id = $1 AND status = 'open'
+                   AND ($2::uuid[] IS NULL OR compilation_id = ANY($2))
+                 ORDER BY first_detected_at DESC LIMIT 50"
+            ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await.unwrap_or_default();
+            conflicts.extend(fact_rows.iter().map(|(id, cid, relation, key_name, key_side, tails, winner)| json!({
+                "id": id, "kind": "fact",
+                "compilationId": cid, "relation": relation,
+                "entity": key_name, "keySide": key_side,
+                "competingValues": tails, "authorityWinner": winner,
+            })));
+            json!({ "conflicts": conflicts })
         }
 
         // ── Action: ingest text ───────────────────────────────────────────────
@@ -661,7 +761,11 @@ pub(crate) async fn execute_tool(
             let Some(cid) = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
                 return json!({ "error": "compilationId is required" });
             };
+            // Default 100, max 500. Agents should start small and page if needed.
             let limit = args["limit"].as_i64().unwrap_or(100).clamp(1, 500);
+            // "summary" (default) = {name,type,degree} + relation-type counts only.
+            // "full" = today's shape with the complete edge list. Always try summary first.
+            let full_mode = args["response_format"].as_str().unwrap_or("summary") == "full";
             let rank = crate::routes::kg::effective_rank_for_compilation(&state.db, claims, cid).await;
             // Resolve the compilation's source jobs (owner-scoped).
             let row: Option<(Vec<uuid::Uuid>,)> = sqlx::query_as(
@@ -671,28 +775,165 @@ pub(crate) async fn execute_tool(
             let uid = claims.sub.to_string();
             let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
             let scope = if jobs.is_empty() { "n._owner = $uid" } else { "n._source_job IN $jobIds" };
-            let cypher = format!(
-                "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
-                 OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
-                 RETURN n.name AS n, type(r) AS rel, m.name AS m LIMIT $limit"
-            );
-            let mut entities = std::collections::BTreeSet::<String>::new();
-            let mut rels: Vec<Value> = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(&cypher).param("uid", uid).param("jobIds", job_strs)
-                    .param("rank", rank as i64).param("limit", limit),
-            ).await {
-                while let Ok(Some(row)) = stream.next().await {
-                    if let Ok(n) = row.get::<String>("n") { entities.insert(n.clone());
-                        if let (Ok(rel), Ok(m)) = (row.get::<String>("rel"), row.get::<String>("m")) {
-                            entities.insert(m.clone());
-                            rels.push(json!({ "head": n, "relType": rel, "tail": m }));
+
+            crate::services::audit::log_access(&state.db, claims, "agent.get_graph", "compilation", &cid.to_string(), rank, None, true, None).await;
+
+            if full_mode {
+                // Full mode: return all nodes + edges (expensive for large graphs).
+                let cypher = format!(
+                    "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+                     OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
+                     RETURN n.name AS n, type(r) AS rel, m.name AS m LIMIT $limit"
+                );
+                let mut entities = std::collections::BTreeSet::<String>::new();
+                let mut rels: Vec<Value> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(
+                    neo4rs::query(&cypher).param("uid", uid).param("jobIds", job_strs)
+                        .param("rank", rank as i64).param("limit", limit),
+                ).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        if let Ok(n) = row.get::<String>("n") { entities.insert(n.clone());
+                            if let (Ok(rel), Ok(m)) = (row.get::<String>("rel"), row.get::<String>("m")) {
+                                entities.insert(m.clone());
+                                rels.push(json!({ "head": n, "relType": rel, "tail": m }));
+                            }
                         }
                     }
                 }
+                json!({ "response_format": "full", "entities": entities.into_iter().collect::<Vec<_>>(), "relationships": rels })
+            } else {
+                // Summary mode (default): per-entity {name,type,degree} + relation-type counts.
+                // Much cheaper — start here, switch to "full" only if you need the edge list.
+                let cypher_nodes = format!(
+                    "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+                     OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+                     RETURN n.name AS name, coalesce(n.coarse_type, n.label, n.type, '') AS type, \
+                            count(r) AS degree LIMIT $limit"
+                );
+                let cypher_rel_types = format!(
+                    "MATCH (n) WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+                     MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+                     RETURN type(r) AS relType, count(r) AS cnt LIMIT 50"
+                );
+                let uid2 = uid.clone();
+                let job_strs2 = job_strs.clone();
+                let mut node_rows: Vec<Value> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(
+                    neo4rs::query(&cypher_nodes).param("uid", uid).param("jobIds", job_strs)
+                        .param("rank", rank as i64).param("limit", limit),
+                ).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        node_rows.push(json!({
+                            "name": row.get::<String>("name").unwrap_or_default(),
+                            "type": row.get::<String>("type").unwrap_or_default(),
+                            "degree": row.get::<i64>("degree").unwrap_or(0),
+                        }));
+                    }
+                }
+                let mut rel_type_counts: Vec<Value> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(
+                    neo4rs::query(&cypher_rel_types).param("uid", uid2).param("jobIds", job_strs2)
+                        .param("rank", rank as i64),
+                ).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        rel_type_counts.push(json!({
+                            "relType": row.get::<String>("relType").unwrap_or_default(),
+                            "count": row.get::<i64>("cnt").unwrap_or(0),
+                        }));
+                    }
+                }
+                json!({
+                    "response_format": "summary",
+                    "hint": "This is a summary. Pass response_format='full' to get the complete edge list (more tokens).",
+                    "entityCount": node_rows.len(),
+                    "entities": node_rows,
+                    "relationTypeCounts": rel_type_counts,
+                })
             }
-            crate::services::audit::log_access(&state.db, claims, "agent.get_graph", "compilation", &cid.to_string(), rank, None, true, None).await;
-            json!({ "entities": entities.into_iter().collect::<Vec<_>>(), "relationships": rels })
+        }
+
+        // ── Read: blended RAG answer (mirrors stdio gctrl_query) ──────────────
+        "query" => {
+            let message = args["message"].as_str().unwrap_or("").trim().to_string();
+            if message.is_empty() { return json!({ "error": "message is required" }); }
+            let compilation_id = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
+            // Call the same POST /api/rag/query endpoint the stdio gctrl_query tool uses
+            // (incognito mode = no server-side conversation persistence).
+            // We generate a short-lived JWT for the loopback call so the RAG handler
+            // enforces the same clearance the caller's claims carry.
+            let jwt = crate::middleware::auth::sign_access(&state.cfg, claims);
+            let client = reqwest::Client::new();
+            let api_base = format!("http://127.0.0.1:{}/api", state.cfg.port);
+            let mut body = json!({ "message": message, "mode": "incognito" });
+            if let Some(cid) = compilation_id {
+                body["compilationId"] = json!(cid);
+            }
+            match client.post(format!("{api_base}/rag/query"))
+                .bearer_auth(&jwt)
+                .json(&body)
+                .timeout(Duration::from_secs(30))
+                .send().await
+            {
+                Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "error": "parse error" })),
+                Err(e) => json!({ "error": format!("RAG query failed: {e}") }),
+            }
+        }
+
+        // ── Write: extract + link to compilation (mirrors stdio gctrl_store) ──
+        "store" => {
+            let text = args["text"].as_str().unwrap_or("");
+            if text.trim().len() < 10 { return json!({ "error": "text too short (min 10 chars)" }); }
+            let compilation_id = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
+            // Inline the extraction logic from create_extraction to avoid recursive async fn.
+            if let (Some(key_rank), Some(c)) = (claims.api_key_rank, Option::<uuid::Uuid>::None) {
+                // No classificationLevelId for store — this path is only reached if we add one later.
+                let lvl_rank: Option<i32> = sqlx::query_scalar(
+                    "SELECT rank FROM classification_levels WHERE id = $1"
+                ).bind(c).fetch_optional(&state.db).await.ok().flatten();
+                if lvl_rank.map_or(false, |r| r > key_rank) {
+                    return json!({ "error": "classification exceeds this access token's clearance" });
+                }
+            }
+            let job_id = uuid::Uuid::new_v4();
+            let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
+                .bind(claims.sub).execute(&state.db).await;
+            let _ = sqlx::query(
+                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
+                 VALUES ($1, $2, 'kex_extract', 'pending', $3, NULL)"
+            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent_store" })).execute(&state.db).await;
+            crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
+            let mut payload = json!({
+                "job_id": job_id, "user_id": claims.sub, "type": "text",
+                "input": text, "classification": null, "classification_level_id": null
+            });
+            crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
+            let _ = crate::services::redis::lpush(&state.redis, "kex:jobs", &payload.to_string()).await;
+            // Link to compilation if provided.
+            let mut linked = false;
+            if let Some(cid) = compilation_id {
+                if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                    return json!({ "error": e.to_string() });
+                }
+                let existing: Option<(Vec<uuid::Uuid>,)> = sqlx::query_as(
+                    "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
+                ).bind(cid).bind(claims.sub).fetch_optional(&state.db).await.ok().flatten();
+                if let Some((mut jobs,)) = existing {
+                    if !jobs.contains(&job_id) {
+                        jobs.push(job_id);
+                        let _ = sqlx::query("UPDATE compilations SET source_job_ids=$1 WHERE id=$2 AND user_id=$3")
+                            .bind(&jobs).bind(cid).bind(claims.sub).execute(&state.db).await;
+                    }
+                    linked = true;
+                }
+            }
+            json!({
+                "ok": true,
+                "jobId": job_id,
+                "compilationId": compilation_id,
+                "linked": linked,
+                "status": "pending",
+                "note": "Extraction enqueued. Use query() once complete to verify the knowledge was stored."
+            })
         }
 
         // ── Read: KEX extraction jobs ─────────────────────────────────────────
@@ -846,20 +1087,24 @@ pub(crate) async fn execute_tool(
             let depth = args["depth"].as_i64().unwrap_or(1).clamp(1, 3);
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
-            // Variable-length expansion, clearance-filtered on every hop's endpoint.
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entity": name, "neighbors": [] }); }
+            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            // Variable-length expansion, clearance- AND KB-scope-filtered on every hop.
             let cypher = format!(
                 "MATCH (n {{name: $name}}) \
-                   WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank \
+                   WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank {njob} \
                  MATCH (n)-[r*1..{depth}]-(m) \
-                   WHERE (m._owner = $uid OR m.user_id = $uid) AND coalesce(m._min_rank,0) <= $rank \
+                   WHERE (m._owner = $uid OR m.user_id = $uid) AND coalesce(m._min_rank,0) <= $rank {mjob} \
                  RETURN DISTINCT m.name AS name, coalesce(m.coarse_type, m.label, m.type) AS type, \
                         length(r) AS hops \
                  ORDER BY hops ASC, name ASC LIMIT 100"
             );
             let mut out: Vec<Value> = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(&cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64),
-            ).await {
+            let mut nq = neo4rs::query(&cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 while let Ok(Some(row)) = stream.next().await {
                     out.push(json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
@@ -881,18 +1126,22 @@ pub(crate) async fn execute_tool(
             }
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "found": false, "from": from, "to": to }); }
             // shortestPath up to 8 hops; reject any path crossing a node above the
-            // caller's clearance (no leaking a connection THROUGH classified nodes).
-            let cypher = "MATCH (a {name: $from}), (b {name: $to}) \
+            // caller's clearance OR outside its granted knowledge base(s) — no leaking a
+            // connection THROUGH classified or out-of-scope nodes.
+            let pathjob = if scoped.is_some() { "AND all(x IN nodes(p) WHERE x._source_job IN $jobs)" } else { "" };
+            let cypher = format!("MATCH (a {{name: $from}}), (b {{name: $to}}) \
                   WHERE (a._owner = $uid OR a.user_id = $uid) AND (b._owner = $uid OR b.user_id = $uid) \
                   MATCH p = shortestPath((a)-[*..8]-(b)) \
-                  WHERE all(x IN nodes(p) WHERE coalesce(x._min_rank,0) <= $rank) \
+                  WHERE all(x IN nodes(p) WHERE coalesce(x._min_rank,0) <= $rank) {pathjob} \
                   RETURN [x IN nodes(p) | x.name] AS names, \
-                         [r IN relationships(p) | type(r)] AS rels, length(p) AS hops LIMIT 1";
+                         [r IN relationships(p) | type(r)] AS rels, length(p) AS hops LIMIT 1");
             let mut result = json!({ "found": false, "from": from, "to": to });
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(cypher).param("from", from.clone()).param("to", to.clone()).param("uid", uid).param("rank", rank as i64),
-            ).await {
+            let mut nq = neo4rs::query(&cypher).param("from", from.clone()).param("to", to.clone()).param("uid", uid).param("rank", rank as i64);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 if let Ok(Some(row)) = stream.next().await {
                     result = json!({
                         "found": true, "from": from, "to": to,
@@ -1173,6 +1422,23 @@ pub(crate) async fn execute_tool(
                 }
                 Err(e) => json!({ "error": format!("DB update failed: {e}") }),
             }
+        }
+
+        // ── Read: fuzzy file-asset search ("where is the rim CAD file?") ──────
+        "find_file" => {
+            let query = args["query"].as_str().unwrap_or("").trim().to_string();
+            if query.is_empty() {
+                return json!({ "error": "query is required" });
+            }
+            let limit = args["limit"].as_i64().unwrap_or(5).clamp(1, 25);
+            let result = crate::routes::connectors::find_file_json(&state.db, claims.sub, &query, limit).await;
+            crate::services::audit::log_access(&state.db, claims, "agent.find_file", "file_assets", &query, 0, None, true, None).await;
+            result
+        }
+
+        // ── Read: connector sync health summary ───────────────────────────────
+        "get_sync_status" => {
+            crate::routes::connectors::sync_status_json(&state.db, claims.sub).await
         }
 
         _ => json!({ "error": format!("Unknown tool: {tool_name}") }),
@@ -1494,6 +1760,79 @@ mod agent_tool_registration_tests {
             assert!(names.contains(&expected.to_string()),
                 "pre-existing tool '{expected}' must still be registered");
         }
+    }
+
+    // ── New unified surface tools ─────────────────────────────────────────────
+
+    #[test]
+    fn tool_schema_contains_query() {
+        assert!(tool_names().contains(&"query".to_string()),
+            "tool_schema() must include 'query' (blended RAG, mirrors stdio gctrl_query)");
+    }
+
+    #[test]
+    fn tool_schema_contains_store() {
+        assert!(tool_names().contains(&"store".to_string()),
+            "tool_schema() must include 'store' (write-back, mirrors stdio gctrl_store)");
+    }
+
+    // ── File-asset index + connector ops tools ────────────────────────────────
+
+    #[test]
+    fn tool_schema_contains_find_file() {
+        assert!(tool_names().contains(&"find_file".to_string()),
+            "tool_schema() must include 'find_file'");
+    }
+
+    #[test]
+    fn tool_schema_contains_get_sync_status() {
+        assert!(tool_names().contains(&"get_sync_status".to_string()),
+            "tool_schema() must include 'get_sync_status'");
+    }
+
+    #[test]
+    fn find_file_descriptor_has_query_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("find_file"))
+            .expect("find_file must be in tool_schema");
+        assert!(tool["args"].get("query").is_some(),
+            "find_file descriptor must declare a 'query' arg");
+        assert!(tool["args"].get("limit").is_some(),
+            "find_file descriptor must declare a 'limit' arg");
+    }
+
+    // ── P2a: grounded nodes — get_entity include_chunks arg ───────────────────
+
+    #[test]
+    fn get_entity_descriptor_has_include_chunks_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("get_entity"))
+            .expect("get_entity must be in tool_schema");
+        assert!(tool["args"].get("include_chunks").is_some(),
+            "get_entity descriptor must declare an 'include_chunks' arg (P2a grounded nodes)");
+    }
+
+    // ── get_graph summary mode ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_graph_descriptor_has_response_format_arg() {
+        let schema = tool_schema();
+        let tool = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("get_graph"))
+            .expect("get_graph must be in tool_schema");
+        assert!(tool["args"].get("response_format").is_some(),
+            "get_graph descriptor must declare a 'response_format' arg");
     }
 
     // ── Admin-gate logic (pure, no DB needed) ─────────────────────────────────

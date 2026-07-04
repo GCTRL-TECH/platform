@@ -213,7 +213,7 @@ services:
   # Optional high-performance runtime: llama.cpp (OpenAI-compatible /v1). Pulled only
   # when selected (profile bundled-llamacpp). Generation at gctrl-llamacpp:8080/v1.
   gctrl-llamacpp:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp:server-b9538
     container_name: gctrl-llamacpp
     restart: unless-stopped
     profiles: [bundled-llamacpp]
@@ -226,7 +226,7 @@ services:
       - gctrl
   # Pinned embedding sidecar (nomic-embed-text, dim 768) — wired into KEX/FUSE in Phase 6.
   gctrl-llamacpp-embed:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp:server-b9538
     container_name: gctrl-llamacpp-embed
     restart: unless-stopped
     profiles: [bundled-llamacpp]

@@ -92,7 +92,8 @@ const CATALOG: &[RecModel] = &[
     RecModel { name: "mxbai-embed-large", purpose: "embedding", size_gb: 0.67, ram_gb: 1.5, speed: 4, quality: 5, recommended: false, note: "Higher retrieval quality, a bit larger/slower." },
     RecModel { name: "all-minilm",        purpose: "embedding", size_gb: 0.05, ram_gb: 0.5, speed: 5, quality: 3, recommended: false, note: "Tiny + fastest; lower quality. Good for weak hardware." },
     // ── Relation extraction (chat-style; quality matters for relation F1) ──
-    RecModel { name: "qwen2.5:7b",  purpose: "relation", size_gb: 4.7, ram_gb: 6.0, speed: 3, quality: 5, recommended: true,  note: "Default. Best local relation F1 (~0.86). Needs ~6GB free RAM." },
+    RecModel { name: "qwen2.5:7b",  purpose: "relation", size_gb: 4.7, ram_gb: 6.0, speed: 3, quality: 5, recommended: true,  note: "Default. Strong local relation quality. Needs ~6GB free RAM." },
+    RecModel { name: "qwen2.5:14b", purpose: "relation", size_gb: 9.0, ram_gb: 12.0, speed: 2, quality: 5, recommended: false, note: "Quality upgrade: +10% relation F1 on our 32-doc business-document benchmark vs the pre-tuning baseline (measured). Slower on CPU; ideal with GPU. Needs ~12GB RAM." },
     RecModel { name: "qwen2.5:3b",  purpose: "relation", size_gb: 1.9, ram_gb: 3.0, speed: 4, quality: 4, recommended: false, note: "Lighter; good relations on ~4GB RAM." },
     RecModel { name: "llama3.2:3b", purpose: "relation", size_gb: 2.0, ram_gb: 3.0, speed: 4, quality: 3, recommended: false, note: "Fast, modest quality. Low-RAM fallback." },
     // ── Distillation (wiki prose; instruction-following + fluency) ──

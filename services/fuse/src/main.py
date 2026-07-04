@@ -447,7 +447,7 @@ class MergeRequest(BaseModel):
     threshold_accept: Optional[float] = None
     threshold_review: Optional[float] = None
     enable_conex: bool = False
-    enable_smart_match: bool = False
+    enable_smart_match: bool = True
     enable_canonical_link: bool = False
     # Embedding best-buddy + model-number pass for NOISY general-name data (the
     # dirty-text quality lever). OFF by default → clean/field-mode paths unchanged.

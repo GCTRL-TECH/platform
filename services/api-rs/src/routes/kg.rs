@@ -24,7 +24,10 @@ pub(crate) async fn get_user_clearance_rank(db: &sqlx::PgPool, claims: &JwtClaim
     // → full access; non-admin → capped to their stored rank). It's `#[serde(skip)]`
     // so it can only be set in-process, never via a token.
     if let Some(o) = claims.agent_override_rank {
-        return o;
+        // Still cap by any API-key rank: an admin deliberately driving a LOW-rank key
+        // must not get full access through the override. (A JWT session has no
+        // api_key_rank, so the board agent's i32::MAX override is unaffected.)
+        return match claims.api_key_rank { Some(k) => o.min(k), None => o };
     }
     let db_rank = sqlx::query_scalar::<_, i32>("SELECT COALESCE(clearance_rank, 100) FROM users WHERE id = $1")
         .bind(claims.sub)
@@ -60,6 +63,27 @@ pub(crate) async fn api_key_scope(
         "SELECT compilation_id FROM api_key_grants WHERE api_key_id = $1"
     ).bind(key_id).fetch_all(db).await.unwrap_or_default();
     Some(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// The set of source-job ids a KB-scoped token may traverse in the graph: the union
+/// of `source_job_ids` across its granted compilations. `None` = JWT/unscoped token
+/// (no restriction). `Some(empty)` = scoped but granted nothing → the caller returns
+/// no results. Graph nodes/edges carry `_source_job` (a UUID string), so adding
+/// `n._source_job IN $jobs` confines a scoped token to its knowledge base(s) — this
+/// closes the hole where the global graph tools (search_entities / get_entity /
+/// get_neighbors / shortest_path / graph_search) enforced only owner + rank and let a
+/// KB-scoped token enumerate the owner's ENTIRE graph across KB boundaries.
+pub(crate) async fn api_key_scoped_jobs(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> Option<Vec<String>> {
+    let set = api_key_scope(db, claims).await?;
+    if set.is_empty() { return Some(Vec::new()); }
+    let comp_ids: Vec<Uuid> = set.into_iter().collect();
+    let jobs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT unnest(source_job_ids) FROM compilations WHERE id = ANY($1)"
+    ).bind(&comp_ids).fetch_all(db).await.unwrap_or_default();
+    Some(jobs.into_iter().map(|j| j.to_string()).collect())
 }
 
 /// Write-scope guard: a KB-scoped token may only WRITE into a compilation in its
@@ -151,6 +175,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/relationship",                         post(add_relationship).delete(delete_relationship))
         .route("/node",                                 axum::routing::delete(delete_node))
         .route("/corrections",                          get(list_corrections))
+        .route("/conflicts/:id/resolve",                post(resolve_fact_conflict))
         .route("/graph/search",                         get(graph_search))
         .route("/graph/entity/:name/neighbors",         get(entity_neighbors))
         .route("/graph/entity/:name/lineage",           get(entity_lineage))
@@ -158,6 +183,53 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/folders",                              get(list_folders).post(create_folder))
         .route("/folders/:id",                          put(update_folder).delete(delete_folder))
         .route("/folders/move/:compilation_id",         put(move_compilation_to_folder))
+        .route("/source-documents",                     get(list_source_documents))
+}
+
+// ── Source document identity + version chains (P2b) ──────────────────────────
+
+#[derive(Deserialize)]
+struct SourceDocQuery { path: String }
+
+/// GET /api/kg/source-documents?path=... — list the version chain for one
+/// (user, path) source document, newest version first. Returns a hash prefix
+/// (not the full sha256) so the response stays light for display purposes.
+async fn list_source_documents(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<SourceDocQuery>,
+) -> Result<Json<Value>> {
+    let rows = sqlx::query_as::<_, (
+        Uuid, i32, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>,
+        bool, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>,
+    )>(
+        "SELECT id, version, content_hash, name, modified_at,
+                latest, first_ingested_at, last_ingested_at
+           FROM source_documents
+          WHERE user_id = $1 AND path = $2
+          ORDER BY version DESC"
+    )
+    .bind(claims.sub)
+    .bind(&q.path)
+    .fetch_all(&state.db)
+    .await?;
+
+    let versions: Vec<Value> = rows.into_iter().map(|(
+        id, version, hash, name, modified_at, latest, first_ingested_at, last_ingested_at,
+    )| {
+        json!({
+            "id":              id,
+            "version":         version,
+            "hashPrefix":      &hash[..hash.len().min(12)],
+            "name":            name,
+            "modifiedAt":      modified_at,
+            "latest":          latest,
+            "firstIngestedAt": first_ingested_at,
+            "lastIngestedAt":  last_ingested_at,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "path": q.path, "versions": versions })))
 }
 
 // ── Folders (workspace organisation) ──────────────────────────────────────────
@@ -325,6 +397,93 @@ fn relation_to_json(r: &Relation) -> Value {
         "confidence": confidence,
         "properties": props,
     })
+}
+
+// ── P2a — grounded nodes: entity URI -> grounding chunks ──────────────────────
+//
+// KEX now writes each chunk's `entity_uris` (the graph URIs of the entities it
+// grounds — see migration 060) alongside the legacy name-based `entity_mentions`.
+// This lets any entity read path answer "show me the source text" precisely,
+// instead of a lossy name/ILIKE search.
+
+/// Fetch up to 3 grounding chunks whose `entity_uris` overlaps the given entity
+/// uri (or a FUSE-merged member's uri, via `SIMILAR_TO` — checked defensively;
+/// no merge pass writes that edge today, so this is a no-op until one does).
+/// Returns `[{id, snippet, sourceDocumentId, jobId, createdAt}]`, newest first.
+pub(crate) async fn fetch_grounding_chunks(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    uri: &str,
+) -> Vec<Value> {
+    let mut uris = vec![uri.to_string()];
+    if let Ok(mut stream) = state.neo.execute(
+        neo_query("MATCH (m)-[:SIMILAR_TO]->(n {uri: $uri}) RETURN DISTINCT m.uri AS u")
+            .param("uri", uri.to_string()),
+    ).await {
+        while let Ok(Some(row)) = stream.next().await {
+            if let Ok(u) = row.get::<String>("u") {
+                if !uris.contains(&u) { uris.push(u); }
+            }
+        }
+    }
+
+    let rows: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT id, content, source_document_id, job_id, created_at
+               FROM text_chunks
+              WHERE user_id = $1 AND entity_uris && $2
+              ORDER BY created_at DESC LIMIT 3"
+        )
+        .bind(user_id)
+        .bind(&uris)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    rows.into_iter()
+        .map(|(id, content, source_document_id, job_id, created_at)| {
+            grounding_chunk_to_json(id, &content, source_document_id, job_id, created_at)
+        })
+        .collect()
+}
+
+/// Pure shape helper: one `text_chunks` row -> the `groundingChunks` entry JSON.
+/// Factored out of `fetch_grounding_chunks` so the snippet-truncation + key
+/// shape is unit-testable without a database.
+fn grounding_chunk_to_json(
+    id: Uuid,
+    content: &str,
+    source_document_id: Option<Uuid>,
+    job_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let snippet: String = content.chars().take(300).collect();
+    json!({
+        "id": id,
+        "snippet": snippet,
+        "sourceDocumentId": source_document_id,
+        "jobId": job_id,
+        "createdAt": created_at,
+    })
+}
+
+/// Resolve the graph `uri` of the canonical (highest-degree) node matching
+/// `name` for `user_id` — used by dossier reads, which only carry a name/
+/// dossier-key (not the graph uri) today.
+pub(crate) async fn resolve_graph_uri(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    name: &str,
+) -> Option<String> {
+    let cypher = "MATCH (n {name: $name}) WHERE n._owner = $uid OR n.user_id = $uid \
+                  OPTIONAL MATCH (n)--() \
+                  WITH n, count(*) AS degree ORDER BY degree DESC, id(n) ASC \
+                  RETURN n.uri AS uri LIMIT 1";
+    let mut stream = state.neo.execute(
+        neo_query(cypher).param("name", name.to_string()).param("uid", user_id.to_string())
+    ).await.ok()?;
+    let row = stream.next().await.ok()??;
+    row.get::<String>("uri").ok()
 }
 
 /// Compute live node + edge counts directly from Neo4j for a compilation.
@@ -1423,15 +1582,21 @@ async fn graph_search(
     // Cross-graph search uses the token's base clearance (per-graph grants are
     // scoped to a specific compilation and don't widen a global search).
     let base_rank = get_user_clearance_rank(&state.db, &claims).await;
+    // KB-scope: a scoped token may only search within its granted knowledge base(s).
+    let scoped = api_key_scoped_jobs(&state.db, &claims).await;
+    if matches!(&scoped, Some(j) if j.is_empty()) { return Ok(Json(json!({ "nodes": [] }))); }
+    let job_clause = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
 
-    let cypher = "MATCH (n) \
+    let cypher = format!("MATCH (n) \
                   WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
                   AND n.user_id = $uid \
-                  AND coalesce(n._min_rank,0) <= $rank \
-                  RETURN n LIMIT $limit";
+                  AND coalesce(n._min_rank,0) <= $rank {job_clause} \
+                  RETURN n LIMIT $limit");
 
+    let mut nq = neo_query(&cypher).param("q", q.q.clone()).param("uid", uid.clone()).param("rank", base_rank as i64).param("limit", limit);
+    if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
     let mut stream = state.neo
-        .execute(neo_query(cypher).param("q", q.q.clone()).param("uid", uid.clone()).param("rank", base_rank as i64).param("limit", limit))
+        .execute(nq)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -1488,7 +1653,8 @@ async fn entity_neighbors(
     let mut stream = state.neo
         .execute(
             neo_query("MATCH (n {name: $name, user_id: $uid})-[r]-(m) \
-                       WHERE coalesce(n._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
+                       WHERE (m._owner = $uid OR m.user_id = $uid) \
+                         AND coalesce(n._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
                        RETURN n, r, m LIMIT $limit")
                 .param("name", name.clone())
                 .param("uid", uid.clone())
@@ -1515,7 +1681,8 @@ async fn entity_neighbors(
         let mut stream2 = state.neo
             .execute(
                 neo_query("MATCH (n {name: $name, user_id: $uid})-[]-(mid)-[r2]-(m) \
-                           WHERE coalesce(mid._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r2._min_rank,0) <= $rank \
+                           WHERE (mid._owner = $uid OR mid.user_id = $uid) AND (m._owner = $uid OR m.user_id = $uid) \
+                             AND coalesce(mid._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r2._min_rank,0) <= $rank \
                            RETURN mid AS n, r2 AS r, m LIMIT $limit")
                     .param("name", name.clone())
                     .param("uid", uid.clone())
@@ -1541,14 +1708,25 @@ async fn entity_neighbors(
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
 }
 
+#[derive(Deserialize)]
+struct EntityDetailQuery {
+    #[serde(default = "default_include_chunks")]
+    include_chunks: bool,
+}
+fn default_include_chunks() -> bool { true }
+
 /// GET /compilations/:id/entity/:name
 /// Returns full detail for a single entity within a compilation's scope:
 /// properties, in/out degree, chunk count, and last source-job metadata.
 /// Powers the Obsidian-style Node Detail drawer (Overview + Source tabs).
+///
+/// `include_chunks` (default true) additionally resolves up to 3 precise
+/// grounding chunks (P2a) via the entity's graph `uri` — the "Sources" section.
 async fn entity_detail(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path((id, name)): Path<(Uuid, String)>,
+    Query(q): Query<EntityDetailQuery>,
 ) -> Result<Json<Value>> {
     // 1. Verify compilation ownership AND fetch its source_job_ids.
     //    Same scoping rules as `get_graph` — empty source_job_ids means
@@ -1673,18 +1851,31 @@ async fn entity_detail(
             )"
     ).bind(claims.sub).bind(&name).bind(eff_rank).fetch_one(&state.db).await.unwrap_or(0);
 
-    // 6. Compose the response — reuse fields from node_to_json, add the extras.
+    // 6. P2a — grounded nodes: precise grounding chunks via the node's graph uri
+    //    (falls back to an empty list when the node predates P2a and has no uri,
+    //    or when the caller opts out via ?include_chunks=false).
+    let grounding_chunks: Vec<Value> = if q.include_chunks {
+        match props.get("uri").and_then(|v| v.as_str()) {
+            Some(uri) => fetch_grounding_chunks(&state, claims.sub, uri).await,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 7. Compose the response — reuse fields from node_to_json, add the extras.
     Ok(Json(json!({
         "entity": {
-            "id":            node_json.get("id").cloned().unwrap_or(Value::Null),
-            "name":          name,
-            "label":         node_json.get("label").cloned().unwrap_or(Value::Null),
-            "type":          node_json.get("type").cloned().unwrap_or(Value::Null),
-            "properties":    node_json.get("properties").cloned().unwrap_or(Value::Null),
-            "inDegree":      in_degree,
-            "outDegree":     out_degree,
-            "chunkCount":    chunk_count,
-            "lastSourceJob": last_source_job,
+            "id":              node_json.get("id").cloned().unwrap_or(Value::Null),
+            "name":            name,
+            "label":           node_json.get("label").cloned().unwrap_or(Value::Null),
+            "type":            node_json.get("type").cloned().unwrap_or(Value::Null),
+            "properties":      node_json.get("properties").cloned().unwrap_or(Value::Null),
+            "inDegree":        in_degree,
+            "outDegree":       out_degree,
+            "chunkCount":      chunk_count,
+            "lastSourceJob":   last_source_job,
+            "groundingChunks": grounding_chunks,
         }
     })))
 }
@@ -1731,6 +1922,60 @@ pub(crate) async fn fetch_dossier_row(
             AND archived = false \
           ORDER BY pinned DESC, heat DESC, updated_at DESC LIMIT 1"
     ).bind(user_id).bind(name).fetch_optional(db).await.ok().flatten()
+}
+
+/// The clearance rank REQUIRED to read an entity's dossier. A dossier synthesises
+/// ALL of an entity's facts into authoritative prose, so if ANY contributing fact is
+/// above the caller's clearance the WHOLE dossier must be withheld (you can't redact
+/// synthesized prose). We derive the ceiling live from the graph — the maximum
+/// `_min_rank` across the entity's node and its relations — so it always reflects the
+/// current sensitivity. 0 (PUBLIC) when the entity has no facts; on a Neo4j error we
+/// fail CLOSED (i32::MAX) so a hiccup never leaks a dossier to a low-clearance caller.
+pub(crate) async fn dossier_required_rank(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    name: &str,
+) -> i32 {
+    let cypher = "MATCH (n) WHERE toLower(n.name) = toLower($name) \
+                    AND (n._owner = $uid OR n.user_id = $uid) \
+                  OPTIONAL MATCH (n)-[r]-() \
+                  RETURN coalesce(max(coalesce(r._min_rank,0)),0) AS relmax, \
+                         coalesce(max(coalesce(n._min_rank,0)),0) AS nodemax";
+    match state.neo.execute(
+        neo4rs::query(cypher).param("name", name).param("uid", user_id.to_string()),
+    ).await {
+        Ok(mut res) => {
+            if let Ok(Some(row)) = res.next().await {
+                let relmax = row.get::<i64>("relmax").unwrap_or(0) as i32;
+                let nodemax = row.get::<i64>("nodemax").unwrap_or(0) as i32;
+                return relmax.max(nodemax);
+            }
+            0
+        }
+        Err(_) => i32::MAX, // fail closed
+    }
+}
+
+/// Dossier read gated for the caller — use on EVERY dossier read path. Denies
+/// KB-scoped tokens outright (a dossier is a cross-KB, per-owner aggregate that can't
+/// be confined to one granted knowledge base), and withholds any dossier whose
+/// aggregated facts exceed the caller's effective clearance. Returns None when the
+/// dossier is absent OR withheld — callers must not distinguish the two to a scoped
+/// reader (don't reveal existence).
+pub(crate) async fn fetch_dossier_row_scoped(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    name: &str,
+) -> Option<Dossier> {
+    if api_key_scope(&state.db, claims).await.is_some() {
+        return None;
+    }
+    let d = fetch_dossier_row(&state.db, claims.sub, name).await?;
+    let caller_rank = get_user_clearance_rank(&state.db, claims).await;
+    if dossier_required_rank(state, claims.sub, name).await > caller_rank {
+        return None;
+    }
+    Some(d)
 }
 
 /// Ask FUSE to build/refresh a dossier for one named entity (on-the-fly path).
@@ -1786,12 +2031,19 @@ async fn get_dossier(
         return Err(AppError::BadRequest("name is required".into()));
     }
 
-    // 1. Try the stored dossier. 2. Build on-the-fly via FUSE if missing. 3. Re-read.
-    let mut row = fetch_dossier_row(&state.db, claims.sub, &name).await;
+    // 1. Try the stored dossier (SCOPED: KB-scoped tokens get nothing, above-clearance
+    //    dossiers are withheld). 2. Build on-the-fly ONLY when truly absent (not merely
+    //    withheld — never rebuild just to withhold again, and never build for a scoped
+    //    token). 3. Re-read scoped.
+    let mut row = fetch_dossier_row_scoped(&state, &claims, &name).await;
     if row.is_none() {
-        match build_dossier_via_fuse(&state, claims.sub, &name).await? {
-            Some(()) => { row = fetch_dossier_row(&state.db, claims.sub, &name).await; }
-            None => return Err(AppError::NotFound),
+        let truly_absent = fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+        let kb_scoped = api_key_scope(&state.db, &claims).await.is_some();
+        if truly_absent && !kb_scoped {
+            match build_dossier_via_fuse(&state, claims.sub, &name).await? {
+                Some(()) => { row = fetch_dossier_row_scoped(&state, &claims, &name).await; }
+                None => return Err(AppError::NotFound),
+            }
         }
     }
     let Some(d) = row else { return Err(AppError::NotFound); };
@@ -1801,18 +2053,27 @@ async fn get_dossier(
     crate::services::audit::log_access(&state.db, &claims, "dossier.read",
         "dossier", &d.entity_name, 0, None, true, None).await;
 
+    // P2a — grounded nodes: the dossier's own `entity_uri` is a dossier-scoped
+    // key (name|type|source_job), not the graph uri, so resolve the graph node's
+    // uri by name first, then fetch its precise grounding chunks.
+    let grounding_chunks: Vec<Value> = match resolve_graph_uri(&state, claims.sub, &d.entity_name).await {
+        Some(uri) => fetch_grounding_chunks(&state, claims.sub, &uri).await,
+        None => Vec::new(),
+    };
+
     Ok(Json(json!({
-        "id":           d.id,
-        "entityUri":    d.entity_uri,
-        "entityName":   d.entity_name,
-        "summary":      d.summary,
-        "keyFacts":     d.key_facts,
-        "originFiles":  d.origin_files,
-        "timeline":     d.timeline,
-        "trust":        d.trust,
-        "pinned":       d.pinned,
-        "heat":         d.heat,
-        "accessCount":  d.access_count + 1,
+        "id":              d.id,
+        "entityUri":       d.entity_uri,
+        "entityName":      d.entity_name,
+        "summary":         d.summary,
+        "keyFacts":        d.key_facts,
+        "originFiles":     d.origin_files,
+        "timeline":        d.timeline,
+        "trust":           d.trust,
+        "pinned":          d.pinned,
+        "heat":            d.heat,
+        "accessCount":     d.access_count + 1,
+        "groundingChunks": grounding_chunks,
     })))
 }
 
@@ -1902,13 +2163,17 @@ pub(crate) fn render_dossier_block(d: &Dossier) -> String {
 /// BEFORE retrieval so the hot block can be injected at the top of the prompt.
 pub(crate) async fn dossiers_referenced_by_query(
     db: &sqlx::PgPool,
-    user_id: Uuid,
+    claims: &JwtClaims,
     query: &str,
 ) -> Vec<String> {
+    // KB-scoped tokens get NO dossiers (cross-KB per-owner aggregates) — deny early.
+    if api_key_scope(db, claims).await.is_some() {
+        return Vec::new();
+    }
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT entity_name FROM entity_dossiers \
           WHERE user_id = $1 AND archived = false"
-    ).bind(user_id).fetch_all(db).await.unwrap_or_default();
+    ).bind(claims.sub).fetch_all(db).await.unwrap_or_default();
     let q_lower = query.to_lowercase();
     let mut matched: Vec<String> = names
         .into_iter()
@@ -1940,18 +2205,22 @@ pub(crate) async fn dossiers_referenced_by_query(
 /// caller then falls through to ordinary hybrid retrieval (no regression).
 pub(crate) async fn collect_hot_blocks(
     state: &Arc<crate::models::AppState>,
-    user_id: Uuid,
+    claims: &JwtClaims,
     candidate_names: &[String],
     max_blocks: usize,
 ) -> (String, Vec<String>) {
-    let mut blocks: Vec<(f32, bool, String, Uuid)> = Vec::new();
+    // Every dossier is fetched through the SCOPED read: KB-scoped tokens get nothing,
+    // and any dossier whose facts exceed the caller's clearance is withheld — so a
+    // low-clearance/scoped caller can never have above-grant dossier prose injected
+    // into their RAG answer.
+    let mut blocks: Vec<(f32, bool, String, Uuid, String)> = Vec::new();
     let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for name in candidate_names {
         if name.trim().is_empty() { continue; }
-        if let Some(d) = fetch_dossier_row(&state.db, user_id, name).await {
+        if let Some(d) = fetch_dossier_row_scoped(state, claims, name).await {
             if seen.insert(d.id) {
                 let rendered = render_dossier_block(&d);
-                blocks.push((d.trust, d.pinned, rendered, d.id));
+                blocks.push((d.trust, d.pinned, rendered, d.id, name.clone()));
             }
         }
     }
@@ -1961,16 +2230,11 @@ pub(crate) async fn collect_hot_blocks(
 
     let mut matched: Vec<String> = Vec::new();
     let mut out = String::new();
-    for (_, _, rendered, id) in &blocks {
+    for (_, _, rendered, id, name) in &blocks {
         out.push_str(rendered);
         out.push('\n');
         bump_dossier_heat(&state.db, *id).await;
-    }
-    // Extract matched entity names from the blocks for logging/trace.
-    for name in candidate_names {
-        if fetch_dossier_row(&state.db, user_id, name).await.is_some() {
-            matched.push(name.clone());
-        }
+        matched.push(name.clone());
     }
     (out, matched)
 }
@@ -2237,14 +2501,20 @@ async fn list_corrections(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
+    // KB-scope: a scoped token only sees corrections in its granted knowledge base(s)
+    // (rows carry head/rel/tail fact values — must not leak cross-KB).
+    let scoped = api_key_scope(&state.db, &claims).await;
+    if matches!(&scoped, Some(s) if s.is_empty()) { return Ok(Json(json!({ "corrections": [] }))); }
+    let scoped_comps: Option<Vec<Uuid>> = scoped.map(|s| s.into_iter().collect());
     let rows = sqlx::query_as::<_, (
         Uuid, Option<Uuid>, String, String, Option<String>, Option<String>, String, Option<String>,
         chrono::DateTime<chrono::Utc>
     )>(
         "SELECT id, compilation_id, element_kind, head, rel_type, tail, action, reason, created_at
            FROM knowledge_corrections WHERE user_id = $1
+             AND ($2::uuid[] IS NULL OR compilation_id = ANY($2))
           ORDER BY created_at DESC LIMIT 200"
-    ).bind(claims.sub).fetch_all(&state.db).await?;
+    ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await?;
     let items: Vec<Value> = rows.into_iter().map(
         |(id, comp, kind, head, rel, tail, action, reason, created)| json!({
             "id": id, "compilationId": comp, "elementKind": kind,
@@ -2253,6 +2523,262 @@ async fn list_corrections(
         })
     ).collect();
     Ok(Json(json!({ "corrections": items })))
+}
+
+// ── P3: fact-conflict resolution ──────────────────────────────────────────────
+//
+// A fact conflict (fact_conflicts, detected by KEX write-time / FUSE post-merge
+// scan) is two+ sources asserting DIFFERENT values for a FUNCTIONAL relation of
+// the same entity. Resolution picks the correct value; the losing edges are
+//   1. deleted from Neo4j (source AND merged graphs — name-based, owner-scoped,
+//      same shape as delete_relationship_core), and
+//   2. recorded in knowledge_corrections (action='delete') so re-extraction of
+//      the same sources can never resurrect them ("remember"),
+// then the winner edge is stamped `_authority='current'` and the conflict row
+// is marked resolved. `dismiss` marks the row dismissed and touches nothing.
+
+/// Mirror of the Python `safe_rel_type` (kg_builder / conflicts.py): the
+/// registry stores canonical lowercase relation names (ceo_of); Neo4j edges
+/// carry the sanitised uppercase type (CEO_OF).
+fn neo4j_rel_type(relation: &str) -> String {
+    let upper = relation.to_uppercase();
+    let mut safe = String::with_capacity(upper.len());
+    let mut prev_us = true; // treat leading separators as trimmed
+    for c in upper.chars() {
+        if c.is_ascii_alphanumeric() {
+            safe.push(c);
+            prev_us = false;
+        } else if !prev_us {
+            safe.push('_');
+            prev_us = true;
+        }
+    }
+    let safe = safe.trim_end_matches('_').to_string();
+    if safe.is_empty() {
+        return "RELATED_TO".into();
+    }
+    if safe.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return format!("REL_{safe}");
+    }
+    safe
+}
+
+/// Pure: the distinct competing values in a conflict's `tails` JSONB.
+fn conflict_tail_values(tails: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(arr) = tails.as_array() {
+        for t in arr {
+            if let Some(v) = t.get("value").and_then(|v| v.as_str()) {
+                if !v.is_empty() && !out.iter().any(|x| x == v) {
+                    out.push(v.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pure: validate the request and decide the resolution.
+/// Ok(None) = dismiss; Ok(Some(winner)) = accept that value, delete the rest.
+fn decide_fact_resolution(
+    action: &str,
+    dismiss: bool,
+    picked_tail: Option<&str>,
+    authority_winner: Option<&str>,
+    tail_values: &[String],
+) -> std::result::Result<Option<String>, String> {
+    if dismiss || action == "dismiss" {
+        return Ok(None);
+    }
+    match action {
+        "accept_winner" => {
+            let w = authority_winner.unwrap_or("").trim();
+            if w.is_empty() {
+                return Err("conflict has no computed authority winner".into());
+            }
+            if !tail_values.iter().any(|v| v == w) {
+                return Err("authority winner is no longer among the competing values".into());
+            }
+            Ok(Some(w.to_string()))
+        }
+        "pick" => {
+            let p = picked_tail.unwrap_or("").trim();
+            if p.is_empty() {
+                return Err("pickedTail is required for action 'pick'".into());
+            }
+            if !tail_values.iter().any(|v| v == p) {
+                return Err("pickedTail is not among the competing values".into());
+            }
+            Ok(Some(p.to_string()))
+        }
+        other => Err(format!("unknown action: {other}")),
+    }
+}
+
+/// Pure: (head, tail) of one edge given the conflict's key side.
+/// tail-keyed (e.g. ceo_of): the VALUE is the head, the key entity the tail.
+/// head-keyed (e.g. located_in): the key entity is the head, the VALUE the tail.
+fn conflict_edge_names(key_side: &str, key_name: &str, value: &str) -> (String, String) {
+    if key_side == "tail" {
+        (value.to_string(), key_name.to_string())
+    } else {
+        (key_name.to_string(), value.to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolveFactConflictReq {
+    /// "accept_winner" (take the computed authority winner), "pick"
+    /// (take `pickedTail`), or "dismiss" (not a real conflict — keep all).
+    action: String,
+    #[serde(rename = "pickedTail")]
+    picked_tail: Option<String>,
+    /// Convenience flag: `{ dismiss: true }` behaves like action "dismiss".
+    #[serde(default)]
+    dismiss: Option<bool>,
+    reason: Option<String>,
+}
+
+/// POST /api/kg/conflicts/:id/resolve — resolve one fact conflict.
+/// Gated owner-or-admin (same policy as the graph mutation endpoints: the
+/// owner fixes their own graph; an admin may fix any user's).
+async fn resolve_fact_conflict(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ResolveFactConflictReq>,
+) -> Result<Json<Value>> {
+    let row = sqlx::query_as::<_, (
+        Uuid, Option<Uuid>, String, String, String, Value, Option<String>, String,
+    )>(
+        "SELECT user_id, compilation_id, relation, key_name, key_side,
+                tails, authority_winner, status
+         FROM fact_conflicts WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let (owner, comp_id, relation, key_name, key_side, tails, winner_col, _status) = row;
+
+    // Owner or admin only. Non-admin callers must not even learn the row exists.
+    if owner != claims.sub && claims.role != "admin" {
+        return Err(AppError::NotFound);
+    }
+
+    let tail_values = conflict_tail_values(&tails);
+    let decision = decide_fact_resolution(
+        &req.action,
+        req.dismiss.unwrap_or(false),
+        req.picked_tail.as_deref(),
+        winner_col.as_deref(),
+        &tail_values,
+    )
+    .map_err(AppError::BadRequest)?;
+
+    let Some(winner) = decision else {
+        sqlx::query(
+            "UPDATE fact_conflicts SET status = 'dismissed', last_evaluated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+        crate::services::audit::log_access(&state.db, &claims, "kg.dismiss_fact_conflict",
+            "fact_conflict", &id.to_string(), 0, None, true, None).await;
+        return Ok(Json(json!({ "ok": true, "status": "dismissed" })));
+    };
+
+    let rel_type = neo4j_rel_type(&relation);
+    let owner_str = owner.to_string();
+    let reason = req.reason.clone().unwrap_or_else(|| {
+        format!("fact-conflict resolution: '{winner}' accepted as current for {relation}({key_name})")
+    });
+
+    // 1+2. Delete each LOSING edge from Neo4j (owner-scoped, matches source AND
+    // merged nodes by name) and remember it in knowledge_corrections so
+    // re-extraction is blocked. Same delete shape as delete_relationship_core.
+    let mut deleted_edges: i64 = 0;
+    let mut first_correction: Option<Uuid> = None;
+    for value in tail_values.iter().filter(|v| *v != &winner) {
+        let (head, tail) = conflict_edge_names(&key_side, &key_name, value);
+        let cypher =
+            "MATCH (a {name: $head})-[r]->(b {name: $tail}) \
+             WHERE type(r) = $rel AND a._owner = $uid \
+             WITH collect(r) AS rels \
+             FOREACH (x IN rels | DELETE x) \
+             RETURN size(rels) AS deleted";
+        if let Ok(mut stream) = state.neo.execute(
+            neo_query(cypher)
+                .param("head", head.clone())
+                .param("tail", tail.clone())
+                .param("rel", rel_type.clone())
+                .param("uid", owner_str.clone()),
+        ).await {
+            if let Ok(Some(row)) = stream.next().await {
+                deleted_edges += row.get::<i64>("deleted").unwrap_or(0);
+            }
+        }
+
+        // Store the CANONICAL lowercase relation (like the vocab emits): the
+        // KEX corrections loader sanitises rel_type before comparing, so the
+        // block matches the CEO_OF edge type on every future extraction.
+        let cid: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO knowledge_corrections
+                (user_id, compilation_id, element_kind, head, rel_type, tail, action, reason)
+             VALUES ($1, $2, 'edge', $3, $4, $5, 'delete', $6)
+             RETURNING id",
+        )
+        .bind(owner)
+        .bind(comp_id)
+        .bind(&head)
+        .bind(&relation)
+        .bind(&tail)
+        .bind(&reason)
+        .fetch_optional(&state.db)
+        .await?;
+        if first_correction.is_none() {
+            first_correction = cid;
+        }
+    }
+
+    // 3. Stamp the winner edge current (and clear any stale superseded marker).
+    let (whead, wtail) = conflict_edge_names(&key_side, &key_name, &winner);
+    let _ = state.neo.run(
+        neo_query(
+            "MATCH (a {name: $head})-[r]->(b {name: $tail}) \
+             WHERE type(r) = $rel AND a._owner = $uid \
+             SET r._authority = 'current' REMOVE r._superseded_by_doc",
+        )
+        .param("head", whead)
+        .param("tail", wtail)
+        .param("rel", rel_type.clone())
+        .param("uid", owner_str),
+    ).await;
+
+    // 4. Close the conflict row.
+    sqlx::query(
+        "UPDATE fact_conflicts
+         SET status = 'resolved', authority_winner = $1,
+             resolved_correction_id = $2, last_evaluated_at = now()
+         WHERE id = $3",
+    )
+    .bind(&winner)
+    .bind(first_correction)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    crate::services::audit::log_access(&state.db, &claims, "kg.resolve_fact_conflict",
+        "fact_conflict", &id.to_string(), 0, None, true, None).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "status": "resolved",
+        "winner": winner,
+        "deletedEdges": deleted_edges,
+        "remembered": first_correction.is_some(),
+    })))
 }
 
 // ── Data lineage endpoints ────────────────────────────────────────────────────
@@ -2539,4 +3065,200 @@ async fn entity_lineage(
     nodes.extend(comp_nodes);
 
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
+}
+
+// ── P2a — grounded nodes: pure shape tests ────────────────────────────────────
+
+#[cfg(test)]
+mod grounded_nodes_tests {
+    use super::grounding_chunk_to_json;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn grounding_chunk_json_has_expected_keys() {
+        let id = Uuid::new_v4();
+        let src_doc = Uuid::new_v4();
+        let job = Uuid::new_v4();
+        let v = grounding_chunk_to_json(id, "hello world", Some(src_doc), Some(job), Utc::now());
+        assert_eq!(v["id"], serde_json::json!(id));
+        assert_eq!(v["snippet"], "hello world");
+        assert_eq!(v["sourceDocumentId"], serde_json::json!(src_doc));
+        assert_eq!(v["jobId"], serde_json::json!(job));
+        assert!(v["createdAt"].is_string());
+    }
+
+    #[test]
+    fn grounding_chunk_json_snippet_truncated_to_300_chars() {
+        let long_content = "x".repeat(500);
+        let v = grounding_chunk_to_json(Uuid::new_v4(), &long_content, None, None, Utc::now());
+        assert_eq!(v["snippet"].as_str().unwrap().chars().count(), 300);
+    }
+
+    #[test]
+    fn grounding_chunk_json_nulls_when_source_and_job_absent() {
+        let v = grounding_chunk_to_json(Uuid::new_v4(), "short", None, None, Utc::now());
+        assert!(v["sourceDocumentId"].is_null());
+        assert!(v["jobId"].is_null());
+    }
+
+    #[test]
+    fn grounding_chunk_json_short_content_not_truncated() {
+        let v = grounding_chunk_to_json(Uuid::new_v4(), "short text", None, None, Utc::now());
+        assert_eq!(v["snippet"], "short text");
+    }
+}
+
+// ── P3 — fact-conflict resolution: pure logic + migration seed tests ─────────
+
+#[cfg(test)]
+mod fact_conflict_tests {
+    use super::{conflict_edge_names, conflict_tail_values, decide_fact_resolution, neo4j_rel_type};
+    use serde_json::json;
+
+    // neo4j_rel_type must mirror the Python safe_rel_type exactly, so that the
+    // relation stored in relation_registry / fact_conflicts (lowercase
+    // canonical) resolves to the edge type kg_builder actually wrote.
+    #[test]
+    fn rel_type_matches_python_sanitiser() {
+        assert_eq!(neo4j_rel_type("ceo_of"), "CEO_OF");
+        assert_eq!(neo4j_rel_type("located_in"), "LOCATED_IN");
+        assert_eq!(neo4j_rel_type("reports_to"), "REPORTS_TO");
+        assert_eq!(neo4j_rel_type("some-rel type!"), "SOME_REL_TYPE");
+        assert_eq!(neo4j_rel_type(""), "RELATED_TO");
+        assert_eq!(neo4j_rel_type("9lives"), "REL_9LIVES");
+    }
+
+    #[test]
+    fn tail_values_dedup_and_skip_empty() {
+        let tails = json!([
+            { "value": "Petra Lausberg", "authority": "current" },
+            { "value": "Karl Mehner",   "authority": "superseded" },
+            { "value": "Karl Mehner" },
+            { "value": "" },
+            { "uri": "no-value-key" },
+        ]);
+        assert_eq!(conflict_tail_values(&tails), vec!["Petra Lausberg", "Karl Mehner"]);
+    }
+
+    #[test]
+    fn dismiss_via_action_or_flag() {
+        let vals = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(decide_fact_resolution("dismiss", false, None, Some("A"), &vals), Ok(None));
+        assert_eq!(decide_fact_resolution("accept_winner", true, None, Some("A"), &vals), Ok(None));
+    }
+
+    #[test]
+    fn accept_winner_takes_computed_winner() {
+        let vals = vec!["Petra".to_string(), "Karl".to_string()];
+        assert_eq!(
+            decide_fact_resolution("accept_winner", false, None, Some("Petra"), &vals),
+            Ok(Some("Petra".to_string()))
+        );
+    }
+
+    #[test]
+    fn accept_winner_requires_a_winner_still_in_tails() {
+        let vals = vec!["Petra".to_string()];
+        assert!(decide_fact_resolution("accept_winner", false, None, None, &vals).is_err());
+        assert!(decide_fact_resolution("accept_winner", false, None, Some(""), &vals).is_err());
+        assert!(decide_fact_resolution("accept_winner", false, None, Some("Gone"), &vals).is_err());
+    }
+
+    #[test]
+    fn pick_validates_membership() {
+        let vals = vec!["Petra".to_string(), "Karl".to_string()];
+        assert_eq!(
+            decide_fact_resolution("pick", false, Some("Karl"), Some("Petra"), &vals),
+            Ok(Some("Karl".to_string()))
+        );
+        assert!(decide_fact_resolution("pick", false, Some("Nobody"), Some("Petra"), &vals).is_err());
+        assert!(decide_fact_resolution("pick", false, None, Some("Petra"), &vals).is_err());
+    }
+
+    #[test]
+    fn unknown_action_rejected() {
+        let vals = vec!["A".to_string()];
+        assert!(decide_fact_resolution("resolve", false, None, Some("A"), &vals).is_err());
+    }
+
+    // Edge direction: tail-keyed relations (ceo_of person->org) put the VALUE
+    // at the head; head-keyed (located_in org->location) at the tail. Getting
+    // this backwards would delete the WRONG edge — pin it.
+    #[test]
+    fn edge_names_respect_key_side() {
+        assert_eq!(
+            conflict_edge_names("tail", "Synthetron GmbH", "Karl Mehner"),
+            ("Karl Mehner".to_string(), "Synthetron GmbH".to_string())
+        );
+        assert_eq!(
+            conflict_edge_names("head", "Synthetron GmbH", "Berlin"),
+            ("Synthetron GmbH".to_string(), "Berlin".to_string())
+        );
+    }
+
+    // ── migration seeds ──────────────────────────────────────────────────────
+
+    const REGISTRY_SQL: &str = include_str!("../../migrations/061_relation_registry.sql");
+    const CONFLICTS_SQL: &str = include_str!("../../migrations/062_fact_conflicts.sql");
+
+    #[test]
+    fn registry_migration_seeds_the_conservative_set() {
+        for rel in [
+            "ceo_of", "heads", "reports_to", "located_in",
+            "headquartered_in", "born_in", "spin_off_of", "version_of",
+        ] {
+            assert!(
+                REGISTRY_SQL.contains(&format!("('{rel}'")),
+                "relation_registry seed must include {rel}"
+            );
+        }
+        // Deliberately EXCLUDED (multi-valued — would create false conflicts).
+        for rel in ["works_at", "founded", "member_of", "has_role", "lived_in"] {
+            assert!(
+                !REGISTRY_SQL.contains(&format!("('{rel}'")),
+                "{rel} must NOT be seeded as functional in round 1"
+            );
+        }
+        assert!(REGISTRY_SQL.contains("key_side   TEXT NOT NULL CHECK (key_side IN ('head', 'tail'))"));
+        assert!(REGISTRY_SQL.contains("ON CONFLICT (relation) DO NOTHING"));
+    }
+
+    #[test]
+    fn registry_seed_key_sides_are_correct() {
+        // ceo_of / heads are keyed by the TAIL org (one head-person per org);
+        // the rest by the HEAD entity. Wrong key_side = conflicts keyed on the
+        // wrong end = false positives, so pin each seeded line.
+        for (rel, side) in [
+            ("ceo_of", "tail"), ("heads", "tail"),
+            ("reports_to", "head"), ("located_in", "head"),
+            ("headquartered_in", "head"), ("born_in", "head"),
+            ("spin_off_of", "head"), ("version_of", "head"),
+        ] {
+            let line = REGISTRY_SQL
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("('{rel}'")))
+                .unwrap_or_else(|| panic!("seed line for {rel} not found"));
+            assert!(
+                line.contains(&format!("'{side}'")),
+                "{rel} must be keyed by {side}: {line}"
+            );
+        }
+        // located_in / headquartered_in are gated to organizations only.
+        for rel in ["located_in", "headquartered_in"] {
+            let line = REGISTRY_SQL
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("('{rel}'")))
+                .unwrap();
+            assert!(line.contains("'organization'"), "{rel} must be org-scoped");
+        }
+    }
+
+    #[test]
+    fn fact_conflicts_migration_has_upsert_key_and_status_check() {
+        assert!(CONFLICTS_SQL.contains("UNIQUE (user_id, relation, key_uri)"));
+        assert!(CONFLICTS_SQL.contains("CHECK (status IN ('open', 'resolved', 'dismissed'))"));
+        assert!(CONFLICTS_SQL.contains("CHECK (key_side IN ('head', 'tail'))"));
+        assert!(CONFLICTS_SQL.contains("resolved_correction_id UUID REFERENCES knowledge_corrections(id)"));
+    }
 }

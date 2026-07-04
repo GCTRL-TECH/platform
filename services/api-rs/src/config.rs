@@ -30,6 +30,12 @@ pub struct Config {
     /// `GET /api/config/public`. Empty means "let the frontend derive it from
     /// the browser host + :7070". Override with `GCTRL_AGENT_URL`.
     pub agent_url: String,
+    /// Shared secret sent as `X-Internal-Secret` on every call to the internal KEX/
+    /// FUSE worker ports. Those ports take a caller-supplied `user_id`/`max_rank` and
+    /// have no user auth of their own, so if the secret is set they require it —
+    /// closing the hole where a host/LAN caller could hit the raw worker port with
+    /// `user_id=<victim>&max_rank=MAX`. Empty = disabled (grace: workers don't check).
+    pub internal_secret: String,
 }
 
 impl Config {
@@ -59,6 +65,7 @@ impl Config {
             agent_gateway_enabled: env_bool("GCTRL_AGENT_GATEWAY_ENABLED", true),
             neo4j_browser_url:    opt_env("GCTRL_NEO4J_BROWSER_URL", ""),
             agent_url:            opt_env("GCTRL_AGENT_URL", ""),
+            internal_secret:      opt_env("INTERNAL_API_SECRET", ""),
         }
     }
 }

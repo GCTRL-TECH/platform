@@ -62,7 +62,8 @@ class TestRelexOpenAICompatible:
                 )
 
     def test_openai_compatible_returns_parsed_relations(self):
-        """Relations are parsed correctly when llm_client returns a JSON array."""
+        """Relations are parsed correctly when llm_client returns a JSON array.
+        extract_relations now returns (relations, report) — unpack accordingly."""
         from src.relex import RelationExtractor
 
         fake_response = '[{"head": "Alice", "relation": "ceo_of", "tail": "Acme"}]'
@@ -71,13 +72,16 @@ class TestRelexOpenAICompatible:
             mock_client.complete.return_value = fake_response
 
             ext = RelationExtractor()
-            relations = ext.extract_relations(
+            result = ext.extract_relations(
                 _text(), _entities(),
                 kind="openai_compatible",
                 ollama_base="http://openai-compat:8080",
                 model="gpt-4o-mini",
             )
 
+        # extract_relations returns (relations, report) tuple.
+        assert isinstance(result, tuple) and len(result) == 2
+        relations, report = result
         # Should get at least the ceo_of triple back (validation may transform it)
         assert isinstance(relations, list)
 
@@ -159,9 +163,12 @@ class TestRelexOllama404AutoPull:
                 assert passed_kind == "ollama", f"Expected kind='ollama', got {passed_kind!r}"
 
     def test_ollama_passes_options_and_timeout_180(self):
-        """Parity with e71ecaf: relex must pass options={temperature:0.0, num_predict:1024}
-        and timeout=180 to llm_client.complete for every Ollama call."""
+        """relex must pass options={temperature:0.0, num_predict:config.RELEX_NUM_PREDICT}
+        and timeout=180 to llm_client.complete for every Ollama call. num_predict was
+        raised from the original 1024 to a configurable RELEX_NUM_PREDICT (default 2048,
+        round-1 fix R2) so long documents don't silently truncate the JSON array."""
         from src.relex import RelationExtractor
+        from src import config
 
         with patch("src.relex.llm_client") as mock_client:
             mock_client.complete.return_value = "[]"
@@ -179,8 +186,8 @@ class TestRelexOllama404AutoPull:
                 args, kwargs = c
                 passed_options = kwargs.get("options")
                 passed_timeout = kwargs.get("timeout")
-                assert passed_options == {"temperature": 0.0, "num_predict": 1024}, (
-                    f"Expected options={{'temperature':0.0,'num_predict':1024}}, got {passed_options!r}"
+                assert passed_options == {"temperature": 0.0, "num_predict": config.RELEX_NUM_PREDICT}, (
+                    f"Expected options={{'temperature':0.0,'num_predict':{config.RELEX_NUM_PREDICT}}}, got {passed_options!r}"
                 )
                 assert passed_timeout == 180, (
                     f"Expected timeout=180, got {passed_timeout!r}"

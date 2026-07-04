@@ -582,6 +582,7 @@ async fn query(
 
     let mut chunks: Vec<KexChunk> = match client
         .post(&kex_url)
+        .header("X-Internal-Secret", &state.cfg.internal_secret)
         .json(&kex_body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -856,7 +857,7 @@ async fn query(
         // Use the CONTEXTUALIZED query so a follow-up ("and his email?") still
         // resolves the referenced entity's dossier (the rewrite carries the name).
         let mut candidates =
-            crate::routes::kg::dossiers_referenced_by_query(&state.db, c.sub, &search_query).await;
+            crate::routes::kg::dossiers_referenced_by_query(&state.db, c, &search_query).await;
         // If the query names an OWNED entity that has no dossier yet, build it now.
         if candidates.is_empty() {
             // Cheap heuristic: try the longest capitalised token-run in the query.
@@ -875,7 +876,7 @@ async fn query(
             }
         }
         let (hot_block, matched) =
-            crate::routes::kg::collect_hot_blocks(&state, c.sub, &candidates, 3).await;
+            crate::routes::kg::collect_hot_blocks(&state, c, &candidates, 3).await;
         if !hot_block.is_empty() {
             tracing::info!(
                 "rag: injected {} dossier hot-block(s) for [{}] (query: {:?})",
@@ -1184,7 +1185,7 @@ async fn deep_query(
     // gets the highest-trust answer before it ever calls a tool, so it states the
     // answer directly instead of hedging or re-querying.
     let mut hot_candidates =
-        crate::routes::kg::dossiers_referenced_by_query(&state.db, claims.sub, &search_query).await;
+        crate::routes::kg::dossiers_referenced_by_query(&state.db, claims, &search_query).await;
     if hot_candidates.is_empty() {
         if let Some(name) = first_proper_name(&search_query) {
             if crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await
@@ -1195,7 +1196,7 @@ async fn deep_query(
         }
     }
     let (hot_block, hot_matched) =
-        crate::routes::kg::collect_hot_blocks(state, claims.sub, &hot_candidates, 3).await;
+        crate::routes::kg::collect_hot_blocks(state, claims, &hot_candidates, 3).await;
     // A6 — USER-PROFILE personalization block. GDPR split: standard mode + opted-in
     // only (skip entirely in incognito). Prepended above the dossier hot block.
     let profile_preamble = if req.mode.as_deref() != Some("incognito") {

@@ -25,6 +25,19 @@ def _make_pg_conn(rows):
     return conn
 
 
+def _chunk_row(chunk_id, content):
+    """Full 12-column text_chunks row matching _reindex_compilation's SELECT:
+    id, content, job_id, user_id, source_document_id, chunk_sequence,
+    start_char, end_char, entity_mentions, entity_uris, min_rank,
+    classification_level_id."""
+    return (
+        chunk_id, content, "job-1", "user-1", None,
+        0, 0, len(content),
+        [{"name": "Acme", "type": "organization", "uri": "databorg:u/organization/acme"}],
+        ["databorg:u/organization/acme"], 0, None,
+    )
+
+
 class FakeEmbedder:
     """Returns a fixed 3-dim vector for any text (mimics EmbeddingClient)."""
     def __init__(self, dim=3):
@@ -49,8 +62,8 @@ class TestDrainReindexQueue:
 
         # Two chunks for one compilation
         fake_pg = _make_pg_conn([
-            ("chunk-id-1", "text chunk one"),
-            ("chunk-id-2", "text chunk two"),
+            _chunk_row("chunk-id-1", "text chunk one"),
+            _chunk_row("chunk-id-2", "text chunk two"),
         ])
 
         job = json.dumps({
@@ -113,7 +126,7 @@ class TestDrainReindexQueue:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise Exception("simulated DB failure for bad-comp")
-            return _make_pg_conn([("chunk-id-1", "text one")])
+            return _make_pg_conn([_chunk_row("chunk-id-1", "text one")])
 
         fake_embedder = FakeEmbedder(dim=768)
         fake_qdrant = MagicMock()
@@ -147,7 +160,7 @@ class TestDrainReindexQueue:
         fake_info.config.params.vectors.size = 768
         fake_qdrant.get_collection.return_value = fake_info
 
-        fake_pg = _make_pg_conn([("chunk-id-1", "text one")])
+        fake_pg = _make_pg_conn([_chunk_row("chunk-id-1", "text one")])
 
         job = json.dumps({
             "compilationId": "comp-xyz",
