@@ -560,14 +560,14 @@ async fn list(
     let rows = sqlx::query_as::<_, (
         Uuid, String, Option<String>, String, Vec<Uuid>, Option<i32>, Option<i32>,
         Option<Uuid>, chrono::DateTime<chrono::Utc>, Option<Uuid>,
-        String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, i32, bool,
+        String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, i32, bool, bool,
     )>(
         "SELECT c.id, c.name, c.description, c.classification,
                 COALESCE(c.source_job_ids, '{}'::uuid[]),
                 c.node_count, c.edge_count, c.folder_id, c.created_at,
                 c.classification_level_id,
                 c.type::text, c.wiki_source_compilation_id, c.last_distill_at, c.page_count,
-                COALESCE(c.is_system, false)
+                COALESCE(c.is_system, false), c.embed_public
          FROM compilations c
          LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
          WHERE c.user_id = $1
@@ -577,7 +577,7 @@ async fn list(
 
     let user_id_str = claims.sub.to_string();
     let mut comps: Vec<Value> = Vec::with_capacity(rows.len());
-    for (id, n, d, cls, sji, nc, ec, fid, c, clid, ctype, wiki_src, last_distill, page_count, is_system) in rows {
+    for (id, n, d, cls, sji, nc, ec, fid, c, clid, ctype, wiki_src, last_distill, page_count, is_system, embed_public) in rows {
         if let Some(set) = &scope { if !set.contains(&id) { continue; } }
         let stored_nc = nc.unwrap_or(0);
         let stored_ec = ec.unwrap_or(0);
@@ -596,6 +596,7 @@ async fn list(
             "wikiSourceCompilationId": wiki_src,
             "lastDistillAt": last_distill,
             "pageCount": page_count,
+            "embedPublic": embed_public,
         }));
     }
 
@@ -797,6 +798,14 @@ async fn update(
         sqlx::query(
             "UPDATE compilations SET classification_level_id=$1, classification=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4"
         ).bind(clid).bind(legacy).bind(id).bind(claims.sub).execute(&state.db).await?;
+    }
+    // Wave 2 — embed: toggle whether this compilation's PUBLIC-classified
+    // content is servable via the unauthenticated /public/embed/:id/graph
+    // route. Owner-only (enforced by the WHERE user_id=$2 below, same as the
+    // other fields on this handler).
+    if let Some(enabled) = req.get("embedPublic").and_then(|v| v.as_bool()) {
+        sqlx::query("UPDATE compilations SET embed_public=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
+            .bind(enabled).bind(id).bind(claims.sub).execute(&state.db).await?;
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -1571,6 +1580,156 @@ async fn get_graph(
 
     crate::services::audit::log_access(&state.db, &claims, "graph.read",
         "compilation", &id.to_string(), eff_rank, None, true, None).await;
+    Ok(Json(json!({
+        "nodes": nodes,
+        "edges": edges,
+        "nodeCount": node_count,
+        "edgeCount": edge_count,
+        "truncated": truncated,
+    })))
+}
+
+/// Public (unauthenticated) embed router — mounted OUTSIDE `require_auth` in
+/// main.rs, alongside the other public routers. Every route here MUST itself
+/// verify the resource opted into public embedding; there is no session/token
+/// to lean on.
+pub fn public_router() -> Router<Arc<crate::models::AppState>> {
+    Router::new().route("/embed/:id/graph", get(public_get_graph))
+}
+
+/// GET /public/embed/:id/graph — serves a compilation's graph with NO auth,
+/// ONLY when the owner has explicitly flipped `embed_public` on (Wave 2
+/// embed). Clearance is hard-forced to rank 0 (PUBLIC-only) regardless of the
+/// compilation's own classification, so a public embed link can never leak
+/// INTERNAL/CONFIDENTIAL/RESTRICTED nodes or edges even if the compilation
+/// itself is classified above PUBLIC. Reuses the same scope/label-pattern
+/// Cypher shape as the authenticated `get_graph` above, just without any
+/// per-user/per-token branching.
+async fn public_get_graph(
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<GraphQuery>,
+) -> Result<Json<Value>> {
+    let row: Option<(Vec<Uuid>, Uuid, bool)> = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids, '{}'::uuid[]), user_id, embed_public
+         FROM compilations WHERE id=$1"
+    ).bind(id).fetch_optional(&state.db).await?;
+    let Some((source_job_ids, owner_id, embed_public)) = row else { return Err(AppError::NotFound); };
+    if !embed_public { return Err(AppError::NotFound); }
+
+    if let Some(ref nt) = q.node_type {
+        if !is_valid_neo4j_label(nt) {
+            return Err(AppError::BadRequest("Invalid node_type".into()));
+        }
+    }
+
+    const PUBLIC_RANK: i64 = 0;
+    let limit = q.limit.unwrap_or(20000).clamp(1, 50000);
+    let user_id_str = owner_id.to_string();
+    let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
+
+    let scope = if source_job_ids.is_empty() {
+        "n._owner = $uid AND NOT n:Compilation"
+    } else {
+        "n._source_job IN $jobIds AND NOT n:Compilation"
+    };
+    let label_pat = match &q.node_type {
+        Some(label) => format!("(n:{label})"),
+        None => "(n)".to_string(),
+    };
+
+    let node_count_cypher = format!(
+        "MATCH {label_pat} WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+         RETURN count(n) AS c"
+    );
+    let edge_count_cypher = format!(
+        "MATCH {label_pat}-[r]->(m) \
+         WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+           AND coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
+         RETURN count(r) AS c"
+    );
+    let node_count: i64 = match state.neo
+        .execute(neo_query(&node_count_cypher)
+            .param("uid", user_id_str.clone())
+            .param("jobIds", job_strs.clone())
+            .param("rank", PUBLIC_RANK)).await
+    {
+        Ok(mut s) => match s.next().await { Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0), _ => 0 },
+        Err(e) => return Err(AppError::Internal(e.to_string())),
+    };
+    let edge_count: i64 = match state.neo
+        .execute(neo_query(&edge_count_cypher)
+            .param("uid", user_id_str.clone())
+            .param("jobIds", job_strs.clone())
+            .param("rank", PUBLIC_RANK)).await
+    {
+        Ok(mut s) => match s.next().await { Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0), _ => 0 },
+        Err(e) => return Err(AppError::Internal(e.to_string())),
+    };
+
+    let core_cypher = format!(
+        "MATCH {label_pat} WHERE {scope} AND coalesce(n._min_rank,0) <= $rank \
+         OPTIONAL MATCH (n)-[rel]-(nb) \
+           WHERE coalesce(rel._min_rank,0) <= $rank AND coalesce(nb._min_rank,0) <= $rank \
+         WITH n, count(rel) AS deg \
+         ORDER BY deg DESC \
+         LIMIT $limit \
+         RETURN n"
+    );
+    let mut core_stream = state.neo
+        .execute(neo_query(&core_cypher)
+            .param("uid", user_id_str.clone())
+            .param("jobIds", job_strs.clone())
+            .param("rank", PUBLIC_RANK)
+            .param("limit", limit))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut core_ids: Vec<i64> = Vec::new();
+    let mut seen_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    while let Ok(Some(row)) = core_stream.next().await {
+        if let Ok(n) = row.get::<Node>("n") {
+            if seen_nodes.insert(n.id()) {
+                core_ids.push(n.id());
+                nodes.push(node_to_json(&n));
+            }
+        }
+    }
+
+    let mut edges: Vec<Value> = Vec::new();
+    let mut seen_edges: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    if !core_ids.is_empty() {
+        let edge_cypher =
+            "MATCH (a)-[r]->(b) \
+             WHERE id(a) IN $ids AND id(b) IN $ids AND coalesce(r._min_rank,0) <= $rank \
+             RETURN r";
+        let mut edge_stream = state.neo
+            .execute(neo_query(edge_cypher)
+                .param("ids", core_ids.clone())
+                .param("rank", PUBLIC_RANK))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        while let Ok(Some(row)) = edge_stream.next().await {
+            if let Ok(r) = row.get::<Relation>("r") {
+                if seen_edges.insert(r.id()) {
+                    edges.push(relation_to_json(&r));
+                }
+            }
+        }
+    }
+
+    let truncated = (nodes.len() as i64) < node_count || (edges.len() as i64) < edge_count;
+
+    // Best-effort audit entry attributed to the compilation's owner (there's
+    // no requester identity to log for a public, unauthenticated read).
+    let synthetic_claims = JwtClaims {
+        sub: owner_id, email: "public-embed".into(), role: "viewer".into(), clearance: None,
+        exp: usize::MAX, api_key_rank: None, api_key_id: None, read_only: true, agent_override_rank: None,
+    };
+    crate::services::audit::log_access(&state.db, &synthetic_claims, "graph.read.public_embed",
+        "compilation", &id.to_string(), 0, None, true, None).await;
+
     Ok(Json(json!({
         "nodes": nodes,
         "edges": edges,

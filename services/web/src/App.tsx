@@ -39,6 +39,7 @@ import ApiKeysPage from '@/pages/settings/ApiKeysPage'
 import SSOPage from '@/pages/settings/SSOPage'
 import { AgentProvider } from '@/components/agent/AgentProvider'
 import { PiConsole } from '@/components/agent/PiConsole'
+import EmbedGraphPage from '@/pages/embed/EmbedGraphPage'
 
 /**
  * Returns true if we're running on localhost / 127.x / a Vite dev server.
@@ -192,6 +193,14 @@ function PublicRoute() {
 
 
 export function App() {
+  // Embed surface (Wave 2): must render for anonymous, never-logged-in
+  // visitors (e.g. an iframe on a third-party site), so it bypasses EVERY
+  // gate below (activation, setup, protected-route auth) via an early
+  // return — it never touches ActivationGate/SetupGate/ProtectedRoute.
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/embed/')) {
+    return <EmbedGraphPage />
+  }
+
   return (
     <ActivationGate>
       <AgentProvider>

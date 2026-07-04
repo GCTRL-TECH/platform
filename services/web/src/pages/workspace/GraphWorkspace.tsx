@@ -14,9 +14,10 @@ import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type P
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ArrowLeft, Search, Network, Hash, Copy, Check, X, PanelRightClose, PanelRightOpen,
-  PanelLeftClose, PanelLeftOpen,
+  PanelLeftClose, PanelLeftOpen, Share2,
 } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
+import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { useGraphData } from '@/components/graph-explorer/hooks'
 import { getNodeColor, resolveTypeLabel } from '@/components/graph-explorer/colors'
@@ -27,6 +28,7 @@ import { NodeDetailChunks } from '@/components/graph-explorer/NodeDetailChunks'
 import { NodeDetailSource } from '@/components/graph-explorer/NodeDetailSource'
 import { NodeDetailDossier } from '@/components/graph-explorer/NodeDetailDossier'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
+import { EmbedShareDialog } from './EmbedShareDialog'
 
 interface CompilationSummary {
   id: string
@@ -34,6 +36,7 @@ interface CompilationSummary {
   nodeCount: number
   edgeCount: number
   classification: string
+  embedPublic?: boolean
 }
 
 const CLS_BADGE: Record<string, string> = {
@@ -89,12 +92,15 @@ export function GraphWorkspace() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const compilationId = id ?? ''
+  const queryClient = useQueryClient()
 
   const { data: compsData } = useApiQuery<{ compilations: CompilationSummary[] }>(['kg', 'compilations'], '/kg/compilations')
   const comps = compsData?.compilations ?? []
   const current = comps.find((c) => c.id === compilationId)
 
   const { nodes, edges, nodeCount, edgeCount, truncated, isLoading, error, mergeNeighbors } = useGraphData(compilationId)
+
+  const [shareOpen, setShareOpen] = useState(false)
 
   const [pickerQuery, setPickerQuery] = useState('')
   const [selectedName, setSelectedName] = useState<string | null>(null)
@@ -234,12 +240,32 @@ export function GraphWorkspace() {
             </>
           )}
         </span>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-1">
+          {current && (
+            <button onClick={() => setShareOpen(true)} className="btn-ghost text-slate-500 hover:text-slate-300" title="Share / embed this graph">
+              <Share2 size={16} />
+            </button>
+          )}
           <button onClick={() => setContextOpen((v) => !v)} className="btn-ghost text-slate-500 hover:text-slate-300" title={contextOpen ? 'Hide context' : 'Show context'}>
             {contextOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
           </button>
         </div>
       </div>
+
+      {current && (
+        <EmbedShareDialog
+          open={shareOpen}
+          onClose={() => setShareOpen(false)}
+          compilationId={current.id}
+          compilationName={current.name}
+          embedPublic={current.embedPublic ?? false}
+          onEmbedPublicChange={(enabled) => {
+            queryClient.setQueryData<{ compilations: CompilationSummary[] }>(['kg', 'compilations'], (prev) =>
+              prev ? { compilations: prev.compilations.map((c) => (c.id === current.id ? { ...c, embedPublic: enabled } : c)) } : prev,
+            )
+          }}
+        />
+      )}
 
       <div className="flex min-h-0 flex-1">
         {/* Column 1 — graph picker (collapsible + resizable) */}

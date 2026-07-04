@@ -167,9 +167,15 @@ interface WorkspaceCanvasProps {
   /** Explicit theme override (e.g. from an embed's ?theme= query param).
    *  Falls back to localStorage['gw.theme'], then 'midnight'. */
   theme?: string
+  /** Explicit initial labels override (e.g. an embed's ?labels=0 query param).
+   *  Bypasses localStorage['gw.showLabels'] when set. */
+  initialLabels?: boolean
 }
 
-export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId = null, className, theme: themeProp }: WorkspaceCanvasProps) {
+export function WorkspaceCanvas({
+  nodes, edges, selectedId, onSelect, peekNodeId = null, className,
+  theme: themeProp, initialLabels,
+}: WorkspaceCanvasProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('2d')
   // Whether 3D can run here at all (WebGL probe). When false we keep the user in
   // 2D and disable the 3D toggle instead of letting three.js throw.
@@ -186,8 +192,10 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
   const fg2dRef = useRef<any>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
   const [dim, setDim] = useState<{ w: number; h: number }>({ w: 0, h: 0 })
 
-  // On-canvas node labels (2D): default ON, persisted.
+  // On-canvas node labels (2D): default ON, persisted. An explicit prop (e.g.
+  // an embed's ?labels=0) bypasses the persisted preference entirely.
   const [showLabels, setShowLabels] = useState<boolean>(() => {
+    if (initialLabels !== undefined) return initialLabels
     try { return localStorage.getItem('gw.showLabels') !== '0' } catch { return true }
   })
   const toggleLabels = useCallback(() => {
