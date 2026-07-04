@@ -1,11 +1,18 @@
 import { Link } from 'react-router-dom'
 
 const STATS = [
-  { value: '0.97', unit: 'F1', label: 'Entity linking on DBLP-ACM', sub: 'unsupervised · zero training' },
-  { value: '<50', unit: 'ms p95', label: 'Memory retrieval latency', sub: '7–27 ms median' },
-  { value: '≈0', unit: 'ms', label: 'Access-control overhead', sub: 'compliance is effectively free' },
-  { value: '2,750', unit: '/s', label: 'Matching-engine throughput', sub: 'sub-quadratic ~O(n^1.5)' },
-  { value: '0.978', unit: '', label: 'NER detection-recall', sub: 'Bilingual 32-doc business gold · zero-shot GLiNER + format pre-pass' },
+  // Two quality numbers share one card so the grid stays a single row of four.
+  {
+    key: 'quality',
+    sub: 'unsupervised · zero training',
+    metrics: [
+      { value: '0.97', unit: 'F1', label: 'Entity linking (DBLP-ACM)' },
+      { value: '0.978', unit: 'recall', label: 'NER detection (bilingual)' },
+    ],
+  },
+  { key: 'latency', value: '<50', unit: 'ms p95', label: 'Memory retrieval latency', sub: '7–27 ms median' },
+  { key: 'acl', value: '≈0', unit: 'ms', label: 'Access-control overhead', sub: 'compliance is effectively free' },
+  { key: 'throughput', value: '2,750', unit: '/s', label: 'Matching-engine throughput', sub: 'sub-quadratic ~O(n^1.5)' },
 ]
 
 // Competitor figures are CITED from published papers on the same public datasets —
@@ -34,13 +41,32 @@ export function BenchmarksSection() {
 
         <div className="mt-12 grid grid-cols-2 gap-4 lg:grid-cols-4">
           {STATS.map((s, i) => (
-            <div key={s.label} className={`stat-card reveal reveal-delay-${(i % 4) + 1}`}>
-              <p className="text-3xl font-bold text-white sm:text-4xl">
-                {s.value}
-                <span className="ml-1 text-base font-medium text-indigo-300">{s.unit}</span>
-              </p>
-              <p className="mt-2 text-sm font-medium text-slate-300">{s.label}</p>
-              <p className="mt-0.5 text-xs text-slate-500">{s.sub}</p>
+            <div key={s.key} className={`stat-card reveal reveal-delay-${(i % 4) + 1}`}>
+              {s.metrics ? (
+                <>
+                  <div className="space-y-2">
+                    {s.metrics.map((m) => (
+                      <div key={m.label} className="flex items-baseline gap-2">
+                        <p className="text-2xl font-bold text-white sm:text-3xl">
+                          {m.value}
+                          <span className="ml-1 text-sm font-medium text-indigo-300">{m.unit}</span>
+                        </p>
+                        <p className="text-xs font-medium text-slate-300">{m.label}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="mt-2 text-xs text-slate-500">{s.sub}</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-3xl font-bold text-white sm:text-4xl">
+                    {s.value}
+                    <span className="ml-1 text-base font-medium text-indigo-300">{s.unit}</span>
+                  </p>
+                  <p className="mt-2 text-sm font-medium text-slate-300">{s.label}</p>
+                  <p className="mt-0.5 text-xs text-slate-500">{s.sub}</p>
+                </>
+              )}
             </div>
           ))}
         </div>
