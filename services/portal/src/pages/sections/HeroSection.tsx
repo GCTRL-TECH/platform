@@ -653,6 +653,13 @@ export function HeroSection() {
           </span>
         </h1>
 
+        {/* Crisp category line — complements the "Sovereign Knowledge
+            Infrastructure" eyebrow badge above with the plain-language
+            positioning term (also read by search + LLM crawlers). */}
+        <p className="mb-6 text-lg font-medium text-slate-300 md:text-xl">
+          The enterprise memory layer for AI.
+        </p>
+
         {/* Glass-card backdrop gives the paragraph solid readability over the
             mission-control imagery without darkening the hero. Mirrors the
             iced-glass language used on the trust signals further down. */}
