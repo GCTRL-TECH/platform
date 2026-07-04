@@ -21,11 +21,11 @@ Each deployment generates its **own random Neo4j and Postgres passwords** into `
 
 > Installs from before this change used shared default passwords. If you ever exposed Neo4j/Postgres on those installs, rotate the credentials (and never expose those ports again).
 
-## Exposing the API (`:4000`) for a remote agent
+## Exposing the gateway for a remote agent
 
-The [Quick Start](quickstart.md) mentions forwarding `:4000` so a remote agent can reach the MCP gateway. If you do:
+Don't forward `:4000` — the API is loopback-only by design (see [Networking & Ports](networking.md)). A remote agent reaches the MCP-over-HTTP gateway through the **same origin as the app UI**, on the one port you actually expose:
 
-- Put it behind **TLS + a reverse proxy** — never serve the API over plain HTTP on the internet.
+- Put that origin behind **TLS + a reverse proxy** — never serve it over plain HTTP on the internet — or use [Tailscale](tailscale.md) to skip public exposure entirely.
 - Restrict access by **firewall / IP allowlist** where you can.
 - Treat the **full-access token like a password** — it grants full control. Prefer **scoped tokens** (per knowledge base / clearance) from [Access Control](access-control.md), and revoke unused ones.
 - The **MCP-over-HTTP gateway is OFF by default** — only enable it when you actually need remote agents.
