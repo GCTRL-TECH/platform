@@ -4,8 +4,14 @@ import { useAuth } from '@/hooks/useAuth'
 import { api } from '@/lib/api'
 import { setAgentModelLocal, setRagModelLocal } from '@/lib/models'
 import { HardwareCard, type HardwareInfo, type Recommendation } from '../settings/HardwareCard'
-import { RuntimeBanner, type ActiveRuntimeInfo } from './RuntimeBanner'
+import { RuntimeCard } from '../settings/RuntimeCard'
+import type { ActiveRuntime } from '../settings/RuntimeSwitcher'
 import { PurposeCard, type CatalogModel, type CatalogResponse, type ModelPrefs } from './PurposeCard'
+
+// Cookbook previously used its own ActiveRuntimeInfo shape (a subset of
+// ActiveRuntime without embedding_mode) — RuntimeCard needs the full shape, so
+// this page now fetches the same ActiveRuntime type Settings → AI Models uses.
+type ActiveRuntimeInfo = ActiveRuntime
 
 interface PurposeMeta {
   id: CatalogModel['purpose']
@@ -60,6 +66,8 @@ export function CookbookPage() {
   const [hardware, setHardware] = useState<HardwareInfo | null>(null)
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
   const [activeRuntime, setActiveRuntime] = useState<ActiveRuntimeInfo | null>(null)
+  // Read starting the next commit (feeds PurposeCard's "runs on" chip).
+  const [, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null)
   const [prefs, setPrefs] = useState<ModelPrefs | null>(null)
   const [loading, setLoading] = useState(true)
@@ -137,11 +145,13 @@ export function CookbookPage() {
 
           <section>
             <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Runtime</p>
-            <RuntimeBanner
-              activeRuntime={activeRuntime}
+            <RuntimeCard
+              hardware={hardware}
               recommendation={recommendation}
+              activeRuntime={activeRuntime}
               isAdmin={isAdmin}
               onSwitched={() => void loadInfra()}
+              onOllamaOverrideChange={setOllamaOverrideUrl}
             />
           </section>
 

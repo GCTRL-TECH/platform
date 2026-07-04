@@ -59,6 +59,7 @@ import WebhooksPage from './WebhooksPage'
 import { NativeOllamaGuide } from './NativeOllamaGuide'
 import { HardwareCard, type HardwareInfo, type Recommendation } from './HardwareCard'
 import { RuntimeSwitcher, type ActiveRuntime } from './RuntimeSwitcher'
+import { RuntimeCard } from './RuntimeCard'
 import { AdvancedEmbeddingModal } from './AdvancedEmbeddingModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -715,6 +716,8 @@ function ModelChooser() {
 
 function ModelsTab() {
   const navigate = useNavigate()
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const [providers, setProviders] = useState<LlmProviderState[]>([])
   const [ollamaBase, setOllamaBase] = useState('')
   const [ollamaKey, setOllamaKey] = useState('')
@@ -724,6 +727,27 @@ function ModelsTab() {
   const [ollamaTest, setOllamaTest] = useState<{ ok: boolean; msg: string } | null>(null)
   // The base URL the server currently has persisted (for the status chip).
   const [ollamaSavedBase, setOllamaSavedBase] = useState<string | null>(null)
+
+  // Shared runtime context — feeds the Inference Runtime card (and, from the
+  // next commit, the per-purpose "runs on" chips below it).
+  const [hardware, setHardware] = useState<HardwareInfo | null>(null)
+  const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
+  const [activeRuntime, setActiveRuntime] = useState<ActiveRuntime | null>(null)
+  // Read starting the next commit (feeds the per-purpose "runs on" chips).
+  const [, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
+
+  const loadRuntimeContext = useCallback(async () => {
+    const [hwRes, recRes, rtRes] = await Promise.allSettled([
+      api.get<HardwareInfo>('/infra/hardware'),
+      api.get<Recommendation>('/infra/recommend'),
+      api.get<ActiveRuntime>('/infra/active-runtime'),
+    ])
+    if (hwRes.status === 'fulfilled') setHardware(hwRes.value.data)
+    if (recRes.status === 'fulfilled') setRecommendation(recRes.value.data)
+    if (rtRes.status === 'fulfilled') setActiveRuntime(rtRes.value.data)
+  }, [])
+
+  useEffect(() => { void loadRuntimeContext() }, [loadRuntimeContext])
 
   const loadProviders = useCallback(async () => {
     try {
@@ -795,6 +819,17 @@ function ModelsTab() {
 
   return (
     <div className="space-y-8">
+      <section>
+        <RuntimeCard
+          hardware={hardware}
+          recommendation={recommendation}
+          activeRuntime={activeRuntime}
+          isAdmin={isAdmin}
+          onSwitched={() => void loadRuntimeContext()}
+          onOllamaOverrideChange={setOllamaOverrideUrl}
+        />
+      </section>
+
       <section>
         <SectionHeader>Cloud Model Providers</SectionHeader>
         <div className="space-y-3">
