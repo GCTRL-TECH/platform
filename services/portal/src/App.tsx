@@ -1,6 +1,8 @@
-import { lazy, Suspense } from 'react'
-import { Routes, Route, Navigate, Outlet } from 'react-router-dom'
-import { useAuth } from '@/hooks/useAuth'
+import { lazy, StrictMode, Suspense } from 'react'
+import { Navigate, Outlet } from 'react-router-dom'
+import type { RouteRecord } from 'vite-react-ssg'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { AuthProvider, useAuth } from '@/hooks/useAuth'
 import { AppShell } from '@/components/layout/AppShell'
 import { LandingPage } from '@/pages/LandingPage'
 import { LoginPage } from '@/pages/auth/LoginPage'
@@ -11,6 +13,7 @@ import { LicensesPage } from '@/pages/LicensesPage'
 import { LicenseDetailPage } from '@/pages/LicenseDetailPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { AdminPage } from '@/pages/AdminPage'
+import { ALL_PAGES } from '@/pages/docs/registry'
 // Marketing content pages are lazy-loaded so react-markdown + doc content stay
 // out of the main (landing) bundle.
 const DocsPage = lazy(() => import('@/pages/docs/DocsPage').then((m) => ({ default: m.DocsPage })))
@@ -57,40 +60,87 @@ function LandingRoute() {
   return <LandingPage />
 }
 
-export function App() {
+// Query client + auth context used to live in main.tsx wrapping <BrowserRouter>.
+// vite-react-ssg builds its own router directly from the `routes` data below
+// (no <BrowserRouter> element to wrap), so the same provider nesting now
+// lives in this root layout route instead — one root route wrapping every
+// other route via <Outlet/>, functionally identical to the old JSX tree.
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30 * 1000,
+      retry: (failureCount, error) => {
+        const status = (error as { response?: { status?: number } })?.response?.status
+        if (status === 401 || status === 403 || status === 404) return false
+        return failureCount < 2
+      },
+    },
+    mutations: { retry: false },
+  },
+})
+
+function RootLayout() {
   return (
-    <Suspense fallback={<Spinner />}>
-    <Routes>
-      <Route element={<PublicRoute />}>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
-        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-      </Route>
-
-      <Route element={<ProtectedRoute />}>
-        <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/licenses" element={<LicensesPage />} />
-        <Route path="/licenses/:id" element={<LicenseDetailPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-      </Route>
-
-      <Route element={<AdminRoute />}>
-        <Route path="/admin" element={<AdminPage />} />
-      </Route>
-
-      <Route path="/" element={<LandingRoute />} />
-
-      {/* Public marketing pages — viewable regardless of auth */}
-      <Route path="/docs" element={<DocsPage />} />
-      <Route path="/docs/:slug" element={<DocsPage />} />
-      <Route path="/use-cases" element={<UseCasesPage />} />
-      <Route path="/integrations" element={<IntegrationsPage />} />
-      <Route path="/pricing" element={<PricingPage />} />
-      <Route path="/imprint" element={<ImprintPage />} />
-      <Route path="/privacy" element={<PrivacyPolicyPage />} />
-
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
-    </Routes>
-    </Suspense>
+    <StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <Suspense fallback={<Spinner />}>
+            <Outlet />
+          </Suspense>
+        </AuthProvider>
+      </QueryClientProvider>
+    </StrictMode>
   )
 }
+
+export const routes: RouteRecord[] = [
+  {
+    element: <RootLayout />,
+    children: [
+      {
+        element: <PublicRoute />,
+        children: [
+          { path: '/login', element: <LoginPage /> },
+          { path: '/register', element: <RegisterPage /> },
+          { path: '/forgot-password', element: <ForgotPasswordPage /> },
+        ],
+      },
+
+      {
+        element: <ProtectedRoute />,
+        children: [
+          { path: '/dashboard', element: <DashboardPage /> },
+          { path: '/licenses', element: <LicensesPage /> },
+          { path: '/licenses/:id', element: <LicenseDetailPage /> },
+          { path: '/settings', element: <SettingsPage /> },
+        ],
+      },
+
+      {
+        element: <AdminRoute />,
+        children: [{ path: '/admin', element: <AdminPage /> }],
+      },
+
+      { path: '/', element: <LandingRoute /> },
+
+      // Public marketing pages — viewable regardless of auth. Prerendered by
+      // vite-react-ssg (see vite.config.ts ssgOptions.includedRoutes).
+      { path: '/docs', element: <DocsPage /> },
+      {
+        path: '/docs/:slug',
+        element: <DocsPage />,
+        // Tells vite-react-ssg every concrete doc URL to prerender.
+        getStaticPaths: () => ALL_PAGES.map((p) => `/docs/${p.slug}`),
+      },
+      { path: '/use-cases', element: <UseCasesPage /> },
+      { path: '/integrations', element: <IntegrationsPage /> },
+      { path: '/pricing', element: <PricingPage /> },
+      { path: '/imprint', element: <ImprintPage /> },
+      { path: '/privacy', element: <PrivacyPolicyPage /> },
+
+      { path: '*', element: <Navigate to="/dashboard" replace /> },
+    ],
+  },
+]
+
+export default routes
