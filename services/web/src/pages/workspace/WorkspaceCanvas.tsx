@@ -19,6 +19,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentType,
   type ReactNode,
 } from 'react'
 import { AlertCircle, Box, Square, Tag, Gauge, Orbit, Eye, Palette } from 'lucide-react'
@@ -74,11 +75,37 @@ function valFromDegree(deg: number): number {
   return (r / NODE_REL_SIZE) ** 2
 }
 
-const ForceGraph2D = lazy(() =>
-  import('react-force-graph-2d').then((m) => ({ default: m.default })),
+// Stale-chunk guard: these renderers are lazy chunks with hashed filenames.
+// A tab left open across a redeploy will 404 on the OLD chunk URL the moment
+// the user first switches renderer (classic symptom: "3D view fails" until a
+// hard refresh). On a chunk-load failure we force ONE full reload (guarded via
+// sessionStorage so a genuinely broken build can't reload-loop) — the fresh
+// index.html then references the current chunk hashes.
+function lazyWithReload(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  load: () => Promise<{ default: ComponentType<any> }>,
+  key: string,
+) {
+  return lazy(() =>
+    load().catch((err) => {
+      const guard = `gw.chunk-reload.${key}`
+      try {
+        if (!sessionStorage.getItem(guard)) {
+          sessionStorage.setItem(guard, '1')
+          window.location.reload()
+        }
+      } catch { /* non-persistent env */ }
+      throw err
+    }),
+  )
+}
+const ForceGraph2D = lazyWithReload(
+  () => import('react-force-graph-2d').then((m) => ({ default: m.default })),
+  '2d',
 )
-const ForceGraph3D = lazy(() =>
-  import('react-force-graph-3d').then((m) => ({ default: m.default })),
+const ForceGraph3D = lazyWithReload(
+  () => import('react-force-graph-3d').then((m) => ({ default: m.default })),
+  '3d',
 )
 
 // Hard ceiling on SIMULATED nodes — a tab-crash safety valve, not the normal

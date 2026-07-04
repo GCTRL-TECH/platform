@@ -70,8 +70,10 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
   const loadCatalog = useCallback(async () => {
     setCatalogLoading(true)
     try {
-      const { data } = await api.get<RuntimeCatalogEntry[]>('/infra/runtimes')
-      setCatalog(data)
+      const { data } = await api.get<RuntimeCatalogEntry[] | { runtimes: RuntimeCatalogEntry[] }>('/infra/runtimes')
+      // The endpoint returns { runtimes: [...] } — treating it as a bare array
+      // made `catalog.find` throw and crashed the whole Infrastructure tab.
+      setCatalog(Array.isArray(data) ? data : data.runtimes ?? [])
     } catch { /* non-fatal */ } finally {
       setCatalogLoading(false)
     }

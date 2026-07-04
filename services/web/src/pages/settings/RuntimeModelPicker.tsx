@@ -33,9 +33,11 @@ export function RuntimeModelPicker({ runtime, value, onChange, systemRamGb, disa
     setLoading(true)
     setError('')
     void api
-      .get<RuntimeModel[]>(`/infra/models?runtime=${encodeURIComponent(runtime)}`)
+      .get<RuntimeModel[] | { models: RuntimeModel[] }>(`/infra/models?runtime=${encodeURIComponent(runtime)}`)
       .then(({ data }) => {
-        if (!cancelled) setModels(data)
+        // Endpoint returns { models: [...] } — same unwrap bug as the runtime
+        // catalog (crashed the Infrastructure tab via models.find).
+        if (!cancelled) setModels(Array.isArray(data) ? data : data.models ?? [])
       })
       .catch(() => {
         if (!cancelled) setError('Could not load models')
