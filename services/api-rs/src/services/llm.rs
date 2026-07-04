@@ -604,6 +604,33 @@ pub async fn inject_ollama_overrides(
     }
 }
 
+/// Resolve a user's per-purpose model preference (Cookbook / Settings → AI
+/// Models), for purposes that pick a CHAT model rather than an engine-side
+/// worker model: `"agent"` (Pi agent chat) or `"rag"` (Talk-to-Graph). Returns
+/// `None` when unset (or for any other purpose) so callers fall back to their
+/// existing resolution chain unchanged — this is purely additive.
+pub async fn resolve_purpose_model(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    purpose: &str,
+) -> Option<String> {
+    let col = match purpose {
+        "agent" => "agent_model",
+        "rag" => "rag_model",
+        _ => return None,
+    };
+    let sql = format!("SELECT {col} FROM user_model_prefs WHERE user_id = $1");
+    let row: Option<Option<String>> = sqlx::query_scalar(&sql)
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    row.flatten()
+        .map(|s: String| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve the wiki-distillation overrides for a user: the chosen distill model
 /// (Settings → AI Models → Models, `user_model_prefs.distill_model`) and the
 /// runtime Ollama base. Either is `None` when unset, so the FUSE distiller falls

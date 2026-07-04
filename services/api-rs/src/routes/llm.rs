@@ -99,6 +99,14 @@ const CATALOG: &[RecModel] = &[
     // ── Distillation (wiki prose; instruction-following + fluency) ──
     RecModel { name: "llama3.2",   purpose: "distill", size_gb: 2.0, ram_gb: 3.0, speed: 4, quality: 3, recommended: true,  note: "Default. Light, fast wiki prose; runs on ~3GB RAM." },
     RecModel { name: "qwen2.5:7b", purpose: "distill", size_gb: 4.7, ram_gb: 6.0, speed: 3, quality: 5, recommended: false, note: "More coherent prose for richer wikis. Needs ~6GB RAM." },
+    // ── Pi agent chat (tool-calling; needs reliable JSON + reasoning) ──
+    RecModel { name: "llama3.2",    purpose: "agent", size_gb: 2.0, ram_gb: 3.0,  speed: 4, quality: 3, recommended: true,  note: "Default. Fast, low-RAM chat for the Pi agent." },
+    RecModel { name: "qwen2.5:7b",  purpose: "agent", size_gb: 4.7, ram_gb: 6.0,  speed: 3, quality: 5, recommended: false, note: "Stronger tool-calling + reasoning. Needs ~6GB RAM." },
+    RecModel { name: "qwen2.5:14b", purpose: "agent", size_gb: 9.0, ram_gb: 12.0, speed: 2, quality: 5, recommended: false, note: "Best quality for complex multi-tool agent tasks. Needs ~12GB RAM." },
+    // ── Talk-to-Graph RAG (grounded Q&A over your knowledge graph) ──
+    RecModel { name: "llama3.2",    purpose: "rag", size_gb: 2.0, ram_gb: 3.0,  speed: 4, quality: 3, recommended: true,  note: "Default. Fast, low-RAM answers grounded in your graph." },
+    RecModel { name: "qwen2.5:7b",  purpose: "rag", size_gb: 4.7, ram_gb: 6.0,  speed: 3, quality: 5, recommended: false, note: "More coherent multi-hop answers. Needs ~6GB RAM." },
+    RecModel { name: "qwen2.5:14b", purpose: "rag", size_gb: 9.0, ram_gb: 12.0, speed: 2, quality: 5, recommended: false, note: "Best answer quality for deep/agentic RAG. Needs ~12GB RAM." },
 ];
 
 /// Recommended default model per purpose (mirrors the kex/fuse env defaults so the
@@ -108,6 +116,8 @@ pub(crate) fn default_model_for(purpose: &str) -> &'static str {
         "embedding" => "nomic-embed-text",
         "relation"  => "qwen2.5:7b",
         "distill"   => "llama3.2",
+        "agent"     => "llama3.2",
+        "rag"       => "llama3.2",
         _ => "",
     }
 }
@@ -515,6 +525,8 @@ struct ModelPrefsRow {
     embedding_base_url: Option<String>,
     relation_model: Option<String>,
     distill_model: Option<String>,
+    agent_model: Option<String>,
+    rag_model: Option<String>,
 }
 
 /// GET /api/llm/model-prefs — the user's per-purpose model choices, with the
@@ -525,7 +537,8 @@ async fn get_model_prefs(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
     let row: ModelPrefsRow = sqlx::query_as(
-        "SELECT embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model
+        "SELECT embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model,
+                agent_model, rag_model
          FROM user_model_prefs WHERE user_id = $1",
     )
     .bind(claims.sub)
@@ -539,6 +552,8 @@ async fn get_model_prefs(
         "embeddingBaseUrl": row.embedding_base_url,
         "relationModel":    row.relation_model.unwrap_or_else(|| default_model_for("relation").into()),
         "distillModel":     row.distill_model.unwrap_or_else(|| default_model_for("distill").into()),
+        "agentModel":       row.agent_model.unwrap_or_else(|| default_model_for("agent").into()),
+        "ragModel":         row.rag_model.unwrap_or_else(|| default_model_for("rag").into()),
     })))
 }
 
@@ -549,6 +564,8 @@ struct SetPrefsReq {
     #[serde(rename = "embeddingBaseUrl")]  embedding_base_url: Option<String>,
     #[serde(rename = "relationModel")]     relation_model:     Option<String>,
     #[serde(rename = "distillModel")]      distill_model:      Option<String>,
+    #[serde(rename = "agentModel")]        agent_model:        Option<String>,
+    #[serde(rename = "ragModel")]          rag_model:          Option<String>,
 }
 
 /// PUT /api/llm/model-prefs — upsert the per-purpose model choices. Empty string
@@ -577,14 +594,17 @@ async fn set_model_prefs(
     };
     sqlx::query(
         "INSERT INTO user_model_prefs
-            (user_id, embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())
+            (user_id, embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model,
+             agent_model, rag_model, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
          ON CONFLICT (user_id) DO UPDATE SET
             embedding_model    = $2,
             embedding_provider = $3,
             embedding_base_url = $4,
             relation_model     = $5,
             distill_model      = $6,
+            agent_model        = $7,
+            rag_model          = $8,
             updated_at         = now()",
     )
     .bind(claims.sub)
@@ -593,6 +613,8 @@ async fn set_model_prefs(
     .bind(emb_base)
     .bind(norm(req.relation_model))
     .bind(norm(req.distill_model))
+    .bind(norm(req.agent_model))
+    .bind(norm(req.rag_model))
     .execute(&state.db)
     .await?;
 
