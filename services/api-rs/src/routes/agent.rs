@@ -379,15 +379,20 @@ pub(crate) async fn execute_tool(
             }
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
-            let cypher = "MATCH (n) \
+            // KB-scope: a scoped token may only enumerate entities from its granted
+            // knowledge base(s); scoped-but-ungranted returns nothing.
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entities": [] }); }
+            let job_clause = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let cypher = format!("MATCH (n) \
                 WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
                   AND (n._owner = $uid OR n.user_id = $uid) \
-                  AND coalesce(n._min_rank,0) <= $rank \
-                RETURN n.name AS name, n.label AS label, n._classification AS cls LIMIT $limit";
+                  AND coalesce(n._min_rank,0) <= $rank {job_clause} \
+                RETURN n.name AS name, n.label AS label, n._classification AS cls LIMIT $limit");
+            let mut nq = neo4rs::query(&cypher).param("q", query).param("uid", uid).param("rank", rank as i64).param("limit", limit);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
             let mut out: Vec<Value> = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(cypher).param("q", query).param("uid", uid).param("rank", rank as i64).param("limit", limit),
-            ).await {
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 while let Ok(Some(row)) = stream.next().await {
                     out.push(json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
@@ -414,20 +419,28 @@ pub(crate) async fn execute_tool(
             // P3 — relations come back as parallel arrays (type/target/
             // authority/supersededBy) so Pi can say "current per <doc>, older
             // value from <doc>" when conflict detection marked an edge.
-            let cypher = "MATCH (n {name: $name}) \
-                WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank \
-                OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank \
+            // KB-scope: confine both the entity AND its shown neighbours to the token's
+            // granted knowledge base(s).
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) {
+                return json!({ "error": "not found or insufficient clearance" });
+            }
+            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            let cypher = format!("MATCH (n {{name: $name}}) \
+                WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank {njob} \
+                OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank {mjob} \
                 WITH n, [x IN collect(DISTINCT CASE WHEN r IS NULL THEN NULL ELSE \
-                    {t: type(r), m: coalesce(m.name,''), a: coalesce(r._authority,''), \
-                     s: coalesce(r._superseded_by_doc,'')} END)][..20] AS rels \
+                    {{t: type(r), m: coalesce(m.name,''), a: coalesce(r._authority,''), \
+                     s: coalesce(r._superseded_by_doc,'')}} END)][..20] AS rels \
                 RETURN n.name AS name, n.label AS label, n._classification AS cls, \
                        n._source_job AS sourceJob, n.uri AS uri, \
                        [x IN rels | x.t] AS relTypes, [x IN rels | x.m] AS relTargets, \
-                       [x IN rels | x.a] AS relAuth, [x IN rels | x.s] AS relSup LIMIT 1";
+                       [x IN rels | x.a] AS relAuth, [x IN rels | x.s] AS relSup LIMIT 1");
             let mut result = json!({ "error": "not found or insufficient clearance" });
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64),
-            ).await {
+            let mut nq = neo4rs::query(&cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 if let Ok(Some(row)) = stream.next().await {
                     // Resolve the origin file/provenance from the source job (Postgres).
                     let provenance: Value = match row.get::<String>("sourceJob").ok()
@@ -501,11 +514,17 @@ pub(crate) async fn execute_tool(
         "get_dossier" => {
             let name = args["name"].as_str().unwrap_or("").to_string();
             if name.trim().is_empty() { return json!({ "error": "name is required" }); }
-            // Try the stored dossier; build on-the-fly via FUSE when missing.
-            let mut row = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await;
+            // SCOPED read: KB-scoped tokens get nothing; a dossier whose facts exceed
+            // the caller's clearance is withheld. Build on-the-fly only when TRULY
+            // absent (not merely withheld) and the caller isn't KB-scoped.
+            let mut row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
             if row.is_none() {
-                if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
-                    row = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await;
+                let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+                let kb_scoped = crate::routes::kg::api_key_scope(&state.db, claims).await.is_some();
+                if truly_absent && !kb_scoped {
+                    if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
+                        row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+                    }
                 }
             }
             let result = match row {
@@ -560,11 +579,18 @@ pub(crate) async fn execute_tool(
 
         // ── Read: open conflicts (classification + P3 fact conflicts) ─────────
         "list_conflicts" => {
+            // KB-scope: a scoped token only sees conflicts in its granted knowledge
+            // base(s) (the rows carry competing fact VALUES — must not leak cross-KB).
+            let scoped = crate::routes::kg::api_key_scope(&state.db, claims).await;
+            if matches!(&scoped, Some(s) if s.is_empty()) { return json!({ "conflicts": [] }); }
+            let scoped_comps: Option<Vec<uuid::Uuid>> = scoped.map(|s| s.into_iter().collect());
             let rows = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>, String, String)>(
                 "SELECT cc.id, cc.compilation_id, cc.element_kind, cc.element_key
                  FROM classification_conflicts cc JOIN compilations c ON c.id = cc.compilation_id
-                 WHERE c.user_id = $1 AND cc.status = 'open' ORDER BY cc.created_at DESC LIMIT 50"
-            ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+                 WHERE c.user_id = $1 AND cc.status = 'open'
+                   AND ($2::uuid[] IS NULL OR cc.compilation_id = ANY($2))
+                 ORDER BY cc.created_at DESC LIMIT 50"
+            ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await.unwrap_or_default();
             let mut conflicts: Vec<Value> = rows.iter().map(|(id, cid, kind, key)| json!({
                 "id": id, "kind": "classification",
                 "compilationId": cid, "elementKind": kind, "elementKey": key
@@ -576,8 +602,9 @@ pub(crate) async fn execute_tool(
             )>(
                 "SELECT id, compilation_id, relation, key_name, key_side, tails, authority_winner
                  FROM fact_conflicts WHERE user_id = $1 AND status = 'open'
+                   AND ($2::uuid[] IS NULL OR compilation_id = ANY($2))
                  ORDER BY first_detected_at DESC LIMIT 50"
-            ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+            ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await.unwrap_or_default();
             conflicts.extend(fact_rows.iter().map(|(id, cid, relation, key_name, key_side, tails, winner)| json!({
                 "id": id, "kind": "fact",
                 "compilationId": cid, "relation": relation,
@@ -1059,20 +1086,24 @@ pub(crate) async fn execute_tool(
             let depth = args["depth"].as_i64().unwrap_or(1).clamp(1, 3);
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
-            // Variable-length expansion, clearance-filtered on every hop's endpoint.
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entity": name, "neighbors": [] }); }
+            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            // Variable-length expansion, clearance- AND KB-scope-filtered on every hop.
             let cypher = format!(
                 "MATCH (n {{name: $name}}) \
-                   WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank \
+                   WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank {njob} \
                  MATCH (n)-[r*1..{depth}]-(m) \
-                   WHERE (m._owner = $uid OR m.user_id = $uid) AND coalesce(m._min_rank,0) <= $rank \
+                   WHERE (m._owner = $uid OR m.user_id = $uid) AND coalesce(m._min_rank,0) <= $rank {mjob} \
                  RETURN DISTINCT m.name AS name, coalesce(m.coarse_type, m.label, m.type) AS type, \
                         length(r) AS hops \
                  ORDER BY hops ASC, name ASC LIMIT 100"
             );
             let mut out: Vec<Value> = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(&cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64),
-            ).await {
+            let mut nq = neo4rs::query(&cypher).param("name", name.clone()).param("uid", uid).param("rank", rank as i64);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 while let Ok(Some(row)) = stream.next().await {
                     out.push(json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
@@ -1094,18 +1125,22 @@ pub(crate) async fn execute_tool(
             }
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
             let uid = claims.sub.to_string();
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "found": false, "from": from, "to": to }); }
             // shortestPath up to 8 hops; reject any path crossing a node above the
-            // caller's clearance (no leaking a connection THROUGH classified nodes).
-            let cypher = "MATCH (a {name: $from}), (b {name: $to}) \
+            // caller's clearance OR outside its granted knowledge base(s) — no leaking a
+            // connection THROUGH classified or out-of-scope nodes.
+            let pathjob = if scoped.is_some() { "AND all(x IN nodes(p) WHERE x._source_job IN $jobs)" } else { "" };
+            let cypher = format!("MATCH (a {{name: $from}}), (b {{name: $to}}) \
                   WHERE (a._owner = $uid OR a.user_id = $uid) AND (b._owner = $uid OR b.user_id = $uid) \
                   MATCH p = shortestPath((a)-[*..8]-(b)) \
-                  WHERE all(x IN nodes(p) WHERE coalesce(x._min_rank,0) <= $rank) \
+                  WHERE all(x IN nodes(p) WHERE coalesce(x._min_rank,0) <= $rank) {pathjob} \
                   RETURN [x IN nodes(p) | x.name] AS names, \
-                         [r IN relationships(p) | type(r)] AS rels, length(p) AS hops LIMIT 1";
+                         [r IN relationships(p) | type(r)] AS rels, length(p) AS hops LIMIT 1");
             let mut result = json!({ "found": false, "from": from, "to": to });
-            if let Ok(mut stream) = state.neo.execute(
-                neo4rs::query(cypher).param("from", from.clone()).param("to", to.clone()).param("uid", uid).param("rank", rank as i64),
-            ).await {
+            let mut nq = neo4rs::query(&cypher).param("from", from.clone()).param("to", to.clone()).param("uid", uid).param("rank", rank as i64);
+            if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
+            if let Ok(mut stream) = state.neo.execute(nq).await {
                 if let Ok(Some(row)) = stream.next().await {
                     result = json!({
                         "found": true, "from": from, "to": to,

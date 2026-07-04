@@ -24,7 +24,10 @@ pub(crate) async fn get_user_clearance_rank(db: &sqlx::PgPool, claims: &JwtClaim
     // → full access; non-admin → capped to their stored rank). It's `#[serde(skip)]`
     // so it can only be set in-process, never via a token.
     if let Some(o) = claims.agent_override_rank {
-        return o;
+        // Still cap by any API-key rank: an admin deliberately driving a LOW-rank key
+        // must not get full access through the override. (A JWT session has no
+        // api_key_rank, so the board agent's i32::MAX override is unaffected.)
+        return match claims.api_key_rank { Some(k) => o.min(k), None => o };
     }
     let db_rank = sqlx::query_scalar::<_, i32>("SELECT COALESCE(clearance_rank, 100) FROM users WHERE id = $1")
         .bind(claims.sub)
@@ -60,6 +63,27 @@ pub(crate) async fn api_key_scope(
         "SELECT compilation_id FROM api_key_grants WHERE api_key_id = $1"
     ).bind(key_id).fetch_all(db).await.unwrap_or_default();
     Some(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// The set of source-job ids a KB-scoped token may traverse in the graph: the union
+/// of `source_job_ids` across its granted compilations. `None` = JWT/unscoped token
+/// (no restriction). `Some(empty)` = scoped but granted nothing → the caller returns
+/// no results. Graph nodes/edges carry `_source_job` (a UUID string), so adding
+/// `n._source_job IN $jobs` confines a scoped token to its knowledge base(s) — this
+/// closes the hole where the global graph tools (search_entities / get_entity /
+/// get_neighbors / shortest_path / graph_search) enforced only owner + rank and let a
+/// KB-scoped token enumerate the owner's ENTIRE graph across KB boundaries.
+pub(crate) async fn api_key_scoped_jobs(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> Option<Vec<String>> {
+    let set = api_key_scope(db, claims).await?;
+    if set.is_empty() { return Some(Vec::new()); }
+    let comp_ids: Vec<Uuid> = set.into_iter().collect();
+    let jobs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT unnest(source_job_ids) FROM compilations WHERE id = ANY($1)"
+    ).bind(&comp_ids).fetch_all(db).await.unwrap_or_default();
+    Some(jobs.into_iter().map(|j| j.to_string()).collect())
 }
 
 /// Write-scope guard: a KB-scoped token may only WRITE into a compilation in its
@@ -1558,15 +1582,21 @@ async fn graph_search(
     // Cross-graph search uses the token's base clearance (per-graph grants are
     // scoped to a specific compilation and don't widen a global search).
     let base_rank = get_user_clearance_rank(&state.db, &claims).await;
+    // KB-scope: a scoped token may only search within its granted knowledge base(s).
+    let scoped = api_key_scoped_jobs(&state.db, &claims).await;
+    if matches!(&scoped, Some(j) if j.is_empty()) { return Ok(Json(json!({ "nodes": [] }))); }
+    let job_clause = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
 
-    let cypher = "MATCH (n) \
+    let cypher = format!("MATCH (n) \
                   WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
                   AND n.user_id = $uid \
-                  AND coalesce(n._min_rank,0) <= $rank \
-                  RETURN n LIMIT $limit";
+                  AND coalesce(n._min_rank,0) <= $rank {job_clause} \
+                  RETURN n LIMIT $limit");
 
+    let mut nq = neo_query(&cypher).param("q", q.q.clone()).param("uid", uid.clone()).param("rank", base_rank as i64).param("limit", limit);
+    if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
     let mut stream = state.neo
-        .execute(neo_query(cypher).param("q", q.q.clone()).param("uid", uid.clone()).param("rank", base_rank as i64).param("limit", limit))
+        .execute(nq)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -1623,7 +1653,8 @@ async fn entity_neighbors(
     let mut stream = state.neo
         .execute(
             neo_query("MATCH (n {name: $name, user_id: $uid})-[r]-(m) \
-                       WHERE coalesce(n._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
+                       WHERE (m._owner = $uid OR m.user_id = $uid) \
+                         AND coalesce(n._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
                        RETURN n, r, m LIMIT $limit")
                 .param("name", name.clone())
                 .param("uid", uid.clone())
@@ -1650,7 +1681,8 @@ async fn entity_neighbors(
         let mut stream2 = state.neo
             .execute(
                 neo_query("MATCH (n {name: $name, user_id: $uid})-[]-(mid)-[r2]-(m) \
-                           WHERE coalesce(mid._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r2._min_rank,0) <= $rank \
+                           WHERE (mid._owner = $uid OR mid.user_id = $uid) AND (m._owner = $uid OR m.user_id = $uid) \
+                             AND coalesce(mid._min_rank,0) <= $rank AND coalesce(m._min_rank,0) <= $rank AND coalesce(r2._min_rank,0) <= $rank \
                            RETURN mid AS n, r2 AS r, m LIMIT $limit")
                     .param("name", name.clone())
                     .param("uid", uid.clone())
@@ -1892,6 +1924,60 @@ pub(crate) async fn fetch_dossier_row(
     ).bind(user_id).bind(name).fetch_optional(db).await.ok().flatten()
 }
 
+/// The clearance rank REQUIRED to read an entity's dossier. A dossier synthesises
+/// ALL of an entity's facts into authoritative prose, so if ANY contributing fact is
+/// above the caller's clearance the WHOLE dossier must be withheld (you can't redact
+/// synthesized prose). We derive the ceiling live from the graph — the maximum
+/// `_min_rank` across the entity's node and its relations — so it always reflects the
+/// current sensitivity. 0 (PUBLIC) when the entity has no facts; on a Neo4j error we
+/// fail CLOSED (i32::MAX) so a hiccup never leaks a dossier to a low-clearance caller.
+pub(crate) async fn dossier_required_rank(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    name: &str,
+) -> i32 {
+    let cypher = "MATCH (n) WHERE toLower(n.name) = toLower($name) \
+                    AND (n._owner = $uid OR n.user_id = $uid) \
+                  OPTIONAL MATCH (n)-[r]-() \
+                  RETURN coalesce(max(coalesce(r._min_rank,0)),0) AS relmax, \
+                         coalesce(max(coalesce(n._min_rank,0)),0) AS nodemax";
+    match state.neo.execute(
+        neo4rs::query(cypher).param("name", name).param("uid", user_id.to_string()),
+    ).await {
+        Ok(mut res) => {
+            if let Ok(Some(row)) = res.next().await {
+                let relmax = row.get::<i64>("relmax").unwrap_or(0) as i32;
+                let nodemax = row.get::<i64>("nodemax").unwrap_or(0) as i32;
+                return relmax.max(nodemax);
+            }
+            0
+        }
+        Err(_) => i32::MAX, // fail closed
+    }
+}
+
+/// Dossier read gated for the caller — use on EVERY dossier read path. Denies
+/// KB-scoped tokens outright (a dossier is a cross-KB, per-owner aggregate that can't
+/// be confined to one granted knowledge base), and withholds any dossier whose
+/// aggregated facts exceed the caller's effective clearance. Returns None when the
+/// dossier is absent OR withheld — callers must not distinguish the two to a scoped
+/// reader (don't reveal existence).
+pub(crate) async fn fetch_dossier_row_scoped(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    name: &str,
+) -> Option<Dossier> {
+    if api_key_scope(&state.db, claims).await.is_some() {
+        return None;
+    }
+    let d = fetch_dossier_row(&state.db, claims.sub, name).await?;
+    let caller_rank = get_user_clearance_rank(&state.db, claims).await;
+    if dossier_required_rank(state, claims.sub, name).await > caller_rank {
+        return None;
+    }
+    Some(d)
+}
+
 /// Ask FUSE to build/refresh a dossier for one named entity (on-the-fly path).
 /// Returns Ok(Some) when built, Ok(None) when the user owns no such entity.
 pub(crate) async fn build_dossier_via_fuse(
@@ -1945,12 +2031,19 @@ async fn get_dossier(
         return Err(AppError::BadRequest("name is required".into()));
     }
 
-    // 1. Try the stored dossier. 2. Build on-the-fly via FUSE if missing. 3. Re-read.
-    let mut row = fetch_dossier_row(&state.db, claims.sub, &name).await;
+    // 1. Try the stored dossier (SCOPED: KB-scoped tokens get nothing, above-clearance
+    //    dossiers are withheld). 2. Build on-the-fly ONLY when truly absent (not merely
+    //    withheld — never rebuild just to withhold again, and never build for a scoped
+    //    token). 3. Re-read scoped.
+    let mut row = fetch_dossier_row_scoped(&state, &claims, &name).await;
     if row.is_none() {
-        match build_dossier_via_fuse(&state, claims.sub, &name).await? {
-            Some(()) => { row = fetch_dossier_row(&state.db, claims.sub, &name).await; }
-            None => return Err(AppError::NotFound),
+        let truly_absent = fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+        let kb_scoped = api_key_scope(&state.db, &claims).await.is_some();
+        if truly_absent && !kb_scoped {
+            match build_dossier_via_fuse(&state, claims.sub, &name).await? {
+                Some(()) => { row = fetch_dossier_row_scoped(&state, &claims, &name).await; }
+                None => return Err(AppError::NotFound),
+            }
         }
     }
     let Some(d) = row else { return Err(AppError::NotFound); };
@@ -2070,13 +2163,17 @@ pub(crate) fn render_dossier_block(d: &Dossier) -> String {
 /// BEFORE retrieval so the hot block can be injected at the top of the prompt.
 pub(crate) async fn dossiers_referenced_by_query(
     db: &sqlx::PgPool,
-    user_id: Uuid,
+    claims: &JwtClaims,
     query: &str,
 ) -> Vec<String> {
+    // KB-scoped tokens get NO dossiers (cross-KB per-owner aggregates) — deny early.
+    if api_key_scope(db, claims).await.is_some() {
+        return Vec::new();
+    }
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT entity_name FROM entity_dossiers \
           WHERE user_id = $1 AND archived = false"
-    ).bind(user_id).fetch_all(db).await.unwrap_or_default();
+    ).bind(claims.sub).fetch_all(db).await.unwrap_or_default();
     let q_lower = query.to_lowercase();
     let mut matched: Vec<String> = names
         .into_iter()
@@ -2108,18 +2205,22 @@ pub(crate) async fn dossiers_referenced_by_query(
 /// caller then falls through to ordinary hybrid retrieval (no regression).
 pub(crate) async fn collect_hot_blocks(
     state: &Arc<crate::models::AppState>,
-    user_id: Uuid,
+    claims: &JwtClaims,
     candidate_names: &[String],
     max_blocks: usize,
 ) -> (String, Vec<String>) {
-    let mut blocks: Vec<(f32, bool, String, Uuid)> = Vec::new();
+    // Every dossier is fetched through the SCOPED read: KB-scoped tokens get nothing,
+    // and any dossier whose facts exceed the caller's clearance is withheld — so a
+    // low-clearance/scoped caller can never have above-grant dossier prose injected
+    // into their RAG answer.
+    let mut blocks: Vec<(f32, bool, String, Uuid, String)> = Vec::new();
     let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for name in candidate_names {
         if name.trim().is_empty() { continue; }
-        if let Some(d) = fetch_dossier_row(&state.db, user_id, name).await {
+        if let Some(d) = fetch_dossier_row_scoped(state, claims, name).await {
             if seen.insert(d.id) {
                 let rendered = render_dossier_block(&d);
-                blocks.push((d.trust, d.pinned, rendered, d.id));
+                blocks.push((d.trust, d.pinned, rendered, d.id, name.clone()));
             }
         }
     }
@@ -2129,16 +2230,11 @@ pub(crate) async fn collect_hot_blocks(
 
     let mut matched: Vec<String> = Vec::new();
     let mut out = String::new();
-    for (_, _, rendered, id) in &blocks {
+    for (_, _, rendered, id, name) in &blocks {
         out.push_str(rendered);
         out.push('\n');
         bump_dossier_heat(&state.db, *id).await;
-    }
-    // Extract matched entity names from the blocks for logging/trace.
-    for name in candidate_names {
-        if fetch_dossier_row(&state.db, user_id, name).await.is_some() {
-            matched.push(name.clone());
-        }
+        matched.push(name.clone());
     }
     (out, matched)
 }
@@ -2405,14 +2501,20 @@ async fn list_corrections(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
+    // KB-scope: a scoped token only sees corrections in its granted knowledge base(s)
+    // (rows carry head/rel/tail fact values — must not leak cross-KB).
+    let scoped = api_key_scope(&state.db, &claims).await;
+    if matches!(&scoped, Some(s) if s.is_empty()) { return Ok(Json(json!({ "corrections": [] }))); }
+    let scoped_comps: Option<Vec<Uuid>> = scoped.map(|s| s.into_iter().collect());
     let rows = sqlx::query_as::<_, (
         Uuid, Option<Uuid>, String, String, Option<String>, Option<String>, String, Option<String>,
         chrono::DateTime<chrono::Utc>
     )>(
         "SELECT id, compilation_id, element_kind, head, rel_type, tail, action, reason, created_at
            FROM knowledge_corrections WHERE user_id = $1
+             AND ($2::uuid[] IS NULL OR compilation_id = ANY($2))
           ORDER BY created_at DESC LIMIT 200"
-    ).bind(claims.sub).fetch_all(&state.db).await?;
+    ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await?;
     let items: Vec<Value> = rows.into_iter().map(
         |(id, comp, kind, head, rel, tail, action, reason, created)| json!({
             "id": id, "compilationId": comp, "elementKind": kind,
