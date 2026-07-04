@@ -311,6 +311,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "list_conflicts",     "description": "List open conflicts — classification conflicts AND fact conflicts (competing values for a functional relation, ranked by source recency; authorityWinner = the current value)", "args": {} },
             { "name": "list_sources",       "description": "List connected data sources", "args": {} },
             { "name": "list_ontologies",    "description": "List ontologies", "args": {} },
+            { "name": "schema",             "description": "Graph schema for your knowledge: distinct entity types (coarse buckets) and relationship types with counts, clearance- and KB-scope-filtered. Use to learn 'what kinds of things and relations exist' before querying. No args", "args": {} },
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
             { "name": "create_extraction",  "description": "Ingest text into the knowledge graph", "args": { "text": "string", "classificationLevelId": "string?" } },
             { "name": "fuse_graphs",        "description": "Merge graphs by their source job ids", "args": { "name": "string", "sourceJobIds": "string[]" } },
@@ -959,6 +960,49 @@ pub(crate) async fn execute_tool(
             json!({ "ontologies": rows.iter().map(|(id, name, desc)| json!({
                 "id": id, "name": name, "description": desc
             })).collect::<Vec<_>>() })
+        }
+
+        // ── Read: graph schema (entity + relationship types) — clearance/KB-scoped ──
+        // Parity with the stdio MCP so external gateway agents can learn "what kinds of
+        // things and relations exist" before querying.
+        "schema" => {
+            let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
+            let uid = claims.sub.to_string();
+            let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
+            if matches!(&scoped, Some(j) if j.is_empty()) {
+                return json!({ "entityTypes": [], "relationTypes": [] });
+            }
+            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            let cypher_e = format!(
+                "MATCH (n) WHERE (n._owner=$uid OR n.user_id=$uid) AND coalesce(n._min_rank,0)<=$rank {njob} \
+                 WITH coalesce(n.coarse_type, n.type, n.label) AS t WHERE t IS NOT NULL AND t <> '' \
+                 RETURN t AS ty, count(*) AS cnt ORDER BY cnt DESC LIMIT 50");
+            let cypher_r = format!(
+                "MATCH (n)-[r]->(m) WHERE (n._owner=$uid OR n.user_id=$uid) AND coalesce(r._min_rank,0)<=$rank {njob} {mjob} \
+                 RETURN type(r) AS ty, count(*) AS cnt ORDER BY cnt DESC LIMIT 50");
+            let run = |cypher: String| {
+                let neo = state.neo.clone();
+                let uid = uid.clone();
+                let scoped = scoped.clone();
+                async move {
+                    let mut q = neo4rs::query(&cypher).param("uid", uid).param("rank", rank as i64);
+                    if let Some(jobs) = &scoped { q = q.param("jobs", jobs.clone()); }
+                    let mut out: Vec<Value> = Vec::new();
+                    if let Ok(mut s) = neo.execute(q).await {
+                        while let Ok(Some(row)) = s.next().await {
+                            out.push(json!({
+                                "type": row.get::<String>("ty").unwrap_or_default(),
+                                "count": row.get::<i64>("cnt").unwrap_or(0),
+                            }));
+                        }
+                    }
+                    out
+                }
+            };
+            let entity_types = run(cypher_e).await;
+            let relation_types = run(cypher_r).await;
+            json!({ "entityTypes": entity_types, "relationTypes": relation_types })
         }
 
         // ── Action: create an empty compilation ───────────────────────────────

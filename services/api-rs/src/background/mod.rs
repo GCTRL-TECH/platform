@@ -60,6 +60,22 @@ pub fn spawn_all(state: Arc<AppState>) {
         }
     });
 
+    // Liveness watchdog: probe the platform's OWN services (Postgres, Neo4j, KEX,
+    // FUSE) on a slow cadence and log a WARN when one is unreachable, so a dead
+    // worker surfaces in logs/observability instead of failing silently. Safe by
+    // design — it only observes + logs; self-healing is an explicit operator/agent
+    // action (the restart_service tool), NEVER automatic, to avoid restart storms.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(45)).await;
+        let period = std::env::var("GCTRL_WATCHDOG_SECS")
+            .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(120);
+        loop {
+            run_watchdog(&s).await;
+            sleep(Duration::from_secs(period)).await;
+        }
+    });
+
     // Cron / heartbeat executor: ticks ~every 60s and re-ingests Obsidian vaults
     // whose triggers are due. This is the only thing that actually executes the
     // `triggers` table — without it, vaults can only be synced manually.
@@ -75,6 +91,36 @@ pub fn spawn_all(state: Arc<AppState>) {
             sleep(Duration::from_secs(60)).await;
         }
     });
+}
+
+/// One liveness probe of the platform's own services. Logs a WARN listing any that
+/// are unreachable; DEBUG when all healthy. Observation only — never restarts.
+async fn run_watchdog(state: &Arc<AppState>) {
+    let pg = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.db).await.is_ok();
+    let neo = state.neo.execute(neo4rs::query("RETURN 1 AS x")).await.is_ok();
+    let client = reqwest::Client::new();
+    let probe = |url: String| {
+        let c = client.clone();
+        async move {
+            c.get(url).timeout(Duration::from_secs(5)).send().await
+                .map(|r| r.status().is_success()).unwrap_or(false)
+        }
+    };
+    let kex = probe(format!("{}/health", state.cfg.kex_worker_url)).await;
+    let fuse = probe(format!("{}/health", state.cfg.fuse_url)).await;
+    let mut down: Vec<&str> = Vec::new();
+    if !pg { down.push("postgres"); }
+    if !neo { down.push("neo4j"); }
+    if !kex { down.push("kex"); }
+    if !fuse { down.push("fuse"); }
+    if down.is_empty() {
+        tracing::debug!("watchdog: all services healthy");
+    } else {
+        tracing::warn!(
+            "watchdog: service(s) unreachable: {} — use the restart_service tool or check the stack",
+            down.join(", ")
+        );
+    }
 }
 
 // ── Cron / heartbeat executor ────────────────────────────────────────────────
