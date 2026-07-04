@@ -282,3 +282,26 @@ class TestFormatNerMergeIntoPipeline:
         entities = pipeline.extract_entities(text, entity_types=["date"])
 
         assert entities == []
+
+
+# ── Compliance/standards gazetteer (coarse type `field`) ──────────────────────
+
+def _field_texts(text):
+    from src.format_ner import detect_format_entities
+    return sorted(e["text"] for e in detect_format_entities(text) if e["type"] == "field")
+
+
+def test_compliance_standards_detected_de():
+    got = _field_texts("Wir sind nach ISO 27001 zertifiziert und DSGVO-konform; TISAX Level 3 erreicht.")
+    assert "ISO 27001" in got and "DSGVO" in got and "TISAX Level 3" in got
+
+
+def test_compliance_standards_detected_en():
+    got = _field_texts("Compliant with GDPR, SOC 2 Type II, PCI-DSS, HIPAA and FDA 510(k).")
+    for s in ("GDPR", "SOC 2 Type II", "PCI-DSS", "HIPAA", "FDA 510(k)"):
+        assert s in got, f"missing {s}: {got}"
+
+
+def test_compliance_no_false_positive_on_lowercase_prose():
+    # 'isometric', 'prism', 'mdr' as a substring must NOT trip GDPR/ISO/MDR gazetteer
+    assert _field_texts("The isometric prism and the commander reviewed it.") == []

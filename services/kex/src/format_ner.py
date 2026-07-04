@@ -106,6 +106,27 @@ _FINANCIAL_PATTERNS = [
 
 _PERCENT_PATTERN = re.compile(rf"\b{_NUM_ANY}\s?%")
 
+# ── Compliance / standards gazetteer (coarse type `field`) ─────────────────────
+# GLiNER reliably misses acronymic regulation/standard names (GDPR, DSGVO,
+# ISO 27001, TISAX). These are a closed, high-precision set — a curated regex
+# gazetteer recovers them without a bigger model. Multi-word/number-bearing
+# forms are listed most-specific-first so the ISO-with-number span wins over a
+# bare "ISO". Matched case-insensitively; `field` maps to gliner_label
+# "regulation" in ner.py's _FORMAT_TYPE_TO_GLINER_LABEL.
+_COMPLIANCE_PATTERNS = [
+    re.compile(r"\bISO/IEC\s?\d{4,5}(?:[-:]\d+)?(?:[-:]\d{4})?\b"),
+    re.compile(r"\bISO\s?\d{4,5}(?:[-:]\d+)?(?:[-:]\d{4})?\b"),
+    re.compile(r"\bTISAX(?:\s+Level\s+\d)?\b", re.IGNORECASE),
+    re.compile(r"\bSOC\s?2(?:\s+Type\s+I{1,2})?\b", re.IGNORECASE),
+    re.compile(r"\bPCI[\s-]?DSS\b", re.IGNORECASE),
+    re.compile(r"\bFDA\s?510\(k\)(?!\w)", re.IGNORECASE),
+    re.compile(r"\bNIS\s?2\b", re.IGNORECASE),
+    re.compile(r"\bIT-Grundschutz\b", re.IGNORECASE),
+    # Bare acronyms — word-boundary, case-SENSITIVE (avoid matching lowercase
+    # prose collisions); these forms are always upper-case in real docs.
+    re.compile(r"\b(?:GDPR|DSGVO|HIPAA|CCPA|BDSG|SOX|MDR|IVDR|GxP|GAMP|HACCP|GoBD)\b"),
+]
+
 _FORMAT_SCORE = 0.95
 _SOURCE = "regex"
 
@@ -176,6 +197,10 @@ def detect_format_entities(text: str):
     percent_matches = []
     _add_matches(text, [_PERCENT_PATTERN], "quantity", percent_matches)
     entities.extend(percent_matches)
+
+    compliance_matches = []
+    _add_matches(text, _COMPLIANCE_PATTERNS, "field", compliance_matches)
+    entities.extend(compliance_matches)
 
     # Cross-category overlap resolution: a financial match ("EUR 92.701,00")
     # can overlap a bare-number temporal false-hit is not expected here, but a

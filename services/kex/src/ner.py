@@ -203,6 +203,7 @@ class NERPipeline:
         "temporal": "date",
         "financial": "monetary value",
         "quantity": "percentage",
+        "field": "regulation",
     }
 
     def _format_to_raw(self, format_entities):
