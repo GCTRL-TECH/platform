@@ -7,6 +7,7 @@ const TITLE_MAP: Record<string, string> = {
   '/graphs': 'Knowledge Graphs',
   '/chat': 'Talk to Graph',
   '/settings': 'Settings',
+  '/cookbook': 'Cookbook',
 }
 
 export function usePageTitle(): string {
