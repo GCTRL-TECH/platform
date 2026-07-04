@@ -88,6 +88,19 @@ WORKER_THREADS: int = int(os.environ.get("KEX_WORKER_THREADS", "1"))
 # GLiNER model
 GLINER_MODEL: str = os.environ.get("GLINER_MODEL", "urchade/gliner_medium-v2.1")
 
+# NER confidence threshold (GLiNER `predict_entities(..., threshold=...)`).
+# Previously hardcoded at 0.3 in ner.py's signature — now a tunable env knob so
+# a per-install recall/precision tradeoff doesn't require a code change. A
+# per-call `threshold=` argument still overrides this (see ner.py).
+NER_THRESHOLD: float = float(os.environ.get("NER_THRESHOLD", "0.3"))
+
+# Format-based NER pre-pass (see format_ner.py): deterministic regex detection
+# of German/EN temporal ("01.03.2026", "12. März 2026") and financial
+# ("EUR 92.701,00", "1,2 Mrd. €") formats, plus percentages ("19 %"), that
+# GLiNER's zero-shot model reliably misses. Safe recall win — on by default,
+# reversible via env if it ever needs to be ruled out during an incident.
+FORMAT_NER_ENABLED: bool = os.environ.get("KEX_FORMAT_NER", "true").lower() in ("1", "true", "yes")
+
 # Kept for backward compat - unused with GLiNER
 NER_MODEL: str = os.environ.get("NER_MODEL", "dslim/bert-base-NER")
 
