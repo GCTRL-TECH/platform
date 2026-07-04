@@ -34,6 +34,7 @@ from .chunking import get_chunker
 from .classification import resolve_classification
 from .code_parser import parse_python_repo
 from .embedding import get_embedding_client, build_embedding_client
+from .entity_verify import verify_entities
 from .kg_builder import get_kg_builder, entity_uri
 from .middleware.license_check import check_credits, report_usage
 from .ner import get_ner_pipeline
@@ -233,6 +234,28 @@ def run_pipeline(
         )
     logger.info(f"[{job_id}] RelEx: {len(relations)} relations")
 
+    # 2b. Entity Verify/Retype (opt-in precision tier, config.ENTITY_VERIFY_ENABLED).
+    # Runs AFTER NER+RelEx (reuses the SAME resolved generation runtime as relex —
+    # relex_base/relex_model/generation_kind/generation_api_key) and BEFORE the
+    # KG builder / chunk mapping, so a dropped-junk or retyped entity is reflected
+    # everywhere downstream. GLiNER remains the only span producer: this tier can
+    # only drop or retype a candidate, never invent one. Failure-safe — any error
+    # leaves `entities` unchanged.
+    entity_verify_report = None
+    if config.ENTITY_VERIFY_ENABLED:
+        try:
+            verify_model = config.ENTITY_VERIFY_MODEL or relex_model or config.RELEX_MODEL
+            entities, entity_verify_report = verify_entities(
+                entities, text,
+                model=verify_model,
+                base=relex_base,
+                kind=generation_kind,
+                api_key=generation_api_key,
+            )
+            logger.info(f"[{job_id}] Entity verify: {entity_verify_report}")
+        except Exception as exc:
+            logger.warning(f"[{job_id}] Entity verify failed (non-fatal, entities unchanged): {exc}")
+
     # 3. Write to Knowledge Graph
     # Origin provenance for A2 dossiers: prefer the caller-supplied source (file
     # name / note path); fall back to a short preview of the extracted text so a
@@ -348,6 +371,8 @@ def run_pipeline(
     }
     if extraction_report is not None:
         result["extraction_report"] = extraction_report
+    if entity_verify_report is not None:
+        result["entity_verify_report"] = entity_verify_report
     if degraded:
         result["degraded"] = True
         result["warning"] = warning_msg

@@ -56,6 +56,12 @@ services:
       # Internal trust boundary: /search takes a caller-supplied user_id, so when set
       # it requires this shared secret (api-rs sends it). Empty = grace (no check).
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
+      # Opt-in NER precision tier: an extra LLM pass verifies/retypes GLiNER
+      # candidates (drops over-extraction junk) using the configured generation
+      # model. Default OFF — it trades ~5pt detection-recall for precision and
+      # adds ~1 LLM call/doc; GRAPH_PRUNE_ISOLATED already curates the graph.
+      # Set true only for RAG-heavy installs that want cleaner entity_mentions.
+      - KEX_ENTITY_VERIFY=${KEX_ENTITY_VERIFY:-false}
     volumes:
       - gctrl-kex-models:/app/models
     depends_on:

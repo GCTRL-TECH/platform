@@ -147,6 +147,7 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), optional_auth));
 
     Router::new()
+        .merge(routes::discovery::router())   // /.well-known/agent.json + /llms.txt (public discovery)
         .nest("/api/health", routes::health::router())
         .nest("/api/config", routes::config::router())
         .nest("/api/auth",   routes::auth::router())

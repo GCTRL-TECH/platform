@@ -47,8 +47,19 @@ services:
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - QDRANT_COLLECTION=gctrl_chunks
       - EMBEDDING_MODEL=nomic-embed-text
+      - RELEX_MODEL=${RELEX_MODEL:-qwen2.5:7b}
+      - AUTO_CLASSIFY_MODEL=${AUTO_CLASSIFY_MODEL:-llama3.2}
       - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - PORT=4010
+      # Internal trust boundary: /search takes a caller-supplied user_id, so when set
+      # it requires this shared secret (api-rs sends it). Empty = grace (no check).
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
+      # Opt-in NER precision tier: an extra LLM pass verifies/retypes GLiNER
+      # candidates (drops over-extraction junk) using the configured generation
+      # model. Default OFF — it trades ~5pt detection-recall for precision and
+      # adds ~1 LLM call/doc; GRAPH_PRUNE_ISOLATED already curates the graph.
+      # Set true only for RAG-heavy installs that want cleaner entity_mentions.
+      - KEX_ENTITY_VERIFY=${KEX_ENTITY_VERIFY:-false}
     volumes:
       - gctrl-kex-models:/app/models
     depends_on:
@@ -82,6 +93,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-gctrl-neo4j-password}
       - REDIS_URL=redis://gctrl-redis:6379
       - PORT=4020
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
       - SIMILARITY_THRESHOLD=0.85
       - RESOLVER_URL=http://gctrl-resolver:8080
       # Where the wiki-distiller's LLM lives (same Ollama as kex/api). Without it,
@@ -123,6 +135,7 @@ services:
       # Without this the API defaults to localhost:4020 and can't reach the FUSE
       # container → community detection / fusion / distill triggers all fail.
       - FUSE_URL=http://gctrl-fuse:4020
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
     depends_on:

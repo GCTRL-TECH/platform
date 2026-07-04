@@ -10,6 +10,7 @@ import threading
 from typing import Optional
 
 from . import config
+from .format_ner import detect_format_entities
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ class NERPipeline:
         self,
         text: str,
         entity_types: list[str] | None = None,
-        threshold: float = 0.3,
+        threshold: float | None = None,
     ) -> list[dict]:
         """
         Run zero-shot NER on text.
@@ -68,7 +69,9 @@ class NERPipeline:
         Args:
             text: Input text
             entity_types: Custom entity type labels (uses defaults if None)
-            threshold: Confidence threshold for entity detection
+            threshold: Confidence threshold for entity detection. If not
+                given (None), resolves to `config.NER_THRESHOLD` (env
+                `NER_THRESHOLD`, default 0.3) — a per-call value still wins.
 
         Returns list of dicts:
             start, end, text, type (Wikidata QID), label, score, gliner_label
@@ -76,6 +79,8 @@ class NERPipeline:
         text = text.strip()
         if not text:
             return []
+
+        thr = threshold if threshold is not None else config.NER_THRESHOLD
 
         labels = entity_types or config.DEFAULT_ENTITY_TYPES
         model = self._get_model()
@@ -87,15 +92,35 @@ class NERPipeline:
         all_raw = []
 
         if len(labels) <= LABEL_BATCH_SIZE:
-            all_raw = self._extract_with_chunking(model, text, labels, threshold)
+            all_raw = self._extract_with_chunking(model, text, labels, thr)
         else:
             # Batch labels to keep GLiNER accurate
             for i in range(0, len(labels), LABEL_BATCH_SIZE):
                 batch_labels = labels[i : i + LABEL_BATCH_SIZE]
                 batch_entities = self._extract_with_chunking(
-                    model, text, batch_labels, threshold
+                    model, text, batch_labels, thr
                 )
                 all_raw.extend(batch_entities)
+
+        # Deterministic format pre-pass (dates, currency amounts, percentages —
+        # German + English). GLiNER's zero-shot model reliably misses these
+        # locale-specific numeric formats; regex catches them precisely and
+        # cheaply. Entities are folded into the SAME raw list, using a
+        # `gliner_label` that already resolves to the right coarse bucket via
+        # WIKIDATA_TYPE_MAP/COARSE_MAP (see mapping below), so they flow
+        # through the existing dedup/type-mapping/consolidation unchanged.
+        # Their fixed 0.95 score is deliberately higher than most GLiNER
+        # confidence scores, so when a regex hit overlaps a GLiNER guess for
+        # the same span, the dedup's score-sort keeps the (authoritative)
+        # regex entity and drops the GLiNER duplicate.
+        if config.FORMAT_NER_ENABLED:
+            format_hits = detect_format_entities(text)
+            if format_hits:
+                all_raw.extend(self._format_to_raw(format_hits))
+                logger.info(
+                    f"Format-NER pre-pass: +{len(format_hits)} entities "
+                    f"(temporal/financial/quantity)"
+                )
 
         # Deduplicate overlapping entities (keep highest score)
         deduped = self._deduplicate(all_raw)
@@ -165,9 +190,48 @@ class NERPipeline:
                     "text": ent["text"],
                     "gliner_label": ent["label"],
                     "score": round(float(ent["score"]), 4),
+                    "source": "gliner",
                 }
             )
         return results
+
+    # Maps format_ner.py's coarse `type` to an EXISTING GLiNER label that
+    # already resolves to the same coarse bucket via WIKIDATA_TYPE_MAP /
+    # COARSE_MAP (see config.py) — so format entities need no special-casing
+    # in `_to_wikidata`/`_consolidate_types`, they just look like ordinary
+    # (very confident) GLiNER hits for that label.
+    _FORMAT_TYPE_TO_GLINER_LABEL = {
+        "temporal": "date",
+        "financial": "monetary value",
+        "quantity": "percentage",
+        "field": "regulation",
+    }
+
+    def _format_to_raw(self, format_entities):
+        """Convert format_ner.py output into the same raw shape GLiNER
+        predictions use (start, end, text, gliner_label, score), so they can
+        be merged into `all_raw` before `_deduplicate`/`_to_wikidata` run.
+
+        Params/return deliberately left without `list`/`dict` annotations —
+        Cython-safety, see the `votes` note in `_consolidate_types` above."""
+        raw = []
+        for ent in format_entities:
+            gliner_label = self._FORMAT_TYPE_TO_GLINER_LABEL.get(ent["type"], "quantity")
+            raw.append(
+                {
+                    "start": ent["start"],
+                    "end": ent["end"],
+                    "text": ent["text"],
+                    "gliner_label": gliner_label,
+                    "score": ent["score"],
+                    # Deterministic format/gazetteer hit — carried downstream so
+                    # the opt-in entity-verify tier NEVER drops it (regex/gazetteer
+                    # matches are high-precision by construction; the verify LLM
+                    # was wrongly dropping ISO 27001 / GDPR / dates / amounts).
+                    "source": ent.get("source", "regex"),
+                }
+            )
+        return raw
 
     def _deduplicate(self, entities: list[dict]) -> list[dict]:
         """
@@ -242,6 +306,9 @@ class NERPipeline:
                     "label": human_label,
                     "score": ent["score"],
                     "gliner_label": gliner_label,
+                    # Provenance ("gliner" | "regex") preserved so the opt-in
+                    # entity-verify tier can bypass deterministic format hits.
+                    "source": ent.get("source", "gliner"),
                 }
             )
 
@@ -252,6 +319,17 @@ class NERPipeline:
     # Surface forms that look like pure numbers / dates must never become a
     # person/organization, even if GLiNER mis-typed one mention.
     _NUMERIC_RE = re.compile(r"^[\d\s.,:/%+\-€$£¥]+$")
+    # Full numeric date shape (DD.MM.YYYY / DD.MM.YY — the format pre-pass's
+    # own DD.MM.YYYY pattern, see format_ner.py). Checked BEFORE the generic
+    # digit-count heuristic below: a plain 4-digit-count check would otherwise
+    # misfire on these (8 digits stripped from "01.03.2026" → falls through to
+    # the bare-number "quantity" branch, discarding the correct "temporal").
+    _DATE_NUMERIC_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{2,4}$")
+    # Presence of a currency symbol means "financial", never a bare quantity
+    # or an accidental 4-digit-year match (e.g. "1.200 €" strips to the
+    # 4-digit string "1200", which without this check would be misread as
+    # the year 1200 instead of the amount it actually is).
+    _CURRENCY_SYMBOL_RE = re.compile(r"[€$£¥]")
     _DATE_WORD_RE = re.compile(
         r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
         r"january|february|march|april|june|july|august|september|"
@@ -264,12 +342,18 @@ class NERPipeline:
         """Return a forced coarse type for obviously numeric/date names, else None.
 
         An all-numeric token (e.g. "42", "3.14", "2026") is a `quantity`; a name
-        that is a date/month/weekday ("April 2026", "Monday") is `temporal`.
+        that is a date/month/weekday ("April 2026", "Monday") is `temporal`; a
+        full numeric date ("01.03.2026") is `temporal`; a number carrying a
+        currency symbol ("1.200 €", "$100") is `financial`.
         """
         stripped = name.strip()
         if not stripped:
             return None
+        if self._DATE_NUMERIC_RE.match(stripped):
+            return "temporal"
         if self._NUMERIC_RE.match(stripped):
+            if self._CURRENCY_SYMBOL_RE.search(stripped):
+                return "financial"
             # bare number → quantity, unless it's a 4-digit year (→ temporal)
             digits = re.sub(r"[^\d]", "", stripped)
             if len(digits) == 4 and digits.isdigit() and 1000 <= int(digits) <= 2999:
