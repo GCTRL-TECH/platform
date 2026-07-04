@@ -55,6 +55,41 @@ class TestJunkDropped:
         assert report["verified"] == 2
         assert report["llm_calls"] == 1
 
+    def test_none_base_falls_back_to_config_ollama_base(self):
+        """Regression: the default install passes no per-job ollama_base, so
+        `base` arrives None. Without the config fallback, base=None hits
+        llm_client.complete's `base.rstrip("/")` and the whole verify pass
+        errors out (dropping nothing). Verify it resolves to config.OLLAMA_BASE
+        and the LLM is actually called."""
+        from src import config
+        from src.entity_verify import verify_entities
+
+        text = "async wrapper built by Dr. Sarah Chen for the project."
+        entities = [
+            _entity("async wrapper", 0, 13, "technology"),
+            _entity("Dr. Sarah Chen", 24, 38, "person"),
+        ]
+        llm_response = json.dumps([
+            {"id": 0, "keep": False, "corrected_type": "technology"},
+            {"id": 1, "keep": True, "corrected_type": "person"},
+        ])
+
+        with patch("src.entity_verify.llm_client") as mock_client:
+            mock_client.complete.return_value = llm_response
+
+            kept, report = verify_entities(
+                entities, text,
+                model="qwen2.5:7b", base=None, kind="ollama",
+            )
+
+        assert report.get("error") is None
+        assert report["llm_calls"] == 1
+        assert report["dropped_junk"] == 1
+        # base kwarg the client was actually called with is config.OLLAMA_BASE
+        _, kwargs = mock_client.complete.call_args
+        called_base = kwargs.get("base") if "base" in kwargs else mock_client.complete.call_args[0][2]
+        assert called_base == config.OLLAMA_BASE
+
 
 # ── (b) retype ───────────────────────────────────────────────────────────────
 

@@ -27,7 +27,7 @@ relex.py's `_GENERIC_SUFFIX_TOKENS` / `votes` comments for the same trap.
 
 import logging
 
-from . import llm_client
+from . import config, llm_client
 from .relex import get_extractor
 
 logger = logging.getLogger(__name__)
@@ -152,6 +152,14 @@ def verify_entities(entities, text, model, base, kind, api_key=None, min_score=0
 
     if not entities:
         return (entities, report)
+
+    # Resolve the endpoint exactly like relex.py does (relex.py:763): a None/empty
+    # `base` (the job didn't pass a per-request ollama_base — the default install)
+    # falls back to config.OLLAMA_BASE. Without this, base=None reaches
+    # llm_client.complete's `base.rstrip("/")` → the whole verify pass errors out
+    # and (failure-safe) drops nothing.
+    base = (base or "").strip() or config.OLLAMA_BASE
+    model = model or config.RELEX_MODEL
 
     # `final[idx]` holds the (possibly retyped) entity, or None once dropped.
     # Entities below min_score are filled in immediately and never touch the LLM.
