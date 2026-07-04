@@ -62,6 +62,47 @@ pub(crate) async fn link_job_to_compilation(
     }
 }
 
+/// Resolve the user's default knowledge base — the oldest compilation that is
+/// neither a system compilation (e.g. the seeded "Knowledge Wiki") nor a WIKI
+/// (distilled view, holds no graph data of its own). Every fresh registration
+/// seeds exactly one such compilation ("My First Knowledge Base" —
+/// `auth::seed_default_workspace`), so this gives every submission path
+/// without an explicit `compilationId` a landing spot instead of orphaning the
+/// job. Returns `None` only for the edge case of a user with no eligible
+/// compilation at all (e.g. it was deleted) — callers then keep today's
+/// behaviour of leaving the job unlinked.
+pub(crate) async fn resolve_default_compilation(db: &sqlx::PgPool, user_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM compilations
+          WHERE user_id = $1
+            AND COALESCE(is_system, false) = false
+            AND type::text NOT IN ('WIKI')
+          ORDER BY created_at ASC LIMIT 1"
+    )
+    .bind(user_id)
+    .fetch_optional(db).await.ok().flatten()
+}
+
+/// Link a job into its target compilation: the caller's explicit choice, or
+/// (when none was given) the user's default knowledge base, so a submission
+/// never silently orphans. Best-effort/idempotent — see `link_job_to_compilation`.
+pub(crate) async fn link_job_to_target_or_default(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    compilation_id: Option<Uuid>,
+    job_id: Uuid,
+) {
+    match compilation_id {
+        Some(cid) => link_job_to_compilation(db, user_id, cid, job_id).await,
+        None => {
+            if let Some(cid) = resolve_default_compilation(db, user_id).await {
+                tracing::debug!(%job_id, %cid, "linking job to default compilation (no compilationId given)");
+                link_job_to_compilation(db, user_id, cid, job_id).await;
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Pagination { limit: Option<i64>, offset: Option<i64> }
 
@@ -132,10 +173,9 @@ async fn extract(
     // Record the spend locally so the heartbeat task can ship it upstream.
     record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
-    // Link into the target compilation (if any) so the document isn't orphaned.
-    if let Some(cid) = req.compilation_id {
-        link_job_to_compilation(&state.db, claims.sub, cid, job_id).await;
-    }
+    // Link into the target compilation: explicit choice, else the user's default
+    // knowledge base, so the document is never orphaned.
+    link_job_to_target_or_default(&state.db, claims.sub, req.compilation_id, job_id).await;
 
     // Look up classification name to forward to KEX worker for Neo4j tagging.
     let classification_name: Option<String> = if let Some(clf_id) = req.classification_level_id {
@@ -237,9 +277,9 @@ async fn ingest_repo(
 
     let _ = sqlx::query("UPDATE jobs SET status='completed', result=$2, completed_at=NOW() WHERE id=$1")
         .bind(job_id).bind(&summary).execute(&state.db).await;
-    if let Some(cid) = req.compilation_id {
-        link_job_to_compilation(&state.db, claims.sub, cid, job_id).await;
-    }
+    // Link into the target compilation: explicit choice, else the user's default
+    // knowledge base, so the repo ingest is never orphaned.
+    link_job_to_target_or_default(&state.db, claims.sub, req.compilation_id, job_id).await;
     record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
     let mut out = summary;
@@ -316,7 +356,30 @@ async fn upload(
     }
 
     let bytes = file_bytes.ok_or(AppError::BadRequest("No file field".into()))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let job_id = submit_upload(
+        &state, &claims, &bytes, &file_name, ontology_id, classification_level_id, compilation_id,
+    ).await?;
+
+    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+}
+
+/// Core of file ingestion: given raw bytes + a filename, resolves the mimetype
+/// from the extension, spends tokens, creates the `kex_upload` job, links it
+/// into a compilation (explicit choice, else the user's default so nothing is
+/// orphaned), and enqueues the KEX worker payload. Shared by the multipart HTTP
+/// handler (`upload`, above) and the `ingest_file` agent tool (`routes::agent`)
+/// so both entry points behave identically. Preserves the exact behaviour the
+/// multipart handler had before this refactor.
+pub(crate) async fn submit_upload(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    bytes: &[u8],
+    file_name: &str,
+    ontology_id: Option<Uuid>,
+    classification_level_id: Option<Uuid>,
+    compilation_id: Option<Uuid>,
+) -> Result<Uuid> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
 
     let mimetype = match file_name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
         "pdf"  => "application/pdf",
@@ -335,12 +398,12 @@ async fn upload(
 
     let (resolved_ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, ontology_id).await;
 
-    // P2b: identity keyed on (user, path). Direct multipart upload has no
-    // folder path — `path` is the file name, and there is no source-side
-    // mtime (browser doesn't send one), so modified_at is left unknown.
-    let content_hash = crate::services::source_docs::hash_content(&bytes);
+    // P2b: identity keyed on (user, path). Direct upload has no folder path —
+    // `path` is the file name, and there is no source-side mtime (neither the
+    // browser nor an agent sends one), so modified_at is left unknown.
+    let content_hash = crate::services::source_docs::hash_content(bytes);
     let source_doc = crate::services::source_docs::resolve_source_document(
-        &state.db, claims.sub, None, &file_name, Some(&file_name),
+        &state.db, claims.sub, None, file_name, Some(file_name),
         &content_hash, None,
     ).await.ok();
     let source_document_id = source_doc.as_ref().map(|d| d.id);
@@ -357,10 +420,9 @@ async fn upload(
 
     record_usage(&state.db, claims.sub, "kex_upload", 5, Some(job_id)).await;
 
-    // Link into the target compilation (if any) so the upload isn't orphaned.
-    if let Some(cid) = compilation_id {
-        link_job_to_compilation(&state.db, claims.sub, cid, job_id).await;
-    }
+    // Link into the target compilation: explicit choice, else the user's default
+    // knowledge base, so the upload is never orphaned.
+    link_job_to_target_or_default(&state.db, claims.sub, compilation_id, job_id).await;
 
     let classification_name: Option<String> = if let Some(clf_id) = classification_level_id {
         sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1")
@@ -390,7 +452,7 @@ async fn upload(
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+    Ok(job_id)
 }
 
 async fn list_jobs(

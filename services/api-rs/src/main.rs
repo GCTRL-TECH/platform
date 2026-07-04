@@ -1,3 +1,8 @@
+// tool_schema()'s json! macro in routes::agent has grown large enough (one entry
+// per agent tool) to hit the default macro recursion limit; raise it rather than
+// splitting the literal.
+#![recursion_limit = "256"]
+
 mod config;
 mod db;
 mod error;

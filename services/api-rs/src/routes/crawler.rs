@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, Result},
     middleware::auth::JwtClaims,
-    routes::kex::{link_job_to_compilation, resolve_ontology},
+    routes::kex::{link_job_to_target_or_default, resolve_ontology},
     services::{redis::lpush, usage::record_usage},
 };
 
@@ -108,10 +108,9 @@ async fn crawl(
     // Record the spend locally so the heartbeat task can ship it upstream.
     record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
-    // Link into the target compilation (if any) so the pages aren't orphaned.
-    if let Some(cid) = req.compilation_id {
-        link_job_to_compilation(&state.db, claims.sub, cid, job_id).await;
-    }
+    // Link into the target compilation: explicit choice, else the user's default
+    // knowledge base, so the crawled pages are never orphaned.
+    link_job_to_target_or_default(&state.db, claims.sub, req.compilation_id, job_id).await;
 
     // Look up classification name to forward to KEX worker for Neo4j tagging.
     let classification_name: Option<String> = if let Some(clf_id) = req.classification_level_id {
