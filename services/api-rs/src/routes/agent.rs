@@ -23,11 +23,25 @@ use crate::{
 // the connect UI's copyable "drop into your agent" block.
 
 pub const MEMORY_SKILL_MD: &str = r#"# GCTRL Knowledge & Memory — Agent Skill
-<!-- gctrl-skill-v3 -->
+<!-- gctrl-skill-v4 -->
 
 You are connected to GCTRL, a graph-native long-term memory. Use it as your persistent second brain: read the right layer, and **always write your conclusions back** so every future session inherits them. That write-back habit is the whole point — it turns GCTRL into compounding memory instead of starting cold each time.
 
 Tool names below are the HTTP/gateway names (`POST /api/agent/tools/<name>` and MCP-over-HTTP `tools/call`). The local stdio MCP server exposes the same tools prefixed `gctrl_` (e.g. `gctrl_store`).
+
+## First run — a 60-second setup (do this ONCE, before anything else)
+On your FIRST connection to a GCTRL instance, configure how you'll use it, then never ask again.
+1. **Check if setup already happened**: `get_dossier("GCTRL Agent Setup")`. If it returns a profile, silently adopt its preferences and skip the rest of this section.
+2. **If not**, run a short interview with the user — one message, all questions at once, with your recommended defaults pre-filled so they can just say "yes":
+   - **Which knowledge base should I use?** Call `list_graphs` and propose their default graph (usually "My First Knowledge Base"); note its `privacyMode`.
+   - **Cloud or local model?** Tell them which model YOU are (e.g. "I'm running on Claude/GPT — a cloud model" or "…a local model"). This drives the next answer.
+   - **Privacy for cloud models (recommended: Cloaked when you're a cloud model).** Explain plainly: *Cloaked* = GCTRL pseudonymizes every entity and PII in what it sends you (you see "Person-7", never real names/amounts) and un-cloaks the answer locally; *Local-only* = that graph is never sent to a cloud model at all; *Open* = sent as-is. If you're a cloud model, recommend **Cloaked**. Never call it "encrypted".
+   - **How eagerly should I remember?** Options: "everything substantive" (default) vs "only when you say 'remember this'".
+   - **Auto-ingest dropped files?** If they drop a PDF/doc, should you `ingest_file` it into the KB automatically (default: yes)?
+3. **Apply the answers**:
+   - Privacy: if they chose Cloaked/Local-only, call `set_privacy_mode(compilationId, "cloaked" | "local_only")` on the chosen graph. (You can only raise privacy this way — loosening it needs the Settings UI.)
+   - Persist the whole config: `store({ text: "<the chosen preferences as plain sentences>", compilationId, title: "GCTRL Agent Setup" })` so `get_dossier("GCTRL Agent Setup")` finds it next time.
+4. Confirm in one line what you set, then continue with the user's actual task.
 
 ## Read the right layer
 - **HOT — dossiers** · `get_dossier(name)`: the authoritative compiled profile of an entity (summary, key facts with confidence, origin files, timeline). When a dossier exists, state it directly — do not hedge.
@@ -58,7 +72,7 @@ Your token sees only the knowledge bases it was granted — typically your own w
 Read HOT/blended first → answer → **write the new conclusion back** with `store` into your `compilationId`. Do this every time and your GCTRL becomes a second brain that gets sharper with every task.
 "#;
 
-pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; get_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with store/create_extraction into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with ingest_file (PDF/DOCX/binary) or store/create_extraction (text), then retrieve with search_chunks or query. (The stdio MCP server prefixes these tool names with gctrl_.)";
+pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. ON FIRST CONNECTION, run a one-time setup: call get_dossier('GCTRL Agent Setup') — if absent, ask the user (one message) which knowledge base to use, whether you're a cloud or local model, and whether to cloak entities for cloud models (recommend set_privacy_mode(cloaked) when you're a cloud model), how eagerly to remember, and whether to auto-ingest dropped files; then store those preferences with title 'GCTRL Agent Setup' so you never ask again. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; get_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with store/create_extraction into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with ingest_file (PDF/DOCX/binary) or store/create_extraction (text), then retrieve with search_chunks or query. (The stdio MCP server prefixes these tool names with gctrl_.)";
 
 /// Core agent-discipline habits folded into Pi's system prompt. Four principles
 /// (think-first, simplicity, surgical edits, goal-driven verification) that make
@@ -357,6 +371,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "create_compilation", "description": "Create a new empty knowledge graph", "args": { "name": "string", "description": "string?" } },
             { "name": "delete_compilation", "description": "Delete a compilation the caller owns", "args": { "compilationId": "string" } },
             { "name": "refresh_compilation","description": "Re-run fusion to refresh a compilation", "args": { "compilationId": "string" } },
+            { "name": "set_privacy_mode",   "description": "Raise a knowledge graph's privacy for cloud LLMs: 'cloaked' (entities/PII pseudonymized before any cloud model sees them) or 'local_only' (never sent to a cloud model). Can only INCREASE privacy (open->cloaked->local_only); loosening it back requires a signed-in user session.", "args": { "compilationId": "string", "mode": "string (cloaked|local_only)" } },
             { "name": "add_relationship",   "description": "Add an edge between two existing entities", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string" } },
             { "name": "correct_relationship","description": "Delete a wrong edge and remember the correction", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string", "reason": "string?" } },
             { "name": "delete_node",        "description": "Remove an entity and its edges (remembered)", "args": { "compilationId": "string", "name": "string", "reason": "string?" } },
@@ -411,8 +426,8 @@ pub(crate) async fn execute_tool(
         // ── Read: list graphs the caller may see ──────────────────────────────
         "list_graphs" => {
             let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>)>(
-                "SELECT c.id, c.name, c.description, cl.name
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String)>(
+                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode
                  FROM compilations c
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
                  WHERE c.user_id = $1 AND (c.classification_level_id IS NULL OR cl.rank <= $2)
@@ -426,8 +441,9 @@ pub(crate) async fn execute_tool(
             json!({
                 "graphs": rows.iter()
                     .filter(|(id, ..)| scope.as_ref().map_or(true, |s| s.contains(id)))
-                    .map(|(id, name, desc, cls)| json!({
-                        "id": id, "name": name, "description": desc, "classification": cls
+                    .map(|(id, name, desc, cls, privacy)| json!({
+                        "id": id, "name": name, "description": desc,
+                        "classification": cls, "privacyMode": privacy
                     })).collect::<Vec<_>>()
             })
         }
@@ -1159,6 +1175,41 @@ pub(crate) async fn execute_tool(
                 "job_id": job_id, "compilation_id": cid, "source_job_ids": source_ids
             }).to_string()).await;
             json!({ "jobId": job_id, "status": "pending" })
+        }
+
+        // ── Action: raise a graph's privacy mode (increase-only) ──────────────
+        // Unlike the session-only privacy toggle in the UI, an agent token MAY
+        // raise privacy (open->cloaked->local_only) — tightening only ever
+        // REDUCES exposure, so a delegated/leaked token can do no harm this way.
+        // Loosening (e.g. local_only->open, more exposure) stays session-only.
+        // This is what lets the connect-time setup interview turn on cloaking.
+        "set_privacy_mode" => {
+            let Some(cid) = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
+                return json!({ "error": "compilationId is required" });
+            };
+            let mode = args["mode"].as_str().unwrap_or("");
+            if !matches!(mode, "cloaked" | "local_only") {
+                return json!({ "error": "mode must be 'cloaked' or 'local_only' (use the Settings UI to set 'open')" });
+            }
+            if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                return json!({ "error": e.to_string() });
+            }
+            let current: Option<(String,)> = sqlx::query_as(
+                "SELECT privacy_mode FROM compilations WHERE id=$1 AND user_id=$2"
+            ).bind(cid).bind(claims.sub).fetch_optional(&state.db).await.ok().flatten();
+            let Some((current,)) = current else { return json!({ "error": "compilation not found or not yours" }); };
+            let rank = |m: &str| match m { "cloaked" => 1, "local_only" => 2, _ => 0 };
+            if rank(mode) < rank(&current) {
+                return json!({ "error": format!(
+                    "'{current}' is already more private than '{mode}'. An access token can only raise privacy; loosening it requires a signed-in user session."
+                )});
+            }
+            if let Err(e) = sqlx::query("UPDATE compilations SET privacy_mode=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
+                .bind(mode).bind(cid).bind(claims.sub).execute(&state.db).await
+            {
+                return json!({ "error": e.to_string() });
+            }
+            json!({ "ok": true, "compilationId": cid, "privacyMode": mode, "previous": current })
         }
 
         // ── Action: add a relationship ────────────────────────────────────────

@@ -160,7 +160,7 @@ async function appendJobToCompilation(compilationId: string, jobId: string): Pro
 // Surfaced to the connecting model by MCP clients: how to use the memory layers
 // and the write-back discipline (the point of GCTRL).
 const GCTRL_INSTRUCTIONS =
-  "GCTRL is your long-term memory. READ the right layer (gctrl_get_dossier = HOT/authoritative — state it, don't hedge; gctrl_query = blended answer; gctrl_search_entities/get_neighbors/shortest_path = graph; gctrl_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via gctrl_list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call gctrl_list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with gctrl_ingest_file (PDF/DOCX/binary) or gctrl_store/gctrl_extract (text), then retrieve with gctrl_search_chunks or gctrl_query.";
+  "GCTRL is your long-term memory. ON FIRST CONNECTION run a one-time setup: call gctrl_get_dossier('GCTRL Agent Setup') — if absent, ask the user (one message) which knowledge base to use, whether you're a cloud or local model, and whether to cloak entities for cloud models (recommend gctrl_set_privacy_mode(cloaked) when you're a cloud model), how eagerly to remember, and whether to auto-ingest dropped files; then gctrl_store those preferences with title 'GCTRL Agent Setup' so you never ask again. READ the right layer (gctrl_get_dossier = HOT/authoritative — state it, don't hedge; gctrl_query = blended answer; gctrl_search_entities/get_neighbors/shortest_path = graph; gctrl_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via gctrl_list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call gctrl_list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with gctrl_ingest_file (PDF/DOCX/binary) or gctrl_store/gctrl_extract (text), then retrieve with gctrl_search_chunks or gctrl_query.";
 
 const server = new McpServer(
   {
@@ -1080,6 +1080,26 @@ registerTool<{ path: string; compilationId?: string; ontologyId?: string }>(
         text: `Ingesting "${fileName}" — job ${r.jobId} (${r.status ?? 'pending'}). Poll gctrl_list_extractions or use gctrl_search_chunks/gctrl_query once complete.`,
       }],
     };
+  },
+);
+
+// ── Tool: Raise a graph's privacy for cloud models ───────────────────────────
+
+const setPrivacyModeSchema = {
+  compilationId: z.string().describe('The knowledge graph to make more private.'),
+  mode: z.enum(['cloaked', 'local_only']).describe("'cloaked' = entities/PII are pseudonymized before any cloud model sees them (recommended when you are a cloud model); 'local_only' = this graph is never sent to a cloud model."),
+};
+
+registerToolWithAlias<{ compilationId: string; mode: 'cloaked' | 'local_only' }>(
+  'gctrl_set_privacy_mode',
+  'borghive_set_privacy_mode',
+  "Raise a knowledge graph's privacy for cloud LLMs during setup: 'cloaked' (pseudonymize entities/PII before a cloud model sees them) or 'local_only' (never send it to a cloud model). Can only INCREASE privacy — loosening it back to 'open' needs the Settings UI. Never call this 'encryption'.",
+  setPrivacyModeSchema,
+  async ({ compilationId, mode }) => {
+    const r = await apiCall('POST', '/agent/tools/set_privacy_mode', { compilationId, mode }) as
+      { ok?: boolean; privacyMode?: string; previous?: string; error?: string };
+    if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
+    return { content: [{ type: 'text' as const, text: `Privacy for ${compilationId} set to "${r.privacyMode}" (was "${r.previous}").` }] };
   },
 );
 
