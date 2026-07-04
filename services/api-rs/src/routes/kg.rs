@@ -598,7 +598,24 @@ async fn list(
             "pageCount": page_count,
         }));
     }
-    Ok(Json(json!({ "compilations": comps })))
+
+    // Real total across ALL of the user's visible compilations — the dashboard
+    // was counting the returned page (length, capped at the default limit of 20).
+    // Same WHERE clause as the page query. For KB-scoped tokens the SQL total
+    // would overcount (scope filters in Rust above), so fall back to the
+    // filtered page length there — scoped sets are small and unpaginated.
+    let total: i64 = if scope.is_some() {
+        comps.len() as i64
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compilations c
+             LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
+             WHERE c.user_id = $1
+               AND (c.classification_level_id IS NULL OR cl.rank <= $2)"
+        ).bind(claims.sub).bind(clearance_rank).fetch_one(&state.db).await?
+    };
+
+    Ok(Json(json!({ "compilations": comps, "total": total })))
 }
 
 async fn create(

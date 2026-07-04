@@ -41,7 +41,7 @@ export function ForgotPasswordPage() {
 
       <div className="relative w-full max-w-sm animate-slide-up">
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <img src="/gctrl/stacked-color-on-darkbg.svg" alt="GCTRL" className="h-20 w-auto" />
+          <img src="/gctrl/stacked-color-on-darkbg.svg?v=2" alt="GCTRL" className="h-20 w-auto" />
         </div>
 
         <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-8 shadow-2xl backdrop-blur-sm">

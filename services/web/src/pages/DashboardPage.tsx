@@ -15,6 +15,9 @@ interface KexJob {
 
 interface KexJobsResponse {
   jobs: KexJob[]
+  /** Real all-time totals from the API (the `jobs` list is a page, default-capped at 20). */
+  total?: number
+  completed?: number
 }
 
 interface StatCardProps {
@@ -63,15 +66,20 @@ export function DashboardPage() {
     ['kex', 'jobs'],
     '/kex/jobs'
   )
-  const { data: compsData } = useApiQuery<{ compilations: unknown[] }>(
+  const { data: compsData } = useApiQuery<{ compilations: unknown[]; total?: number }>(
     ['kg', 'compilations'],
     '/kg/compilations'
   )
 
   const jobs = jobsData?.jobs ?? []
   const recentJobs = jobs.slice(0, 5)
-  const completedJobs = jobs.filter((j) => j.status === 'completed').length
-  const graphCount = compsData?.compilations?.length ?? 0
+  // Use the API's real totals — `jobs`/`compilations` are pages (default limit
+  // 20), so counting their length showed "20" forever. Fall back to page length
+  // only while talking to an older API without the total fields.
+  const totalJobs = jobsData?.total ?? jobs.length
+  const completedJobs =
+    jobsData?.completed ?? jobs.filter((j) => j.status === 'completed').length
+  const graphCount = compsData?.total ?? compsData?.compilations?.length ?? 0
 
   return (
     <div className="space-y-8 animate-slide-up">
@@ -89,7 +97,7 @@ export function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <StatCard
           label="Total Extractions"
-          value={jobs?.length ?? 0}
+          value={totalJobs}
           icon={Zap}
           iconColor="text-blue-400"
           iconBg="bg-blue-500/10"

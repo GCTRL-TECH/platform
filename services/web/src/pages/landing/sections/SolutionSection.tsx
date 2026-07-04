@@ -37,7 +37,7 @@ export function SolutionSection() {
             {/* Centre hub */}
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="relative z-10 flex h-20 w-20 items-center justify-center rounded-2xl border border-indigo-500/40 bg-indigo-600/20 shadow-lg shadow-indigo-900/40 backdrop-blur-sm">
-                <img src="/gctrl/icon-color.svg" alt="GCTRL" className="h-10 w-10" />
+                <img src="/gctrl/icon-color.svg?v=2" alt="GCTRL" className="h-10 w-10" />
               </div>
               <div className="absolute h-20 w-20 rounded-2xl bg-indigo-600/10 blur-xl" />
             </div>

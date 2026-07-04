@@ -164,9 +164,9 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
         className={`flex h-16 items-center border-b border-slate-800 ${collapsed ? 'justify-center px-2' : 'px-5'}`}
       >
         {collapsed ? (
-          <img src="/gctrl/icon-color.svg" alt="GCTRL" className="h-8 w-8 shrink-0" />
+          <img src="/gctrl/icon-color.svg?v=2" alt="GCTRL" className="h-8 w-8 shrink-0" />
         ) : (
-          <img src="/gctrl/horizontal-color-on-darkbg.svg" alt="GCTRL" className="h-7 w-auto shrink-0" />
+          <img src="/gctrl/horizontal-color-on-darkbg.svg?v=2" alt="GCTRL" className="h-7 w-auto shrink-0" />
         )}
       </div>
 
