@@ -23,6 +23,7 @@ import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
+import { useUiMode } from '@/hooks/useUiMode'
 
 type Classification = 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'RESTRICTED'
 
@@ -440,6 +441,7 @@ function CompilationCard({
 
 export function KGListPage() {
   const navigate = useNavigate()
+  const { isExpert } = useUiMode()
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [filterClassification, setFilterClassification] = useState<Classification | 'ALL'>('ALL')
@@ -491,9 +493,21 @@ export function KGListPage() {
     (f) => (f.parentFolderId ?? null) === currentFolderId
   )
 
-  const compilationsInFolder = filtered.filter(
-    (c) => (c.folderId ?? null) === currentFolderId
-  )
+  // Easy mode has no folder navigation — flatten by ignoring folderId so
+  // nothing disappears from view; folder cards/breadcrumb/back-target are
+  // gated off below (render-only, filtering is unchanged).
+  const compilationsInFolder = isExpert
+    ? filtered.filter((c) => (c.folderId ?? null) === currentFolderId)
+    : filtered
+
+  // Easy mode sorts system graphs first, then WIKI, then the rest — display
+  // order only, no data mutation.
+  const displayedCompilations = isExpert
+    ? compilationsInFolder
+    : [...compilationsInFolder].sort((a, b) => {
+        const rank = (c: Compilation) => (c.isSystem ? 0 : c.type === 'WIKI' ? 1 : 2)
+        return rank(a) - rank(b)
+      })
 
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null)
 
@@ -566,19 +580,21 @@ export function KGListPage() {
             Manage and explore your knowledge compilations.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowCreateFolder(true)}
-            className="btn-secondary"
-          >
-            <FolderPlus size={15} />
-            New Folder
-          </button>
-          <button onClick={() => setShowCreateModal(true)} className="btn-primary">
-            <Plus size={15} />
-            New Compilation
-          </button>
-        </div>
+        {isExpert && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowCreateFolder(true)}
+              className="btn-secondary"
+            >
+              <FolderPlus size={15} />
+              New Folder
+            </button>
+            <button onClick={() => setShowCreateModal(true)} className="btn-primary">
+              <Plus size={15} />
+              New Compilation
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Filter bar */}
@@ -596,24 +612,26 @@ export function KGListPage() {
             placeholder="Search knowledge graphs..."
           />
         </div>
-        <select
-          value={filterClassification}
-          onChange={(e) =>
-            setFilterClassification(e.target.value as Classification | 'ALL')
-          }
-          className="input-field w-auto min-w-[160px]"
-        >
-          <option value="ALL">All Classifications</option>
-          {CLASSIFICATION_OPTIONS.map((c) => (
-            <option key={c} value={c}>
-              {CLASSIFICATION_STYLES[c].label}
-            </option>
-          ))}
-        </select>
+        {isExpert && (
+          <select
+            value={filterClassification}
+            onChange={(e) =>
+              setFilterClassification(e.target.value as Classification | 'ALL')
+            }
+            className="input-field w-auto min-w-[160px]"
+          >
+            <option value="ALL">All Classifications</option>
+            {CLASSIFICATION_OPTIONS.map((c) => (
+              <option key={c} value={c}>
+                {CLASSIFICATION_STYLES[c].label}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       {/* Breadcrumb */}
-      {folderPath.length > 0 && (
+      {isExpert && folderPath.length > 0 && (
         <div className="flex items-center gap-1.5 text-sm">
           <button
             onClick={() => navigateToBreadcrumb(-1)}
@@ -670,7 +688,7 @@ export function KGListPage() {
                 : 'Try adjusting your search or filter'}
             </p>
           </div>
-          {compilations.length === 0 && (
+          {isExpert && compilations.length === 0 && (
             <button onClick={() => setShowCreateModal(true)} className="btn-primary">
               <Plus size={15} />
               New Compilation
@@ -679,8 +697,8 @@ export function KGListPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {/* Folder cards */}
-          {foldersInView.map((folder) => (
+          {/* Folder cards (Expert only — Easy mode is flattened) */}
+          {isExpert && foldersInView.map((folder) => (
             <button
               key={folder.id}
               onClick={() => navigateToFolder(folder)}
@@ -724,8 +742,8 @@ export function KGListPage() {
             </button>
           ))}
 
-          {/* Back button when inside a folder — also a drop target to move card up */}
-          {currentFolderId && (
+          {/* Back button when inside a folder — also a drop target to move card up (Expert only) */}
+          {isExpert && currentFolderId && (
             <button
               onClick={navigateUp}
               onDragOver={(e) => {
@@ -756,7 +774,7 @@ export function KGListPage() {
           )}
 
           {/* Compilation cards */}
-          {compilationsInFolder.map((compilation) => (
+          {displayedCompilations.map((compilation) => (
             <CompilationCard
               key={compilation.id}
               compilation={compilation}
