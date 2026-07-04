@@ -5,6 +5,8 @@ use futures::StreamExt;
 use uuid::Uuid;
 use crate::models::AppState;
 
+pub mod guardrail;
+
 pub fn spawn_all(state: Arc<AppState>) {
     let s = state.clone();
     tokio::spawn(async move { subscribe_results(s).await });
@@ -91,6 +93,12 @@ pub fn spawn_all(state: Arc<AppState>) {
             sleep(Duration::from_secs(60)).await;
         }
     });
+
+    // Runtime guardrail: a SEPARATE loop (never folds into run_watchdog, which
+    // stays observe-only) that probes the active generation runtime and
+    // auto-reverts to bundled Ollama after repeated real failures. See
+    // background::guardrail for the full design.
+    guardrail::spawn(state.clone());
 }
 
 /// One liveness probe of the platform's own services. Logs a WARN listing any that
