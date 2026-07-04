@@ -1,12 +1,12 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{config::Config, credits, license::LicenseCache, usage_queue::UsageQueue};
@@ -283,6 +283,73 @@ async fn handle_tuning(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+#[derive(Deserialize)]
+struct RecreateRequest {
+    container: String,
+}
+
+/// `POST /recreate {"container": "gctrl-api"}` — swaps `container` onto its
+/// already-pulled image via the docker socket this agent mounts. Exists solely
+/// so the api container can update ITSELF: the api can't delete-and-recreate
+/// its own container without dying mid-operation, but this agent is already
+/// recreated onto the new image earlier in the same update run, so it can do
+/// the api's swap on its behalf.
+///
+/// Trust boundary, same shape as the existing kex/fuse `/search` pattern:
+/// (a) only `gctrl-*` container names are ever accepted (never an arbitrary
+///     name — this endpoint deletes and recreates a container);
+/// (b) if `INTERNAL_API_SECRET` is configured, the caller must present it via
+///     `X-Internal-Secret`, else 403. Empty secret = grace (no check), for
+///     installs that haven't set one yet.
+///
+/// Responds `202 Accepted` immediately and does the actual inspect → remove →
+/// create → start dance in a spawned task ~1.5s later — long enough for the
+/// caller (api-rs, mid-response to its OWN client) to finish sending its
+/// response before the target container (possibly its own, for gctrl-api)
+/// actually goes away.
+async fn handle_recreate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RecreateRequest>,
+) -> impl IntoResponse {
+    if !req.container.starts_with("gctrl-") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "container must start with gctrl-" })),
+        )
+            .into_response();
+    }
+
+    if !state.cfg.internal_api_secret.is_empty() {
+        let provided = headers
+            .get("x-internal-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != state.cfg.internal_api_secret {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "forbidden" })),
+            )
+                .into_response();
+        }
+    }
+
+    let container = req.container.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let name = container.clone();
+        let result = tokio::task::spawn_blocking(move || crate::docker::recreate_container(&name)).await;
+        match result {
+            Ok(Ok(true)) => tracing::info!("recreate: {container} recreated"),
+            Ok(Ok(false)) => tracing::warn!("recreate: {container} not found — nothing to recreate"),
+            Ok(Err(e)) => tracing::error!("recreate: {container} failed: {e}"),
+            Err(e) => tracing::error!("recreate: {container} task panicked: {e}"),
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
 pub async fn run(
     cache: Arc<RwLock<LicenseCache>>,
     queue: Arc<Mutex<UsageQueue>>,
@@ -303,6 +370,7 @@ pub async fn run(
         .route("/status",   get(handle_status))
         .route("/version",  post(handle_set_version))
         .route("/tuning",   get(handle_tuning))
+        .route("/recreate", post(handle_recreate))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));

@@ -1,4 +1,5 @@
 mod config;
+mod docker;
 mod error;
 mod fingerprint;
 mod license;
