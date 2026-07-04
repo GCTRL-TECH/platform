@@ -71,13 +71,25 @@ const galaxy: GraphTheme = {
   id: 'galaxy',
   label: 'Galaxy',
   background: '#04040f',
-  link: { neutral: '#64748b', opacityScale: 1.1 },
-  labelStyle: { color: '#f8fafc', outline: '#04040f' },
+  // Nodes look like STARS: every type color maps into the white→light-gold
+  // band (founder request — the full type palette was too colorful for a
+  // night sky). Deterministic per base color, so the same entity type keeps
+  // the same star shade: warm hue 40-52°, gentle saturation, high lightness.
+  nodeColor: (base) => {
+    const h = fnv1a(base)
+    const hue = 40 + (h % 13)          // 40-52° — warm gold band
+    const sat = 12 + (h % 48)          // 12-59% — near-white … light gold
+    const light = 80 + ((h >> 8) % 13) // 80-92% — always bright, star-like
+    return hsl(hue, sat, light)
+  },
+  // Relations as faint warm starlight instead of slate blue.
+  link: { neutral: '#e8dfc0', opacityScale: 0.85 },
+  labelStyle: { color: '#f5efdc', outline: '#04040f' },
   glow: { spriteScale: 2.4, maxNodes: 1500 },
   threeD: {
     bg: '#04040f',
     starfield: { count: 2500, radius: 2000 },
-    spriteColor: '#f8fafc',
+    spriteColor: '#f5efdc',
   },
 }
 
