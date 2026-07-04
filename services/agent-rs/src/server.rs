@@ -288,6 +288,28 @@ struct RecreateRequest {
     container: String,
 }
 
+/// Constant-time string equality — a plain `!=` short-circuits on the first
+/// differing byte and leaks secret prefixes through response timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A container name this endpoint may touch: `gctrl-` prefix AND a strict
+/// charset/length. The name is interpolated into the HTTP request line sent to
+/// the docker socket — without this gate a CR/LF (or other control char) could
+/// smuggle a second request onto the socket. (Security review CRITICAL.)
+fn valid_container_name(name: &str) -> bool {
+    name.starts_with("gctrl-")
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// `POST /recreate {"container": "gctrl-api"}` — swaps `container` onto its
 /// already-pulled image via the docker socket this agent mounts. Exists solely
 /// so the api container can update ITSELF: the api can't delete-and-recreate
@@ -295,12 +317,13 @@ struct RecreateRequest {
 /// recreated onto the new image earlier in the same update run, so it can do
 /// the api's swap on its behalf.
 ///
-/// Trust boundary, same shape as the existing kex/fuse `/search` pattern:
-/// (a) only `gctrl-*` container names are ever accepted (never an arbitrary
-///     name — this endpoint deletes and recreates a container);
-/// (b) if `INTERNAL_API_SECRET` is configured, the caller must present it via
-///     `X-Internal-Secret`, else 403. Empty secret = grace (no check), for
-///     installs that haven't set one yet.
+/// Trust boundary (STRICTER than the read-only kex/fuse `/search` pattern —
+/// this endpoint DELETES and recreates a container, so it fails CLOSED):
+/// (a) only strictly-validated `gctrl-*` container names are accepted;
+/// (b) `INTERNAL_API_SECRET` must be configured on the agent AND matched by the
+///     caller's `X-Internal-Secret` (constant-time). An empty secret disables
+///     the endpoint entirely (403) rather than running unauthenticated — the
+///     installer always generates one, so real installs are unaffected.
 ///
 /// Responds `202 Accepted` immediately and does the actual inspect → remove →
 /// create → start dance in a spawned task ~1.5s later — long enough for the
@@ -312,26 +335,36 @@ async fn handle_recreate(
     headers: HeaderMap,
     Json(req): Json<RecreateRequest>,
 ) -> impl IntoResponse {
-    if !req.container.starts_with("gctrl-") {
+    if !valid_container_name(&req.container) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "container must start with gctrl-" })),
+            Json(serde_json::json!({ "error": "invalid container name" })),
         )
             .into_response();
     }
 
-    if !state.cfg.internal_api_secret.is_empty() {
-        let provided = headers
-            .get("x-internal-secret")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if provided != state.cfg.internal_api_secret {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "forbidden" })),
-            )
-                .into_response();
-        }
+    // Fail CLOSED: a destructive endpoint must never run without a secret.
+    // (Security review HIGH — fail-open.) The whole agent keeps serving /status
+    // + the license heartbeat, so we reject just this route rather than panicking.
+    if state.cfg.internal_api_secret.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "recreate disabled: INTERNAL_API_SECRET is not configured on the agent"
+            })),
+        )
+            .into_response();
+    }
+    let provided = headers
+        .get("x-internal-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !ct_eq(provided, &state.cfg.internal_api_secret) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden" })),
+        )
+            .into_response();
     }
 
     let container = req.container.clone();
@@ -377,4 +410,28 @@ pub async fn run(
     tracing::info!("Agent listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod recreate_guard_tests {
+    use super::{ct_eq, valid_container_name};
+
+    #[test]
+    fn rejects_non_gctrl_and_injection() {
+        assert!(valid_container_name("gctrl-api"));
+        assert!(valid_container_name("gctrl-web"));
+        assert!(!valid_container_name("postgres"));           // no prefix
+        assert!(!valid_container_name("gctrl-api/../etc"));    // slash
+        assert!(!valid_container_name("gctrl-api\r\nGET /"));  // CRLF smuggling
+        assert!(!valid_container_name("gctrl-api name"));      // space
+        assert!(!valid_container_name(&format!("gctrl-{}", "a".repeat(70)))); // too long
+    }
+
+    #[test]
+    fn ct_eq_matches_only_exact() {
+        assert!(ct_eq("s3cr3t", "s3cr3t"));
+        assert!(!ct_eq("s3cr3t", "s3cr3T"));
+        assert!(!ct_eq("s3cr3t", "s3cr3t-longer"));
+        assert!(!ct_eq("", "x"));
+    }
 }
