@@ -1,0 +1,41 @@
+# GCTRL
+
+> GCTRL (Ground Control) is the enterprise memory layer for AI: a self-hosted knowledge graph and governed memory tier that ingests unstructured organizational data, resolves it into one clean graph, and serves it to any agent framework as durable, access-controlled shared memory — running fully on-prem, with local inference, no vendor lock-in, and no per-token cost.
+
+GCTRL sits between an organization's raw data (documents, mail servers, SharePoint, SQL databases, file shares) and its AI agents. Instead of every coding agent, copilot, or automation rebuilding its own understanding of the company from scratch, they all read and write to the same governed knowledge graph — what one agent learns is already there when the next one asks.
+
+## Core capabilities
+
+- **KEX (Knowledge Extraction)** — turns unstructured documents into structured entities and relations, locally and fast.
+- **FUSE (Knowledge Fusion)** — merges extractions and resolves duplicate/conflicting entities into one coherent graph, with zero training required.
+- **Classification & Access Control** — clearance enforced on every graph read, scoped tokens for per-project or per-agent isolation.
+- **Multi-Agent Fabric** — one governed memory layer exposed over MCP and HTTP to every agent framework (Claude Code, Cursor, Codex, LangChain, LlamaIndex, n8n, and more).
+- **Cloaking** — use frontier cloud models without exposing real identities in the data sent upstream.
+- **Sovereign & On-Prem** — every component (graph, vectors, relational store, queue, inference) runs on infrastructure you control; deployments can go fully air-gapped.
+- **Talk to Graph** — grounded, cited, GDPR-compliant chat over your own knowledge graph.
+
+## Docs
+
+- [Introduction](https://gctrl.tech/docs/introduction): What GCTRL is and how it differs from agent-memory tools and RAG scripts.
+- [Quick Start](https://gctrl.tech/docs/quickstart): Get the stack running.
+- [Architecture](https://gctrl.tech/docs/architecture): How the pieces fit together.
+- [The Four Modules](https://gctrl.tech/docs/modules): KEX, FUSE, Manage KGs, Talk to Graph.
+- [Why a Memory Layer](https://gctrl.tech/docs/tech-memory-layer): The conceptual case for a governed memory tier.
+- [KEX — Knowledge Extraction](https://gctrl.tech/docs/tech-kex)
+- [FUSE — Knowledge Fusion](https://gctrl.tech/docs/tech-fuse)
+- [Classification & Access Control](https://gctrl.tech/docs/tech-classification)
+- [Multi-Agent Fabric](https://gctrl.tech/docs/tech-multi-agent-fabric)
+- [Cloaking](https://gctrl.tech/docs/tech-cloaking)
+- [Sovereign & On-Prem](https://gctrl.tech/docs/tech-sovereign)
+- [Talk to Graph](https://gctrl.tech/docs/tech-talk-to-graph)
+- [Access Control & Multi-Tenancy](https://gctrl.tech/docs/access-control)
+- [Compliance & Data Sovereignty](https://gctrl.tech/docs/compliance)
+- [Benchmarks](https://gctrl.tech/docs/benchmarks)
+- [Agents & MCP](https://gctrl.tech/docs/agents-mcp)
+- [FAQ & Troubleshooting](https://gctrl.tech/docs/faq)
+
+## Site
+
+- [Pricing](https://gctrl.tech/pricing): Free forever for non-commercial private use; Business and Individual tiers for teams and sovereign deployments.
+- [Use Cases](https://gctrl.tech/use-cases): Agentic team memory, per-project isolation, legacy data activation.
+- [Integrations](https://gctrl.tech/integrations): Coding agents, IDEs, agent frameworks, copilots, automation, and knowledge-source connectors.
