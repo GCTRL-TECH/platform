@@ -48,6 +48,17 @@ RELEX_MIN_CONFIDENCE: float = float(os.environ.get("KEX_MIN_RELATION_CONFIDENCE"
 # overridable per-install for very constrained hosts.
 RELEX_NUM_PREDICT: int = int(os.environ.get("RELEX_NUM_PREDICT", "2048"))
 
+# Entity Verify/Retype tier (precision, opt-in): an LLM verify/retype pass
+# over GLiNER's candidate entities — drops junk noun-phrases and fixes obvious
+# type errors WITHOUT ever inventing a span (GLiNER stays the only span
+# producer). Off by default so Ollama-parity installs see zero behavior
+# change; enable per-install once the extra ~1 LLM call per document latency
+# cost is acceptable. ENTITY_VERIFY_MODEL empty (default) means "use the job's
+# already-resolved generation model" (the same one relex uses) rather than a
+# separate hardcoded model.
+ENTITY_VERIFY_ENABLED: bool = os.environ.get("KEX_ENTITY_VERIFY", "false").lower() in ("1", "true", "yes")
+ENTITY_VERIFY_MODEL: str = os.environ.get("ENTITY_VERIFY_MODEL", "")
+
 # Graph pruning: GLiNER over-extracts — it promotes emotions ("Cool"), generic nouns
 # ("software", "box"), and sentence fragments to entities, which become thousands of
 # ORPHAN graph nodes that add nothing (they stay searchable in the vector store either
