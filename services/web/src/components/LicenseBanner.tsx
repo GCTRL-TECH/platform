@@ -53,7 +53,8 @@ const STALL_TIMEOUT_MS = 25_000
  *   progress/done/error arrives within STALL_TIMEOUT_MS we flip to `error`.
  * - pulling:    at least one `pull`/`pulled` progress event seen.
  * - restarting: a `restart`/`restarted` progress event seen.
- * - done:       `done` event — auto-reloads after a short delay.
+ * - done:       `done` event — auto-reloads after ~20s (the api recreates
+ *               itself in the background after `done`; see api-rs update.rs).
  * - error:      explicit error event, transport onerror, or stall timeout. Always
  *               offers the manual command + a Retry button. Never shown while still
  *               legitimately connecting.
@@ -149,7 +150,10 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
         setPhase('done')
         phaseRef.current = 'done'
         controller.abort()
-        setTimeout(() => window.location.reload(), 4000)
+        // The api recreates ITSELF in the background after `done` (see
+        // api-rs update.rs) — it briefly disconnects, so reload only once it
+        // has had time to come back up rather than racing it at 4s.
+        setTimeout(() => window.location.reload(), 20_000)
       } else if (eventType === 'error') {
         try {
           const data = JSON.parse(dataStr) as { message?: string; manualCommand?: string }
@@ -268,7 +272,7 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
         <div className="border-t border-slate-800 px-5 py-4">
           {done && (
             <p className="text-sm text-emerald-400 text-center">
-              Reloading in a moment…
+              The app is finishing updating itself in the background — reloading in ~20s…
             </p>
           )}
           {isError && (
