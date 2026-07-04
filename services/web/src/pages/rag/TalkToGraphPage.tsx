@@ -38,6 +38,7 @@ import {
 } from 'lucide-react'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
+import { useUiMode } from '@/hooks/useUiMode'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { getToken } from '@/lib/auth'
@@ -503,6 +504,7 @@ function TracePanel({
   const [cypherCopied, setCypherCopied] = useState(false)
   const [cypherExpanded, setCypherExpanded] = useState(false)
   const { neo4jBrowser } = usePublicConfig()
+  const { isExpert } = useUiMode()
 
   function copyQuery() {
     if (!message.cypher) return
@@ -664,8 +666,8 @@ function TracePanel({
             </div>
           )}
 
-        {/* Cypher query — collapsible */}
-        {message.cypher && (
+        {/* Cypher query — collapsible (Expert only) */}
+        {isExpert && message.cypher && (
           <div>
             <button
               onClick={() => setCypherExpanded((v) => !v)}

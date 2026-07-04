@@ -542,7 +542,7 @@ export default function OnboardingWizard() {
 
                   <p className="text-[11px] text-amber-400/80">
                     For a remote agent, enable the MCP-over-HTTP gateway in Settings → Agent and make sure port :4000 is reachable.
-                    You can create more (scoped) tokens any time under Access Control.
+                    You can create more (scoped) tokens any time under Settings → Connect an Agent.
                   </p>
                 </div>
               )}
@@ -560,7 +560,7 @@ export default function OnboardingWizard() {
 
               <div className="flex items-center justify-between pt-1">
                 <button onClick={() => setCurrentStep('extract')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
-                <span className="text-[11px] text-slate-600">You can revisit this any time: Access Control → Agent tokens.</span>
+                <span className="text-[11px] text-slate-600">You can revisit this any time: Settings → Connect an Agent.</span>
               </div>
             </div>
           )}

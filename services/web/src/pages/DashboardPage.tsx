@@ -1,8 +1,9 @@
 import { useNavigate } from 'react-router-dom'
-import { Zap, Network, ArrowRight, Clock, Compass, ChefHat, type LucideIcon } from 'lucide-react'
+import { Zap, Network, ArrowRight, Clock, Compass, ChefHat, Terminal, type LucideIcon } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
+import { useUiMode } from '@/hooks/useUiMode'
 import { cn } from '@/lib/utils'
 
 interface KexJob {
@@ -61,6 +62,7 @@ const STATUS_BADGE: Record<string, { className: string; label: string }> = {
 export function DashboardPage() {
   const { user } = useAuth()
   const navigate = useNavigate()
+  const { isExpert } = useUiMode()
 
   const { data: jobsData, isLoading: jobsLoading } = useApiQuery<KexJobsResponse>(
     ['kex', 'jobs'],
@@ -70,6 +72,11 @@ export function DashboardPage() {
     ['kg', 'compilations'],
     '/kg/compilations'
   )
+  const { data: keysData } = useApiQuery<{ apiKeys: unknown[] }>(
+    ['users', 'api-keys'],
+    '/users/api-keys'
+  )
+  const hasApiKeys = (keysData?.apiKeys?.length ?? 0) > 0
 
   const jobs = jobsData?.jobs ?? []
   const recentJobs = jobs.slice(0, 5)
@@ -96,7 +103,7 @@ export function DashboardPage() {
       {/* Stats */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <StatCard
-          label="Total Extractions"
+          label={isExpert ? 'Total Extractions' : 'Items added'}
           value={totalJobs}
           icon={Zap}
           iconColor="text-blue-400"
@@ -120,15 +127,17 @@ export function DashboardPage() {
           className="btn-primary"
         >
           <Zap size={15} />
-          New Extraction
+          {isExpert ? 'New Extraction' : 'Add Knowledge'}
         </button>
-        <button
-          onClick={() => navigate('/graphs')}
-          className="btn-secondary"
-        >
-          <Network size={14} />
-          Browse Graphs
-        </button>
+        {isExpert && (
+          <button
+            onClick={() => navigate('/graphs')}
+            className="btn-secondary"
+          >
+            <Network size={14} />
+            Browse Graphs
+          </button>
+        )}
         <button
           onClick={() => navigate('/onboarding')}
           className="btn-secondary"
@@ -147,10 +156,35 @@ export function DashboardPage() {
         </button>
       </div>
 
+      {/* Connect your agent — nudge shown until the user has at least one API key */}
+      {!hasApiKeys && (
+        <div className="card flex items-center justify-between gap-4">
+          <div className="flex items-start gap-4">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-500/10">
+              <Terminal size={20} className="text-cyan-400" />
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-slate-200">Connect your agent</p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Give Claude Code, Codex or Cursor durable memory — one token, one config block.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => navigate('/settings?tab=connect-agent')}
+            className="btn-secondary shrink-0"
+          >
+            Connect agent
+          </button>
+        </div>
+      )}
+
       {/* Recent Jobs */}
       <div className="card p-0 overflow-hidden">
         <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
-          <h3 className="text-sm font-semibold text-slate-200">Recent Extractions</h3>
+          <h3 className="text-sm font-semibold text-slate-200">
+            {isExpert ? 'Recent Extractions' : 'Recently added'}
+          </h3>
           <button
             onClick={() => navigate('/kex')}
             className="flex items-center gap-1 text-xs text-slate-500 hover:text-blue-400 transition-colors"
@@ -174,7 +208,7 @@ export function DashboardPage() {
               <p className="mt-0.5 text-xs text-slate-600">Run your first extraction to get started</p>
             </div>
             <button onClick={() => navigate('/kex')} className="btn-primary mt-1">
-              Start extracting
+              {isExpert ? 'Start extracting' : 'Add your first knowledge'}
             </button>
           </div>
         ) : (

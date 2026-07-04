@@ -48,6 +48,7 @@ import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useTokenBalance } from '@/hooks/useTokenBalance'
+import { useUiMode } from '@/hooks/useUiMode'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { api, apiGet } from '@/lib/api'
@@ -70,6 +71,8 @@ interface Tab {
   id: TabId
   label: string
   icon: typeof Brain
+  /** Only shown in Expert mode's nav (Easy mode hides these tabs). */
+  expert?: boolean
 }
 
 interface ApiKeyField {
@@ -103,14 +106,14 @@ const TABS: Tab[] = [
   { id: 'models', label: 'AI Models', icon: Brain },
   { id: 'agent', label: 'Agent', icon: Bot },
   { id: 'connect-agent', label: 'Connect an Agent', icon: Code2 },
-  { id: 'integrations', label: 'Integrations', icon: Plug },
-  { id: 'mcp', label: 'MCP Server', icon: Code2 },
-  { id: 'n8n', label: 'n8n', icon: Plug },
-  { id: 'webhooks', label: 'Webhooks', icon: Webhook },
-  { id: 'infrastructure', label: 'Infrastructure', icon: Server },
-  { id: 'memory', label: 'Memory', icon: Brain },
-  { id: 'profile', label: 'Personal Memory', icon: Sparkles },
-  { id: 'sso', label: 'SSO / SCIM', icon: KeyRound },
+  { id: 'integrations', label: 'Integrations', icon: Plug, expert: true },
+  { id: 'mcp', label: 'MCP Server', icon: Code2, expert: true },
+  { id: 'n8n', label: 'n8n', icon: Plug, expert: true },
+  { id: 'webhooks', label: 'Webhooks', icon: Webhook, expert: true },
+  { id: 'infrastructure', label: 'Infrastructure', icon: Server, expert: true },
+  { id: 'memory', label: 'Memory', icon: Brain, expert: true },
+  { id: 'profile', label: 'Personal Memory', icon: Sparkles, expert: true },
+  { id: 'sso', label: 'SSO / SCIM', icon: KeyRound, expert: true },
   { id: 'account', label: 'Account', icon: User },
 ]
 
@@ -4240,6 +4243,7 @@ cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc`}
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export function SettingsPage() {
+  const { isExpert } = useUiMode()
   // Deep-linkable via `?tab=<id>` (e.g. /settings?tab=models). Defaults to
   // 'models' when the param is missing or unknown — non-breaking.
   const [activeTab, setActiveTab] = useState<TabId>(() => {
@@ -4258,6 +4262,15 @@ export function SettingsPage() {
 
   const currentTab = TABS.find((t) => t.id === activeTab)!
 
+  // Easy mode hides Expert-only tabs from the nav, but a deep link (or a
+  // stale nav state) can still land on one — keep it in the rendered list so
+  // the active-tab highlight isn't orphaned. Tab content itself is untouched;
+  // this only affects which buttons are shown in the sidebar.
+  const visibleTabs = TABS.filter((t) => isExpert || !t.expert)
+  const navTabs = visibleTabs.some((t) => t.id === activeTab)
+    ? visibleTabs
+    : [...visibleTabs, currentTab]
+
   function handleTabClick(id: TabId) {
     setActiveTab(id)
     window.history.replaceState(null, '', '/settings?tab=' + id)
@@ -4271,7 +4284,7 @@ export function SettingsPage() {
           Settings
         </p>
         <nav className="space-y-0.5 px-2">
-          {TABS.map((tab) => {
+          {navTabs.map((tab) => {
             const Icon = tab.icon
             return (
               <button

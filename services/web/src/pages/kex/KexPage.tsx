@@ -32,6 +32,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
+import { useUiMode } from '@/hooks/useUiMode'
 import { ExtractionsTable } from './components/ExtractionsTable'
 import { KexEngineBanner } from './components/KexEngineBanner'
 import LocalFolderManager from '@/components/connectors/LocalFolderManager'
@@ -91,6 +92,7 @@ const ACCEPTED_TYPES: Record<string, string[]> = {
 
 export function KexPage() {
   const { user } = useAuth()
+  const { isExpert } = useUiMode()
 
   // Form state
   const [activeTab, setActiveTab] = useState<Tab>('sources')
@@ -566,8 +568,12 @@ export function KexPage() {
       <div className="card">
         <div className="mb-4 flex items-start justify-between">
           <div>
-            <h2 className="text-base font-semibold text-slate-100">Knowledge Extraction</h2>
-            <p className="mt-0.5 text-xs text-slate-500">Extract structured knowledge from any source.</p>
+            <h2 className="text-base font-semibold text-slate-100">{isExpert ? 'Knowledge Extraction' : 'Add Knowledge'}</h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              {isExpert
+                ? 'Extract structured knowledge from any source.'
+                : 'Drop in files, notes, or links — GCTRL builds your knowledge base.'}
+            </p>
           </div>
         </div>
 
@@ -754,16 +760,18 @@ export function KexPage() {
                 <div>
                   <input type="url" value={url} onChange={(e) => setUrl(e.target.value)} className="w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none" placeholder="https://example.com" autoFocus />
                 </div>
-                <div className="flex gap-2">
-                  <div className="flex-1">
-                    <label className="text-[10px] text-slate-500">Max Depth</label>
-                    <input type="number" min={1} max={10} defaultValue={3} className="mt-0.5 w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 focus:border-indigo-500 focus:outline-none" />
+                {isExpert && (
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <label className="text-[10px] text-slate-500">Max Depth</label>
+                      <input type="number" min={1} max={10} defaultValue={3} className="mt-0.5 w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 focus:border-indigo-500 focus:outline-none" />
+                    </div>
+                    <div className="flex-1">
+                      <label className="text-[10px] text-slate-500">Max Pages</label>
+                      <input type="number" min={1} max={200} defaultValue={50} className="mt-0.5 w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 focus:border-indigo-500 focus:outline-none" />
+                    </div>
                   </div>
-                  <div className="flex-1">
-                    <label className="text-[10px] text-slate-500">Max Pages</label>
-                    <input type="number" min={1} max={200} defaultValue={50} className="mt-0.5 w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 focus:border-indigo-500 focus:outline-none" />
-                  </div>
-                </div>
+                )}
                 <p className="text-[10px] text-slate-600">Crawls the site recursively, extracts text from each page, and creates a batch extraction.</p>
               </div>
             ) : selectedProvider === 'localfolder' ? (
@@ -864,8 +872,8 @@ export function KexPage() {
                   </div>
                 </div>
 
-                {/* Local-vault trigger caveat */}
-                {selectedObsidianVault?.kind === 'local' && (
+                {/* Local-vault trigger caveat (expert-only: triggers/scheduling are hidden in easy) */}
+                {isExpert && selectedObsidianVault?.kind === 'local' && (
                   <p className="text-[10px] text-amber-400/80">Scheduled triggers need a server-mounted or REST vault.</p>
                 )}
 
@@ -925,7 +933,15 @@ export function KexPage() {
           </div>
         )}
 
-        {/* ── Extraction Options ──────────────────────────── */}
+        {/* ── Extraction Options (Expert only — easy mode uses server defaults) ── */}
+        {!isExpert && (
+          <div className="mt-4 border-t border-slate-800 pt-3">
+            <p className="text-[11px] text-slate-500">
+              Everything you add is merged into your knowledge base automatically.
+            </p>
+          </div>
+        )}
+        {isExpert && (
         <div className="mt-4 border-t border-slate-800 pt-3">
           <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Extraction Options</p>
           <div className="space-y-2">
@@ -1036,6 +1052,7 @@ export function KexPage() {
             </div>
           </div>
         </div>
+        )}
 
         {/* Error */}
         {submitError && (

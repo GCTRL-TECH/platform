@@ -29,6 +29,8 @@ interface NavItemConfig {
   badge?: string
   /** Only shown in Expert mode. */
   expert?: boolean
+  /** Label override shown in Easy mode (falls back to `label`). */
+  easyLabel?: string
 }
 
 interface NavSection {
@@ -44,8 +46,8 @@ const NAV_SECTIONS: NavSection[] = [
     items: [
       { label: 'Knowledge Graphs', icon: Database, to: '/graphs' },
       { label: 'Wiki', icon: BookOpenText, to: '/wiki' },
-      { label: 'KEX Extract', icon: Zap, to: '/kex' },
-      { label: 'FUSE Merge', icon: GitMerge, to: '/fuse' },
+      { label: 'KEX Extract', easyLabel: 'Add Knowledge', icon: Zap, to: '/kex' },
+      { label: 'FUSE Merge', icon: GitMerge, to: '/fuse', expert: true },
       { label: 'Ontologies', icon: BookOpen, to: '/ontologies', expert: true },
       { label: 'Triggers', icon: Timer, to: '/triggers', expert: true },
     ],
@@ -53,7 +55,7 @@ const NAV_SECTIONS: NavSection[] = [
   {
     label: 'Access & Ask',
     items: [
-      { label: 'Access Control', icon: Shield, to: '/access' },
+      { label: 'Access Control', icon: Shield, to: '/access', expert: true },
       { label: 'Talk to Graph', icon: MessageSquare, to: '/chat' },
       { label: 'Agent', icon: Terminal, to: '/agent' },
     ],
@@ -88,21 +90,24 @@ function UserAvatar({ name }: { name: string }) {
 function NavItemLink({
   item,
   collapsed,
+  isExpert,
 }: {
   item: NavItemConfig
   collapsed: boolean
+  isExpert: boolean
 }) {
   const Icon = item.icon
+  const displayLabel = !isExpert && item.easyLabel ? item.easyLabel : item.label
 
   if (item.disabled) {
     return (
       <div
         key={item.to}
         className={cn('nav-item-disabled', collapsed && 'justify-center px-0')}
-        title={collapsed ? item.label : undefined}
+        title={collapsed ? displayLabel : undefined}
       >
         <Icon size={16} />
-        {!collapsed && <span className="flex-1">{item.label}</span>}
+        {!collapsed && <span className="flex-1">{displayLabel}</span>}
         {!collapsed && item.badge && (
           <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
             {item.badge}
@@ -115,7 +120,7 @@ function NavItemLink({
   return (
     <NavLink
       to={item.to}
-      title={collapsed ? item.label : undefined}
+      title={collapsed ? displayLabel : undefined}
       className={({ isActive }) =>
         cn(
           isActive ? 'nav-item-active' : 'nav-item',
@@ -130,7 +135,7 @@ function NavItemLink({
             size={16}
             className={cn(isActive ? 'text-blue-400' : 'text-slate-500 group-hover:text-slate-300')}
           />
-          {!collapsed && <span className="flex-1">{item.label}</span>}
+          {!collapsed && <span className="flex-1">{displayLabel}</span>}
           {!collapsed && isActive && (
             <ChevronRight size={14} className="text-blue-400/50" />
           )}
@@ -174,24 +179,24 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
       <nav className={`flex-1 overflow-y-auto py-3 ${collapsed ? 'px-1.5' : 'px-3'}`}>
         {/* Dashboard — top-level, no section header */}
         <div className="mb-1">
-          <NavItemLink item={TOP_ITEM} collapsed={collapsed} />
+          <NavItemLink item={TOP_ITEM} collapsed={collapsed} isExpert={isExpert} />
         </div>
 
         {/* Sectioned navigation */}
         {sections.map((section) => (
           <div key={section.label}>
-            {/* Section label — hidden when collapsed */}
-            {!collapsed && (
+            {/* Section label — hidden when collapsed, and hidden entirely in Easy mode */}
+            {!collapsed && isExpert && (
               <p className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-600">
                 {section.label}
               </p>
             )}
-            {/* Spacer when collapsed to visually separate groups */}
-            {collapsed && <div className="my-1 border-t border-slate-800/60" />}
+            {/* Spacer when collapsed to visually separate groups (Expert only) */}
+            {collapsed && isExpert && <div className="my-1 border-t border-slate-800/60" />}
 
             <div className="space-y-0.5">
               {section.items.map((item) => (
-                <NavItemLink key={item.to} item={item} collapsed={collapsed} />
+                <NavItemLink key={item.to} item={item} collapsed={collapsed} isExpert={isExpert} />
               ))}
             </div>
           </div>
@@ -215,6 +220,7 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
           <div className="mb-2 flex items-center gap-1 rounded-lg border border-slate-800 bg-slate-900/60 p-1">
             <button
               onClick={() => setMode('easy')}
+              title="The essentials — everything fuses into your knowledge base automatically"
               className={cn('flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
                 !isExpert ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300')}
             >
@@ -222,6 +228,7 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
             </button>
             <button
               onClick={() => setMode('expert')}
+              title="All controls: ontologies, triggers, fusion, access control"
               className={cn('flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
                 isExpert ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300')}
             >
@@ -239,7 +246,7 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
         )}
 
         <div className="mb-1">
-          <NavItemLink item={{ label: 'Settings', icon: Settings, to: '/settings' }} collapsed={collapsed} />
+          <NavItemLink item={{ label: 'Settings', icon: Settings, to: '/settings' }} collapsed={collapsed} isExpert={isExpert} />
         </div>
 
         {collapsed ? (
