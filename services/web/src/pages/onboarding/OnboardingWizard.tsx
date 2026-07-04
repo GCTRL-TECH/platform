@@ -20,26 +20,30 @@ import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
 
+// The agent connection is deliberately the LAST step — the wizard's climax is
+// "your knowledge graph is live, now plug your agent into it", not a mid-flow
+// chore. 'chat' was folded into the final step's completion actions.
 const STEPS = [
   { id: 'welcome', title: 'Welcome', icon: Zap },
   { id: 'model', title: 'Connect AI', icon: Brain },
   { id: 'license', title: 'Activate', icon: KeyRound },
-  { id: 'connect', title: 'Connect Agent', icon: Plug },
   { id: 'source', title: 'Add a Source', icon: Upload },
   { id: 'extract', title: 'First Extraction', icon: Database },
-  { id: 'chat', title: 'Talk to Your Data', icon: MessageSquare },
+  { id: 'connect', title: 'Connect Agent', icon: Plug },
 ]
 
-type StepId = 'welcome' | 'model' | 'license' | 'connect' | 'source' | 'extract' | 'chat'
+type StepId = 'welcome' | 'model' | 'license' | 'source' | 'extract' | 'connect'
 
 export default function OnboardingWizard() {
   const navigate = useNavigate()
   const { user } = useAuth()
   const [currentStep, setCurrentStep] = useState<StepId>(() => {
     // Resume where the user left off instead of resetting to 'welcome'.
-    const valid: StepId[] = ['welcome', 'model', 'license', 'connect', 'source', 'extract', 'chat']
-    const saved = localStorage.getItem('onboarding_step') as StepId | null
-    return saved && valid.includes(saved) ? saved : 'welcome'
+    const valid: StepId[] = ['welcome', 'model', 'license', 'source', 'extract', 'connect']
+    const saved = localStorage.getItem('onboarding_step')
+    // Migration: 'chat' (removed final step) → its successor 'connect'.
+    if (saved === 'chat') return 'connect'
+    return saved && valid.includes(saved as StepId) ? (saved as StepId) : 'welcome'
   })
   // Persist progress so a refresh or a quick detour keeps the user's place.
   useEffect(() => {
@@ -58,7 +62,7 @@ export default function OnboardingWizard() {
   const [activated, setActivated] = useState(false)
   const [activateError, setActivateError] = useState('')
 
-  // ── Full-access token + MCP (step 4) ─────────────────────────────────
+  // ── Full-access token + MCP (final step) ─────────────────────────────
   const [generatingToken, setGeneratingToken] = useState(false)
   const [agentToken, setAgentToken] = useState('')
   const [tokenError, setTokenError] = useState('')
@@ -74,10 +78,31 @@ export default function OnboardingWizard() {
     },
   }, null, 2)
 
+  // Pi-agent drop-in for agent frameworks (Paperclip, OpenClaw, Hermes …):
+  // the framework talks to the harness endpoints directly — no MCP client
+  // needed. skill.md is the agent-facing instruction sheet served by the API.
+  const harnessSnippet = [
+    `GCTRL_API_URL=${window.location.origin}/api`,
+    `GCTRL_API_TOKEN=${agentToken || '<your-token>'}`,
+    '',
+    `# Invoke tools directly (access-controlled by the token):`,
+    `#   POST ${window.location.origin}/api/agent/tools/<tool>`,
+    `#   Header: Authorization: ApiKey <token>`,
+  ].join('\n')
+
   function copy(text: string, what: string) {
     void navigator.clipboard.writeText(text)
     setCopied(what)
     setTimeout(() => setCopied(''), 2000)
+  }
+
+  async function copySkillMd() {
+    try {
+      const { data } = await api.get('/agent/skill.md', { responseType: 'text' })
+      await navigator.clipboard.writeText(typeof data === 'string' ? data : String(data))
+      setCopied('skill')
+      setTimeout(() => setCopied(''), 2000)
+    } catch { /* non-fatal */ }
   }
 
   async function handleActivate() {
@@ -172,6 +197,20 @@ export default function OnboardingWizard() {
 
   const stepIndex = STEPS.findIndex((s) => s.id === currentStep)
 
+  // Furthest step the user has ever reached — completed bullets stay clickable
+  // so the user can move back and forth freely; steps beyond it stay locked
+  // (their gates, e.g. the LLM check, haven't been passed yet).
+  const [maxReached, setMaxReached] = useState<number>(() => {
+    const saved = parseInt(localStorage.getItem('onboarding_max_step') ?? '', 10)
+    return Number.isFinite(saved) ? Math.min(Math.max(saved, 0), STEPS.length - 1) : 0
+  })
+  useEffect(() => {
+    if (stepIndex > maxReached) {
+      setMaxReached(stepIndex)
+      try { localStorage.setItem('onboarding_max_step', String(stepIndex)) } catch { /* ignore */ }
+    }
+  }, [stepIndex, maxReached])
+
   async function handleExtract() {
     setExtracting(true)
     try {
@@ -186,6 +225,7 @@ export default function OnboardingWizard() {
     // Mark onboarding as done in localStorage
     localStorage.setItem('onboarding_complete', 'true')
     localStorage.removeItem('onboarding_step')
+    localStorage.removeItem('onboarding_max_step')
     navigate('/dashboard')
   }
 
@@ -195,6 +235,7 @@ export default function OnboardingWizard() {
     localStorage.setItem('onboarding_complete', 'true')
     localStorage.setItem('onboarding_skipped', 'true')
     localStorage.removeItem('onboarding_step')
+    localStorage.removeItem('onboarding_max_step')
     navigate('/dashboard')
   }
 
@@ -212,22 +253,38 @@ export default function OnboardingWizard() {
           </button>
         </div>
 
-        {/* Progress */}
+        {/* Progress — every step up to the furthest one reached is clickable,
+            so the user can move back and forth between completed steps. */}
         <div className="mb-8 flex items-center justify-center gap-2">
-          {STEPS.map((step, i) => (
-            <div key={step.id} className="flex items-center gap-2">
-              <div className={cn(
-                'flex h-8 w-8 items-center justify-center rounded-full text-xs font-medium transition-all',
-                i < stepIndex ? 'bg-emerald-500 text-white' :
-                i === stepIndex ? 'bg-indigo-500 text-white' : 'bg-slate-800 text-slate-500'
-              )}>
-                {i < stepIndex ? <Check size={14} /> : i + 1}
+          {STEPS.map((step, i) => {
+            const reachable = i <= maxReached
+            return (
+              <div key={step.id} className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => { if (reachable) setCurrentStep(step.id as StepId) }}
+                  disabled={!reachable}
+                  title={reachable ? step.title : `${step.title} — complete the previous steps first`}
+                  aria-label={`Step ${i + 1}: ${step.title}`}
+                  aria-current={i === stepIndex ? 'step' : undefined}
+                  className={cn(
+                    'flex h-8 w-8 items-center justify-center rounded-full text-xs font-medium transition-all',
+                    i < stepIndex ? 'bg-emerald-500 text-white' :
+                    i === stepIndex ? 'bg-indigo-500 text-white' :
+                    reachable ? 'bg-slate-800 text-indigo-300 ring-1 ring-indigo-500/40' :
+                    'bg-slate-800 text-slate-500',
+                    reachable && i !== stepIndex && 'cursor-pointer hover:ring-2 hover:ring-indigo-400/60 hover:scale-105',
+                    !reachable && 'cursor-not-allowed'
+                  )}
+                >
+                  {i < stepIndex ? <Check size={14} /> : i + 1}
+                </button>
+                {i < STEPS.length - 1 && (
+                  <div className={cn('h-0.5 w-8', i < stepIndex ? 'bg-emerald-500' : 'bg-slate-800')} />
+                )}
               </div>
-              {i < STEPS.length - 1 && (
-                <div className={cn('h-0.5 w-8', i < stepIndex ? 'bg-emerald-500' : 'bg-slate-800')} />
-              )}
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         {/* Step content */}
@@ -250,8 +307,8 @@ export default function OnboardingWizard() {
                 {[
                   { n: 1, label: 'Connect an AI model', desc: 'Cloud, or local Ollama — run it natively for GPU speed.' },
                   { n: 2, label: 'Register & activate your license', desc: 'Grab a key at gctrl.tech, then activate it here.' },
-                  { n: 3, label: 'Create a full-access agent token', desc: 'Drop the MCP config into Claude Code, Codex, or Cursor.' },
-                  { n: 4, label: 'Ingest a source & build the graph', desc: 'Upload a PDF or paste text — KEX extracts entities & relations.' },
+                  { n: 3, label: 'Ingest a source & build the graph', desc: 'Upload a PDF or paste text — KEX extracts entities & relations.' },
+                  { n: 4, label: 'Connect your agent', desc: 'Access token + MCP config for Claude Code, Codex, Cursor — or drop the Pi agent into your framework.' },
                   { n: 5, label: 'Talk to your data', desc: 'Grounded, local RAG over your knowledge graph.' },
                 ].map((s) => (
                   <div key={s.n} className="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
@@ -404,8 +461,8 @@ export default function OnboardingWizard() {
               <div className="flex items-center justify-between pt-2">
                 <button onClick={() => setCurrentStep('model')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
                 <div className="flex items-center gap-4">
-                  <button onClick={() => setCurrentStep('connect')} className="text-xs text-slate-500 hover:text-slate-300">Skip for now</button>
-                  <button onClick={() => setCurrentStep('connect')} className="btn-primary">
+                  <button onClick={() => setCurrentStep('source')} className="text-xs text-slate-500 hover:text-slate-300">Skip for now</button>
+                  <button onClick={() => setCurrentStep('source')} className="btn-primary">
                     Continue <ArrowRight size={14} />
                   </button>
                 </div>
@@ -413,17 +470,18 @@ export default function OnboardingWizard() {
             </div>
           )}
 
-          {/* ── Connect an agent (token + MCP) ─────────── */}
+          {/* ── Connect an agent (final step: token + MCP + Pi drop-in) ── */}
           {currentStep === 'connect' && (
             <div className="space-y-6">
               <div className="text-center">
                 <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
                   <Plug size={32} className="text-indigo-400" />
                 </div>
-                <h2 className="mt-4 text-xl font-bold text-slate-100">Connect Your Agent</h2>
+                <h2 className="mt-4 text-xl font-bold text-slate-100">Last Step: Connect Your Agent</h2>
                 <p className="mx-auto mt-2 max-w-md text-sm text-slate-400">
-                  Generate a full-access token and drop the MCP config into Claude Code, Codex, Cursor —
-                  your agent gets durable, access-controlled memory over GCTRL.
+                  Your knowledge graph is building. Now give your AI agent access to it —
+                  Claude Code, Codex, Cursor, or any agent framework. One access token, durable
+                  access-controlled memory.
                 </p>
               </div>
 
@@ -437,7 +495,7 @@ export default function OnboardingWizard() {
                   Generate full-access token
                 </button>
               ) : (
-                <div className="space-y-3">
+                <div className="space-y-4">
                   <div>
                     <p className="mb-1 text-[11px] text-slate-500">Your token (shown once — copy it now):</p>
                     <div className="flex gap-2">
@@ -447,8 +505,12 @@ export default function OnboardingWizard() {
                       </button>
                     </div>
                   </div>
+
+                  {/* Option A — MCP clients */}
                   <div>
-                    <p className="mb-1 text-[11px] text-slate-500">MCP config (Claude Code / Codex / Cursor):</p>
+                    <p className="mb-1 text-[11px] font-medium text-slate-300">
+                      Option A — MCP config <span className="font-normal text-slate-500">(Claude Code, Codex, Cursor — paste into <code>.mcp.json</code>):</span>
+                    </p>
                     <div className="relative">
                       <pre className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-3 text-[11px] leading-relaxed text-slate-300"><code>{mcpConfig}</code></pre>
                       <button onClick={() => copy(mcpConfig, 'config')} className="absolute right-2 top-2 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-700">
@@ -456,21 +518,49 @@ export default function OnboardingWizard() {
                       </button>
                     </div>
                   </div>
+
+                  {/* Option B — Pi agent drop-in for agent frameworks */}
+                  <div>
+                    <p className="mb-1 text-[11px] font-medium text-slate-300">
+                      Option B — drop the GCTRL Pi agent into your framework <span className="font-normal text-slate-500">(Paperclip, OpenClaw, Hermes …):</span>
+                    </p>
+                    <div className="relative">
+                      <pre className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-3 text-[11px] leading-relaxed text-slate-300"><code>{harnessSnippet}</code></pre>
+                      <button onClick={() => copy(harnessSnippet, 'harness')} className="absolute right-2 top-2 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-700">
+                        {copied === 'harness' ? 'Copied' : 'Copy'}
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => void copySkillMd()}
+                      className="mt-2 flex items-center gap-1.5 text-[11px] text-indigo-400 hover:text-indigo-300"
+                      type="button"
+                    >
+                      {copied === 'skill' ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                      Copy skill.md — the agent-facing instructions; paste it into your framework's skill / system prompt
+                    </button>
+                  </div>
+
                   <p className="text-[11px] text-amber-400/80">
                     For a remote agent, enable the MCP-over-HTTP gateway in Settings → Agent and make sure port :4000 is reachable.
+                    You can create more (scoped) tokens any time under Access Control.
                   </p>
                 </div>
               )}
               {tokenError && <p className="text-[11px] text-red-400">{tokenError}</p>}
 
-              <div className="flex items-center justify-between pt-2">
-                <button onClick={() => setCurrentStep('license')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
-                <div className="flex items-center gap-4">
-                  <button onClick={() => setCurrentStep('source')} className="text-xs text-slate-500 hover:text-slate-300">Skip for now</button>
-                  <button onClick={() => setCurrentStep('source')} className="btn-primary">
-                    Continue <ArrowRight size={14} />
-                  </button>
-                </div>
+              {/* Completion */}
+              <div className="space-y-3 border-t border-slate-800 pt-5">
+                <button onClick={() => { handleComplete(); navigate('/chat') }} className="btn-primary w-full justify-center">
+                  <MessageSquare size={14} /> Finish — Talk to Your Data
+                </button>
+                <button onClick={handleComplete} className="w-full rounded-lg border border-slate-700 bg-slate-800 py-2.5 text-sm font-medium text-slate-300 hover:bg-slate-700 transition-colors">
+                  Finish — Go to Dashboard
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between pt-1">
+                <button onClick={() => setCurrentStep('extract')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <span className="text-[11px] text-slate-600">You can revisit this any time: Access Control → Agent tokens.</span>
               </div>
             </div>
           )}
@@ -501,7 +591,7 @@ export default function OnboardingWizard() {
                 ))}
               </div>
               <div className="flex justify-between pt-2">
-                <button onClick={() => setCurrentStep('connect')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
+                <button onClick={() => setCurrentStep('license')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
                 <button onClick={() => setCurrentStep('extract')} className="text-xs text-indigo-400 hover:text-indigo-300">Skip — use sample text</button>
               </div>
             </div>
@@ -540,38 +630,13 @@ export default function OnboardingWizard() {
               )}
               <div className="flex justify-between pt-2">
                 <button onClick={() => setCurrentStep('source')} className="text-xs text-slate-500 hover:text-slate-300">Back</button>
-                <button onClick={() => setCurrentStep('chat')} className="text-xs text-indigo-400 hover:text-indigo-300">
+                <button onClick={() => setCurrentStep('connect')} className="text-xs text-indigo-400 hover:text-indigo-300">
                   {extracted ? 'Continue' : 'Skip'}
                 </button>
               </div>
             </div>
           )}
 
-          {/* ── Chat ──────────────────────────────────── */}
-          {currentStep === 'chat' && (
-            <div className="space-y-6 text-center">
-              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-emerald-500/10">
-                <Check size={32} className="text-emerald-400" />
-              </div>
-              <div>
-                <h2 className="text-xl font-bold text-slate-100">You're All Set!</h2>
-                <p className="mt-2 text-sm text-slate-400">
-                  Your first knowledge extraction is processing. Once complete, you can ask questions about it using Talk to Graph.
-                </p>
-              </div>
-              <div className="space-y-3 pt-4">
-                <button onClick={() => { handleComplete(); navigate('/chat') }} className="btn-primary w-full justify-center">
-                  <MessageSquare size={14} /> Talk to Your Data
-                </button>
-                <button onClick={() => { handleComplete(); navigate('/kex') }} className="w-full rounded-lg border border-slate-700 bg-slate-800 py-2.5 text-sm font-medium text-slate-300 hover:bg-slate-700 transition-colors">
-                  Extract More Knowledge
-                </button>
-                <button onClick={handleComplete} className="text-xs text-slate-500 hover:text-slate-300">
-                  Go to Dashboard
-                </button>
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </div>
