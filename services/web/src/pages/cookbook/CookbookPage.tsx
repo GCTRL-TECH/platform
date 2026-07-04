@@ -94,9 +94,10 @@ export function CookbookPage() {
 
   // Persist the FULL prefs object on every purpose change — the PUT endpoint
   // overwrites all columns, so a partial body would silently wipe out the
-  // other purposes' saved choices.
+  // other purposes' saved choices. Local state updates only AFTER the server
+  // confirms (W7): an optimistic setPrefs left the card showing a selection
+  // the backend never accepted when the PUT failed.
   async function persistPrefs(next: ModelPrefs) {
-    setPrefs(next)
     await api.put('/llm/model-prefs', {
       embeddingModel: next.embeddingModel,
       embeddingProvider: next.embeddingProvider || 'ollama',
@@ -106,6 +107,7 @@ export function CookbookPage() {
       agentModel: next.agentModel,
       ragModel: next.ragModel,
     })
+    setPrefs(next)
   }
 
   return (

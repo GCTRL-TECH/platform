@@ -110,7 +110,7 @@ async fn crawl(
 
     // Link into the target compilation: explicit choice, else the user's default
     // knowledge base, so the crawled pages are never orphaned.
-    link_job_to_target_or_default(&state.db, claims.sub, req.compilation_id, job_id).await;
+    link_job_to_target_or_default(&state.db, &claims, req.compilation_id, job_id).await;
 
     // Look up classification name to forward to KEX worker for Neo4j tagging.
     let classification_name: Option<String> = if let Some(clf_id) = req.classification_level_id {

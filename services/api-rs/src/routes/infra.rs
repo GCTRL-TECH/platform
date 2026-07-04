@@ -206,14 +206,18 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
 
 // ── GET /api/infra/guardrail ─────────────────────────────────────────────────
 
-/// `GET /api/infra/guardrail` — any authenticated user. Returns the guardrail's
-/// current failure-tracking state plus every undismissed event (runtime
-/// reverts, degraded-job notices), newest first. Drives the amber
-/// `GuardrailBanner` in the app shell.
+/// `GET /api/infra/guardrail` — returns the guardrail's current
+/// failure-tracking state plus undismissed events (runtime reverts,
+/// degraded-job notices), newest first. Drives the amber `GuardrailBanner`.
+/// Events are ADMIN-scoped (bug-hunt W7): they alert the operator that the
+/// platform runtime auto-reverted; a non-admin seeing (and being unable to
+/// act on) them adds nothing, and a non-admin dismissing them could hide the
+/// alert from the admin. Non-admins receive state with an empty event list.
 async fn get_guardrail(
-    Extension(_claims): Extension<JwtClaims>,
+    Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
+    let is_admin = crate::middleware::auth::require_role(&claims, "admin").is_ok();
     let state_row: Option<(i32, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<chrono::DateTime<chrono::Utc>>, Option<Value>)> =
         sqlx::query_as(
             "SELECT consecutive_failures, last_probe_at, last_error, reverted_at, reverted_from
@@ -232,12 +236,16 @@ async fn get_guardrail(
         kind: String,
         detail: Value,
     }
-    let events: Vec<EventRow> = sqlx::query_as(
-        "SELECT id, created_at, kind, detail FROM guardrail_events
-          WHERE dismissed = false ORDER BY created_at DESC LIMIT 20",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let events: Vec<EventRow> = if is_admin {
+        sqlx::query_as(
+            "SELECT id, created_at, kind, detail FROM guardrail_events
+              WHERE dismissed = false ORDER BY created_at DESC LIMIT 20",
+        )
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(json!({
         "state": {
@@ -258,13 +266,16 @@ async fn get_guardrail(
 
 // ── POST /api/infra/guardrail/events/:id/dismiss ─────────────────────────────
 
-/// Dismiss a guardrail event (any authenticated user) — hides it from the
-/// banner. Purely a UI-acknowledgement flag; never affects guardrail logic.
+/// Dismiss a guardrail event — hides it from the banner. Admin-only (matching
+/// every other mutating endpoint in this file, bug-hunt W7): a low-privilege
+/// account must not be able to hide a platform-wide revert alert before the
+/// operator sees it. Purely a UI-acknowledgement flag; never affects guardrail logic.
 async fn dismiss_guardrail_event(
-    Extension(_claims): Extension<JwtClaims>,
+    Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<Value>> {
+    crate::middleware::auth::require_role(&claims, "admin")?;
     sqlx::query("UPDATE guardrail_events SET dismissed = true WHERE id = $1")
         .bind(id)
         .execute(&state.db)

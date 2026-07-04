@@ -29,19 +29,18 @@ interface EmbedShareDialogProps {
 
 type Tab = 'token' | 'public'
 
-function buildUrls(compilationId: string, token?: string, theme?: string) {
+function buildUrls(compilationId: string, compilationName: string, token?: string, theme?: string) {
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
   const params = new URLSearchParams()
   if (token) params.set('token', token)
   if (theme) params.set('theme', theme)
   const qs = params.toString()
   const url = `${origin}/embed/graph/${compilationId}${qs ? `?${qs}` : ''}`
-  const iframe = `<iframe src="${url}" width="800" height="600" style="border:0;border-radius:8px" title="${compilationName_escape(compilationId)}"></iframe>`
+  const iframe = `<iframe src="${url}" width="800" height="600" style="border:0;border-radius:8px" title="${escapeAttr(compilationName)}"></iframe>`
   return { url, iframe }
 }
-// Kept trivial on purpose — the title attribute only needs to not break the
-// markup; compilation names are already sanitised at creation.
-function compilationName_escape(s: string) { return s }
+// Minimal attribute escaping so a quote in a graph name can't break the markup.
+function escapeAttr(s: string) { return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;') }
 
 export function EmbedShareDialog({
   open, onClose, compilationId, compilationName, embedPublic, onEmbedPublicChange,
@@ -164,13 +163,13 @@ function TokenTab({ compilationId, compilationName }: { compilationId: string; c
 }
 
 function TokenResult({
-  compilationId, token, copied, onCopy,
+  compilationId, compilationName, token, copied, onCopy,
 }: {
   compilationId: string; compilationName: string; token: string
   copied: 'url' | 'iframe' | null
   onCopy: (which: 'url' | 'iframe', text: string) => void
 }) {
-  const { url, iframe } = buildUrls(compilationId, token)
+  const { url, iframe } = buildUrls(compilationId, compilationName, token)
   return (
     <div className="space-y-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3">
       <p className="text-xs font-medium text-emerald-300">Copy your link now — the token won't be shown again.</p>
@@ -211,7 +210,7 @@ function PublicTab({
     setTimeout(() => setCopied(null), 1500)
   }
 
-  const { url, iframe } = buildUrls(compilationId, undefined)
+  const { url, iframe } = buildUrls(compilationId, compilationName, undefined)
 
   return (
     <div className="space-y-3">

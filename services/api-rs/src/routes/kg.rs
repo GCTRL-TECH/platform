@@ -801,9 +801,15 @@ async fn update(
     }
     // Wave 2 — embed: toggle whether this compilation's PUBLIC-classified
     // content is servable via the unauthenticated /public/embed/:id/graph
-    // route. Owner-only (enforced by the WHERE user_id=$2 below, same as the
-    // other fields on this handler).
+    // route. Owner-only (WHERE user_id=$3) — and additionally restricted to a
+    // real user session: an access token (even a KB-scoped write token) runs
+    // under the owner's user_id, and exposing a KB to the anonymous internet
+    // is too consequential to be flippable by a delegated key (bug-hunt W7).
     if let Some(enabled) = req.get("embedPublic").and_then(|v| v.as_bool()) {
+        if claims.api_key_id.is_some() {
+            return Err(AppError::Forbidden(
+                "embedPublic can only be changed from a signed-in user session, not via an access token".into()));
+        }
         sqlx::query("UPDATE compilations SET embed_public=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
             .bind(enabled).bind(id).bind(claims.sub).execute(&state.db).await?;
     }
@@ -1605,6 +1611,19 @@ pub fn public_router() -> Router<Arc<crate::models::AppState>> {
 /// itself is classified above PUBLIC. Reuses the same scope/label-pattern
 /// Cypher shape as the authenticated `get_graph` above, just without any
 /// per-user/per-token branching.
+/// Strip internal bookkeeping fields from a node/edge JSON before serving it
+/// to ANONYMOUS embed viewers: underscore-prefixed props carry the owner's
+/// user UUID (`_owner`), internal job UUIDs (`_source_job`), and rank
+/// metadata; `uri` embeds internal identifiers too. The authenticated graph
+/// endpoint intentionally keeps them (the owner sees their own ids) — the
+/// public one must not (bug-hunt W7).
+fn redact_internal_props(mut v: Value) -> Value {
+    if let Some(props) = v.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.retain(|k, _| !k.starts_with('_') && k != "uri");
+    }
+    v
+}
+
 async fn public_get_graph(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
@@ -1624,7 +1643,10 @@ async fn public_get_graph(
     }
 
     const PUBLIC_RANK: i64 = 0;
-    let limit = q.limit.unwrap_or(20000).clamp(1, 50000);
+    // Anonymous endpoint: keep the ceiling well below the authenticated 50k —
+    // each request runs an OPTIONAL-MATCH degree computation over the scoped
+    // subgraph, and there is no rate limiting in front of /public/* yet.
+    let limit = q.limit.unwrap_or(5000).clamp(1, 10000);
     let user_id_str = owner_id.to_string();
     let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
@@ -1692,7 +1714,7 @@ async fn public_get_graph(
         if let Ok(n) = row.get::<Node>("n") {
             if seen_nodes.insert(n.id()) {
                 core_ids.push(n.id());
-                nodes.push(node_to_json(&n));
+                nodes.push(redact_internal_props(node_to_json(&n)));
             }
         }
     }
@@ -1713,7 +1735,7 @@ async fn public_get_graph(
         while let Ok(Some(row)) = edge_stream.next().await {
             if let Ok(r) = row.get::<Relation>("r") {
                 if seen_edges.insert(r.id()) {
-                    edges.push(relation_to_json(&r));
+                    edges.push(redact_internal_props(relation_to_json(&r)));
                 }
             }
         }

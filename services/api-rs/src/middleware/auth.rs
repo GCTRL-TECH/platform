@@ -93,7 +93,14 @@ pub async fn require_auth(
 
         // Wave 2 — read-only embed tokens: a single chokepoint blocking any
         // mutating request before it ever reaches a route handler.
-        if read_only && !matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS) {
+        // Exception (bug-hunt W7): the agent tool surface is POST-only by
+        // transport even for pure reads (list_graphs, query, search_chunks …),
+        // so those two paths pass through here and are enforced per-tool via
+        // the READ_TOOLS whitelist in agent::execute_tool instead.
+        if read_only
+            && !matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS)
+            && !is_agent_tool_path(req.uri().path())
+        {
             return Err(StatusCode::FORBIDDEN);
         }
 
@@ -194,6 +201,14 @@ pub async fn optional_auth(
 
     req.extensions_mut().insert(claims);
     next.run(req).await
+}
+
+/// Agent tool invocation is POST-only by transport even for pure reads
+/// (list_graphs, query, search_chunks …). Read-only keys are allowed through
+/// the HTTP-method chokepoint on these paths; per-tool enforcement happens in
+/// `agent::execute_tool` (READ_TOOLS whitelist).
+fn is_agent_tool_path(path: &str) -> bool {
+    path.starts_with("/api/agent/tools/") || path == "/api/agent/mcp"
 }
 
 pub fn require_role(claims: &JwtClaims, role: &str) -> crate::error::Result<()> {

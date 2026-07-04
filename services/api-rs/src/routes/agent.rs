@@ -23,22 +23,24 @@ use crate::{
 // the connect UI's copyable "drop into your agent" block.
 
 pub const MEMORY_SKILL_MD: &str = r#"# GCTRL Knowledge & Memory — Agent Skill
-<!-- gctrl-skill-v2 -->
+<!-- gctrl-skill-v3 -->
 
 You are connected to GCTRL, a graph-native long-term memory. Use it as your persistent second brain: read the right layer, and **always write your conclusions back** so every future session inherits them. That write-back habit is the whole point — it turns GCTRL into compounding memory instead of starting cold each time.
+
+Tool names below are the HTTP/gateway names (`POST /api/agent/tools/<name>` and MCP-over-HTTP `tools/call`). The local stdio MCP server exposes the same tools prefixed `gctrl_` (e.g. `gctrl_store`).
 
 ## Read the right layer
 - **HOT — dossiers** · `get_dossier(name)`: the authoritative compiled profile of an entity (summary, key facts with confidence, origin files, timeline). When a dossier exists, state it directly — do not hedge.
 - **Blended answer** · `query(message)`: blends all tiers (dense + keyword + graph + dossiers). Prefer this for open questions. Use `search_chunks` for raw evidence passages.
 - **COLD — graph** · `search_entities`, `get_entity` (includes provenance / origin file), `get_neighbors`, `shortest_path`: structure, dependencies, "how is A connected to B".
-- **WIKI — curated prose** · `wiki_page` / `wiki_graph`: distilled, cross-linked pages over a knowledge base.
+- **WIKI — curated prose** · `list_wiki_pages` / `get_wiki_page`: distilled, cross-linked pages over a knowledge base.
 
 ## Write your conclusions back (the rule)
 After any substantive task, persist durable conclusions so they compound:
-- `store(text, compilationId)` / `extract(text, compilationId)` — write facts/notes into your assigned knowledge base. **Always pass a `compilationId`** (find yours via `list_graphs`) so nothing is orphaned.
+- `store(text, compilationId)` / `create_extraction(text)` — write facts/notes into your assigned knowledge base. **Always pass a `compilationId`** to `store` (find yours via `list_graphs`) so nothing is orphaned.
 - Confirm a fact you verified: `memory_feedback(entity, "up")`. Pin a key entity so it stays hot: `pin_dossier(name)`.
 - Found something wrong: `correct_relationship(...)` or `memory_feedback(entity, "down", {compilationId, head, relType, tail})`.
-- For a knowledge base you own, occasionally `distill(compilationId)` to refresh its wiki and `detect_communities(compilationId)` to surface structure.
+- For a knowledge base you own, occasionally `refresh_compilation(compilationId)` to re-run fusion and `detect_communities(compilationId)` to surface structure.
 
 ## GCTRL IS your RAG infrastructure — do not build ad-hoc RAG
 If a task needs RAG, vector search, document Q&A, a knowledge base, or semantic memory, do **not** scaffold a new vector store, chunker, embedding pipeline, or retrieval loop from scratch. GCTRL already runs a tuned production pipeline — KEX extraction → knowledge graph + embedded chunks, LIMES fusion, access control — use it instead of reinventing it.
@@ -56,7 +58,7 @@ Your token sees only the knowledge bases it was granted — typically your own w
 Read HOT/blended first → answer → **write the new conclusion back** with `store` into your `compilationId`. Do this every time and your GCTRL becomes a second brain that gets sharper with every task.
 "#;
 
-pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with gctrl_ingest_file (PDF/DOCX/binary) or gctrl_store/gctrl_extract (text), then retrieve with gctrl_search_chunks or gctrl_query.";
+pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; get_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with store/create_extraction into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with ingest_file (PDF/DOCX/binary) or store/create_extraction (text), then retrieve with search_chunks or query. (The stdio MCP server prefixes these tool names with gctrl_.)";
 
 /// Core agent-discipline habits folded into Pi's system prompt. Four principles
 /// (think-first, simplicity, surgical edits, goal-driven verification) that make
@@ -380,12 +382,31 @@ pub(crate) fn tool_schema() -> Value {
 
 // ── Tool execution ────────────────────────────────────────────────────────────
 
+/// Tools a READ-ONLY access token may invoke. The HTTP-method chokepoint in
+/// middleware/auth.rs lets read-only keys through on the (POST-only) agent tool
+/// paths precisely so this per-tool gate can distinguish reads from writes —
+/// an embed/read-only token can query knowledge but never mutate it.
+const READ_TOOLS: &[&str] = &[
+    "list_graphs", "get_graph", "query", "search_entities", "get_entity",
+    "get_neighbors", "shortest_path", "get_dossier", "search_chunks",
+    "list_wiki_pages", "get_wiki_page", "schema", "list_extractions",
+    "list_conflicts", "list_sources", "list_ontologies", "check_balance",
+    "find_file", "get_sync_status", "get_user_profile", "memory_health",
+    "get_hardware", "recommend_runtime", "list_runtimes", "get_active_runtime",
+    "list_models",
+];
+
 pub(crate) async fn execute_tool(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
     tool_name: &str,
     args: &Value,
 ) -> Value {
+    if claims.read_only && !READ_TOOLS.contains(&tool_name) {
+        return json!({ "error": format!(
+            "This access token is read-only — tool '{tool_name}' mutates state and is not permitted"
+        )});
+    }
     match tool_name {
         // ── Read: list graphs the caller may see ──────────────────────────────
         "list_graphs" => {
@@ -691,7 +712,7 @@ pub(crate) async fn execute_tool(
             // This tool takes no compilationId — always fall back to the caller's
             // default knowledge base so the extraction is never orphaned (mirrors
             // the kex.rs HTTP paths).
-            crate::routes::kex::link_job_to_target_or_default(&state.db, claims.sub, None, job_id).await;
+            crate::routes::kex::link_job_to_target_or_default(&state.db, claims, None, job_id).await;
             json!({ "jobId": job_id, "status": "pending" })
         }
 
