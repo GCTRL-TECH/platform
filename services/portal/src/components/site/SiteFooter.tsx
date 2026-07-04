@@ -39,7 +39,7 @@ export function SiteFooter() {
         <div className="grid gap-10 md:grid-cols-4">
           <div>
             <div className="mb-4">
-              <img src="/gctrl/wordmark-white.svg" alt="GCTRL" className="h-5 w-auto" />
+              <img src="/gctrl/wordmark-white.svg?v=2" alt="GCTRL" className="h-5 w-auto" />
             </div>
             <p className="text-sm leading-relaxed text-slate-500">
               The knowledge infrastructure layer for enterprise AI. Ground your data. Command your AI.
