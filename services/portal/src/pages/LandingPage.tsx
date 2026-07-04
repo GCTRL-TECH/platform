@@ -10,6 +10,7 @@ import { HowItWorksSection } from './sections/HowItWorksSection'
 import { ExplainabilitySection } from './sections/ExplainabilitySection'
 import { IntegrationsSection } from './sections/IntegrationsSection'
 import { BenchmarksSection } from './sections/BenchmarksSection'
+import { VisionSection } from './sections/VisionSection'
 import { CtaSection } from './sections/CtaSection'
 
 export function LandingPage() {
@@ -28,6 +29,7 @@ export function LandingPage() {
         <ExplainabilitySection />
         <section id="integrations"><IntegrationsSection /></section>
         <section id="benchmarks"><BenchmarksSection /></section>
+        <VisionSection />
         <CtaSection />
       </main>
       <SiteFooter />
