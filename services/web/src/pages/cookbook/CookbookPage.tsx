@@ -6,6 +6,7 @@ import { setAgentModelLocal, setRagModelLocal } from '@/lib/models'
 import { HardwareCard, type HardwareInfo, type Recommendation } from '../settings/HardwareCard'
 import { RuntimeCard } from '../settings/RuntimeCard'
 import type { ActiveRuntime } from '../settings/RuntimeSwitcher'
+import { useInstalledModels } from '../settings/ModelPickerShared'
 import { PurposeCard, type CatalogModel, type CatalogResponse, type ModelPrefs } from './PurposeCard'
 
 // Cookbook previously used its own ActiveRuntimeInfo shape (a subset of
@@ -66,11 +67,11 @@ export function CookbookPage() {
   const [hardware, setHardware] = useState<HardwareInfo | null>(null)
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
   const [activeRuntime, setActiveRuntime] = useState<ActiveRuntimeInfo | null>(null)
-  // Read starting the next commit (feeds PurposeCard's "runs on" chip).
-  const [, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
+  const [ollamaOverrideUrl, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null)
   const [prefs, setPrefs] = useState<ModelPrefs | null>(null)
   const [loading, setLoading] = useState(true)
+  const { items: installedModels, reload: reloadInstalledModels } = useInstalledModels()
 
   const loadInfra = useCallback(async () => {
     const [hwRes, recRes, rtRes] = await Promise.allSettled([
@@ -165,6 +166,9 @@ export function CookbookPage() {
                 blurb={p.blurb}
                 catalog={catalog}
                 selected={prefs ? String(prefs[p.prefKey] ?? '') : ''}
+                activeRuntime={activeRuntime}
+                ollamaOverrideUrl={ollamaOverrideUrl}
+                installedModels={installedModels}
                 onApply={async (name) => {
                   if (!prefs) return
                   await persistPrefs({ ...prefs, [p.prefKey]: name })
@@ -176,7 +180,7 @@ export function CookbookPage() {
                   await persistPrefs({ ...prefs, [p.prefKey]: '' })
                   await loadModels() // re-fetch so the card shows the recommended default
                 }}
-                onPulled={() => void loadModels()}
+                onPulled={() => { void loadModels(); void reloadInstalledModels() }}
               />
             ))}
           </section>

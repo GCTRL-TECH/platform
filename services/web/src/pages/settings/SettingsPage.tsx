@@ -59,7 +59,10 @@ import WebhooksPage from './WebhooksPage'
 import { NativeOllamaGuide } from './NativeOllamaGuide'
 import { HardwareCard, type HardwareInfo, type Recommendation } from './HardwareCard'
 import { RuntimeSwitcher, type ActiveRuntime } from './RuntimeSwitcher'
+import { RuntimeModelPicker } from './RuntimeModelPicker'
 import { RuntimeCard } from './RuntimeCard'
+import { bundledGenerationRuntimeId, describeRuntimeShort } from './runtimeLabel'
+import { useInstalledModels, PullAnyModelRow, AllInstalledModelsRow } from './ModelPickerShared'
 import { AdvancedEmbeddingModal } from './AdvancedEmbeddingModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -426,7 +429,10 @@ function LevelBar({ level, icon: Icon, label }: { level: number; icon: typeof Za
   )
 }
 
-function ModelChooser() {
+function ModelChooser({ activeRuntime, ollamaOverrideUrl }: {
+  activeRuntime: ActiveRuntime | null
+  ollamaOverrideUrl: string | null | undefined
+}) {
   const [data, setData] = useState<CatalogResponse | null>(null)
   const [prefs, setPrefs] = useState<ModelPrefs | null>(null)
   const [loading, setLoading] = useState(true)
@@ -434,6 +440,7 @@ function ModelChooser() {
   const [saved, setSaved] = useState(false)
   const [pulling, setPulling] = useState<string | null>(null)
   const [pullMsg, setPullMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const { items: installedModels, reload: reloadInstalledModels } = useInstalledModels()
 
   const loadCatalog = useCallback(async () => {
     try {
@@ -564,19 +571,39 @@ function ModelChooser() {
         const isInstalled = (n: string) =>
           installedList.some((i) => i === n || i.split(':')[0] === n.split(':')[0])
         const selInstalled = isInstalled(sel)
-        // Installed models NOT in the curated set — surfaced so a user whose local
-        // generation models crash (or who runs cloud-passthrough models) can still
-        // pick something that works here, without code changes. Embedding models
-        // are name-gated so chat models don't pollute the embedding picker.
-        const isEmbeddingName = (n: string) => /embed|minilm|nomic|bge|mxbai|gte|e5-/i.test(n)
         const curatedNames = new Set(models.map((m) => m.name))
-        const otherInstalled = installedList
-          .filter((n) => !curatedNames.has(n) && !curatedNames.has(n.split(':')[0]))
-          .filter((n) => (purpose === 'embedding' ? isEmbeddingName(n) : !isEmbeddingName(n)))
+        const runtimeId = purpose === 'embedding' ? null : bundledGenerationRuntimeId(activeRuntime)
+        const ollamaSuffix = ollamaOverrideUrl === undefined ? '' : ollamaOverrideUrl ? ' · native' : ' · bundled'
+        const runtimeChip = purpose === 'embedding'
+          ? `Ollama${ollamaSuffix}`
+          : `${describeRuntimeShort(activeRuntime)}${describeRuntimeShort(activeRuntime) === 'Ollama' ? ollamaSuffix : ''}`
         return (
           <section key={purpose}>
-            <h3 className="text-sm font-medium text-slate-200">{meta.title}</h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-medium text-slate-200">{meta.title}</h3>
+              <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Which runtime this purpose executes on">
+                Runs on: {runtimeChip}
+              </span>
+            </div>
             <p className="mb-3 mt-0.5 text-xs text-slate-500">{meta.blurb}</p>
+
+            {runtimeId && (
+              <div className="mb-3 rounded-md border border-indigo-800/30 bg-indigo-950/10 p-3">
+                <p className="mb-2 text-[11px] text-indigo-300">
+                  This purpose currently executes on <strong>{runtimeId === 'llamacpp' ? 'llama.cpp' : 'vLLM'}</strong>, not
+                  Ollama — pick a model from its catalog below (embeddings always run on Ollama regardless of the active
+                  generation runtime).
+                </p>
+                <RuntimeModelPicker
+                  runtime={runtimeId}
+                  value={sel}
+                  onChange={(name) => choose(purpose, name)}
+                  systemRamGb={data?.systemRamGb}
+                />
+              </div>
+            )}
+
+            <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-600">Recommended</p>
             <div className="space-y-2">
               {models.map((m) => {
                 const isSel = m.name === sel
@@ -640,29 +667,24 @@ function ModelChooser() {
               })}
             </div>
 
-            {/* Other installed models (e.g. cloud-passthrough or non-curated
-                locals) — pick one when the curated locals don't run on this box. */}
-            {otherInstalled.length > 0 && (
-              <div className="mt-2">
-                <p className="mb-1.5 text-[11px] text-slate-500">Other installed models on your Ollama:</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {otherInstalled.map((n) => (
-                    <button
-                      key={n}
-                      onClick={() => choose(purpose, n)}
-                      className={cn(
-                        'rounded-md border px-2 py-1 font-mono text-[11px] transition-colors',
-                        n === sel
-                          ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-300'
-                          : 'border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-600'
-                      )}
-                    >
-                      {n}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* Open selection: every installed/reachable model, not just the 3
+                curated cards above — click to select. */}
+            <AllInstalledModelsRow
+              purpose={purpose}
+              curatedNames={curatedNames}
+              ollamaInstalled={installedList}
+              cloudModels={installedModels}
+              selected={sel}
+              onSelect={(name) => choose(purpose, name)}
+            />
+
+            {/* Pull any tag by name — installs then selects it for this purpose. */}
+            <PullAnyModelRow
+              onPulled={async (name) => {
+                choose(purpose, name)
+                await Promise.all([loadCatalog(), reloadInstalledModels()])
+              }}
+            />
 
             {/* Escape hatch: any model name (handles models not yet pulled, or a
                 remote/cloud model the engine should call by name). */}
@@ -728,13 +750,12 @@ function ModelsTab() {
   // The base URL the server currently has persisted (for the status chip).
   const [ollamaSavedBase, setOllamaSavedBase] = useState<string | null>(null)
 
-  // Shared runtime context — feeds the Inference Runtime card (and, from the
-  // next commit, the per-purpose "runs on" chips below it).
+  // Shared runtime context — feeds the Inference Runtime card and the per-purpose
+  // "runs on" chips below, so the whole tab agrees on what's actually active.
   const [hardware, setHardware] = useState<HardwareInfo | null>(null)
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
   const [activeRuntime, setActiveRuntime] = useState<ActiveRuntime | null>(null)
-  // Read starting the next commit (feeds the per-purpose "runs on" chips).
-  const [, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
+  const [ollamaOverrideUrl, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
 
   const loadRuntimeContext = useCallback(async () => {
     const [hwRes, recRes, rtRes] = await Promise.allSettled([
@@ -929,7 +950,7 @@ function ModelsTab() {
           distillation. Recommended defaults run locally on your Ollama for speed and GDPR
           compliance. Missing models can be installed with one click.
         </p>
-        <ModelChooser />
+        <ModelChooser activeRuntime={activeRuntime} ollamaOverrideUrl={ollamaOverrideUrl} />
       </section>
     </div>
   )
