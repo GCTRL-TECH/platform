@@ -21,11 +21,16 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { AlertCircle, Box, Square, Tag, Gauge, Orbit } from 'lucide-react'
+import { AlertCircle, Box, Square, Tag, Gauge, Orbit, Eye, Palette } from 'lucide-react'
 import SpriteText from 'three-spritetext'
+import * as THREE from 'three'
 import { cn } from '@/lib/utils'
 import { getNodeColor, resolveTypeLabel, withAlpha } from '@/components/graph-explorer/colors'
 import type { GraphEdge, GraphNode, ViewMode } from '@/components/graph-explorer/types'
+import {
+  THEME_LIST, resolveTheme, rotateHue, renderStarfield2D, renderGlowSprite,
+} from '@/components/graph-explorer/themes'
+import { useAdaptiveQuality, type QualityLevel } from './useAdaptiveQuality'
 
 // ── Label rendering tuning (2D) ───────────────────────────────────────────────
 // Node labels fade in between these zoom levels; below MIN nothing is drawn (the
@@ -35,8 +40,6 @@ const LABEL_ZOOM_MIN = 0.9
 const LABEL_ZOOM_FULL = 1.8
 const EDGE_LABEL_ZOOM = 4
 const MAX_LABELS_PER_FRAME = 200
-const FPS_FLOOR = 12 // below this (smoothed) → drop labels
-const FPS_RECOVER = 22 // above this → restore labels
 
 // ── Label tuning (3D) ─────────────────────────────────────────────────────────
 // 3D labels are SpriteText objects whose opacity fades by distance from the
@@ -78,12 +81,16 @@ const ForceGraph3D = lazy(() =>
   import('react-force-graph-3d').then((m) => ({ default: m.default })),
 )
 
-// Hard ceiling on SIMULATED nodes — the force layout (not drawing) is the cost,
-// and react-force-graph stays smooth up to a few thousand. Realistic graphs sit
-// well under this, so every node renders; only a pathological graph degrades to
-// its degree-ordered core. The viewport bounds what's *visible* via the zoom
-// clamp below (MIN_ZOOM/MAX_ZOOM) — the user pans to reach the rest.
-const MAX_NODES = 4000
+// Hard ceiling on SIMULATED nodes — a tab-crash safety valve, not the normal
+// quality control. The force layout (not drawing) is the cost here; below this
+// ceiling every node is simulated and the adaptive quality governor
+// (useAdaptiveQuality) decides what's actually DRAWN via nodeVisibility /
+// linkVisibility (degree/confidence-ranked, FPS-driven — see Wave 2). Only a
+// truly pathological graph (>50k nodes) gets pre-sliced to its degree-ordered
+// core before it ever reaches the simulation. The viewport bounds what's
+// *visible* via the zoom clamp below (MIN_ZOOM/MAX_ZOOM) — the user pans to
+// reach the rest.
+const NODE_HARD_CEILING = 50_000
 // Zoom-out floor: can't shrink the whole graph to dust — a big graph shows a
 // readable region and you pan for more. Zoom-in ceiling keeps nodes from
 // ballooning. These give the "≤~viewport-worth visible, pan to see more" feel.
@@ -157,9 +164,12 @@ interface WorkspaceCanvasProps {
    *  this node and it is highlighted, without committing a selection. */
   peekNodeId?: string | null
   className?: string
+  /** Explicit theme override (e.g. from an embed's ?theme= query param).
+   *  Falls back to localStorage['gw.theme'], then 'midnight'. */
+  theme?: string
 }
 
-export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId = null, className }: WorkspaceCanvasProps) {
+export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId = null, className, theme: themeProp }: WorkspaceCanvasProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('2d')
   // Whether 3D can run here at all (WebGL probe). When false we keep the user in
   // 2D and disable the 3D toggle instead of letting three.js throw.
@@ -187,12 +197,41 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
       return nv
     })
   }, [])
-  // Surfaced indicator when the FPS guard has dropped labels.
-  const [labelsThrottled, setLabelsThrottled] = useState(false)
-
   // Auto-orbit (3D only): a showcase mode that slowly rotates the camera.
   const [autoRotate, setAutoRotate] = useState(false)
   const fg3dRef = useRef<any>(null)
+
+  // ── Theme (Wave 2) ──────────────────────────────────────────────────────
+  // Precedence: explicit prop (embed ?theme=) > persisted pick > default.
+  const [themeId, setThemeId] = useState<string>(() => {
+    if (themeProp) return themeProp
+    try { return localStorage.getItem('gw.theme') ?? 'midnight' } catch { return 'midnight' }
+  })
+  const [themeHue, setThemeHue] = useState<number>(() => {
+    if (themeProp) return 0 // embeds don't read the hue slider's own storage
+    try { return parseInt(localStorage.getItem('gw.themeHue') ?? '0', 10) || 0 } catch { return 0 }
+  })
+  const [themePickerOpen, setThemePickerOpen] = useState(false)
+  const theme = resolveTheme(themeId)
+  const selectTheme = useCallback((id: string) => {
+    setThemeId(id)
+    try { localStorage.setItem('gw.theme', id) } catch { /* ignore */ }
+  }, [])
+  const setHue = useCallback((deg: number) => {
+    setThemeHue(deg)
+    try { localStorage.setItem('gw.themeHue', String(deg)) } catch { /* ignore */ }
+  }, [])
+  // Resolve a node's final drawn colour: curated/hashed base → theme hue
+  // transform (if any) → user hue-slider rotation. Shared by the 2D/3D node
+  // colour callbacks AND the glow sprite so they never drift apart.
+  const resolveThemedNodeColor = useCallback(
+    (node: GraphNode) => {
+      const base = getNodeColor(node, 'type')
+      const themed = theme.nodeColor?.(base) ?? base
+      return rotateHue(themed, themeHue)
+    },
+    [theme, themeHue],
+  )
 
   // Measure the container; the canvas mounts only once we have real dimensions.
   useEffect(() => {
@@ -208,23 +247,51 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
     return () => ro.disconnect()
   }, [])
 
-  // Cap node count by degree and keep only edges whose BOTH endpoints survive —
-  // react-force-graph throws on a link referencing a missing node.
-  const { displayNodes, displayLinks, degree } = useMemo(() => {
+  // Cap node count by degree (tab-crash safety valve only, see
+  // NODE_HARD_CEILING) and keep only edges whose BOTH endpoints survive —
+  // react-force-graph throws on a link referencing a missing node. Also
+  // precompute a degree RANK per node and a confidence/degree RANK per edge —
+  // the adaptive quality governor uses these ranks (not raw degree/confidence)
+  // to decide what's visible each frame, so the "top N" is always the most
+  // meaningfully-connected/most-confident subset, never an arbitrary slice.
+  const { displayNodes, displayLinks, degree, degreeRank, edgeCount } = useMemo(() => {
     const degree = new Map<string, number>()
     for (const e of edges) {
       degree.set(e.source, (degree.get(e.source) ?? 0) + 1)
       degree.set(e.target, (degree.get(e.target) ?? 0) + 1)
     }
     let ns = nodes
-    if (nodes.length > MAX_NODES) {
-      ns = [...nodes].sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0)).slice(0, MAX_NODES)
+    if (nodes.length > NODE_HARD_CEILING) {
+      ns = [...nodes].sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0)).slice(0, NODE_HARD_CEILING)
     }
     const ids = new Set(ns.map((n) => n.id))
-    const ls = edges
+
+    // Degree rank: 0 = most-connected. Used by nodeVisibility (L3 culling).
+    const degreeRank = new Map<string, number>()
+    ;[...ns]
+      .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
+      .forEach((n, i) => degreeRank.set(n.id, i))
+
+    // Edge rank: confidence desc, then min-endpoint-degree desc. Embedded
+    // directly on each (freshly-created) edge object as `_edgeRank` — edges
+    // are already remapped into new objects every recompute, so this is a
+    // free O(1) lookup at draw time with no extra Map/identity bookkeeping.
+    const lsBase = edges
       .filter((e) => ids.has(e.source) && ids.has(e.target))
-      .map((e) => ({ source: e.source, target: e.target, type: e.type, confidence: e.confidence }))
-    return { displayNodes: ns, displayLinks: ls, degree }
+      .map((e) => ({ source: e.source, target: e.target, type: e.type, confidence: e.confidence, _edgeRank: 0 }))
+    const minEndpointDegree = (e: { source: string; target: string }) =>
+      Math.min(degree.get(e.source) ?? 0, degree.get(e.target) ?? 0)
+    const order = lsBase
+      .map((_, i) => i)
+      .sort((a, b) => {
+        const ca = lsBase[a].confidence ?? -1
+        const cb = lsBase[b].confidence ?? -1
+        if (cb !== ca) return cb - ca
+        return minEndpointDegree(lsBase[b]) - minEndpointDegree(lsBase[a])
+      })
+    order.forEach((origIdx, rank) => { lsBase[origIdx]._edgeRank = rank })
+
+    return { displayNodes: ns, displayLinks: lsBase, degree, degreeRank, edgeCount: lsBase.length }
   }, [nodes, edges])
 
   // Live degree map for the size + label callbacks (read via ref so accessor
@@ -232,6 +299,36 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
   const degreeRef = useRef(degree)
   degreeRef.current = degree
   const nodeVal = useCallback((n: object) => valFromDegree(degreeRef.current.get((n as GraphNode).id) ?? 0), [])
+
+  // ── Adaptive render quality (Wave 2) ───────────────────────────────────
+  // Replaces the old binary "labels throttled at low FPS" guard with a
+  // graduated ladder (labels → edges → nodes) — see useAdaptiveQuality.ts.
+  const quality = useAdaptiveQuality()
+  const qualityRef = useRef(quality)
+  qualityRef.current = quality
+  const degreeRankRef = useRef(degreeRank)
+  degreeRankRef.current = degreeRank
+  const edgeCountRef = useRef(edgeCount)
+  edgeCountRef.current = edgeCount
+
+  // "Show all" override: suppresses the governor (frozen at full quality)
+  // until the user turns it off again or the underlying graph data changes.
+  const [userForcedFull, setUserForcedFull] = useState(false)
+  const userForcedFullRef = useRef(userForcedFull)
+  userForcedFullRef.current = userForcedFull
+
+  // Warmup seeding: a very large graph starts pre-degraded instead of visibly
+  // "falling" into it after a few slow seconds. Also clears the "show all"
+  // override whenever the underlying data actually changes (new compilation).
+  useEffect(() => {
+    const total = nodes.length
+    const seedLevel: QualityLevel = total > 35_000 ? 3 : total > 20_000 ? 2 : 0
+    quality.reset(seedLevel)
+    setUserForcedFull(false)
+    // quality.reset has a stable identity (useCallback, no deps) — only `nodes`
+    // (fresh data) should re-trigger this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodes])
 
   const graphData = useMemo(() => ({ nodes: displayNodes, links: displayLinks }), [displayNodes, displayLinks])
 
@@ -324,10 +421,10 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
   }, [peekNodeId, viewMode])
 
   const nodeColor = useCallback(
-    (n: object) => withAlpha(getNodeColor(n as GraphNode, 'type'), alphaOf((n as GraphNode).id)),
+    (n: object) => withAlpha(resolveThemedNodeColor(n as GraphNode), alphaOf((n as GraphNode).id)),
     // animTick: fresh identity each frame so the ForceGraph re-reads colours.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [alphaOf, animTick],
+    [alphaOf, animTick, resolveThemedNodeColor],
   )
   const linkColor = useCallback(
     (l: object) => {
@@ -341,19 +438,22 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
       const f = Math.min(alphaOf(s), alphaOf(t)) // least-focused endpoint
       const focusOp = 0.08 + (0.5 - 0.08) * ((f - FADE) / (1 - FADE))
       // A4 — encode per-edge confidence. Higher confidence = brighter + greener;
-      // lower = dimmer + amber/red. Edges with no confidence render neutral slate.
+      // lower = dimmer + amber/red. Edges with no confidence render the theme's
+      // neutral link colour. `opacityScale` lets a theme (e.g. galaxy) run
+      // slightly brighter edges without touching the confidence math itself.
       const c = typeof e.confidence === 'number' ? Math.max(0, Math.min(1, e.confidence)) : null
-      if (c === null) return withAlpha('#475569', focusOp)
+      const scaledOp = Math.min(1, focusOp * theme.link.opacityScale)
+      if (c === null) return withAlpha(theme.link.neutral, scaledOp)
       // Confidence scales opacity (0.5 floor → 1.0) on top of the focus dimming,
       // and shifts hue from amber (#f59e0b, low) → emerald (#10b981, high).
-      const op = focusOp * (0.5 + 0.5 * c)
+      const op = Math.min(1, scaledOp * (0.5 + 0.5 * c))
       const lo = [245, 158, 11] // amber-500
       const hi = [16, 185, 129] // emerald-500
       const rgb = lo.map((v, i) => Math.round(v + (hi[i] - v) * c))
       return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${op.toFixed(3)})`
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [alphaOf, animTick],
+    [alphaOf, animTick, theme],
   )
   // A4 — edge WIDTH by confidence: 0.4 (low) → 2.0 (high). Unknown → 0.8 baseline.
   const linkWidth = useCallback((l: object) => {
@@ -364,14 +464,37 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
 
   // ── Label perf guard ──────────────────────────────────────────────────
   // Refs (not state) so the per-frame canvas callbacks read live values without
-  // re-rendering. A smoothed FPS estimate auto-drops labels under load.
+  // re-rendering. Labels are gated by the adaptive quality governor
+  // (qualityRef.labelsEnabled, off from L1 up) OR the "show all" override.
   const zoomRef = useRef(1)
-  const labelsThrottledRef = useRef(false)
-  const fpsRef = useRef(60)
-  const lastFrameRef = useRef(0)
   const frameLabelCountRef = useRef(0)
   const showLabelsRef = useRef(showLabels)
   showLabelsRef.current = showLabels
+  const labelsGatedOff = useCallback(
+    () => !qualityRef.current.labelsEnabled && !userForcedFullRef.current,
+    [],
+  )
+
+  // ── Theme refs (per-frame-safe reads) ──────────────────────────────────
+  const themeRef = useRef(theme)
+  themeRef.current = theme
+  // 2D glow: cached one radial-gradient sprite per resolved node colour.
+  // Cleared whenever the theme changes so stale-colour sprites never linger.
+  const glowCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map())
+  useEffect(() => { glowCacheRef.current.clear() }, [theme])
+  const getGlowSprite = useCallback((color: string) => {
+    let spr = glowCacheRef.current.get(color)
+    if (!spr) {
+      spr = renderGlowSprite(color)
+      glowCacheRef.current.set(color, spr)
+    }
+    return spr
+  }, [])
+  // Glow only at full quality and under the theme's node-count ceiling — it
+  // never fights the adaptive quality governor for frame budget.
+  const glowActive = Boolean(theme.glow) && quality.level === 0 && displayNodes.length <= (theme.glow?.maxNodes ?? 0)
+  const glowActiveRef = useRef(glowActive)
+  glowActiveRef.current = glowActive
 
   // ── 3D label sprites ──────────────────────────────────────────────────
   // SpriteText objects created by nodeThreeObject / linkThreeObject, kept in maps
@@ -398,38 +521,62 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
     [idOfEndpoint],
   )
 
-  // Runs once per rendered frame (2D): track zoom, reset the per-frame label
-  // budget, and measure smoothed FPS → toggle the throttle with hysteresis.
-  const onRenderFramePre = useCallback((_ctx: CanvasRenderingContext2D, globalScale: number) => {
+  // ── 2D starfield (theme-driven) ────────────────────────────────────────
+  // Rendered ONCE into a detached canvas sized to the container, then blitted
+  // per frame with an identity transform (never regenerated per-frame — see
+  // themes.ts renderStarfield2D). Regenerates on resize or theme change.
+  const starfieldCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  useEffect(() => {
+    const cfg = theme.threeD.starfield
+    if (!cfg || dim.w <= 0 || dim.h <= 0) {
+      starfieldCanvasRef.current = null
+      return
+    }
+    starfieldCanvasRef.current = renderStarfield2D(dim.w, dim.h, cfg.count)
+  }, [theme, dim.w, dim.h])
+
+  // Runs once per rendered frame (2D): blit the starfield (if any), track
+  // zoom, reset the per-frame label budget, and feed the adaptive quality
+  // governor's smoothed FPS estimate.
+  const onRenderFramePre = useCallback((ctx: CanvasRenderingContext2D, globalScale: number) => {
+    const starfield = starfieldCanvasRef.current
+    if (starfield) {
+      // Identity transform so the starfield sits in screen space (not
+      // affected by zoom/pan) — a small parallax offset keeps it from
+      // feeling perfectly static as the user pans.
+      const tf = ctx.getTransform()
+      ctx.save()
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.drawImage(starfield, tf.e * 0.05, tf.f * 0.05)
+      ctx.restore()
+    }
     zoomRef.current = globalScale
     frameLabelCountRef.current = 0
-    const now = performance.now()
-    const last = lastFrameRef.current
-    lastFrameRef.current = now
-    if (last) {
-      const dt = now - last
-      if (dt > 0) fpsRef.current = fpsRef.current * 0.9 + (1000 / dt) * 0.1
-    }
-    if (!labelsThrottledRef.current && fpsRef.current < FPS_FLOOR) {
-      labelsThrottledRef.current = true
-      setLabelsThrottled(true)
-    } else if (labelsThrottledRef.current && fpsRef.current > FPS_RECOVER) {
-      labelsThrottledRef.current = false
-      setLabelsThrottled(false)
-    }
+    if (!userForcedFullRef.current) qualityRef.current.registerFrame(performance.now())
   }, [])
 
-  // Draw a node label (after the default node circle) — zoom-faded, focus-aware,
-  // viewport-culled, per-frame-capped. Skipped entirely when off / throttled /
-  // zoomed out (the main perf win).
+  // Draw a node's glow (theme-driven, independent of the labels toggle) + its
+  // label — zoom-faded, focus-aware, viewport-culled, per-frame-capped. The
+  // glow half always runs when active (drawn first so it lands behind the
+  // node circle — see nodeCanvasObjectMode below); the label half is skipped
+  // entirely when off / degraded / zoomed out (the main perf win).
   const nodeCanvasObject = useCallback(
     (node: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      if (!showLabelsRef.current || labelsThrottledRef.current) return
+      const n = node as GraphNode & { x?: number; y?: number }
+      if (n.x == null || n.y == null) return
+
+      if (glowActiveRef.current) {
+        const color = resolveThemedNodeColor(n)
+        const spr = getGlowSprite(color)
+        const r = radiusFromDegree(degreeRef.current.get(n.id) ?? 0)
+        const size = r * (themeRef.current.glow?.spriteScale ?? 2.2) * 2
+        ctx.drawImage(spr, n.x - size / 2, n.y - size / 2, size, size)
+      }
+
+      if (!showLabelsRef.current || labelsGatedOff()) return
       const zoomT = smoothstep(globalScale, LABEL_ZOOM_MIN, LABEL_ZOOM_FULL)
       if (zoomT <= 0) return
       if (frameLabelCountRef.current >= MAX_LABELS_PER_FRAME) return
-      const n = node as GraphNode & { x?: number; y?: number }
-      if (n.x == null || n.y == null) return
       // Viewport cull (device-pixel screen coords via the current transform).
       const tf = ctx.getTransform()
       const sx = tf.a * n.x + tf.e
@@ -448,19 +595,24 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
       ctx.textAlign = 'center'
       ctx.textBaseline = 'top'
       ctx.lineWidth = 2 / globalScale
-      ctx.strokeStyle = `rgba(2,6,23,${(0.7 * alpha).toFixed(3)})`
+      ctx.strokeStyle = withAlpha(themeRef.current.labelStyle.outline, 0.7 * alpha)
       ctx.strokeText(label, n.x, n.y + r + 2)
-      ctx.fillStyle = `rgba(214,222,236,${alpha.toFixed(3)})`
+      ctx.fillStyle = withAlpha(themeRef.current.labelStyle.color, alpha)
       ctx.fillText(label, n.x, n.y + r + 2)
       ctx.restore()
     },
-    [alphaOf],
+    [alphaOf, labelsGatedOff, resolveThemedNodeColor, getGlowSprite],
   )
+  // Glow needs to draw BEHIND the default node circle; force-graph only
+  // supports one timing per render, so when glow is active we switch to
+  // 'before' mode globally (the label still reads fine drawn first — it sits
+  // below the node, offset by its radius, so there's no visual conflict).
+  const nodeCanvasObjectMode = useCallback(() => (glowActiveRef.current ? 'before' : 'after'), [])
 
   // Edge/relationship label — only when zoomed in very close.
   const linkCanvasObject = useCallback(
     (link: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      if (!showLabelsRef.current || labelsThrottledRef.current) return
+      if (!showLabelsRef.current || labelsGatedOff()) return
       if (globalScale < EDGE_LABEL_ZOOM) return
       if (frameLabelCountRef.current >= MAX_LABELS_PER_FRAME) return
       const l = link as {
@@ -481,13 +633,13 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
       ctx.lineWidth = 2 / globalScale
-      ctx.strokeStyle = `rgba(2,6,23,${(0.7 * alpha).toFixed(3)})`
+      ctx.strokeStyle = withAlpha(themeRef.current.labelStyle.outline, 0.7 * alpha)
       ctx.strokeText(l.type, mx, my)
-      ctx.fillStyle = `rgba(148,163,184,${alpha.toFixed(3)})`
+      ctx.fillStyle = withAlpha(theme.link.neutral, alpha)
       ctx.fillText(l.type, mx, my)
       ctx.restore()
     },
-    [],
+    [labelsGatedOff, theme.link.neutral],
   )
 
   // ── 3D sprite factories ───────────────────────────────────────────────
@@ -499,7 +651,7 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
     const text = n.label || resolveTypeLabel(n)
     const sprite = new SpriteText(text || '')
     sprite.textHeight = 3.5
-    sprite.color = '#d6deec'
+    sprite.color = themeRef.current.threeD.spriteColor
     sprite.material.depthWrite = false
     sprite.material.transparent = true
     sprite.material.opacity = 0
@@ -519,7 +671,7 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
       }
       const sprite = new SpriteText(l.type)
       sprite.textHeight = 2.5
-      sprite.color = '#94a3b8'
+      sprite.color = themeRef.current.threeD.spriteColor
       sprite.material.depthWrite = false
       sprite.material.transparent = true
       sprite.material.opacity = 0
@@ -543,6 +695,53 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
     },
     [],
   )
+
+  // ── 3D theme application ────────────────────────────────────────────────
+  // Scene background + starfield are imperative (three.js) state that react-
+  // force-graph doesn't expose as props, so we reach into scene() directly.
+  // Runs whenever the theme changes or 3D mounts. No bloom pass — deliberately
+  // kept out per the design (post-processing is a real frame-time cost on
+  // large graphs and glow is already handled cheaply in 2D via sprites).
+  const starPointsRef = useRef<THREE.Points | null>(null)
+  useEffect(() => {
+    if (viewMode !== '3d') return
+    const fg = fg3dRef.current
+    if (!fg || typeof fg.scene !== 'function') return
+    const scene = fg.scene()
+    scene.background = new THREE.Color(theme.threeD.bg)
+
+    if (starPointsRef.current) {
+      scene.remove(starPointsRef.current)
+      starPointsRef.current.geometry.dispose()
+      ;(starPointsRef.current.material as THREE.Material).dispose()
+      starPointsRef.current = null
+    }
+    const cfg = theme.threeD.starfield
+    if (cfg) {
+      const positions = new Float32Array(cfg.count * 3)
+      for (let i = 0; i < cfg.count; i++) {
+        const r = cfg.radius * (0.8 + Math.random() * 0.2)
+        const t = Math.random() * Math.PI * 2
+        const p = Math.acos(2 * Math.random() - 1)
+        positions[i * 3] = r * Math.sin(p) * Math.cos(t)
+        positions[i * 3 + 1] = r * Math.sin(p) * Math.sin(t)
+        positions[i * 3 + 2] = r * Math.cos(p)
+      }
+      const geo = new THREE.BufferGeometry()
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+      const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: false })
+      const points = new THREE.Points(geo, mat)
+      scene.add(points)
+      starPointsRef.current = points
+    }
+
+    // Sprites created before this theme change won't pick up the new colour
+    // on their own (react-force-graph only recreates them on graphData
+    // change) — refresh them in place; three-spritetext regenerates its
+    // canvas texture on the `color` setter.
+    for (const spr of spriteMapRef.current.values()) spr.color = theme.threeD.spriteColor
+    for (const spr of edgeSpriteMapRef.current.values()) spr.color = theme.threeD.spriteColor
+  }, [viewMode, theme])
 
   // ── 3D auto-orbit loop ─────────────────────────────────────────────────
   // When 3D + autoRotate, slowly orbit the camera in the xz-plane (keeping y).
@@ -578,38 +777,26 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
   }, [viewMode, autoRotate])
 
   // ── 3D distance-gated label loop ───────────────────────────────────────
-  // Runs only in 3D. Each frame: measure smoothed FPS (the 2D onRenderFramePre
-  // doesn't fire here, so drive the guard from this loop), then fade every node /
-  // edge sprite by its distance from the camera. Reuses showLabels + the same
-  // throttle pill machinery as 2D. A per-frame visible cap bounds draw cost.
+  // Runs only in 3D. Each frame: feed the adaptive quality governor's smoothed
+  // FPS estimate (the 2D onRenderFramePre doesn't fire here, so drive it from
+  // this loop instead), then fade every node/edge sprite by its distance from
+  // the camera. Reuses showLabels + the same quality gate as 2D. A per-frame
+  // visible cap bounds draw cost.
   useEffect(() => {
     if (viewMode !== '3d') return
     let raf = 0
-    let last = 0
     const camPos = { x: 0, y: 0, z: 0 }
     const tick = () => {
       const fg = fg3dRef.current
       if (fg && typeof fg.camera === 'function') {
-        // Smoothed FPS measured from this loop's own cadence.
         const now = performance.now()
-        if (last) {
-          const dt = now - last
-          if (dt > 0) fpsRef.current = fpsRef.current * 0.9 + (1000 / dt) * 0.1
-        }
-        last = now
-        if (!labelsThrottledRef.current && fpsRef.current < FPS_FLOOR) {
-          labelsThrottledRef.current = true
-          setLabelsThrottled(true)
-        } else if (labelsThrottledRef.current && fpsRef.current > FPS_RECOVER) {
-          labelsThrottledRef.current = false
-          setLabelsThrottled(false)
-        }
+        if (!userForcedFullRef.current) qualityRef.current.registerFrame(now)
 
         const cam = fg.camera().position
         camPos.x = cam.x
         camPos.y = cam.y
         camPos.z = cam.z
-        const gateOff = !showLabelsRef.current || labelsThrottledRef.current
+        const gateOff = !showLabelsRef.current || labelsGatedOff()
         let shown = 0
 
         // Node sprites.
@@ -683,15 +870,46 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
   const handleHover = useCallback((n: object | null) => setHoveredId(n ? (n as GraphNode).id : null), [])
   const ready = dim.w > 0 && dim.h > 0
 
+  // ── Visibility-only culling (Wave 2 adaptive quality) ──────────────────
+  // These never touch graphData/simulation — react-force-graph still lays out
+  // every node, so nothing jumps or restarts when the governor steps; it just
+  // stops DRAWING the lowest-ranked nodes/edges. Reads go through refs so the
+  // callbacks' identities stay stable across frames (recreated only on an
+  // actual quality-level or "show all" change, both rare).
+  const nodeVisibility = useCallback((n: object) => {
+    if (userForcedFullRef.current) return true
+    const budget = qualityRef.current.nodeVisibleBudget
+    if (!Number.isFinite(budget)) return true
+    const rank = degreeRankRef.current.get((n as GraphNode).id) ?? Infinity
+    return rank < budget
+  }, [])
+  const linkVisibility = useCallback((l: object) => {
+    if (userForcedFullRef.current) return true
+    const edge = l as { source: unknown; target: unknown; _edgeRank?: number }
+    const frac = qualityRef.current.edgeVisibleFraction
+    const total = edgeCountRef.current
+    const rank = edge._edgeRank ?? Infinity
+    if (frac < 1 && rank >= total * frac) return false
+    const budget = qualityRef.current.nodeVisibleBudget
+    if (Number.isFinite(budget)) {
+      const sRank = degreeRankRef.current.get(idOfEndpoint(edge.source)) ?? Infinity
+      const tRank = degreeRankRef.current.get(idOfEndpoint(edge.target)) ?? Infinity
+      if (sRank >= budget || tRank >= budget) return false
+    }
+    return true
+  }, [idOfEndpoint])
+
   const commonProps = {
     graphData,
     width: dim.w,
     height: dim.h,
-    backgroundColor: '#020617',
+    backgroundColor: theme.background,
     nodeRelSize: NODE_REL_SIZE,
     nodeVal: nodeVal as never,
     nodeColor: nodeColor as never,
     nodeLabel: ((n: object) => (n as GraphNode).label || resolveTypeLabel(n as GraphNode)) as never,
+    nodeVisibility: nodeVisibility as never,
+    linkVisibility: linkVisibility as never,
     linkColor: linkColor as never,
     linkWidth: linkWidth as never,
     linkDirectionalArrowLength: 3,
@@ -704,10 +922,62 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
     maxZoom: MAX_ZOOM,
   }
 
+  // Human-readable summary of the current degradation, for the quality pill.
+  const qualityMessage = (() => {
+    if (quality.level === 0) return null
+    if (quality.level === 1) return 'labels off'
+    if (quality.level === 2) return 'labels off · edges reduced'
+    return `showing top ${quality.nodeVisibleBudget.toLocaleString()} nodes`
+  })()
+
   return (
     <div ref={containerRef} className={cn('relative h-full w-full overflow-hidden bg-slate-950', className)}>
-      {/* Controls: labels toggle + 2D/3D */}
+      {/* Controls: theme picker + labels toggle + 2D/3D */}
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
+        <div className="relative">
+          <button
+            onClick={() => setThemePickerOpen((v) => !v)}
+            title="Canvas theme"
+            className={cn('flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] transition-colors',
+              themePickerOpen ? 'border-indigo-600 bg-indigo-950/50 text-indigo-300' : 'border-slate-700 bg-slate-900/90 text-slate-500 hover:text-slate-300')}
+          >
+            <Palette size={11} /> Theme
+          </button>
+          {themePickerOpen && (
+            <>
+              <div className="fixed inset-0 z-30" onClick={() => setThemePickerOpen(false)} />
+              <div className="absolute right-0 top-full z-40 mt-1.5 w-52 rounded-lg border border-slate-700 bg-slate-900 p-2.5 shadow-2xl">
+                <div className="grid grid-cols-1 gap-1">
+                  {THEME_LIST.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => selectTheme(t.id)}
+                      className={cn('flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11px] transition-colors',
+                        themeId === t.id ? 'bg-indigo-500/15 text-indigo-200 ring-1 ring-indigo-500/30' : 'text-slate-300 hover:bg-slate-800/70')}
+                    >
+                      <span
+                        className="h-3.5 w-3.5 shrink-0 rounded-full border border-white/10"
+                        style={{ background: t.background }}
+                      />
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-2.5 border-t border-slate-800 pt-2.5">
+                  <label className="flex items-center justify-between text-[10px] text-slate-500">
+                    Hue shift
+                    <span className="tabular-nums text-slate-400">{themeHue}°</span>
+                  </label>
+                  <input
+                    type="range" min={-180} max={180} step={1} value={themeHue}
+                    onChange={(e) => setHue(parseInt(e.target.value, 10))}
+                    className="mt-1 w-full accent-indigo-500"
+                  />
+                </div>
+              </div>
+            </>
+          )}
+        </div>
         <button
           onClick={toggleLabels}
           title={showLabels ? 'Hide node labels' : 'Show node labels'}
@@ -750,10 +1020,30 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
         </div>
       )}
 
-      {/* FPS guard surfaced: labels auto-dropped under load (2D + 3D). */}
-      {showLabels && labelsThrottled && (
+      {/* Adaptive quality governor surfaced: what got degraded, plus an escape
+          hatch back to full quality (2D + 3D — see useAdaptiveQuality). */}
+      {!userForcedFull && qualityMessage && (
         <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-md border border-amber-700/50 bg-amber-950/40 px-2 py-1 text-[10px] text-amber-300">
-          <Gauge size={11} /> Labels paused (performance)
+          <Gauge size={11} /> Performance mode: {qualityMessage}
+          <button
+            onClick={() => setUserForcedFull(true)}
+            title="Force full quality until the graph changes"
+            className="ml-1 flex items-center gap-1 rounded border border-amber-600/40 px-1.5 py-0.5 text-amber-200 hover:bg-amber-900/40"
+          >
+            <Eye size={10} /> Show all
+          </button>
+        </div>
+      )}
+      {userForcedFull && (
+        <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-md border border-indigo-700/50 bg-indigo-950/40 px-2 py-1 text-[10px] text-indigo-300">
+          <Eye size={11} /> Full quality (forced)
+          <button
+            onClick={() => setUserForcedFull(false)}
+            title="Resume automatic performance scaling"
+            className="ml-1 rounded border border-indigo-600/40 px-1.5 py-0.5 text-indigo-200 hover:bg-indigo-900/40"
+          >
+            Auto
+          </button>
         </div>
       )}
 
@@ -782,7 +1072,7 @@ export function WorkspaceCanvas({ nodes, edges, selectedId, onSelect, peekNodeId
                 {...commonProps}
                 ref={fg2dRef as never}
                 onRenderFramePre={onRenderFramePre as never}
-                nodeCanvasObjectMode={(() => 'after') as never}
+                nodeCanvasObjectMode={nodeCanvasObjectMode as never}
                 nodeCanvasObject={nodeCanvasObject as never}
                 linkCanvasObjectMode={(() => 'after') as never}
                 linkCanvasObject={linkCanvasObject as never}

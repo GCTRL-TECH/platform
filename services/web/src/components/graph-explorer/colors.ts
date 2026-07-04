@@ -99,9 +99,10 @@ export function resolveSourceJobId(node: GraphNode): string | null {
 /**
  * FNV-1a 32-bit hash — small, fast, deterministic.
  * Used for the unknown-key fallback palette so the same string always maps to
- * the same hue across reloads.
+ * the same hue across reloads. Exported for reuse by theme hue transforms
+ * (see graph-explorer/themes.ts).
  */
-function fnv1a(s: string): number {
+export function fnv1a(s: string): number {
   let h = 0x811c9dc5
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i)
@@ -181,7 +182,8 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
   return { r: (num >> 16) & 0xff, g: (num >> 8) & 0xff, b: num & 0xff }
 }
 
-function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: number } {
+/** Exported for reuse by theme hue transforms (see graph-explorer/themes.ts). */
+export function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: number } {
   s /= 100
   l /= 100
   const k = (n: number) => (n + h / 30) % 12
