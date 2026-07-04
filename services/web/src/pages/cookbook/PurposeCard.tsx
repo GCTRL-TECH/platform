@@ -2,6 +2,10 @@ import { useState, useEffect } from 'react'
 import { Check, Sparkles, AlertTriangle, Download, Loader2, Zap, Gauge } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
+import type { ActiveRuntime } from '../settings/RuntimeSwitcher'
+import { RuntimeModelPicker } from '../settings/RuntimeModelPicker'
+import { bundledGenerationRuntimeId, describeRuntimeShort } from '../settings/runtimeLabel'
+import { AllInstalledModelsRow, PullAnyModelRow, type InstalledModelEntry } from '../settings/ModelPickerShared'
 
 export interface CatalogModel {
   name: string
@@ -61,6 +65,13 @@ interface Props {
   onReset: () => Promise<void>
   /** Called after a successful install so the parent can refresh the catalog. */
   onPulled: () => void
+  /** The globally active generation runtime — drives the "runs on" chip and the
+   * llama.cpp/vLLM model-catalog branch below. */
+  activeRuntime?: ActiveRuntime | null
+  /** Ollama location (bundled vs. native) — undefined when unknown (non-admin). */
+  ollamaOverrideUrl?: string | null | undefined
+  /** Every model GET /llm/models can currently address (Ollama + connected cloud), for the open "All installed models" selection. */
+  installedModels?: InstalledModelEntry[]
 }
 
 /**
@@ -68,7 +79,10 @@ interface Props {
  * Settings → AI Models → ModelChooser, but with a per-card Apply/Reset instead
  * of one global save (the Cookbook applies purpose-by-purpose).
  */
-export function PurposeCard({ purpose, title, blurb, catalog, selected, onApply, onReset, onPulled }: Props) {
+export function PurposeCard({
+  purpose, title, blurb, catalog, selected, onApply, onReset, onPulled,
+  activeRuntime = null, ollamaOverrideUrl, installedModels = [],
+}: Props) {
   const [applying, setApplying] = useState<string | null>(null)
   const [pulling, setPulling] = useState<string | null>(null)
   const [resetting, setResetting] = useState(false)
@@ -79,8 +93,15 @@ export function PurposeCard({ purpose, title, blurb, catalog, selected, onApply,
 
   const models = (catalog?.catalog ?? []).filter((m) => m.purpose === purpose)
   const installedList = catalog?.installed ?? []
+  const curatedNames = new Set(models.map((m) => m.name))
   const isInstalled = (n: string) =>
     installedList.some((i) => i === n || i.split(':')[0] === n.split(':')[0])
+
+  const runtimeId = purpose === 'embedding' ? null : bundledGenerationRuntimeId(activeRuntime)
+  const ollamaSuffix = ollamaOverrideUrl === undefined ? '' : ollamaOverrideUrl ? ' · native' : ' · bundled'
+  const runtimeChip = purpose === 'embedding'
+    ? `Ollama${ollamaSuffix}`
+    : `${describeRuntimeShort(activeRuntime)}${describeRuntimeShort(activeRuntime) === 'Ollama' ? ollamaSuffix : ''}`
 
   async function pullThenApply(name: string) {
     if (!name || applying !== null || pulling !== null) return
@@ -113,6 +134,23 @@ export function PurposeCard({ purpose, title, blurb, catalog, selected, onApply,
     }
   }
 
+  // Everything AllInstalledModelsRow lists is already installed/reachable —
+  // apply directly, no pull step (unlike pullThenApply, used by the curated
+  // cards where "Install & apply" may need to pull first).
+  async function selectInstalled(name: string) {
+    if (!name || busy) return
+    setApplying(name)
+    setMsg(null)
+    try {
+      await onApply(name)
+      setMsg({ ok: true, text: `Applied ${name}.` })
+    } catch {
+      setMsg({ ok: false, text: 'Apply failed.' })
+    } finally {
+      setApplying(null)
+    }
+  }
+
   async function handleReset() {
     setResetting(true)
     setMsg(null)
@@ -131,7 +169,12 @@ export function PurposeCard({ purpose, title, blurb, catalog, selected, onApply,
   return (
     <section className="rounded-lg border border-slate-800 bg-slate-900/30 p-4">
       <div className="mb-1 flex items-center justify-between">
-        <h3 className="text-sm font-medium text-slate-200">{title}</h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="text-sm font-medium text-slate-200">{title}</h3>
+          <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Which runtime this purpose executes on">
+            Runs on: {runtimeChip}
+          </span>
+        </div>
         <button
           onClick={() => void handleReset()}
           disabled={resetting || busy}
@@ -141,6 +184,22 @@ export function PurposeCard({ purpose, title, blurb, catalog, selected, onApply,
         </button>
       </div>
       <p className="mb-3 text-xs text-slate-500">{blurb}</p>
+
+      {runtimeId && (
+        <div className="mb-3 rounded-md border border-indigo-800/30 bg-indigo-950/10 p-3">
+          <p className="mb-2 text-[11px] text-indigo-300">
+            This purpose currently executes on <strong>{runtimeId === 'llamacpp' ? 'llama.cpp' : 'vLLM'}</strong>, not
+            Ollama — pick a model from its catalog below (embeddings always run on Ollama regardless of the active
+            generation runtime).
+          </p>
+          <RuntimeModelPicker
+            runtime={runtimeId}
+            value={selected}
+            onChange={(name) => void onApply(name)}
+            systemRamGb={catalog?.systemRamGb}
+          />
+        </div>
+      )}
 
       {msg && (
         <div className={cn(
@@ -223,6 +282,25 @@ export function PurposeCard({ purpose, title, blurb, catalog, selected, onApply,
           )
         })}
       </div>
+
+      {/* Open selection: every installed/reachable model, not just the curated
+          cards above — click to select. */}
+      <AllInstalledModelsRow
+        purpose={purpose}
+        curatedNames={curatedNames}
+        ollamaInstalled={installedList}
+        cloudModels={installedModels}
+        selected={selected}
+        onSelect={(name) => void selectInstalled(name)}
+      />
+
+      {/* Pull any tag by name — installs then applies it for this purpose. */}
+      <PullAnyModelRow
+        onPulled={async (name) => {
+          onPulled()
+          await onApply(name)
+        }}
+      />
 
       {/* Escape hatch: any exact model name (not-yet-pulled, or a remote/cloud
           model the engine should call by name). */}

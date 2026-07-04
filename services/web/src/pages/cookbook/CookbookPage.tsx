@@ -4,8 +4,15 @@ import { useAuth } from '@/hooks/useAuth'
 import { api } from '@/lib/api'
 import { setAgentModelLocal, setRagModelLocal } from '@/lib/models'
 import { HardwareCard, type HardwareInfo, type Recommendation } from '../settings/HardwareCard'
-import { RuntimeBanner, type ActiveRuntimeInfo } from './RuntimeBanner'
+import { RuntimeCard } from '../settings/RuntimeCard'
+import type { ActiveRuntime } from '../settings/RuntimeSwitcher'
+import { useInstalledModels } from '../settings/ModelPickerShared'
 import { PurposeCard, type CatalogModel, type CatalogResponse, type ModelPrefs } from './PurposeCard'
+
+// Cookbook previously used its own ActiveRuntimeInfo shape (a subset of
+// ActiveRuntime without embedding_mode) — RuntimeCard needs the full shape, so
+// this page now fetches the same ActiveRuntime type Settings → AI Models uses.
+type ActiveRuntimeInfo = ActiveRuntime
 
 interface PurposeMeta {
   id: CatalogModel['purpose']
@@ -60,9 +67,11 @@ export function CookbookPage() {
   const [hardware, setHardware] = useState<HardwareInfo | null>(null)
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
   const [activeRuntime, setActiveRuntime] = useState<ActiveRuntimeInfo | null>(null)
+  const [ollamaOverrideUrl, setOllamaOverrideUrl] = useState<string | null | undefined>(undefined)
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null)
   const [prefs, setPrefs] = useState<ModelPrefs | null>(null)
   const [loading, setLoading] = useState(true)
+  const { items: installedModels, reload: reloadInstalledModels } = useInstalledModels()
 
   const loadInfra = useCallback(async () => {
     const [hwRes, recRes, rtRes] = await Promise.allSettled([
@@ -137,11 +146,13 @@ export function CookbookPage() {
 
           <section>
             <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Runtime</p>
-            <RuntimeBanner
-              activeRuntime={activeRuntime}
+            <RuntimeCard
+              hardware={hardware}
               recommendation={recommendation}
+              activeRuntime={activeRuntime}
               isAdmin={isAdmin}
               onSwitched={() => void loadInfra()}
+              onOllamaOverrideChange={setOllamaOverrideUrl}
             />
           </section>
 
@@ -155,6 +166,9 @@ export function CookbookPage() {
                 blurb={p.blurb}
                 catalog={catalog}
                 selected={prefs ? String(prefs[p.prefKey] ?? '') : ''}
+                activeRuntime={activeRuntime}
+                ollamaOverrideUrl={ollamaOverrideUrl}
+                installedModels={installedModels}
                 onApply={async (name) => {
                   if (!prefs) return
                   await persistPrefs({ ...prefs, [p.prefKey]: name })
@@ -166,7 +180,7 @@ export function CookbookPage() {
                   await persistPrefs({ ...prefs, [p.prefKey]: '' })
                   await loadModels() // re-fetch so the card shows the recommended default
                 }}
-                onPulled={() => void loadModels()}
+                onPulled={() => { void loadModels(); void reloadInstalledModels() }}
               />
             ))}
           </section>
