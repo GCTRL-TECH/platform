@@ -259,7 +259,41 @@ export function HeroSection() {
   const copyTimerRef = useRef<number | null>(null)
   const typed = useTypewriter(TYPED_PHRASES)
 
+  // Scroll parallax is continuous work (rAF-throttled setState on every
+  // scroll frame, driving translate3d on 5 layered elements) — mobile GPUs
+  // feel this as jank. Disable it under prefers-reduced-motion (mirrors the
+  // typewriter/shooting-star guards above) AND on small viewports, where the
+  // effect is barely visible anyway. Reacts live to OS setting changes and to
+  // viewport size crossing the breakpoint (e.g. rotation).
+  const [parallaxEnabled, setParallaxEnabled] = useState(() => {
+    if (typeof window === 'undefined') return true
+    return (
+      !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
+      !window.matchMedia('(max-width: 640px)').matches
+    )
+  })
+
   useEffect(() => {
+    if (typeof window === 'undefined') return
+    const reduceMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const mobileQuery = window.matchMedia('(max-width: 640px)')
+    const update = () => setParallaxEnabled(!reduceMotionQuery.matches && !mobileQuery.matches)
+    update()
+    reduceMotionQuery.addEventListener('change', update)
+    mobileQuery.addEventListener('change', update)
+    return () => {
+      reduceMotionQuery.removeEventListener('change', update)
+      mobileQuery.removeEventListener('change', update)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!parallaxEnabled) {
+      // Freeze all layers at their rest position instead of leaving them
+      // stuck at whatever scroll offset was last recorded.
+      setScrollY(0)
+      return
+    }
     const onScroll = () => {
       if (rafRef.current != null) return
       rafRef.current = requestAnimationFrame(() => {
@@ -272,7 +306,7 @@ export function HeroSection() {
       window.removeEventListener('scroll', onScroll)
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
     }
-  }, [])
+  }, [parallaxEnabled])
 
   // Shooting-star spawner. Respects prefers-reduced-motion. Each star is
   // self-cleaning — removed from state after its animation completes.
@@ -582,19 +616,40 @@ export function HeroSection() {
               traces the shape of the rendered (gradient-filled) glyphs and
               drops the shadow behind them — which is what we want. The caret
               lives inside the gradient span (so it's gradient-tinted too) and
-              is always rendered, which keeps the line from ever collapsing. */}
-          <span
-            aria-hidden
-            className="bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent"
-            style={{
-              filter:
-                'drop-shadow(0 1px 2px rgba(0,0,0,0.55)) ' +
-                'drop-shadow(0 2px 8px rgba(0,0,0,0.45)) ' +
-                'drop-shadow(0 4px 18px rgba(0,0,0,0.35))',
-            }}
-          >
-            {typed}
-            <span className="animate-caret">_</span>
+              is always rendered, which keeps the line from ever collapsing.
+
+              Height reservation: on mobile the phrases wrap differently
+              ("Command Your Data." wraps to 2 lines while the shorter phrases
+              fit on 1), so the H1's rendered height used to change every
+              rotation and everything below it jumped. Fix: stack an invisible
+              copy of every phrase in the same CSS grid cell as the visible
+              one (`grid-area:1/1`). Grid auto-sizes the shared row to the
+              TALLEST item, so the box always reserves the worst-case (2-line)
+              height up front — no JS measurement, adapts to every breakpoint
+              automatically, and the visible phrase just overlays on top. */}
+          <span className="relative grid">
+            {TYPED_PHRASES.map((phrase) => (
+              <span
+                key={phrase}
+                aria-hidden
+                className="invisible [grid-area:1/1] bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent"
+              >
+                {phrase}
+              </span>
+            ))}
+            <span
+              aria-hidden
+              className="[grid-area:1/1] bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent"
+              style={{
+                filter:
+                  'drop-shadow(0 1px 2px rgba(0,0,0,0.55)) ' +
+                  'drop-shadow(0 2px 8px rgba(0,0,0,0.45)) ' +
+                  'drop-shadow(0 4px 18px rgba(0,0,0,0.35))',
+              }}
+            >
+              {typed}
+              <span className="animate-caret">_</span>
+            </span>
           </span>
         </h1>
 
