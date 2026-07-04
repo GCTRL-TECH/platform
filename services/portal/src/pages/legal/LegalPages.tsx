@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { SiteHeader } from '@/components/site/SiteHeader'
 import { SiteFooter } from '@/components/site/SiteFooter'
+import { Seo } from '@/components/Seo'
 
 // Single legal entity for the whole product / site.
 const COMPANY = 'Cinque Monti Ltd.'
@@ -14,12 +15,23 @@ function Fill({ children }: { children: ReactNode }) {
   return <span className="italic text-slate-500">[{children}]</span>
 }
 
-function LegalLayout({ title, children }: { title: string; children: ReactNode }) {
+function LegalLayout({
+  title,
+  children,
+  path,
+  description,
+}: {
+  title: string
+  children: ReactNode
+  path: string
+  description: string
+}) {
   useEffect(() => {
     window.scrollTo(0, 0)
   }, [])
   return (
     <div className="min-h-screen bg-[#020617]">
+      <Seo title={`${title} — GCTRL`} description={description} path={path} />
       <SiteHeader />
       <section className="px-6 pt-32 pb-24">
         <div className="mx-auto max-w-3xl">
@@ -44,7 +56,11 @@ function Section({ heading, children }: { heading: string; children: ReactNode }
 
 export function ImprintPage() {
   return (
-    <LegalLayout title="Legal Notice (Imprint)">
+    <LegalLayout
+      title="Legal Notice (Imprint)"
+      path="/imprint"
+      description="Legal notice and statutory registration details for Cinque Monti Ltd., the operator of GCTRL (Ground Control)."
+    >
       <p className="rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-sm text-slate-500">
         Statutory registration details are being finalized and will be completed here shortly. For any
         enquiries in the meantime, please contact us at the email below.
@@ -125,7 +141,11 @@ export function ImprintPage() {
 
 export function PrivacyPolicyPage() {
   return (
-    <LegalLayout title="Privacy Policy">
+    <LegalLayout
+      title="Privacy Policy"
+      path="/privacy"
+      description="How GCTRL and Cinque Monti Ltd. handle personal data: cookieless analytics, GDPR rights, data retention, and our on-prem, privacy-by-design approach."
+    >
       <Section heading="1. Who is responsible (controller)">
         <p>
           The controller for the processing of personal data on this website is:

@@ -89,6 +89,24 @@ export function groupForSlug(slug: string): string | null {
   return DOC_GROUPS.find((g) => g.pages.some((p) => p.slug === slug))?.group ?? null
 }
 
+/** Derive a ~155-char meta description from a doc's markdown: strip the H1,
+ * headings, and markdown syntax, then take the first paragraph of prose. */
+export function getDocDescription(slug: string): string {
+  const md = getDocContent(slug)
+  if (!md) return 'GCTRL documentation.'
+  const withoutH1 = md.replace(/^#\s+.*$/m, '')
+  const firstParagraph = withoutH1
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .find((p) => p.length > 0 && !/^#{1,6}\s/.test(p)) ?? ''
+  const plain = firstParagraph
+    .replace(/[#*`>|_]/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return plain.length > 157 ? `${plain.slice(0, 154).trimEnd()}...` : plain
+}
+
 // ── Search index ─────────────────────────────────────────────────────────────
 export type SearchHit = { slug: string; title: string; group: string; heading: string; anchor: string; snippet: string }
 
