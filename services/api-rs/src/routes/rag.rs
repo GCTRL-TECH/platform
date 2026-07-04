@@ -554,6 +554,21 @@ async fn query(
         },
     };
 
+    // ── Private Memory: early local_only check ────────────────────────────────
+    // Fires BEFORE any provider call (including the contextualize_query rewrite
+    // below) whenever the request names a specific compilation. A request with
+    // no compilationId can't be checked yet — the full set of touched
+    // compilations is only known once retrieval resolves the chunks' own
+    // compilation_id (ground truth); that full re-check happens further down,
+    // right before the context is handed to the LLM.
+    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref());
+    if let Some(cid) = req.compilation_id {
+        let decision = crate::services::privacy::resolve_privacy(&state.db, &[cid]).await;
+        if is_cloud_target && decision.mode == crate::services::privacy::PrivacyMode::LocalOnly {
+            return Err(AppError::Forbidden(crate::services::privacy::LOCAL_ONLY_REFUSAL.into()));
+        }
+    }
+
     // Contextualize retrieval: for a follow-up, rewrite it into a standalone query
     // using the conversation so search finds the right entity. First turn (no
     // history) → unchanged, so no extra cost. Used for chunk search + dossier/entity
@@ -1038,14 +1053,64 @@ async fn query(
         })));
     }
 
+    // ── Private Memory: full re-check + cloaking ──────────────────────────────
+    // Ground truth: the request-level compilationId (checked above already, but
+    // re-derived here for completeness) UNIONed with the ACTUAL compilation of
+    // every chunk retrieved — covers requests that named no compilationId at all.
+    let chunk_ids_for_privacy: Vec<Uuid> = chunks.iter()
+        .filter_map(|c| c.chunk_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()))
+        .collect();
+    let involved_compilations = crate::services::privacy::compilations_for_chunks(
+        &state.db, req.compilation_id, &chunk_ids_for_privacy,
+    ).await;
+    let privacy_decision = crate::services::privacy::resolve_privacy(&state.db, &involved_compilations).await;
+    if is_cloud_target && privacy_decision.mode == crate::services::privacy::PrivacyMode::LocalOnly {
+        return Err(AppError::Forbidden(crate::services::privacy::LOCAL_ONLY_REFUSAL.into()));
+    }
+
+    let mut cloak_session = crate::services::privacy::CloakSession::empty();
+    let mut privacy_meta: Option<Value> = None;
+    let (context, cloaked_message) = if is_cloud_target
+        && privacy_decision.mode == crate::services::privacy::PrivacyMode::Cloaked
+    {
+        // Typed entity mentions (with `type`, needed to bucket Person/Org/Place)
+        // for the chunks actually used. `chunks[].entity_mentions` from KEX's
+        // /search response is a flat name list with no type, so this is one
+        // extra, cheap, id-indexed query — paid ONLY when cloaking actually
+        // applies, not on every request.
+        let typed_mentions: Vec<Value> = if chunk_ids_for_privacy.is_empty() {
+            vec![]
+        } else {
+            sqlx::query_scalar::<_, Value>(
+                "SELECT COALESCE(entity_mentions, '[]'::jsonb) FROM text_chunks WHERE id = ANY($1)"
+            ).bind(&chunk_ids_for_privacy).fetch_all(&state.db).await.unwrap_or_default()
+        };
+        let candidates = crate::services::privacy::candidates_from_entity_mentions(&typed_mentions);
+        // Cloak BOTH the assembled context and the user's own question — the
+        // question may name the same entities as the context.
+        let (cloaked_context, sess1) = crate::services::privacy::cloak(
+            &state.db, &involved_compilations, &candidates, &context,
+        ).await;
+        let (cloaked_question, sess2) = crate::services::privacy::cloak(
+            &state.db, &involved_compilations, &candidates, &req.message,
+        ).await;
+        cloak_session.merge(sess1);
+        cloak_session.merge(sess2);
+        tracing::debug!("rag: cloaked {} entities for compilation(s) {:?}", cloak_session.map.len(), involved_compilations);
+        privacy_meta = Some(json!({ "mode": "cloaked", "cloakedEntities": cloak_session.map.len() }));
+        (cloaked_context, cloaked_question)
+    } else {
+        (context, req.message.clone())
+    };
+
     // ── 4. LLM call with context (+ working memory) ───────────────────────────
     // `target` was resolved up front (before retrieval, for query contextualization).
     // The conversation `history` is threaded in as prior turns so the model resolves
     // references ("his email", "that company") instead of forcing the user to repeat.
     let user_content = if context.is_empty() {
-        req.message.clone()
+        cloaked_message.clone()
     } else {
-        format!("Context:\n{context}\n\nQuestion: {}", req.message)
+        format!("Context:\n{context}\n\nQuestion: {}", cloaked_message)
     };
 
     let system_prompt =
@@ -1073,6 +1138,9 @@ async fn query(
     )
     .await
     .map_err(AppError::Internal)?;
+    // De-cloak the answer before it's persisted/returned — the cloak map never
+    // leaves this request (it lives only in `cloak_maps`, keyed by compilation).
+    let answer = if cloak_session.is_empty() { answer } else { crate::services::privacy::decloak(&cloak_session, &answer) };
 
     // ── 5. Persist the turn (STANDARD mode only) ──────────────────────────────
     // Incognito stays browser-memory-only (GDPR). Standard mode writes the thread
@@ -1132,14 +1200,18 @@ async fn query(
             "compilation", &res_id, eff_rank as i32, None, true, None).await;
     }
 
-    Ok(Json(json!({
+    let mut resp = json!({
         "answer":     answer,
         "sources":    sources,
         "confidence": confidence,
         "cypher":     cypher_val,
         "graphTrace": graph_trace,
         "conversationId": conversation_id_out,
-    })))
+    });
+    if let Some(meta) = privacy_meta {
+        resp["privacy"] = meta;
+    }
+    Ok(Json(resp))
 }
 
 /// Agentic ("deep") RAG: a bounded tool-calling loop reusing the agent machinery.
@@ -1185,6 +1257,20 @@ async fn deep_query(
     };
     let effective_model = requested_model.map(str::to_string).or(purpose_model);
     let target = llm::resolve_for_user(&state.db, claims.sub, requested_provider, effective_model.as_deref()).await;
+
+    // ── Private Memory: early local_only check ────────────────────────────────
+    // Deep mode drives tool calls whose compilation isn't known until the model
+    // actually names one, so this early check only covers the request-level
+    // compilationId (the `compilation_hint` fed to the model below). Per-tool
+    // enforcement (the ground truth for what deep mode actually touches) happens
+    // at each tool result below — see the honesty note there.
+    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref());
+    if let Some(cid) = req.compilation_id {
+        let decision = crate::services::privacy::resolve_privacy(&state.db, &[cid]).await;
+        if is_cloud_target && decision.mode == crate::services::privacy::PrivacyMode::LocalOnly {
+            return Err(AppError::Forbidden(crate::services::privacy::LOCAL_ONLY_REFUSAL.into()));
+        }
+    }
 
     // WORKING MEMORY: contextualize the question against the running conversation so
     // dossier/entity resolution (and the agent's own framing) follow a follow-up's
@@ -1275,6 +1361,7 @@ async fn deep_query(
     let mut graph_trace: Vec<Value> = Vec::new();
     let mut seen_triples: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tools_invoked: usize = 0;
+    let mut cloak_session = crate::services::privacy::CloakSession::empty();
 
     let mut final_answer = String::new();
 
@@ -1402,17 +1489,57 @@ async fn deep_query(
         }
 
         // Feed the assistant's tool call + the tool result back into the transcript.
-        let tool_result_text = format!(
-            "Tool `{}` returned: {}",
-            tool_name,
-            serde_json::to_string(&result).unwrap_or_default().chars().take(4000).collect::<String>()
-        );
+        //
+        // ── Private Memory enforcement (per tool call) ────────────────────────
+        // `sources`/`graph_trace` above stay plaintext regardless — they're
+        // returned directly to the authenticated owner, never sent to the LLM.
+        // What matters here is what gets fed BACK into `messages` for the next
+        // turn, since THAT is what actually reaches a cloud model. Ground truth
+        // is the tool call's own `compilationId` arg; a tool invoked WITHOUT one
+        // (e.g. a cross-graph `query`) can't be attributed to a single
+        // compilation here and is NOT gated by this check — documented gap,
+        // mirrored in routes::agent's Pi chat wiring.
+        let raw_result_str = serde_json::to_string(&result).unwrap_or_default().chars().take(4000).collect::<String>();
+        let tool_cid = args.get("compilationId").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok());
+        let tool_result_text = if is_cloud_target {
+            let decision = match tool_cid {
+                Some(cid) => crate::services::privacy::resolve_privacy(&state.db, &[cid]).await,
+                None => crate::services::privacy::PrivacyDecision { mode: crate::services::privacy::PrivacyMode::Open },
+            };
+            match decision.mode {
+                // Whole-request refusal (not a per-tool withhold): deep mode
+                // synthesizes a single answer across every tool call, so letting
+                // the conversation continue with one gap risks the final answer
+                // still leaning on it indirectly. Matches the fast path's refusal.
+                crate::services::privacy::PrivacyMode::LocalOnly => {
+                    return Err(AppError::Forbidden(crate::services::privacy::LOCAL_ONLY_REFUSAL.into()));
+                }
+                crate::services::privacy::PrivacyMode::Cloaked => {
+                    let typed_mentions: Vec<Value> = result["chunks"].as_array()
+                        .map(|arr| arr.iter().map(|ch| ch.get("entity_mentions").cloned().unwrap_or_else(|| json!([]))).collect())
+                        .unwrap_or_default();
+                    let candidates = crate::services::privacy::candidates_from_entity_mentions(&typed_mentions);
+                    let (cloaked, sess) = crate::services::privacy::cloak(
+                        &state.db, &[tool_cid.expect("cloaked branch only reached with Some(cid)")], &candidates, &raw_result_str,
+                    ).await;
+                    cloak_session.merge(sess);
+                    format!("Tool `{tool_name}` returned: {cloaked}")
+                }
+                crate::services::privacy::PrivacyMode::Open => format!("Tool `{tool_name}` returned: {raw_result_str}"),
+            }
+        } else {
+            format!("Tool `{tool_name}` returned: {raw_result_str}")
+        };
         messages.push(json!({ "role": "assistant", "content": trimmed }));
         messages.push(json!({ "role": "user", "content": tool_result_text }));
     }
 
     if final_answer.trim().is_empty() {
         final_answer = "I gathered evidence but could not produce a final answer within the iteration limit. Please try rephrasing your question.".to_string();
+    }
+    // De-cloak the synthesized answer before it's persisted/returned.
+    if !cloak_session.is_empty() {
+        final_answer = crate::services::privacy::decloak(&cloak_session, &final_answer);
     }
 
     let confidence: f64 = if sources.is_empty() {
@@ -1432,14 +1559,18 @@ async fn deep_query(
         persist_turn(&state.db, claims.sub, req.conversation_id, &req.message, &final_answer).await
     } else { None };
 
-    Ok(Json(json!({
+    let mut resp = json!({
         "answer":     final_answer,
         "sources":    sources,
         "confidence": confidence,
         "cypher":     Value::Null,
         "graphTrace": graph_trace,
         "conversationId": conversation_id_out,
-    })))
+    });
+    if !cloak_session.is_empty() {
+        resp["privacy"] = json!({ "mode": "cloaked", "cloakedEntities": cloak_session.map.len() });
+    }
+    Ok(Json(resp))
 }
 
 async fn list_conversations(

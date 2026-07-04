@@ -1674,6 +1674,12 @@ async fn chat(
     )
     .await;
 
+    // Private Memory: is this turn's model a cloud endpoint? Gates the
+    // per-tool-result enforcement below (local_only refusal / cloaking). See
+    // the `execute_tool` call site further down for the honest scope of what
+    // this can and cannot attribute to a compilation.
+    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref());
+
     // Build the effective system prompt: GCTRL base + the caller's enabled skills.
     let system_prompt = build_system_prompt(&state, &claims).await;
 
@@ -1733,6 +1739,13 @@ async fn chat(
         convo.push(json!({"role": "user", "content": &message}));
         let mut iter = 0usize;
 
+        // Private Memory: accumulates across every tool call this conversation
+        // makes (see the per-tool enforcement below), and is used to de-cloak
+        // every token this loop streams out. Empty session → decloak_stream_chunk
+        // is a zero-cost passthrough, so a non-cloaked chat is unaffected.
+        let mut cloak_session = crate::services::privacy::CloakSession::empty();
+        let mut decloak_buf = String::new();
+
         loop {
             let turn = ChatMessages { system: &system_prompt, messages: convo.clone() };
             let mut accumulated = String::new();
@@ -1755,16 +1768,24 @@ async fn chat(
                                 decided = true;
                                 suppress = lead.starts_with('{');
                                 if suppress { continue; }
-                                // Prose: flush what we've accumulated so far as one token.
-                                let ev = Event::default()
-                                    .data(json!({"type":"token","content": accumulated.clone()}).to_string());
-                                yield Ok(ev);
+                                // Prose: flush what we've accumulated so far as one token —
+                                // decloaked (a no-op unless a prior tool call cloaked
+                                // something into this conversation; see below).
+                                let safe = crate::services::privacy::decloak_stream_chunk(&cloak_session, &mut decloak_buf, &accumulated);
+                                if !safe.is_empty() {
+                                    let ev = Event::default()
+                                        .data(json!({"type":"token","content": safe}).to_string());
+                                    yield Ok(ev);
+                                }
                                 continue;
                             }
                             if !suppress {
-                                let ev = Event::default()
-                                    .data(json!({"type":"token","content": token}).to_string());
-                                yield Ok(ev);
+                                let safe = crate::services::privacy::decloak_stream_chunk(&cloak_session, &mut decloak_buf, &token);
+                                if !safe.is_empty() {
+                                    let ev = Event::default()
+                                        .data(json!({"type":"token","content": safe}).to_string());
+                                    yield Ok(ev);
+                                }
                             }
                         }
                         Err(e) => {
@@ -1786,10 +1807,13 @@ async fn chat(
 
             let Some(call) = tool_call else {
                 // No tool call. If we suppressed a `{`-leading turn that turned out
-                // not to be valid tool JSON, flush it now so the user isn't left blank.
+                // not to be valid tool JSON, flush it now so the user isn't left blank
+                // (decloaked — this content bypassed the streaming decloaker above
+                // since it was held back as a suspected tool call).
                 if suppress && !trimmed.is_empty() {
+                    let decloaked = crate::services::privacy::decloak(&cloak_session, &trimmed);
                     let ev = Event::default()
-                        .data(json!({"type":"token","content": trimmed}).to_string());
+                        .data(json!({"type":"token","content": decloaked}).to_string());
                     yield Ok(ev);
                 }
                 break;  // plain answer → done
@@ -1805,17 +1829,56 @@ async fn chat(
 
             let result = execute_tool(&state_clone, &claims_clone, &tool_name, &args).await;
 
+            // `tool_result` event carries the PLAIN result to the UI — it's
+            // rendered directly to the authenticated owner, never sent to an
+            // LLM, so Private Memory has nothing to enforce on it.
             let ev = Event::default()
                 .data(json!({"type":"tool_result","name": tool_name,"result": result}).to_string());
             yield Ok(ev);
 
+            // ── Private Memory enforcement (per tool call, best-effort) ────────
+            // What actually reaches a cloud model is the text fed back into
+            // `convo` below — that's what this gates. Ground truth is the tool
+            // call's own `compilationId` arg; a tool invoked WITHOUT one (e.g.
+            // a cross-graph `query`) can't be attributed to a single
+            // compilation here and is NOT gated — documented gap, same as the
+            // rag.rs deep-mode wiring. Unlike rag.rs deep mode (which refuses
+            // the whole request on a local_only hit), Pi is a standing,
+            // multi-turn chat: killing the whole conversation over one tool
+            // call would be disproportionate, so ONLY that tool's result is
+            // replaced with a refusal notice — explicitly the "acceptable
+            // minimal version" called out in the Private Memory spec.
+            let tool_cid = args.get("compilationId").and_then(|v| v.as_str()).and_then(|s| s.parse::<uuid::Uuid>().ok());
+            let pretty_result = serde_json::to_string_pretty(&result).unwrap_or_default();
+            let tool_result_text = if is_cloud_target {
+                let decision = match tool_cid {
+                    Some(cid) => crate::services::privacy::resolve_privacy(&state_clone.db, &[cid]).await,
+                    None => crate::services::privacy::PrivacyDecision { mode: crate::services::privacy::PrivacyMode::Open },
+                };
+                match decision.mode {
+                    crate::services::privacy::PrivacyMode::LocalOnly => format!(
+                        "Tool `{tool_name}` result withheld: {}", crate::services::privacy::LOCAL_ONLY_REFUSAL
+                    ),
+                    crate::services::privacy::PrivacyMode::Cloaked => {
+                        let typed_mentions: Vec<Value> = result["chunks"].as_array()
+                            .map(|arr| arr.iter().map(|ch| ch.get("entity_mentions").cloned().unwrap_or_else(|| json!([]))).collect())
+                            .unwrap_or_default();
+                        let candidates = crate::services::privacy::candidates_from_entity_mentions(&typed_mentions);
+                        let (cloaked, sess) = crate::services::privacy::cloak(
+                            &state_clone.db, &[tool_cid.expect("cloaked branch only reached with Some(cid)")], &candidates, &pretty_result,
+                        ).await;
+                        cloak_session.merge(sess);
+                        format!("Tool `{tool_name}` returned: {cloaked}")
+                    }
+                    crate::services::privacy::PrivacyMode::Open => format!("Tool `{tool_name}` returned: {pretty_result}"),
+                }
+            } else {
+                format!("Tool `{tool_name}` returned: {pretty_result}")
+            };
+
             // Feed the tool call + result back into the conversation for the next turn.
             convo.push(json!({"role": "assistant", "content": trimmed}));
-            convo.push(json!({"role": "user", "content": format!(
-                "Tool `{}` returned: {}",
-                tool_name,
-                serde_json::to_string_pretty(&result).unwrap_or_default()
-            )}));
+            convo.push(json!({"role": "user", "content": tool_result_text}));
 
             if iter >= MAX_ITERS {
                 // Safety stop: ask for a final plain-text answer without more tools.
@@ -1826,13 +1889,24 @@ async fn chat(
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
                     if let Ok(token) = item {
-                        let ev = Event::default()
-                            .data(json!({"type":"token","content": token}).to_string());
-                        yield Ok(ev);
+                        let safe = crate::services::privacy::decloak_stream_chunk(&cloak_session, &mut decloak_buf, &token);
+                        if !safe.is_empty() {
+                            let ev = Event::default()
+                                .data(json!({"type":"token","content": safe}).to_string());
+                            yield Ok(ev);
+                        }
                     }
                 }
                 break;
             }
+        }
+
+        // Flush anything still held in the streaming decloak buffer (a pseudonym
+        // could legitimately end the stream — e.g. the model's last word).
+        let tail = crate::services::privacy::decloak_stream_finish(&cloak_session, &mut decloak_buf);
+        if !tail.is_empty() {
+            let ev = Event::default().data(json!({"type":"token","content": tail}).to_string());
+            yield Ok(ev);
         }
 
         // ── Send done event ───────────────────────────────────────────────────

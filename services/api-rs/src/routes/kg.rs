@@ -575,10 +575,23 @@ async fn list(
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset).fetch_all(&state.db).await?;
 
+    // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
+    // the same constraint) — privacyMode is fetched via one small batched query
+    // instead of growing the tuple past the limit.
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let privacy_rows: Vec<(Uuid, String)> = if ids.is_empty() {
+        vec![]
+    } else {
+        sqlx::query_as("SELECT id, privacy_mode FROM compilations WHERE id = ANY($1)")
+            .bind(&ids).fetch_all(&state.db).await.unwrap_or_default()
+    };
+    let privacy_map: std::collections::HashMap<Uuid, String> = privacy_rows.into_iter().collect();
+
     let user_id_str = claims.sub.to_string();
     let mut comps: Vec<Value> = Vec::with_capacity(rows.len());
     for (id, n, d, cls, sji, nc, ec, fid, c, clid, ctype, wiki_src, last_distill, page_count, is_system, embed_public) in rows {
         if let Some(set) = &scope { if !set.contains(&id) { continue; } }
+        let privacy_mode = privacy_map.get(&id).cloned().unwrap_or_else(|| "open".to_string());
         let stored_nc = nc.unwrap_or(0);
         let stored_ec = ec.unwrap_or(0);
         // N+1 query — acceptable while typical users have <20 compilations.
@@ -597,6 +610,7 @@ async fn list(
             "lastDistillAt": last_distill,
             "pageCount": page_count,
             "embedPublic": embed_public,
+            "privacyMode": privacy_mode,
         }));
     }
 
@@ -712,11 +726,11 @@ async fn get_one(
         clid,
     ) = row;
 
-    let (ctype, wiki_src, last_distill, page_count, is_system) = sqlx::query_as::<_, (
-        String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, i32, bool,
+    let (ctype, wiki_src, last_distill, page_count, is_system, privacy_mode) = sqlx::query_as::<_, (
+        String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, i32, bool, String,
     )>(
         "SELECT type::text, wiki_source_compilation_id, last_distill_at, page_count,
-                COALESCE(is_system, false)
+                COALESCE(is_system, false), privacy_mode
          FROM compilations WHERE id=$1 AND user_id=$2"
     ).bind(id).bind(claims.sub).fetch_one(&state.db).await?;
 
@@ -769,6 +783,7 @@ async fn get_one(
         "wikiSourceCompilationId": wiki_src,
         "lastDistillAt": last_distill,
         "pageCount": page_count,
+        "privacyMode": privacy_mode,
     } })))
 }
 
@@ -812,6 +827,23 @@ async fn update(
         }
         sqlx::query("UPDATE compilations SET embed_public=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
             .bind(enabled).bind(id).bind(claims.sub).execute(&state.db).await?;
+    }
+    // Private Memory: privacyMode ('open'|'cloaked'|'local_only'). Session-only
+    // like embedPublic — a delegated access token (even an owner-scoped one)
+    // must not be able to loosen or tighten a graph's privacy posture; only a
+    // signed-in user session can. Enum-validated so a bad value 400s rather
+    // than tripping the DB CHECK constraint.
+    if let Some(mode) = req.get("privacyMode").and_then(|v| v.as_str()) {
+        if claims.api_key_id.is_some() {
+            return Err(AppError::Forbidden(
+                "privacyMode can only be changed from a signed-in user session, not via an access token".into()));
+        }
+        if !matches!(mode, "open" | "cloaked" | "local_only") {
+            return Err(AppError::BadRequest(
+                "privacyMode must be one of 'open', 'cloaked', 'local_only'".into()));
+        }
+        sqlx::query("UPDATE compilations SET privacy_mode=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
+            .bind(mode).bind(id).bind(claims.sub).execute(&state.db).await?;
     }
     Ok(Json(json!({ "ok": true })))
 }
