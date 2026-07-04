@@ -190,6 +190,7 @@ class NERPipeline:
                     "text": ent["text"],
                     "gliner_label": ent["label"],
                     "score": round(float(ent["score"]), 4),
+                    "source": "gliner",
                 }
             )
         return results
@@ -223,6 +224,11 @@ class NERPipeline:
                     "text": ent["text"],
                     "gliner_label": gliner_label,
                     "score": ent["score"],
+                    # Deterministic format/gazetteer hit — carried downstream so
+                    # the opt-in entity-verify tier NEVER drops it (regex/gazetteer
+                    # matches are high-precision by construction; the verify LLM
+                    # was wrongly dropping ISO 27001 / GDPR / dates / amounts).
+                    "source": ent.get("source", "regex"),
                 }
             )
         return raw
@@ -300,6 +306,9 @@ class NERPipeline:
                     "label": human_label,
                     "score": ent["score"],
                     "gliner_label": gliner_label,
+                    # Provenance ("gliner" | "regex") preserved so the opt-in
+                    # entity-verify tier can bypass deterministic format hits.
+                    "source": ent.get("source", "gliner"),
                 }
             )
 

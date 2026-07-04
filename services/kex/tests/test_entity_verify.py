@@ -55,6 +55,38 @@ class TestJunkDropped:
         assert report["verified"] == 2
         assert report["llm_calls"] == 1
 
+    def test_regex_sourced_entities_bypass_verify(self):
+        """Deterministic format/gazetteer hits (source='regex') must NEVER be
+        sent to the LLM — they're high-precision by construction. Measured: the
+        verify LLM wrongly dropped ISO 27001 / GDPR / dates, costing ~6pts
+        recall. They pass through kept, and only GLiNER-sourced candidates reach
+        the LLM."""
+        from src.entity_verify import verify_entities
+
+        text = "Ground Control is ISO 27001 certified and uses an async wrapper."
+        iso = _entity("ISO 27001", 18, 27, "field")
+        iso["source"] = "regex"
+        junk = _entity("async wrapper", 51, 64, "technology")
+        junk["source"] = "gliner"
+        entities = [iso, junk]
+        # LLM only ever sees the gliner candidate (id 1); it says drop it.
+        llm_response = json.dumps([{"id": 1, "keep": False, "corrected_type": "technology"}])
+
+        with patch("src.entity_verify.llm_client") as mock_client:
+            mock_client.complete.return_value = llm_response
+            kept, report = verify_entities(
+                entities, text,
+                model="qwen2.5:7b", base="http://ollama:11434", kind="ollama",
+            )
+
+        kept_names = [e["text"] for e in kept]
+        assert "ISO 27001" in kept_names  # regex hit survived (never verified)
+        assert "async wrapper" not in kept_names  # gliner junk dropped
+        assert report["dropped_junk"] == 1
+        # verified==1 proves ONLY the gliner candidate reached the LLM (the
+        # regex entity was never a candidate, so it couldn't be dropped).
+        assert report["verified"] == 1
+
     def test_none_base_falls_back_to_config_ollama_base(self):
         """Regression: the default install passes no per-job ollama_base, so
         `base` arrives None. Without the config fallback, base=None hits

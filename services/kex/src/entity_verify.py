@@ -100,8 +100,9 @@ Coarse types (pick ONLY from this list):
 {_bucket_block()}
 
 Rules:
-- Drop generic descriptive phrases (e.g. "async wrapper", "Primary Product"), tool/version fragments (e.g. "Port 443"), and non-named descriptive concepts (e.g. "Berlin-based") — these are keep=false.
-- Keep named people, organizations, locations, products, technologies, dates, amounts, and standards — these are keep=true.
+- Drop ONLY clear cases: generic descriptive phrases (e.g. "async wrapper", "Primary Product"), tool/version fragments (e.g. "Port 443"), and non-named descriptive concepts (e.g. "Berlin-based") — these are keep=false.
+- Keep named people, organizations, locations, products, technologies, dates, amounts, standards, and any recognized concept/discipline term — these are keep=true.
+- When in doubt, KEEP (keep=true). A wrongly dropped entity is unrecoverable; a wrongly kept one is cheap. Only set keep=false when you are confident the span is not a real entity.
 - Respond for EXACTLY the candidates given below, matched by "id". Do not add or omit any.
 
 Candidates:
@@ -166,6 +167,14 @@ def verify_entities(entities, text, model, base, kind, api_key=None, min_score=0
     final = [None] * len(entities)
     candidates = []
     for idx, ent in enumerate(entities):
+        # Deterministic format/gazetteer hits (dates, amounts, percentages, and
+        # compliance standards like ISO 27001 / GDPR / TISAX) are high-precision
+        # by construction — NEVER submit them to the LLM. Measured: without this
+        # the verify LLM wrongly dropped them, costing ~6pts recall (doc 06
+        # collapsed 0.82→0.27 on ISO 27001 / TISAX / GDPR).
+        if ent.get("source") == "regex":
+            final[idx] = ent
+            continue
         score = ent.get("score", 0.0) or 0.0
         if score < min_score:
             final[idx] = ent
