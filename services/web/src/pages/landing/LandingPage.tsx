@@ -28,7 +28,7 @@ function LandingNav() {
     >
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
         <Link to="/" className="flex items-center">
-          <img src="/gctrl/horizontal-color-on-darkbg.svg" alt="GCTRL" className="h-7 w-auto" />
+          <img src="/gctrl/horizontal-color-on-darkbg.svg?v=2" alt="GCTRL" className="h-7 w-auto" />
         </Link>
 
         <nav className="hidden items-center gap-6 md:flex">
@@ -107,7 +107,7 @@ function LandingFooter() {
         <div className="grid gap-10 md:grid-cols-4">
           <div>
             <div className="mb-4">
-              <img src="/gctrl/wordmark-white.svg" alt="GCTRL" className="h-5 w-auto" />
+              <img src="/gctrl/wordmark-white.svg?v=2" alt="GCTRL" className="h-5 w-auto" />
             </div>
             <p className="text-sm leading-relaxed text-slate-500">
               The knowledge infrastructure layer for enterprise AI. Ground your data. Command your AI.

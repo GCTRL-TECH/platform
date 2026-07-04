@@ -51,7 +51,7 @@ export function LoginPage() {
       <div className="relative w-full max-w-sm animate-slide-up">
         {/* Logo */}
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <img src="/gctrl/stacked-color-on-darkbg.svg" alt="GCTRL" className="h-20 w-auto" />
+          <img src="/gctrl/stacked-color-on-darkbg.svg?v=2" alt="GCTRL" className="h-20 w-auto" />
         </div>
 
         {/* Card */}

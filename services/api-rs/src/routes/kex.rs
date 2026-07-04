@@ -415,7 +415,18 @@ async fn list_jobs(
             "createdAt": created, "completedAt": completed,
         })
     }).collect();
-    Ok(Json(json!({ "jobs": jobs })))
+
+    // Real totals across ALL of the user's jobs — the dashboard was counting the
+    // returned page (jobs.length, capped at the default limit of 20) and showed
+    // "20 extractions" forever. Same WHERE clause as the page query above.
+    let (total, completed_total): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'completed') FROM jobs
+         WHERE user_id = $1 AND type IN ('kex_extract','kex_upload','kex_connector')"
+    )
+    .bind(claims.sub)
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({ "jobs": jobs, "total": total, "completed": completed_total })))
 }
 
 // Frontend KexJobDetail expects `{ job: ... }` wrapper.

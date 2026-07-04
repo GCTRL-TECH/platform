@@ -63,7 +63,7 @@ export default function ActivationWizard({ onActivated }: Props) {
       <div className="w-full max-w-md">
         {/* Logo / brand */}
         <div className="mb-8 flex flex-col items-center gap-3">
-          <img src="/gctrl/stacked-color-on-darkbg.svg" alt="GCTRL" className="h-20 w-auto" />
+          <img src="/gctrl/stacked-color-on-darkbg.svg?v=2" alt="GCTRL" className="h-20 w-auto" />
           <p className="text-sm text-slate-500">Activate your installation</p>
         </div>
 
