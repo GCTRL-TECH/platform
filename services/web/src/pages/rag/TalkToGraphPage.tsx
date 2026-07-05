@@ -70,6 +70,9 @@ interface Source {
   imageUrl?: string
   entityMentions?: string[]
   chunkId?: string
+  // The graph THIS source came from (server-resolved) — so "open in graph" opens
+  // the exact graph the node is in, even when chatting across all graphs.
+  compilationId?: string
 }
 
 interface ChatMessage {
@@ -1180,11 +1183,12 @@ export function TalkToGraphPage() {
   // language or date) that isn't in the graph, which left the click unselected.
   // Preserve the current conversation in the URL so Back returns to this thread.
   function handleTraceSource(src: Source, answerCompilationId?: string) {
-    // Target the graph the ANSWER's evidence came from (server-resolved), then
-    // the KB the user has selected, then a last-resort first graph. Without this,
-    // chatting over "all graphs" opened a guessed first graph that didn't contain
-    // the node, so the source was never findable.
-    const target = answerCompilationId || selectedCompilation || compilations[0]?.id
+    // Target the graph THIS source came from (server-resolved, per source), then
+    // the answer's overall graph, then the KB the user has selected, then a
+    // last-resort first graph. Without the per-source id, chatting over "all
+    // graphs" opened a guessed first graph that didn't contain the node, so the
+    // source was never findable and the detail pane stayed empty.
+    const target = src.compilationId || answerCompilationId || selectedCompilation || compilations[0]?.id
     if (!target) { navigate('/graphs'); return }
     const candidates = (src.entityMentions ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 12)
     const focus = candidates.length ? `?focus=${encodeURIComponent(candidates.join('\n'))}` : ''
@@ -1415,6 +1419,7 @@ export function TalkToGraphPage() {
           text: (s.text as string) ?? (s.excerpt as string),
           entityMentions: mentions,
           chunkId: s.chunkId as string | undefined,
+          compilationId: (s.compilationId as string | undefined) || undefined,
         }
       })
 

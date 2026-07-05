@@ -980,7 +980,14 @@ export function WorkspaceCanvas({
   })()
 
   return (
-    <div ref={containerRef} className={cn('relative h-full w-full overflow-hidden bg-slate-950', className)}>
+    <div
+      ref={containerRef}
+      className={cn('relative h-full w-full overflow-hidden bg-slate-950', className)}
+      // The force-graph canvas is transparent, so its background is really this
+      // container's. Drive it from the theme (inline style beats the bg-slate-950
+      // fallback) or a light theme like Paper stays dark. Transition softens the swap.
+      style={{ background: theme.background, transition: 'background 200ms ease' }}
+    >
       {/* Controls: theme picker + labels toggle + 2D/3D */}
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
         <div className="relative">

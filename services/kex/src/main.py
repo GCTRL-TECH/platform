@@ -1385,6 +1385,11 @@ def _dense_search(vector, req: "SearchReq") -> list[dict]:
             "entity_mentions": names,
             "source": payload.get("source_document_id", "") or "",
             "chunk_id": str(hit.id),
+            # compilation_id is often NULL on rebuilt chunks, but job_id survives and
+            # resolves to a compilation via compilations.source_job_ids — the API uses
+            # these to trace a source back to the EXACT graph it came from.
+            "compilation_id": payload.get("compilation_id"),
+            "job_id": payload.get("job_id"),
         })
     return out
 
@@ -1429,7 +1434,7 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             clauses.append("(tc.compilation_id = %(comp)s OR tc.compilation_id IS NULL)")
             params["comp"] = req.compilation_id
         sql = (
-            "SELECT tc.id::text, tc.content, tc.entity_mentions, "
+            "SELECT tc.id::text, tc.content, tc.entity_mentions, tc.job_id::text, tc.compilation_id::text, "
             "       ts_rank_cd(tc.content_tsv, websearch_to_tsquery('simple', %(q)s)) AS rank "
             "FROM text_chunks tc "
             "WHERE " + " AND ".join(clauses) + " "
@@ -1449,12 +1454,12 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
         if include_comp and req.compilation_id:
             clauses.append("(tc.compilation_id = %(comp)s OR tc.compilation_id IS NULL)"); params["comp"] = req.compilation_id
         sql = (
-            "SELECT tc.id::text, tc.content, tc.entity_mentions "
+            "SELECT tc.id::text, tc.content, tc.entity_mentions, tc.job_id::text, tc.compilation_id::text "
             "FROM text_chunks tc WHERE " + " AND ".join(clauses) + " LIMIT %(limit)s"
         )
         return sql, params
 
-    def _normalize(row_id: str, content: str, mentions) -> dict:
+    def _normalize(row_id: str, content: str, mentions, job_id=None, comp_id=None) -> dict:
         names: list[str] = []
         seen: set[str] = set()
         items = mentions if isinstance(mentions, list) else []
@@ -1463,7 +1468,10 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             nm = nm.strip()
             if nm and nm not in seen:
                 seen.add(nm); names.append(nm)
-        return {"text": content or "", "entity_mentions": names, "source": "", "chunk_id": row_id}
+        # job_id resolves to the source graph via compilations.source_job_ids (the
+        # API traces a source back to the exact compilation it came from).
+        return {"text": content or "", "entity_mentions": names, "source": "",
+                "chunk_id": row_id, "job_id": job_id, "compilation_id": comp_id}
 
     def _query(include_comp: bool) -> list[dict]:
         results: dict[str, dict] = {}
@@ -1472,9 +1480,9 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             with conn.cursor() as cur:
                 sql, params = _scope_sql(include_comp)
                 cur.execute(sql, params)
-                for rid, content, mentions, rank in cur.fetchall():
+                for rid, content, mentions, job_id, comp_id, rank in cur.fetchall():
                     if rid not in results:
-                        results[rid] = _normalize(rid, content, mentions)
+                        results[rid] = _normalize(rid, content, mentions, job_id, comp_id)
                         results[rid]["score"] = float(rank or 0.0)
                         order.append(rid)
             # ILIKE fallback for exact substrings (punctuated IDs/filenames). These
@@ -1492,10 +1500,10 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
                         lead.append(rid)
                     else:
                         with conn.cursor() as cur:
-                            cur.execute("SELECT id::text, content, entity_mentions FROM text_chunks WHERE id = %s", (rid,))
+                            cur.execute("SELECT id::text, content, entity_mentions, job_id::text, compilation_id::text FROM text_chunks WHERE id = %s", (rid,))
                             row = cur.fetchone()
                         if row:
-                            results[rid] = _normalize(row[0], row[1], row[2])
+                            results[rid] = _normalize(row[0], row[1], row[2], row[3], row[4])
                             results[rid]["score"] = 0.0
                             lead.append(rid)
                 order = lead + [r for r in order if r not in set(lead)]

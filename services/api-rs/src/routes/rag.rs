@@ -586,6 +586,12 @@ async fn query(
         entity_mentions:  Option<Vec<String>>,
         source:           Option<String>,
         chunk_id:         Option<String>,
+        // Which graph this chunk came from. `compilation_id` is often NULL on
+        // rebuilt chunks; `job_id` survives and resolves to a compilation via
+        // compilations.source_job_ids — used to trace a source back to the EXACT
+        // graph so the Talk-to-Graph "open in graph" lands on the right node.
+        #[serde(default)] compilation_id: Option<String>,
+        #[serde(default)] job_id:         Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct KexSearchResp {
@@ -1159,6 +1165,40 @@ async fn query(
         sum / chunks.len() as f64
     };
 
+    // ── Resolve each source chunk to the graph (compilation) it came from ──────
+    // So a source card opens the EXACT graph the evidence is in (not a guessed
+    // first-in-list). `compilation_id` is usually NULL on rebuilt chunks, so fall
+    // back to job_id → compilations.source_job_ids (owner-scoped).
+    let mut chunk_compilation: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for c in &chunks {
+        if let (Some(cid), Some(comp)) = (c.chunk_id.as_deref(), c.compilation_id.as_deref()) {
+            if !comp.is_empty() { chunk_compilation.insert(cid.to_string(), comp.to_string()); }
+        }
+    }
+    if let Some(ref cl) = claims {
+        let pending_jobs: Vec<Uuid> = chunks.iter()
+            .filter(|c| c.chunk_id.as_deref().map(|id| !chunk_compilation.contains_key(id)).unwrap_or(true))
+            .filter_map(|c| c.job_id.as_deref().and_then(|j| Uuid::parse_str(j).ok()))
+            .collect();
+        if !pending_jobs.is_empty() {
+            let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT j AS job, id AS comp FROM compilations, unnest(source_job_ids) AS j \
+                 WHERE j = ANY($1) AND user_id = $2"
+            ).bind(&pending_jobs).bind(cl.sub).fetch_all(&state.db).await.unwrap_or_default();
+            let job_to_comp: std::collections::HashMap<Uuid, Uuid> = rows.into_iter().collect();
+            for c in &chunks {
+                let Some(cid) = c.chunk_id.as_deref() else { continue };
+                if chunk_compilation.contains_key(cid) { continue; }
+                if let Some(comp) = c.job_id.as_deref()
+                    .and_then(|j| Uuid::parse_str(j).ok())
+                    .and_then(|j| job_to_comp.get(&j))
+                {
+                    chunk_compilation.insert(cid.to_string(), comp.to_string());
+                }
+            }
+        }
+    }
+
     let sources: Vec<Value> = chunks
         .iter()
         .map(|c| {
@@ -1168,6 +1208,7 @@ async fn query(
                 .and_then(|id| chunk_files.get(id).map(|s| s.as_str()))
                 .or(c.source.as_deref())
                 .unwrap_or("");
+            let comp_id = c.chunk_id.as_deref().and_then(|id| chunk_compilation.get(id)).cloned();
             json!({
                 "text":    c.text,
                 "score":   c.score,
@@ -1176,6 +1217,9 @@ async fn query(
                 // Entities this chunk mentions — lets the UI jump into the viewer
                 // and focus a real node to trace the chunk's provenance.
                 "entityMentions": c.entity_mentions.clone().unwrap_or_default(),
+                // The graph THIS source came from — the UI opens it directly so the
+                // focused node is present (per-source, so all-graphs chats work too).
+                "compilationId": comp_id,
             })
         })
         .collect();
@@ -1209,8 +1253,13 @@ async fn query(
         "conversationId": conversation_id_out,
         // The graph the evidence actually came from — so "trace this source" opens
         // the RIGHT graph (with the node in it) instead of guessing the first one
-        // in the list when the user chats without a compilation selected.
-        "sourceCompilationId": involved_compilations.first(),
+        // in the list when the user chats without a compilation selected. Prefer the
+        // TOP source's resolved graph; fall back to the requested/derived compilation.
+        "sourceCompilationId": chunks.first()
+            .and_then(|c| c.chunk_id.as_deref())
+            .and_then(|id| chunk_compilation.get(id))
+            .cloned()
+            .or_else(|| involved_compilations.first().map(|u| u.to_string())),
     });
     if let Some(meta) = privacy_meta {
         resp["privacy"] = meta;
@@ -1360,6 +1409,9 @@ async fn deep_query(
 
     // Evidence surfaced by tools, deduped, for the response `sources`/`graphTrace`.
     let mut sources: Vec<Value> = Vec::new();
+    // chunkId → job_id for sources whose compilation_id is NULL — resolved to the
+    // origin graph after the loop so a source card opens the RIGHT graph.
+    let mut source_jobs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut seen_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut score_sum: f64 = 0.0;
     let mut graph_trace: Vec<Value> = Vec::new();
@@ -1474,12 +1526,24 @@ async fn deep_query(
                     let entity_names: Vec<String> = ch["entity_mentions"].as_array()
                         .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
                         .unwrap_or_default();
+                    let chunk_id_str = ch["chunk_id"].as_str().or_else(|| ch["chunkId"].as_str()).unwrap_or("").to_string();
+                    // Resolve the graph this source came from (same as the fast path):
+                    // direct compilation_id, else job_id → compilations.source_job_ids
+                    // (patched in after the loop). Track the job so a source card opens
+                    // the EXACT graph the node lives in.
+                    let comp_direct = ch["compilation_id"].as_str().filter(|s| !s.is_empty());
+                    if comp_direct.is_none() {
+                        if let Some(j) = ch["job_id"].as_str().filter(|s| !s.is_empty()) {
+                            if !chunk_id_str.is_empty() { source_jobs.insert(chunk_id_str.clone(), j.to_string()); }
+                        }
+                    }
                     sources.push(json!({
                         "text":    text,
                         "score":   score,
                         "source":  ch["source"].as_str().unwrap_or(""),
-                        "chunkId": ch["chunk_id"].as_str().or_else(|| ch["chunkId"].as_str()).unwrap_or(""),
+                        "chunkId": chunk_id_str,
                         "entityMentions": entity_names,
+                        "compilationId": comp_direct,
                     }));
                 }
             }
@@ -1561,6 +1625,31 @@ async fn deep_query(
         score_sum / sources.len() as f64
     };
 
+    // Resolve pending job_ids → origin graph, then patch each source's null
+    // compilationId (so "open in graph" targets the exact graph the node is in).
+    if !source_jobs.is_empty() {
+        let jobs: Vec<Uuid> = source_jobs.values().filter_map(|j| Uuid::parse_str(j).ok()).collect();
+        if !jobs.is_empty() {
+            let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT j AS job, id AS comp FROM compilations, unnest(source_job_ids) AS j \
+                 WHERE j = ANY($1) AND user_id = $2"
+            ).bind(&jobs).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+            let job_to_comp: std::collections::HashMap<Uuid, Uuid> = rows.into_iter().collect();
+            for s in sources.iter_mut() {
+                if !s["compilationId"].is_null() { continue; }
+                let comp = s["chunkId"].as_str()
+                    .and_then(|cid| source_jobs.get(cid))
+                    .and_then(|j| Uuid::parse_str(j).ok())
+                    .and_then(|j| job_to_comp.get(&j));
+                if let Some(c) = comp { s["compilationId"] = json!(c.to_string()); }
+            }
+        }
+    }
+    // Answer-level target = the top source's graph, else the requested compilation.
+    let source_compilation_id: Option<String> = sources.first()
+        .and_then(|s| s["compilationId"].as_str().map(|x| x.to_string()))
+        .or_else(|| req.compilation_id.map(|x| x.to_string()));
+
     let res_id = req.compilation_id.map(|x| x.to_string()).unwrap_or_else(|| "global".into());
     tracing::info!("rag deep mode: tools_invoked={tools_invoked}, sources={}", sources.len());
     crate::services::audit::log_access(&state.db, claims, "rag.query.deep",
@@ -1579,6 +1668,7 @@ async fn deep_query(
         "cypher":     Value::Null,
         "graphTrace": graph_trace,
         "conversationId": conversation_id_out,
+        "sourceCompilationId": source_compilation_id,
     });
     if !cloak_session.is_empty() {
         resp["privacy"] = json!({ "mode": "cloaked", "cloakedEntities": cloak_session.map.len() });
