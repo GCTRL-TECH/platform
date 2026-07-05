@@ -34,6 +34,8 @@ GCTRL sits between an organization's raw data (documents, mail servers, SharePoi
 - [Agents & MCP](https://gctrl.tech/docs/agents-mcp)
 - [FAQ & Troubleshooting](https://gctrl.tech/docs/faq)
 
+Agent skill: https://gctrl.tech/skill.md
+
 ## Site
 
 - [Pricing](https://gctrl.tech/pricing): Free forever for non-commercial private use; Business and Individual tiers for teams and sovereign deployments.

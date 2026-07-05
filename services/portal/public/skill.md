@@ -1,8 +1,3 @@
----
-name: gctrl
-description: Use the connected GCTRL knowledge base as long-term memory over MCP. Trigger BEFORE answering any factual question about the user's organization, projects, people, systems, decisions, history, or file locations — including "what do we know about X", unfamiliar proper nouns, and "our/we" references — and AFTER completing substantive work (decision made, task finished, fact learned or corrected) to write conclusions back.
----
-
 <!-- Source of truth: services/api-rs/src/routes/agent.rs MEMORY_SKILL_MD. Keep in sync. -->
 
 # GCTRL Knowledge & Memory — Agent Skill

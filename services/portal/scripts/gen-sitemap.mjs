@@ -22,6 +22,7 @@ const STATIC_ROUTES = [
   { path: '/integrations', priority: '0.7', changefreq: 'monthly' },
   { path: '/imprint', priority: '0.2', changefreq: 'yearly' },
   { path: '/privacy', priority: '0.2', changefreq: 'yearly' },
+  { path: '/skill.md', priority: '0.5', changefreq: 'monthly' },
 ]
 
 // Pull every doc slug straight out of the content directory rather than
