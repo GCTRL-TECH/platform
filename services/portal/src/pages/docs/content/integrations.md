@@ -49,6 +49,10 @@ Every tool GCTRL exposes over MCP is also callable directly at `POST /api/agent/
 
 Every integration sees exactly the clearance and knowledge-base scope carried by its token — create tokens in [Access Control](access-control.md).
 
+### After connecting: install the skill
+
+Whichever transport you pick, the MCP config only gives the agent the *tools*. Right after connecting, [install the GCTRL skill](memory-skill.md) too — it teaches the agent when to read which memory layer and to always write conclusions back, which is what makes GCTRL's memory compound across sessions instead of sitting there unused. Canonical copy: [gctrl.tech/skill.md](https://gctrl.tech/skill.md).
+
 ## Coding agents
 
 | Agent | Method |
@@ -104,4 +108,4 @@ Every integration sees exactly the clearance and knowledge-base scope carried by
 
 ## See also
 
-[Agents & MCP](agents-mcp.md) · [Access Control](access-control.md) · [Quick Start](quickstart.md)
+[Agents & MCP](agents-mcp.md) · [Install the GCTRL Skill](memory-skill.md) · [Access Control](access-control.md) · [Quick Start](quickstart.md)

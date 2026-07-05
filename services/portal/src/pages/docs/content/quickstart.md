@@ -72,11 +72,12 @@ The last step, and the point of the whole exercise: give an AI agent durable, ac
 
      (A local stdio variant for desktop/IDE agents is in [Agents & MCP](agents-mcp.md).) Remote agents need the MCP-over-HTTP gateway enabled (**Settings → Agent** — off by default). No extra port to open — the gateway rides the same origin as the app UI (`:3001`, or your TLS domain / tailnet hostname once you expose it, see [Networking & Ports](networking.md)).
    - **Any other agent framework** (LangChain, LlamaIndex, a custom harness) — drop in `GET /api/agent/skill.md` as the agent's system instructions and call tools directly at `POST /api/agent/tools/<tool>` with the same `Authorization: ApiKey` header. No MCP client required.
-3. Ask your agent: *"Ingest this PDF and show me the knowledge graph."* Agents can call `ingest_file` directly, so they don't need the UI upload step at all.
+3. **Install the skill.** The MCP config gives the agent tools; the skill teaches it how to use them — read the right memory layer, and always write conclusions back so GCTRL compounds instead of starting cold. Click **Copy skill.md** next to the MCP config (onboarding, or Settings → Agent), or fetch it directly from **[gctrl.tech/skill.md](https://gctrl.tech/skill.md)**. Full per-client install steps: [Install the GCTRL Skill](memory-skill.md).
+4. Ask your agent: *"Ingest this PDF and show me the knowledge graph."* Agents can call `ingest_file` directly, so they don't need the UI upload step at all.
 
 Your agent now has durable, access-controlled, audited memory — GCTRL becomes a memory node in your agent team.
 
-→ Detail: [Access Control](access-control.md) · [Agents & MCP](agents-mcp.md) · [Integrations](integrations.md).
+→ Detail: [Access Control](access-control.md) · [Agents & MCP](agents-mcp.md) · [Install the GCTRL Skill](memory-skill.md) · [Integrations](integrations.md).
 
 ## You're operational
 

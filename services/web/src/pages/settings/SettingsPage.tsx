@@ -1802,6 +1802,16 @@ function AgentTab({ initialSubTab = 'harness' }: { initialSubTab?: AgentSubTabId
   const [mcpToken, setMcpToken] = useState<string | null>(null)
   const [genBusy, setGenBusy] = useState(false)
   const [genErr, setGenErr] = useState<string | null>(null)
+  const [skillCopied, setSkillCopied] = useState(false)
+
+  async function copySkillMd() {
+    try {
+      const { data } = await api.get('/agent/skill.md', { responseType: 'text' })
+      await navigator.clipboard.writeText(typeof data === 'string' ? data : String(data))
+      setSkillCopied(true)
+      setTimeout(() => setSkillCopied(false), 1800)
+    } catch { /* non-fatal */ }
+  }
 
   // One-click full-access token for the MCP gateway: a max-rank, non-KB-scoped
   // Access Token. Shown once (only the hash is stored), revocable on /access.
@@ -2014,6 +2024,27 @@ function AgentTab({ initialSubTab = 'harness' }: { initialSubTab?: AgentSubTabId
                     Access Control page <ExternalLink size={10} /></a>. All calls are audited and clearance-scoped.
                 </p>
               </div>
+            </div>
+
+            {/* GCTRL Memory skill — the config above gives the agent tools; the skill
+                teaches it how to use them (which layer to read, write-back habit). */}
+            <div className="mt-4 rounded-md border border-violet-500/20 bg-violet-500/5 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[11px] font-medium text-violet-300">Add the GCTRL Memory skill</p>
+                <button
+                  onClick={() => void copySkillMd()}
+                  className="flex items-center gap-1.5 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-700"
+                >
+                  {skillCopied ? <Check size={11} /> : <Copy size={11} />}
+                  {skillCopied ? 'Copied skill.md' : 'Copy skill.md'}
+                </button>
+              </div>
+              <p className="mt-1.5 text-[10px] text-slate-500">
+                Drop this into your agent's skills/rules (a Claude Code skill, a Cursor rule, an <code>AGENTS.md</code>{' '}
+                section, or a plain system prompt) so it reads the right hot/warm/cold/wiki layer per question and{' '}
+                <span className="text-slate-300">writes its conclusions back</span> — turning GCTRL into compounding
+                memory instead of a blank context window every session.
+              </p>
             </div>
           </section>
         </div>

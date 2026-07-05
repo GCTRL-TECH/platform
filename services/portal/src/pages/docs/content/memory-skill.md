@@ -1,11 +1,65 @@
-# GCTRL Memory Skill
+# GCTRL Memory Skill — Install the Skill
 
-The **GCTRL Memory** skill is a short discipline that teaches a connected agent *how* to use GCTRL's memory layers well. It has two halves: **read the right layer** for each question, and **write conclusions back** after each task. The write-back habit is the payoff — it is what makes memory compound across sessions.
+The **GCTRL Memory** skill is a short discipline that teaches a connected agent *how* to use GCTRL's memory layers well: run the one-time setup interview, **read the right layer** for each question, and **write conclusions back** after each task. The write-back habit is the payoff — it is what makes memory compound across sessions instead of every agent starting cold.
+
+Connecting the MCP server gives an agent the *tools*. Installing the skill is what gives it the *discipline* to use them — without it, the tools sit there unused or get called at random. **Always install the skill right after you connect the MCP server or a direct-HTTP integration.**
+
+## One canonical file
+
+The skill text lives in exactly one place and is mirrored everywhere it's needed:
+
+- **Live, always current:** `GET /api/agent/skill.md` on your own instance, or the public mirror at **[gctrl.tech/skill.md](https://gctrl.tech/skill.md)**.
+- Every install method below is just "get that file to where your agent reads it from."
+
+## Install per client
+
+### Claude Code
+
+```bash
+mkdir -p .claude/skills/gctrl
+curl -fsSL https://gctrl.tech/skill.md -o .claude/skills/gctrl/SKILL.md
+# user-level alternative (all projects): ~/.claude/skills/gctrl/SKILL.md
+```
+
+Claude Code loads it automatically as a project (or user) skill.
+
+### Cursor
+
+```bash
+mkdir -p .cursor/rules
+curl -fsSL https://gctrl.tech/skill.md -o .cursor/rules/gctrl.mdc
+```
+
+Cursor rules read plain Markdown; the file works as-is. (For a `description` + `alwaysApply` front-matter block tuned for Cursor's rule-matching, see `sdk/claude-skill/cursor/gctrl.mdc` in the repo.)
+
+### Codex / AGENTS.md-based CLIs
+
+Append the skill text to the project's `AGENTS.md` (Codex and similar CLIs read it automatically):
+
+```bash
+curl -fsSL https://gctrl.tech/skill.md >> AGENTS.md
+```
+
+### Any other framework — paste as a system prompt
+
+No skill-file convention? Fetch the text and drop it straight into the agent's system prompt:
+
+```bash
+curl -fsSL https://gctrl.tech/skill.md
+```
+
+This is the same drop-in pattern used for frameworks like Paperclip or Hermes — `GET /api/agent/skill.md` on your own instance returns your token-aware instance's copy; it never requires an MCP client.
+
+### MCP clients: automatic skill delivery
+
+GCTRL's MCP gateway exposes the **full skill as an MCP resource** (`gctrl://skill`). A compliant client can list it (`resources/list`) and read it (`resources/read`) — so the whole skill can be pulled automatically on connect, no copy step. The `initialize` handshake also returns a short instruction that points the agent at that resource, and MCP clients that fold `initialize.instructions` into their system prompt get the pointer for free.
+
+That short form is a summary, not a substitute: for clients that don't auto-read resources or surface `initialize.instructions`, **installing the full skill file is the reliable path** — it works across every client.
 
 ## Where it ships
 
-- **System skill.** It ships with the platform — every internally-connected agent already follows it.
-- **Copyable.** It is exportable into external agents as a **Claude Code skill** or **Cursor rules**, straight from the connect UI, so your own agents adopt the same discipline.
+- **System skill.** It ships with the platform — every internally-connected agent (Pi) already follows it.
+- **Copyable.** Exportable into external agents from the connect UI (Onboarding's "Connect Agent" step, or Settings → Agent / Access Control), or via the install commands above.
 
 ## Rule 1 — Read the right layer
 

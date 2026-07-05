@@ -2,235 +2,241 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://gctrl.tech/</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/pricing</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.8</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/use-cases</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/integrations</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/imprint</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>yearly</changefreq>
     <priority>0.2</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/privacy</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>yearly</changefreq>
     <priority>0.2</priority>
   </url>
   <url>
+    <loc>https://gctrl.tech/skill.md</loc>
+    <lastmod>2026-07-05</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.5</priority>
+  </url>
+  <url>
     <loc>https://gctrl.tech/docs/access-control</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/activation</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/agents-mcp</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/architecture</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/benchmarks</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/compliance</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/cookbook</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/faq</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/gpu</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/graph-embed</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/infrastructure</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/installation</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/integrations</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/introduction</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/llm-providers</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/memory-layers</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/memory-skill</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/modules</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/networking</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/performance</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/quickstart</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/security</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tailscale</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-classification</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-cloaking</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-fuse</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-kex</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-memory-layer</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-multi-agent-fabric</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-sovereign</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/tech-talk-to-graph</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
     <loc>https://gctrl.tech/docs/windows</loc>
-    <lastmod>2026-07-04</lastmod>
+    <lastmod>2026-07-05</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
