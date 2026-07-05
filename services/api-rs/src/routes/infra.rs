@@ -355,32 +355,153 @@ fn proc_hardware() -> (Option<u32>, Option<f64>) {
     (cores, ram)
 }
 
+/// Probe the real GPU via the docker socket: `docker exec` into the `ollama`
+/// container (which has GPU passthrough) and run `nvidia-smi`. The api
+/// container itself has no GPU access — this is the only place `nvidia-smi`
+/// is reachable at runtime, so it's the only way to detect the GPU without an
+/// installer-written `hardware.json`.
+///
+/// Tries container name `ollama` first, then `gctrl-ollama`. Returns
+/// `(gpu_name, vram_gb)` on success, `None` on any failure (best-effort — the
+/// caller must not fail the whole endpoint if this comes back empty).
+#[cfg(unix)]
+fn probe_gpu_via_docker() -> Option<(String, f64)> {
+    for container in ["ollama", "gctrl-ollama"] {
+        if let Some(result) = probe_gpu_in_container(container) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn probe_gpu_in_container(container: &str) -> Option<(String, f64)> {
+    let exec_cfg = json!({
+        "AttachStdout": true,
+        "AttachStderr": false,
+        "Tty": true,
+        "Cmd": ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+    })
+    .to_string();
+
+    let create_path = format!("/containers/{container}/exec");
+    let (create_status, create_body) =
+        crate::routes::update::docker_http("POST", &create_path, Some(&exec_cfg), 15).ok()?;
+    if create_status != 201 && create_status != 200 {
+        return None;
+    }
+    let exec_id = crate::routes::update::json_from_body(&create_body)["Id"]
+        .as_str()?
+        .to_string();
+
+    let start_path = format!("/exec/{exec_id}/start");
+    let (start_status, output) = crate::routes::update::docker_http(
+        "POST",
+        &start_path,
+        Some(r#"{"Detach":false,"Tty":true}"#),
+        15,
+    )
+    .ok()?;
+    if start_status != 200 {
+        return None;
+    }
+
+    parse_nvidia_smi_output(&output)
+}
+
+#[cfg(not(unix))]
+fn probe_gpu_via_docker() -> Option<(String, f64)> {
+    None
+}
+
+/// Parse `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits`
+/// output (e.g. `NVIDIA GeForce RTX 3080 Ti, 12288`). Splits on the LAST comma
+/// since GPU names can themselves contain commas in rare cases. VRAM is
+/// reported in MiB — converted to GB (1 decimal).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_nvidia_smi_output(output: &str) -> Option<(String, f64)> {
+    let line = output.lines().find(|l| l.contains(','))?;
+    let (name_part, vram_part) = line.rsplit_once(',')?;
+    let name = name_part.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let vram_mib: f64 = vram_part.trim().parse().ok()?;
+    let vram_gb = (vram_mib / 1024.0 * 10.0).round() / 10.0;
+    Some((name, vram_gb))
+}
+
 // ── GET /api/infra/hardware ───────────────────────────────────────────────────
 
 /// `GET /api/infra/hardware` — any authenticated user.
 ///
 /// Reads `hardware.json` (installer-written) and OVERLAYS live `/proc` values
-/// for `cpu_cores` and `ram_gb` so stale file values self-correct. Returns the
-/// merged object. When no file is found, builds a best-effort object from
-/// `/proc` alone (gpu fields empty).
+/// for `cpu_cores` and `ram_gb` so stale file values self-correct. Also probes
+/// the GPU at request time via the docker socket (`nvidia-smi` inside the
+/// `ollama` container — see `probe_gpu_via_docker`), since `hardware.json`'s
+/// GPU fields are install-time-only and empty on most dev boxes.
+///
+/// Returns both the flat legacy fields (back-compat) AND two structured
+/// blocks — `docker` (container-visible CPU/RAM) and `system` (probed GPU +
+/// host RAM if known) — so the UI can show both views side by side.
 async fn get_hardware(
     Extension(_claims): Extension<JwtClaims>,
 ) -> Result<Json<Value>> {
-    let mut hw: Hardware = match hardware_json_path() {
+    let file_path = hardware_json_path();
+    let mut hw: Hardware = match &file_path {
         Some(path) => {
-            let text = std::fs::read_to_string(&path)
+            let text = std::fs::read_to_string(path)
                 .map_err(|e| AppError::Internal(format!("read hardware.json: {e}")))?;
             serde_json::from_str(&text).unwrap_or_default()
         }
         None => Hardware::default(),
     };
 
-    // Overlay live /proc values so stale file values self-correct.
+    // Host RAM as recorded by the installer — the only known source of the
+    // TRUE host total. /proc inside the container only ever sees the
+    // container/WSL2-VM-visible total, never the real host RAM.
+    let host_ram_gb: Option<f64> = if file_path.is_some() && hw.ram_gb > 0.0 {
+        Some(hw.ram_gb)
+    } else {
+        None
+    };
+
+    // Overlay live /proc values so stale file values self-correct (container view).
     let (live_cores, live_ram) = proc_hardware();
     if let Some(c) = live_cores { hw.cpu_cores = c; }
     if let Some(r) = live_ram   { hw.ram_gb    = r; }
+    let docker_cpu_cores = hw.cpu_cores;
+    let docker_ram_gb = hw.ram_gb;
 
-    Ok(Json(serde_json::to_value(&hw).unwrap_or(json!({}))))
+    // Runtime GPU probe (best-effort, off the async executor thread — the
+    // docker socket I/O is blocking).
+    let had_file_gpu = !hw.gpu_name.trim().is_empty();
+    let probed = tokio::task::spawn_blocking(probe_gpu_via_docker)
+        .await
+        .unwrap_or(None);
+    if let Some((name, vram)) = probed {
+        if !had_file_gpu {
+            hw.gpu_name = name;
+            hw.vram_gb = vram;
+        }
+        hw.nvidia_toolkit = true;
+    }
+
+    let mut resp = serde_json::to_value(&hw).unwrap_or(json!({}));
+    resp["docker"] = json!({
+        "cpu_cores": docker_cpu_cores,
+        "ram_gb": docker_ram_gb,
+        "source": "container",
+    });
+    resp["system"] = json!({
+        "gpu_name": hw.gpu_name,
+        "vram_gb": hw.vram_gb,
+        "nvidia_toolkit": hw.nvidia_toolkit,
+        "ram_gb": host_ram_gb,
+        "ram_source": if host_ram_gb.is_some() { "installer" } else { "unknown" },
+    });
+
+    Ok(Json(resp))
 }
 
 // ── POST /api/infra/rescan-hardware ──────────────────────────────────────────
