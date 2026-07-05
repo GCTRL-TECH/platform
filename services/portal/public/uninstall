@@ -31,8 +31,28 @@ for arg in "$@"; do
   case "$arg" in
     --purge|--all|--complete) PURGE=1 ;;
     --keep-data|--safe)       PURGE=0 ;;
+    --yes|-y)                 GCTRL_YES=1 ;;
   esac
 done
+
+# Ask for a typed confirmation word. Reads from /dev/tty so it also works when
+# the script itself arrives on stdin (curl ... | bash) — a plain `read` would
+# consume the next script line there and silently abort. GCTRL_YES=1 (or
+# --yes) skips the prompt for scripted/CI use.
+confirm_word() { # $1=prompt  $2=required word
+  [ "${GCTRL_YES:-0}" = "1" ] && return 0
+  local answer=""
+  if [ -t 0 ]; then
+    read -rp "$1" answer
+  elif [ -r /dev/tty ]; then
+    read -rp "$1" answer < /dev/tty
+  else
+    warn "No terminal available for the confirmation prompt."
+    warn "Re-run with GCTRL_YES=1 (or --yes) to confirm non-interactively."
+    exit 1
+  fi
+  [ "$answer" = "$2" ]
+}
 
 echo -e "${RED}Ground Control Uninstaller${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -42,15 +62,13 @@ if [ "$PURGE" = "1" ]; then
   echo -e "  • ${RED}all data volumes (Postgres, Neo4j, Qdrant, models) — UNRECOVERABLE${NC}"
   echo -e "  • the docker network and ${INSTALL_DIR} (incl. config + data)"
   echo ""
-  read -rp "Type 'purge' to permanently delete everything: " confirm
-  [ "$confirm" = "purge" ] || { echo "Aborted."; exit 0; }
+  confirm_word "Type 'purge' to permanently delete everything: " "purge" || { echo "Aborted."; exit 0; }
 else
   echo -e "${YELLOW}This stops GCTRL and removes its images.${NC}"
   echo -e "${YELLOW}Your data in ${INSTALL_DIR}/data + volumes is PRESERVED.${NC}"
   echo -e "  (Run with ${BLUE}--purge${NC} to wipe data too for a clean reinstall test.)"
   echo ""
-  read -rp "Type 'uninstall' to confirm: " confirm
-  [ "$confirm" = "uninstall" ] || { echo "Aborted."; exit 0; }
+  confirm_word "Type 'uninstall' to confirm: " "uninstall" || { echo "Aborted."; exit 0; }
 fi
 
 # Resolve which compose files exist so `down` targets the real project.

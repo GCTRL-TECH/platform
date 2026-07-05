@@ -57,6 +57,38 @@ GCTRL_MODEL=qwen2.5:7b curl -fsSL https://gctrl.tech/install | bash
 
 This is the recommended form for scripted or repeatable deployments.
 
+## Uninstall
+
+GCTRL ships a dedicated uninstaller with two modes:
+
+| Mode | Command | What happens |
+|------|---------|--------------|
+| **Safe** (default) | `curl -fsSL https://gctrl.tech/uninstall \| bash` | Stops GCTRL and removes its containers and images. **Your data is preserved** — the Postgres/Neo4j/Qdrant volumes and `~/gctrl/data` stay on disk, so a later reinstall picks up where you left off. |
+| **Purge** | `curl -fsSL https://gctrl.tech/uninstall \| bash -s -- --purge` | **Complete removal.** Every container, image, named volume (all knowledge-graph data — unrecoverable), the docker network, and the entire `~/gctrl` directory. The host ends up as if GCTRL was never installed. |
+
+The uninstaller asks for a typed confirmation before touching anything: `uninstall` in safe mode, `purge` in purge mode. It also deactivates your license key on the server (best-effort), so the key is free to use on a fresh install.
+
+What it cleans up beyond the compose project: stray `gctrl-*` containers are removed even if the compose state is broken or partial, and in purge mode any `gctrl`-prefixed volumes and networks are swept as well.
+
+### Non-interactive uninstall
+
+For scripted use (CI, test boxes), skip the confirmation prompt with `--yes` or `GCTRL_YES=1`:
+
+```bash
+# Complete wipe, no prompt — for clean-reinstall testing
+GCTRL_YES=1 curl -fsSL https://gctrl.tech/uninstall | bash -s -- --purge
+```
+
+If GCTRL was installed to a custom location, point the uninstaller at it with `GCTRL_INSTALL_DIR=/path/to/gctrl`.
+
+### Reinstall afterwards
+
+```bash
+curl -fsSL https://gctrl.tech/install | bash
+```
+
+After a **safe** uninstall the installer reuses your preserved volumes — graphs, users and settings are back. After a **purge** you start from zero.
+
 ## Next steps
 
 Once the stack is up, continue to [Activation](activation.md) to create your admin account and enter your license key.
