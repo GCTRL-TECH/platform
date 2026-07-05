@@ -28,6 +28,8 @@ import { cn } from '@/lib/utils'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
 import { useAuth } from '@/hooks/useAuth'
 import { resolveSourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+import { Tabs } from '@/components/ui/Tabs'
+import { ConflictsPanel } from '@/components/conflicts/ConflictsPanel'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -571,11 +573,21 @@ export function FusePage() {
   const { user } = useAuth()
 
   const [mode, setMode] = useState<Mode>('mode_select')
+  // Landing-page tab: the merge flow vs the conflict-reconciliation surface.
+  // Conflicts are a fusion concern (contradictory values for one entity), so they
+  // live here with a live count instead of on a separate page.
+  const [view, setView] = useState<'merge' | 'conflicts'>('merge')
   const [name, setName] = useState('')
   const [selectedJobIds, setSelectedJobIds] = useState<string[]>([])
   const [targetCompilationId, setTargetCompilationId] = useState('')
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [selectedOntologyId, setSelectedOntologyId] = useState<string | null>(null)
+
+  // Open-conflict count for the tab badge ("X unresolved conflicts").
+  const { data: conflictsData } = useApiQuery<{ conflicts: unknown[] }>(
+    ['classification', 'conflicts'], '/classification/conflicts',
+  )
+  const conflictCount = conflictsData?.conflicts?.length ?? 0
 
   // Fetch compilations for "enrich existing"
   const { data: compilationsData, isLoading: compilationsLoading } =
@@ -707,14 +719,28 @@ export function FusePage() {
   if (mode === 'mode_select') {
     return (
       <div className="space-y-6 animate-slide-up">
+        <div className="mb-1">
+          <h2 className="text-base font-semibold text-slate-100">Knowledge Fusion</h2>
+          <p className="mt-0.5 text-sm text-slate-500">
+            Merge extraction jobs into unified knowledge graphs, and reconcile conflicting facts.
+          </p>
+        </div>
+
+        <Tabs
+          tabs={[
+            { id: 'merge', label: 'Merge', icon: GitMerge },
+            { id: 'conflicts', label: 'Conflicts', icon: AlertCircle, badge: conflictCount },
+          ]}
+          active={view}
+          onChange={(id) => setView(id as 'merge' | 'conflicts')}
+        />
+
+        {view === 'conflicts' ? (
+          <ConflictsPanel />
+        ) : (
+          <>
         {/* Mode cards */}
         <div>
-          <div className="mb-5">
-            <h2 className="text-base font-semibold text-slate-100">Knowledge Fusion</h2>
-            <p className="mt-0.5 text-sm text-slate-500">
-              Merge extraction jobs into unified knowledge graphs.
-            </p>
-          </div>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {/* Create New */}
             <button
@@ -780,6 +806,8 @@ export function FusePage() {
           compilations={compilations}
           isLoading={compilationsLoading}
         />
+          </>
+        )}
       </div>
     )
   }
