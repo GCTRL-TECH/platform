@@ -86,7 +86,9 @@ export GCTRL_GATEWAY_URL="https://your-gctrl-host/api/agent/mcp"
 
 ## Install the skill
 
-The skill teaches the agent _when_ to retrieve, how to descend the tool ladder without flooding context, and how to write conclusions back so memory compounds. Without it the tools are available but the agent has no discipline about using them.
+The skill teaches the agent _when_ to retrieve, how to descend the tool ladder without flooding context, and how to write conclusions back so memory compounds. Without it the tools are available but the agent has no discipline about using them. **Do this right after wiring up the MCP config above.**
+
+The canonical, always-current copy is served at `GET /api/agent/skill.md` on your own instance, and publicly mirrored at **[gctrl.tech/skill.md](https://gctrl.tech/skill.md)**. Full per-client install commands (Claude Code, Cursor, Codex/AGENTS.md, or paste-as-system-prompt) live on the **[Install the GCTRL Skill](memory-skill.md)** page — this section just covers the token you'll need first.
 
 ### Create a scoped access token
 
@@ -96,28 +98,7 @@ In the GCTRL portal: **Settings → Access Control → New Token**. Pick a clear
 Authorization: ApiKey gctrl_your_scoped_token
 ```
 
-### Claude Code
-
-```bash
-mkdir -p .claude/skills/gctrl
-cp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md
-# user-level alternative (all projects): ~/.claude/skills/gctrl/SKILL.md
-```
-
-Claude Code loads the skill's trigger description automatically; the body is pulled in when it fires.
-
-### Cursor
-
-```bash
-mkdir -p .cursor/rules
-cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc
-```
-
-### Codex / other CLIs
-
-Append `sdk/claude-skill/codex/AGENTS-snippet.md` to the project's `AGENTS.md`. See `sdk/claude-skill/README.md` for the full setup guide and a 5-question smoke-test protocol.
-
-> **Settings shortcut** — the [Connect an Agent](settings?tab=connect-agent) tab in Settings generates ready-to-copy config snippets for all transports with your instance URL pre-filled.
+> **Settings shortcut** — the **Settings → Agent** Harness tab and the onboarding wizard's "Connect Agent" step both have a one-click **Copy skill.md** button alongside the MCP config, with your instance URL pre-filled.
 
 ## GCTRL as a memory node
 

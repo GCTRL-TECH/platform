@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import {
   Code2, Terminal, Bot, GitBranch, Zap, MousePointer2, Wind, AppWindow, Github,
   Workflow, Paperclip, Rss, Link2, Layers, Webhook, HardDrive, BookOpen,
-  FolderKanban, Globe, FileText, type LucideIcon,
+  FolderKanban, Globe, FileText, Puzzle, Copy, Check, ExternalLink, type LucideIcon,
 } from 'lucide-react'
 import { useScrollReveal } from '@/hooks/useScrollReveal'
 import { SiteHeader } from '@/components/site/SiteHeader'
@@ -88,12 +88,25 @@ function IntegrationCard({ item }: { item: Integration }) {
 }
 
 function HowItWorks() {
+  const [skillCopied, setSkillCopied] = useState(false)
+
+  async function copySkill() {
+    try {
+      const res = await fetch('/skill.md')
+      const text = await res.text()
+      await navigator.clipboard.writeText(text)
+      setSkillCopied(true)
+      setTimeout(() => setSkillCopied(false), 1800)
+    } catch { /* non-fatal */ }
+  }
+
   return (
-    <div className="reveal grid gap-4 lg:grid-cols-3">
-      <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5">
-        <p className="text-xs font-semibold uppercase tracking-wider text-cyan-400">MCP over HTTP</p>
-        <p className="mt-1.5 text-xs text-slate-500">Remote agents, orchestrators — the gateway is off by default, enable it in Settings → Agent.</p>
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
+    <div className="space-y-4">
+      <div className="reveal grid gap-4 lg:grid-cols-3">
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5">
+          <p className="text-xs font-semibold uppercase tracking-wider text-cyan-400">1. MCP over HTTP</p>
+          <p className="mt-1.5 text-xs text-slate-500">Remote agents, orchestrators — the gateway is off by default, enable it in Settings → Agent.</p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
 {`{
   "mcpServers": {
     "gctrl": {
@@ -105,12 +118,13 @@ function HowItWorks() {
     }
   }
 }`}
-        </pre>
-      </div>
-      <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5">
-        <p className="text-xs font-semibold uppercase tracking-wider text-violet-400">MCP over stdio</p>
-        <p className="mt-1.5 text-xs text-slate-500">Local agents — Claude Code, Cursor, Claude Desktop — on the same machine or LAN.</p>
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
+          </pre>
+          <p className="mt-2 text-[10px] text-slate-600">2. Install the skill (below) so the agent knows how to use it.</p>
+        </div>
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5">
+          <p className="text-xs font-semibold uppercase tracking-wider text-violet-400">1. MCP over stdio</p>
+          <p className="mt-1.5 text-xs text-slate-500">Local agents — Claude Code, Cursor, Claude Desktop — on the same machine or LAN.</p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
 {`{
   "mcpServers": {
     "gctrl": {
@@ -122,18 +136,62 @@ function HowItWorks() {
     }
   }
 }`}
-        </pre>
-      </div>
-      <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5">
-        <p className="text-xs font-semibold uppercase tracking-wider text-indigo-400">Direct HTTP</p>
-        <p className="mt-1.5 text-xs text-slate-500">Any framework with its own tool-calling convention — no MCP client required.</p>
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
+          </pre>
+          <p className="mt-2 text-[10px] text-slate-600">2. Install the skill (below) so the agent knows how to use it.</p>
+        </div>
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5">
+          <p className="text-xs font-semibold uppercase tracking-wider text-indigo-400">1. Direct HTTP</p>
+          <p className="mt-1.5 text-xs text-slate-500">Any framework with its own tool-calling convention — no MCP client required.</p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
 {`curl -X POST \\
   https://<your-install>/api/agent/tools/search_entities \\
   -H "Authorization: ApiKey <token>" \\
   -H "Content-Type: application/json" \\
   -d '{ "query": "..." }'`}
-        </pre>
+          </pre>
+          <p className="mt-2 text-[10px] text-slate-600">2. Install the skill (below) so the agent knows how to use it.</p>
+        </div>
+      </div>
+
+      {/* Step 2 — the skill teaches the agent HOW to use the tools above: setup
+          interview, which memory layer to read, and to always write conclusions
+          back. Without it the tools are available but undirected. */}
+      <div className="reveal rounded-2xl border border-violet-500/20 bg-violet-500/5 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="flex shrink-0 items-center justify-center rounded-xl border border-violet-400/20 bg-violet-500/10 p-2.5" style={{ width: '2.75rem', height: '2.75rem' }}>
+              <Puzzle className="h-5 w-5 text-violet-300" strokeWidth={1.75} />
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-slate-100">2. Install the GCTRL skill</p>
+              <p className="mt-1 max-w-2xl text-xs leading-relaxed text-slate-500">
+                The config above gives your agent the <em>tools</em>. The skill teaches it <em>how</em> to use them well:
+                run the one-time setup interview, read the right memory layer for each question, and always{' '}
+                <span className="text-slate-300">write conclusions back</span> so GCTRL compounds instead of
+                starting cold every session.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => void copySkill()}
+            className="flex shrink-0 items-center gap-1.5 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs font-medium text-violet-200 transition-colors hover:bg-violet-500/20"
+          >
+            {skillCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+            {skillCopied ? 'Copied' : 'Copy skill'}
+          </button>
+        </div>
+        <p className="mt-3 text-[11px] text-slate-500">
+          <Link to="/docs/memory-skill" className="text-violet-300 hover:underline">Read the skill docs</Link>
+          {' · '}
+          <a
+            href="https://gctrl.tech/skill.md"
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-violet-300 hover:underline"
+          >
+            gctrl.tech/skill.md <ExternalLink className="h-3 w-3" />
+          </a>
+        </p>
       </div>
     </div>
   )
