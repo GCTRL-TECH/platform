@@ -35,6 +35,7 @@ import SharePointPage from '@/pages/connectors/SharePointPage'
 import ObsidianPage from '@/pages/connectors/ObsidianPage'
 import ClassificationPage from '@/pages/admin/ClassificationPage'
 import AccessControlPage from '@/pages/access/AccessControlPage'
+import KnowledgeQualityPage from '@/pages/quality/KnowledgeQualityPage'
 import ApiKeysPage from '@/pages/settings/ApiKeysPage'
 import SSOPage from '@/pages/settings/SSOPage'
 import { AgentProvider } from '@/components/agent/AgentProvider'
@@ -254,6 +255,7 @@ export function App() {
             <Route path="/obsidian" element={<ObsidianPage />} />
             <Route path="/admin/classification" element={<ClassificationPage />} />
             <Route path="/access" element={<AccessControlPage />} />
+            <Route path="/quality" element={<KnowledgeQualityPage />} />
             {/* Webhooks moved into Settings as a tab; keep the old link working. */}
             <Route path="/settings/webhooks" element={<Navigate to="/settings?tab=webhooks" replace />} />
             <Route path="/settings/api-keys" element={<ApiKeysPage />} />

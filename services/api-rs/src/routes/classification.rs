@@ -440,15 +440,53 @@ async fn list_conflicts(
     .fetch_all(&state.db)
     .await?;
 
-    conflicts.extend(fact_rows.into_iter().map(
-        |(id, cid, relation, key_uri, key_name, key_side, tails, winner,
-          status, first_detected, last_evaluated)| json!({
-            "id": id, "kind": "fact",
-            "compilationId": cid, "relation": relation,
-            "keyUri": key_uri, "keyName": key_name, "keySide": key_side,
-            "tails": tails, "authorityWinner": winner, "status": status,
-            "createdAt": first_detected, "lastEvaluatedAt": last_evaluated,
+    // Enrich tails with a READABLE source-document name. Each tail carries a
+    // `sourceDoc` = source_documents.id; the raw card only showed a truncated uuid
+    // ("doc 2be4cf5b"), which is undecidable. Resolve id → name so the user can see
+    // WHICH document each competing value came from.
+    let doc_ids: Vec<Uuid> = fact_rows.iter()
+        .flat_map(|r| r.6.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+        .filter_map(|t| t.get("sourceDoc").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()))
+        .collect();
+    let doc_names: std::collections::HashMap<Uuid, String> = if doc_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        sqlx::query_as::<_, (Uuid, Option<String>, String)>(
+            "SELECT id, name, path FROM source_documents WHERE id = ANY($1) AND user_id = $2",
+        )
+        .bind(&doc_ids).bind(claims.sub)
+        .fetch_all(&state.db).await.unwrap_or_default()
+        .into_iter()
+        .map(|(id, name, path)| {
+            // Prefer a name; else the basename of the path; else nothing (UI falls back).
+            let label = name.filter(|s| !s.is_empty())
+                .unwrap_or_else(|| path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string());
+            (id, label)
         })
+        .collect()
+    };
+
+    conflicts.extend(fact_rows.into_iter().map(
+        |(id, cid, relation, key_uri, key_name, key_side, mut tails, winner,
+          status, first_detected, last_evaluated)| {
+            if let Some(arr) = tails.as_array_mut() {
+                for t in arr.iter_mut() {
+                    let name = t.get("sourceDoc").and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .and_then(|id| doc_names.get(&id).cloned());
+                    if let (Some(obj), Some(n)) = (t.as_object_mut(), name) {
+                        obj.insert("sourceDocName".into(), json!(n));
+                    }
+                }
+            }
+            json!({
+                "id": id, "kind": "fact",
+                "compilationId": cid, "relation": relation,
+                "keyUri": key_uri, "keyName": key_name, "keySide": key_side,
+                "tails": tails, "authorityWinner": winner, "status": status,
+                "createdAt": first_detected, "lastEvaluatedAt": last_evaluated,
+            })
+        }
     ));
 
     Ok(Json(json!({ "conflicts": conflicts })))
