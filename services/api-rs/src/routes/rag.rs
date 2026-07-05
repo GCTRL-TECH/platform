@@ -1207,6 +1207,10 @@ async fn query(
         "cypher":     cypher_val,
         "graphTrace": graph_trace,
         "conversationId": conversation_id_out,
+        // The graph the evidence actually came from — so "trace this source" opens
+        // the RIGHT graph (with the node in it) instead of guessing the first one
+        // in the list when the user chats without a compilation selected.
+        "sourceCompilationId": involved_compilations.first(),
     });
     if let Some(meta) = privacy_meta {
         resp["privacy"] = meta;
@@ -1462,11 +1466,20 @@ async fn deep_query(
                 if seen_chunks.insert(key) {
                     let score = ch["score"].as_f64().unwrap_or(0.0);
                     score_sum += score;
+                    // Entity names this chunk mentions — so clicking the source in
+                    // Talk-to-Graph opens the viewer focused on a real node (same as
+                    // the fast path). search_chunks returns entity_mentions as
+                    // {name,type,...} objects, so pull the names. Without this,
+                    // deep-mode sources opened the whole graph with nothing focused.
+                    let entity_names: Vec<String> = ch["entity_mentions"].as_array()
+                        .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
                     sources.push(json!({
                         "text":    text,
                         "score":   score,
                         "source":  ch["source"].as_str().unwrap_or(""),
                         "chunkId": ch["chunk_id"].as_str().or_else(|| ch["chunkId"].as_str()).unwrap_or(""),
+                        "entityMentions": entity_names,
                     }));
                 }
             }

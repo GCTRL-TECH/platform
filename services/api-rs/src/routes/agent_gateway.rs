@@ -133,18 +133,28 @@ async fn mcp_rpc(
 
     match method {
         // ── Handshake ──────────────────────────────────────────────────────────
-        "initialize" => rpc_result(
-            id,
-            json!({
-                "protocolVersion": "2025-06-18",
-                "serverInfo": { "name": "gctrl", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": { "tools": {} },
-                // Surfaced to the connecting model by MCP clients: how to use the
-                // memory layers + the write-back discipline (the point of GCTRL).
-                "instructions": crate::routes::agent::MEMORY_INSTRUCTIONS
-            }),
-        )
-        .into_response(),
+        "initialize" => {
+            // Prepend a pointer so the connecting model pulls the FULL skill
+            // (exposed as the gctrl://skill resource below) — the short
+            // MEMORY_INSTRUCTIONS is only the gist.
+            let instructions = format!(
+                "IMPORTANT: read the full GCTRL skill before your first task — it's the MCP resource `gctrl://skill` (call resources/read) or GET /api/agent/skill.md. Follow it: it covers the one-time setup interview, using GCTRL as your RAG/memory infrastructure, and the write-back discipline. Gist: {}",
+                crate::routes::agent::MEMORY_INSTRUCTIONS
+            );
+            rpc_result(
+                id,
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "serverInfo": { "name": "gctrl", "version": env!("CARGO_PKG_VERSION") },
+                    // `resources` advertised so a connecting client can auto-fetch the
+                    // full GCTRL skill (setup interview, RAG-infra framing, write-back
+                    // discipline) — the `instructions` below is only the gist + pointer.
+                    "capabilities": { "tools": {}, "resources": {} },
+                    "instructions": instructions
+                }),
+            )
+            .into_response()
+        }
 
         // ── Lifecycle no-ops ───────────────────────────────────────────────────
         // Notifications carry no `id` and expect no response body; a 202 with an
@@ -157,6 +167,32 @@ async fn mcp_rpc(
         // ── Discovery ──────────────────────────────────────────────────────────
         "tools/list" => {
             rpc_result(id, json!({ "tools": mcp_tool_descriptors() })).into_response()
+        }
+
+        // ── Resources: expose the full GCTRL skill so a connecting agent can
+        //    pull and follow it (the short `instructions` is only a pointer). ──
+        "resources/list" => rpc_result(
+            id,
+            json!({ "resources": [ {
+                "uri": "gctrl://skill",
+                "name": "GCTRL Agent Skill",
+                "title": "How to get the most out of GCTRL",
+                "description": "Read and follow this on connect: first-run setup, using GCTRL as your RAG/memory infrastructure, and the write-back discipline.",
+                "mimeType": "text/markdown"
+            } ] }),
+        )
+        .into_response(),
+        "resources/read" => {
+            let uri = req.get("params").and_then(|p| p.get("uri")).and_then(|u| u.as_str()).unwrap_or("");
+            if uri == "gctrl://skill" {
+                rpc_result(id, json!({ "contents": [ {
+                    "uri": "gctrl://skill",
+                    "mimeType": "text/markdown",
+                    "text": crate::routes::agent::MEMORY_SKILL_MD
+                } ] })).into_response()
+            } else {
+                rpc_error(id, -32602, &format!("unknown resource: {uri}")).into_response()
+            }
         }
 
         // ── Invocation ─────────────────────────────────────────────────────────

@@ -88,6 +88,9 @@ interface ChatMessage {
   imageUrl?: string
   createdAt: string
   feedback?: 'up' | 'down'
+  // The graph this answer's evidence came from — so tracing a source opens the
+  // correct graph (with the node in it), not a guessed first graph.
+  sourceCompilationId?: string
   // Private Memory: present only when this answer's context was routed
   // through a cloud model with the graph's privacy mode set to "cloaked".
   privacy?: { mode: string; cloakedEntities?: number }
@@ -130,6 +133,7 @@ interface RagQueryResponse {
   tokensUsed?: number
   model?: string
   privacy?: { mode: string; cloakedEntities?: number }
+  sourceCompilationId?: string
 }
 
 interface ConversationsResponse {
@@ -504,7 +508,7 @@ function TracePanel({
   message: ChatMessage
   onClose: () => void
   /** Open the graph viewer focused on this source's entity (trace provenance). */
-  onTraceSource: (src: Source) => void
+  onTraceSource: (src: Source, compilationId?: string) => void
 }) {
   const [cypherCopied, setCypherCopied] = useState(false)
   const [cypherExpanded, setCypherExpanded] = useState(false)
@@ -552,7 +556,7 @@ function TracePanel({
               {message.sources.map((src, i) => (
                 <div
                   key={i}
-                  onClick={() => onTraceSource(src)}
+                  onClick={() => onTraceSource(src, message.sourceCompilationId)}
                   role="button"
                   title="Open in the graph viewer to trace where this came from"
                   className="group cursor-pointer rounded-xl border border-white/5 bg-white/[0.03] p-3 transition-all duration-150 hover:border-blue-500/30 hover:bg-blue-500/5"
@@ -1175,8 +1179,12 @@ export function TalkToGraphPage() {
   // a real node — `entityMentions[0]` alone is often a generic term (e.g. a
   // language or date) that isn't in the graph, which left the click unselected.
   // Preserve the current conversation in the URL so Back returns to this thread.
-  function handleTraceSource(src: Source) {
-    const target = selectedCompilation || compilations[0]?.id
+  function handleTraceSource(src: Source, answerCompilationId?: string) {
+    // Target the graph the ANSWER's evidence came from (server-resolved), then
+    // the KB the user has selected, then a last-resort first graph. Without this,
+    // chatting over "all graphs" opened a guessed first graph that didn't contain
+    // the node, so the source was never findable.
+    const target = answerCompilationId || selectedCompilation || compilations[0]?.id
     if (!target) { navigate('/graphs'); return }
     const candidates = (src.entityMentions ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 12)
     const focus = candidates.length ? `?focus=${encodeURIComponent(candidates.join('\n'))}` : ''
@@ -1443,6 +1451,7 @@ export function TalkToGraphPage() {
         model: data.model,
         imageUrl: (data as unknown as Record<string, unknown>).imageUrl as string | undefined,
         privacy: data.privacy,
+        sourceCompilationId: data.sourceCompilationId,
         createdAt: new Date().toISOString(),
       }
 
