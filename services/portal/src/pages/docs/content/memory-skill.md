@@ -50,9 +50,11 @@ curl -fsSL https://gctrl.tech/skill.md
 
 This is the same drop-in pattern used for frameworks like Paperclip or Hermes — `GET /api/agent/skill.md` on your own instance returns your token-aware instance's copy; it never requires an MCP client.
 
-### MCP clients that read server `initialize` instructions
+### MCP clients: automatic skill delivery
 
-GCTRL's MCP gateway also returns a short version of this discipline in the `initialize` handshake's `instructions` field, per the MCP spec — some MCP-compliant clients fold that into their system prompt automatically, with no extra step. That short form is a summary, not a substitute: **installing the full skill file is the reliable path** across every client, since not all clients surface `initialize.instructions`.
+GCTRL's MCP gateway exposes the **full skill as an MCP resource** (`gctrl://skill`). A compliant client can list it (`resources/list`) and read it (`resources/read`) — so the whole skill can be pulled automatically on connect, no copy step. The `initialize` handshake also returns a short instruction that points the agent at that resource, and MCP clients that fold `initialize.instructions` into their system prompt get the pointer for free.
+
+That short form is a summary, not a substitute: for clients that don't auto-read resources or surface `initialize.instructions`, **installing the full skill file is the reliable path** — it works across every client.
 
 ## Where it ships
 
