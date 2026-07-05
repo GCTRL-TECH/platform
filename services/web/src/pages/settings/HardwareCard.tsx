@@ -1,10 +1,27 @@
 import { useState, useRef, useEffect } from 'react'
-import { Cpu, Zap, Sparkles, RefreshCw, AlertTriangle, Check, Loader2, MemoryStick } from 'lucide-react'
+import { Cpu, Zap, Sparkles, RefreshCw, AlertTriangle, Check, Loader2, MemoryStick, Box, Server } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { getToken } from '@/lib/auth'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+/** Container-visible CPU/RAM — what containers (KEX/FUSE/etc) can actually use. */
+export interface HardwareDockerView {
+  cpu_cores: number
+  ram_gb: number
+  source: string
+}
+
+/** Host-level view — GPU is probed at runtime; host RAM is only known if the
+ *  installer recorded it (unknowable from inside a container otherwise). */
+export interface HardwareSystemView {
+  gpu_name: string | null
+  vram_gb: number | null
+  nvidia_toolkit: boolean
+  ram_gb: number | null
+  ram_source: string
+}
 
 export interface HardwareInfo {
   cpu_cores: number
@@ -14,6 +31,11 @@ export interface HardwareInfo {
   nvidia_toolkit: boolean
   arch: string
   os: string
+  // Added so the UI can show Docker vs System views side by side. Optional —
+  // an api build that predates this still returns the flat fields above, so
+  // every read below falls back to them.
+  docker?: HardwareDockerView
+  system?: HardwareSystemView
 }
 
 export interface Recommendation {
@@ -168,6 +190,15 @@ export function HardwareCard({ hardware, recommendation, isAdmin, onHardwareResc
     )
   }
 
+  // Defensive fallback: `docker`/`system` may be absent if the api hasn't been
+  // rebuilt yet — fall back to the flat legacy fields so this never crashes.
+  const dockerCpuCores = hardware.docker?.cpu_cores ?? hardware.cpu_cores
+  const dockerRamGb = hardware.docker?.ram_gb ?? hardware.ram_gb
+  const sysGpuName = hardware.system?.gpu_name ?? hardware.gpu_name
+  const sysVramGb = hardware.system?.vram_gb ?? hardware.vram_gb
+  const sysNvidiaToolkit = hardware.system?.nvidia_toolkit ?? hardware.nvidia_toolkit
+  const sysRamGb = hardware.system ? hardware.system.ram_gb : null
+
   return (
     <div className="space-y-3">
       {/* Hardware specs card */}
@@ -189,26 +220,61 @@ export function HardwareCard({ hardware, recommendation, isAdmin, onHardwareResc
           )}
         </div>
 
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <Spec label="CPU cores" value={String(hardware.cpu_cores)} icon={Cpu} />
-          <Spec label="RAM" value={`${hardware.ram_gb} GB`} icon={MemoryStick} />
-          <Spec
-            label="GPU"
-            value={hardware.gpu_name ?? 'None detected'}
-            icon={Zap}
-            highlight={!!hardware.gpu_name}
-          />
-          <Spec
-            label="VRAM"
-            value={hardware.vram_gb != null ? `${hardware.vram_gb} GB` : '—'}
-            icon={Zap}
-          />
+        {/* Docker (container-visible) */}
+        <div className="mb-3">
+          <div className="mb-1.5 flex items-center gap-1.5">
+            <Box size={11} className="text-indigo-400" />
+            <span className="text-[10px] font-medium uppercase tracking-wide text-indigo-300">
+              Docker (container-visible)
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Spec label="CPU cores" value={String(dockerCpuCores)} icon={Cpu} />
+            <Spec label="RAM" value={`${dockerRamGb} GB`} icon={MemoryStick} />
+          </div>
+          <p className="mt-1 text-[10px] text-slate-500">
+            What containers can use (WSL2 VM on Windows)
+          </p>
+        </div>
+
+        {/* System (host) */}
+        <div>
+          <div className="mb-1.5 flex items-center gap-1.5">
+            <Server size={11} className="text-violet-400" />
+            <span className="text-[10px] font-medium uppercase tracking-wide text-violet-300">
+              System (host)
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Spec
+              label="GPU"
+              value={sysGpuName ?? 'None detected'}
+              icon={Zap}
+              highlight={!!sysGpuName}
+            />
+            <Spec
+              label="VRAM"
+              value={sysVramGb != null ? `${sysVramGb} GB` : '—'}
+              icon={Zap}
+            />
+            <Spec
+              label="Host RAM"
+              value={sysRamGb != null ? `${sysRamGb} GB` : 'Not detected'}
+              icon={MemoryStick}
+              highlight={sysRamGb != null}
+            />
+          </div>
+          {sysRamGb == null && (
+            <p className="mt-1 text-[10px] text-slate-500">
+              Host RAM not detected — run the installer to capture host specs
+            </p>
+          )}
         </div>
 
         <div className="mt-3 flex flex-wrap gap-2 text-[10px]">
           <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-slate-400">{hardware.arch}</span>
           <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-slate-400">{hardware.os}</span>
-          {hardware.nvidia_toolkit ? (
+          {sysNvidiaToolkit ? (
             <span className="rounded bg-emerald-950/40 px-2 py-0.5 font-mono text-emerald-400">CUDA toolkit detected</span>
           ) : (
             <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-slate-500">No CUDA toolkit</span>
