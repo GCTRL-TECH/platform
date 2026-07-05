@@ -170,12 +170,18 @@ export function WikiPage() {
   const queryClient = useQueryClient()
 
   // All compilations — we derive the set of accessible WIKI spaces from these.
+  // The query key MUST encode the limit: Dashboard/KG list/FUSE cache plain
+  // '/kg/compilations' (server default: 20 newest) under ['kg','compilations'].
+  // Sharing that key made this page render from their 20-newest cache — which
+  // often contains no WIKI compilations — so the wiki list showed empty until
+  // a hard refresh. (invalidateQueries on the ['kg','compilations'] prefix
+  // still reaches this key.)
   const {
     data: compsData,
     isLoading: compsLoading,
     error: compsError,
   } = useApiQuery<CompilationsResponse>(
-    ['kg', 'compilations'],
+    ['kg', 'compilations', { limit: 100 }],
     '/kg/compilations?limit=100'
   )
 
