@@ -118,8 +118,12 @@ function TokensSection() {
         ? new Date(Date.now() + expiryDays * 86400_000).toISOString()
         : null
       const grants = Array.from(grantIds).map((compilationId) => ({ compilationId, grantedRank: null }))
+      // Selecting specific graphs makes the token KB-scoped by policy (the server
+      // enforces this too): "limited" must actually limit — grants never widen an
+      // otherwise-full token anymore.
       const { data } = await api.post<{ key: string }>('/users/api-keys', {
-        name: name.trim(), maxClearanceLevelId: levelId || defaultLevelId, expiresAt, grants, kbScoped,
+        name: name.trim(), maxClearanceLevelId: levelId || defaultLevelId, expiresAt, grants,
+        kbScoped: kbScoped || grants.length > 0,
       })
       setFreshKey(data.key)
       setShowForm(false); reset()
@@ -202,24 +206,28 @@ function TokensSection() {
             </div>
           </div>
 
-          {/* KB-scope toggle — for colleague tokens (Single-Owner + Scoped Tokens) */}
-          <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
-            <input type="checkbox" checked={kbScoped} onChange={(e) => setKbScoped(e.target.checked)} className="mt-0.5" />
+          {/* KB-scope toggle — for colleague tokens (Single-Owner + Scoped Tokens).
+              Selecting any graph below forces scoping (server-enforced): grants
+              confine a token, they never widen an otherwise-full one. */}
+          <label className={cn('flex items-start gap-2.5 rounded-lg border border-slate-800 bg-slate-900/40 p-3',
+            grantIds.size > 0 ? 'cursor-not-allowed opacity-80' : 'cursor-pointer')}>
+            <input type="checkbox" checked={kbScoped || grantIds.size > 0} disabled={grantIds.size > 0}
+              onChange={(e) => setKbScoped(e.target.checked)} className="mt-0.5" />
             <span>
               <span className="text-xs font-medium text-slate-200">Scope to specific knowledge bases (colleague token)</span>
               <span className="mt-0.5 block text-[11px] text-slate-500">
-                When on, this token can read &amp; write ONLY the graphs selected below — every other knowledge
-                base is invisible. When off, the token has full owner access (selections merely raise clearance).
+                This token can read &amp; write ONLY the graphs selected below — every other knowledge
+                base is invisible. Selecting a graph below turns this on automatically; a token with
+                no selection and this off has full owner access.
               </span>
             </span>
           </label>
 
           <div>
-            <label className="label">{kbScoped ? 'Knowledge bases this token may access (exclusive)' : 'Per-graph access (beyond base clearance)'}</label>
+            <label className="label">Knowledge bases this token may access (exclusive)</label>
             <p className="mb-2 text-[11px] text-slate-600">
-              {kbScoped
-                ? 'This token can read & write ONLY the selected graphs, capped at its base clearance. Nothing else is visible.'
-                : 'Grant this token access to specific graphs even if their classification exceeds its base clearance.'}
+              A token with a selection can read &amp; write ONLY the selected graphs (full access to each
+              selected graph, regardless of its classification). Nothing else is visible.
             </p>
             <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-slate-800 p-2">
               {comps.length === 0 ? (

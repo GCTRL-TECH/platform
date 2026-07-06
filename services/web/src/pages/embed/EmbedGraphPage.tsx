@@ -23,6 +23,7 @@ import { useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { AlertCircle, Loader2 } from 'lucide-react'
 import { WorkspaceCanvas } from '@/pages/workspace/WorkspaceCanvas'
+import { EmbedNodeContext } from './EmbedNodeContext'
 import type { GraphData, GraphEdge, GraphNode } from '@/components/graph-explorer/types'
 
 const BASE_URL = (import.meta.env as Record<string, string | undefined>)['VITE_API_URL'] || '/api'
@@ -45,6 +46,9 @@ export default function EmbedGraphPage() {
   const [state, setState] = useState<LoadState>('loading')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [data, setData] = useState<GraphData | null>(null)
+  // Node context drawer: selected entity display name (same convention as the
+  // full explorer — nodes are looked up by label first, then id).
+  const [selectedName, setSelectedName] = useState<string | null>(null)
 
   // GDPR/embedding hygiene: never leak the host page's URL to the API origin
   // via the Referer header on this cross-site-friendly surface.
@@ -112,21 +116,53 @@ export default function EmbedGraphPage() {
   const nodes: GraphNode[] = data.nodes ?? []
   const edges: GraphEdge[] = data.edges ?? []
 
+  const selectedNode =
+    selectedName
+      ? nodes.find((n) => n.label === selectedName) ?? nodes.find((n) => n.id === selectedName) ?? null
+      : null
+
+  function handleSelect(node: GraphNode | null) {
+    const name = node ? (node.label || (node.properties?.name as string | undefined) || '') : null
+    setSelectedName(name || null)
+  }
+
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-slate-950">
       <WorkspaceCanvas
         nodes={nodes}
         edges={edges}
-        selectedId={null}
-        onSelect={() => { /* embed is read-only: react-force-graph's own
-                              nodeLabel hover tooltip is the only per-node
-                              affordance — no side drawer here. */ }}
+        selectedId={selectedNode?.id ?? null}
+        onSelect={handleSelect}
         theme={themeParam}
         initialLabels={initialLabels}
         datasetKey={compilationId ?? undefined}
         className="h-full w-full"
       />
-      <div className="pointer-events-none absolute bottom-2 right-2 z-30 rounded-md border border-slate-700/60 bg-slate-900/80 px-2 py-1 text-[10px] text-slate-400">
+
+      {/* Node context drawer — overlays the right edge (closable, read-only),
+          so the canvas keeps its full size underneath. */}
+      {selectedName && compilationId && (
+        <div className="absolute inset-y-0 right-0 z-20 w-[340px] max-w-[85vw] border-l border-slate-800 bg-slate-950/95 shadow-2xl backdrop-blur-sm">
+          <EmbedNodeContext
+            key={selectedName}
+            baseUrl={BASE_URL}
+            token={token}
+            compilationId={compilationId}
+            entityName={selectedName}
+            localNode={selectedNode}
+            nodes={nodes}
+            edges={edges}
+            onClose={() => setSelectedName(null)}
+            onNavigate={(name) => setSelectedName(name)}
+          />
+        </div>
+      )}
+
+      {/* Badge slides left of the drawer while it is open so it never covers it. */}
+      <div
+        className="pointer-events-none absolute bottom-2 z-30 rounded-md border border-slate-700/60 bg-slate-900/80 px-2 py-1 text-[10px] text-slate-400"
+        style={{ right: selectedName && compilationId ? 348 : 8 }}
+      >
         GCTRL · {nodes.length.toLocaleString()} nodes
       </div>
     </div>

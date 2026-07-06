@@ -20,15 +20,18 @@ fn is_valid_neo4j_label(s: &str) -> bool {
 /// Fetch the effective clearance_rank for this request.
 /// Takes the user's DB rank and caps it at api_key_rank when an API key was used.
 pub(crate) async fn get_user_clearance_rank(db: &sqlx::PgPool, claims: &JwtClaims) -> i32 {
-    // Per-session agent override wins (the chat handler already validated it: admin
-    // → full access; non-admin → capped to their stored rank). It's `#[serde(skip)]`
-    // so it can only be set in-process, never via a token.
-    if let Some(o) = claims.agent_override_rank {
-        // Still cap by any API-key rank: an admin deliberately driving a LOW-rank key
-        // must not get full access through the override. (A JWT session has no
-        // api_key_rank, so the board agent's i32::MAX override is unaffected.)
-        return match claims.api_key_rank { Some(k) => o.min(k), None => o };
-    }
+    clearance_rank_with_cap(db, claims).await.0
+}
+
+/// Effective clearance for this request PLUS whether it is CAPPED below the
+/// owner's own clearance (a rank-limited API key, or a downgraded agent
+/// session). Capped requests are "limited" by intent: list endpoints must NOT
+/// show them UNCLASSIFIED compilations (`classification_level_id IS NULL`) —
+/// those are owner-default content, visible only at full owner clearance or
+/// via an explicit per-graph grant on the token. (Previously the NULL branch
+/// bypassed every rank cap, so a PUBLIC-capped token could enumerate all of
+/// the owner's unclassified graphs.)
+pub(crate) async fn clearance_rank_with_cap(db: &sqlx::PgPool, claims: &JwtClaims) -> (i32, bool) {
     let db_rank = sqlx::query_scalar::<_, i32>("SELECT COALESCE(clearance_rank, 100) FROM users WHERE id = $1")
         .bind(claims.sub)
         .fetch_optional(db)
@@ -36,10 +39,18 @@ pub(crate) async fn get_user_clearance_rank(db: &sqlx::PgPool, claims: &JwtClaim
         .ok()
         .flatten()
         .unwrap_or(100);
-    match claims.api_key_rank {
-        Some(key_rank) => db_rank.min(key_rank),
-        None => db_rank,
-    }
+    // Per-session agent override wins (the chat handler already validated it: admin
+    // → full access; non-admin → capped to their stored rank). It's `#[serde(skip)]`
+    // so it can only be set in-process, never via a token.
+    let effective = if let Some(o) = claims.agent_override_rank {
+        // Still cap by any API-key rank: an admin deliberately driving a LOW-rank key
+        // must not get full access through the override. (A JWT session has no
+        // api_key_rank, so the board agent's i32::MAX override is unaffected.)
+        match claims.api_key_rank { Some(k) => o.min(k), None => o }
+    } else {
+        match claims.api_key_rank { Some(key_rank) => db_rank.min(key_rank), None => db_rank }
+    };
+    (effective, effective < db_rank)
 }
 
 /// KB-scope of the current request.
@@ -552,11 +563,19 @@ async fn list(
     State(state): State<Arc<crate::models::AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>> {
-    let clearance_rank = get_user_clearance_rank(&state.db, &claims).await;
+    let (clearance_rank, rank_capped) = clearance_rank_with_cap(&state.db, &claims).await;
     // KB-scoped tokens see only their assigned knowledge base(s).
     let scope = api_key_scope(&state.db, &claims).await;
     let limit  = q.limit.unwrap_or(20).min(100);
     let offset = q.offset.unwrap_or(0);
+    // Visibility, per row:
+    //   - classified within clearance (cl.rank <= $2), OR
+    //   - unclassified — but ONLY for uncapped requests ($5): a rank-limited
+    //     token must not enumerate the owner's unclassified graphs, OR
+    //   - explicitly granted to the API key used ($6) at a sufficient
+    //     granted_rank (NULL grant = full access to that graph). This keeps
+    //     granted graphs (e.g. embed/colleague tokens) listable even when the
+    //     cap would otherwise hide them.
     let rows = sqlx::query_as::<_, (
         Uuid, String, Option<String>, String, Vec<Uuid>, Option<i32>, Option<i32>,
         Option<Uuid>, chrono::DateTime<chrono::Utc>, Option<Uuid>,
@@ -571,9 +590,16 @@ async fn list(
          FROM compilations c
          LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
          WHERE c.user_id = $1
-           AND (c.classification_level_id IS NULL OR cl.rank <= $2)
+           AND (cl.rank <= $2
+                OR (c.classification_level_id IS NULL AND NOT $5)
+                OR EXISTS (SELECT 1 FROM api_key_grants g
+                           WHERE g.api_key_id = $6 AND g.compilation_id = c.id
+                             AND (g.granted_rank IS NULL
+                                  OR c.classification_level_id IS NULL
+                                  OR g.granted_rank >= cl.rank)))
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
-    ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset).fetch_all(&state.db).await?;
+    ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
+     .bind(rank_capped).bind(claims.api_key_id).fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
     // the same constraint) — privacyMode is fetched via one small batched query
@@ -626,8 +652,15 @@ async fn list(
             "SELECT COUNT(*) FROM compilations c
              LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
              WHERE c.user_id = $1
-               AND (c.classification_level_id IS NULL OR cl.rank <= $2)"
-        ).bind(claims.sub).bind(clearance_rank).fetch_one(&state.db).await?
+               AND (cl.rank <= $2
+                    OR (c.classification_level_id IS NULL AND NOT $3)
+                    OR EXISTS (SELECT 1 FROM api_key_grants g
+                               WHERE g.api_key_id = $4 AND g.compilation_id = c.id
+                                 AND (g.granted_rank IS NULL
+                                      OR c.classification_level_id IS NULL
+                                      OR g.granted_rank >= cl.rank)))"
+        ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
+         .fetch_one(&state.db).await?
     };
 
     Ok(Json(json!({ "compilations": comps, "total": total })))

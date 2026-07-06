@@ -172,6 +172,12 @@ async fn create_key(
     let (rank, clearance_name, level_id) =
         resolve_clearance(&state.db, req.max_clearance_level_id, req.max_clearance_rank).await;
 
+    // A key created WITH explicit compilation grants is a limited key by intent —
+    // force kb_scoped so "limited" actually limits. Without this, an unscoped key
+    // with grants could still list/read every other knowledge base at its base
+    // clearance (grants would merely RAISE access instead of confining it).
+    let kb_scoped = req.kb_scoped || !req.grants.is_empty();
+
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys
            (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only)
@@ -186,7 +192,7 @@ async fn create_key(
     .bind(&clearance_name)
     .bind(level_id)
     .bind(req.expires_at)
-    .bind(req.kb_scoped)
+    .bind(kb_scoped)
     .bind(req.read_only)
     .fetch_one(&state.db).await?;
 
@@ -211,7 +217,7 @@ async fn create_key(
         "maxClearanceLevel": clearance_name,
         "maxClearanceLevelId": level_id,
         "expiresAt":        req.expires_at,
-        "kbScoped":         req.kb_scoped,
+        "kbScoped":         kb_scoped,
         "readOnly":         req.read_only,
         "grants":           grants_for_keys(&state.db, &[id]).await.remove(&id).unwrap_or_default(),
     })))

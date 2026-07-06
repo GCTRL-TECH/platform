@@ -425,15 +425,26 @@ pub(crate) async fn execute_tool(
     match tool_name {
         // ── Read: list graphs the caller may see ──────────────────────────────
         "list_graphs" => {
-            let rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
+            // Same visibility rule as /kg/compilations (routes/kg.rs list): a
+            // rank-CAPPED request must not enumerate unclassified graphs — the
+            // NULL-classification branch used to bypass every rank cap. Granted
+            // graphs stay visible so scoped/embed tokens can still list them.
+            let (rank, rank_capped) = crate::routes::kg::clearance_rank_with_cap(&state.db, claims).await;
             let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String)>(
                 "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode
                  FROM compilations c
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
-                 WHERE c.user_id = $1 AND (c.classification_level_id IS NULL OR cl.rank <= $2)
+                 WHERE c.user_id = $1
+                   AND (cl.rank <= $2
+                        OR (c.classification_level_id IS NULL AND NOT $3)
+                        OR EXISTS (SELECT 1 FROM api_key_grants g
+                                   WHERE g.api_key_id = $4 AND g.compilation_id = c.id
+                                     AND (g.granted_rank IS NULL
+                                          OR c.classification_level_id IS NULL
+                                          OR g.granted_rank >= cl.rank)))
                  ORDER BY c.created_at DESC LIMIT 50"
             )
-            .bind(claims.sub).bind(rank)
+            .bind(claims.sub).bind(rank).bind(rank_capped).bind(claims.api_key_id)
             .fetch_all(&state.db).await.unwrap_or_default();
 
             // KB-scoped token: only its assigned knowledge base(s) are visible.
