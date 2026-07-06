@@ -68,6 +68,15 @@ export function PiConsole() {
   // model so the widget never sits on a non-working default.
   useEffect(() => {
     if (models.length === 0) return
+    // Pair repair: the model itself is valid but stored under a DIFFERENT
+    // provider (e.g. Cookbook applied an ollama_cloud model while this widget's
+    // provider stayed 'ollama') — re-point the provider, keep the model.
+    // Without this, every chat turn 404s with "model not found".
+    const pairValid = models.some((m) => m.provider === llmProvider && m.model === llmModel && m.available)
+    if (!pairValid && isValidChatSelection(llmModel, models)) {
+      const entry = models.find((m) => m.model === llmModel && m.available)
+      if (entry) { setLlmProvider(entry.provider); return }
+    }
     if (llmProvider === 'ollama' && !isValidChatSelection(llmModel, models)) {
       // Prefer the user's configured provider default (e.g. a working cloud model)
       // over the "biggest local" heuristic, which can pick a model that crashes.

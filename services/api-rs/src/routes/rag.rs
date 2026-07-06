@@ -542,9 +542,17 @@ async fn query(
                 None
             };
             let effective_model = requested_model.map(str::to_string).or(purpose_model);
-            crate::services::llm::resolve_for_user(
-                &state.db, c.sub, requested_provider, effective_model.as_deref(),
-            ).await
+            if requested_provider.is_some() {
+                crate::services::llm::resolve_for_user(
+                    &state.db, c.sub, requested_provider, effective_model.as_deref(),
+                ).await
+            } else {
+                // P2 per-purpose RUNTIME override for "rag" (keyless local); else
+                // inherits the full chain (per-user provider WITH key → global → Ollama).
+                let mut t = crate::services::llm::resolve_purpose(&state.db, c.sub, "rag").await;
+                if let Some(m) = effective_model.clone() { t.model = m; }
+                t
+            }
         }
         None => crate::services::llm::LlmTarget {
             provider: "ollama".into(),
@@ -1199,7 +1207,7 @@ async fn query(
         }
     }
 
-    let sources: Vec<Value> = chunks
+    let mut sources: Vec<Value> = chunks
         .iter()
         .map(|c| {
             // Prefer the resolved origin file (chunk → job → fileName) so source
@@ -1223,6 +1231,26 @@ async fn query(
             })
         })
         .collect();
+
+    // Surface graph edges as traceable sources too — otherwise a FAST answer that
+    // is grounded on the graph (relationships/entities) rather than on retrieved
+    // text chunks shows no clickable sources at all. Each edge focuses its two
+    // endpoint entities when "open in graph" is used. Capped so a dense answer
+    // doesn't bury the chunk sources.
+    {
+        let graph_comp = involved_compilations.first().map(|u| u.to_string());
+        for t in graph_triples.iter().take(8) {
+            sources.push(json!({
+                "text":    format!("{} — {} → {}", t.from, t.relation, t.to),
+                "score":   0.0,
+                "source":  "graph",
+                "type":    "graph",
+                "chunkId": "",
+                "entityMentions": [t.from.clone(), t.to.clone()],
+                "compilationId": graph_comp,
+            }));
+        }
+    }
 
     let graph_trace: Vec<Value> = graph_triples
         .iter()
@@ -1309,7 +1337,15 @@ async fn deep_query(
         None
     };
     let effective_model = requested_model.map(str::to_string).or(purpose_model);
-    let target = llm::resolve_for_user(&state.db, claims.sub, requested_provider, effective_model.as_deref()).await;
+    // P2 per-purpose RUNTIME override for "rag" (keyless local); else inherits the
+    // full chain (per-user provider WITH key → global → Ollama). Request provider wins.
+    let target = if requested_provider.is_some() {
+        llm::resolve_for_user(&state.db, claims.sub, requested_provider, effective_model.as_deref()).await
+    } else {
+        let mut t = llm::resolve_purpose(&state.db, claims.sub, "rag").await;
+        if let Some(m) = effective_model.clone() { t.model = m; }
+        t
+    };
 
     // ── Private Memory: early local_only check ────────────────────────────────
     // Deep mode drives tool calls whose compilation isn't known until the model

@@ -522,14 +522,25 @@ async fn rescan_hardware(
     require_role(&claims, "admin")?;
 
     // Load the file baseline (best-effort; default if missing).
-    let mut hw: Hardware = match hardware_json_path() {
+    let file_path = hardware_json_path();
+    let mut hw: Hardware = match &file_path {
         Some(path) => {
-            std::fs::read_to_string(&path)
+            std::fs::read_to_string(path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
         }
         None => Hardware::default(),
+    };
+
+    // Host RAM is only knowable from the installer-written file — capture it
+    // BEFORE the Docker /info overlay overwrites hw.ram_gb with the
+    // container/WSL2-VM-visible total. Without this, re-scan drops the
+    // "System (host)" RAM to null and the UI blanks it.
+    let host_ram_gb: Option<f64> = if file_path.is_some() && hw.ram_gb > 0.0 {
+        Some(hw.ram_gb)
+    } else {
+        None
     };
 
     // Probe Docker daemon.
@@ -562,7 +573,24 @@ async fn rescan_hardware(
         }
     }
 
+    // Return the SAME structured shape as GET /hardware so the UI keeps its
+    // Docker + System views (and host RAM) after a re-scan — otherwise the flat
+    // payload has no `system` block and the client blanks the host-RAM tile.
+    let docker_cpu_cores = hw.cpu_cores;
+    let docker_ram_gb = hw.ram_gb;
     let mut resp = serde_json::to_value(&hw).unwrap_or(json!({}));
+    resp["docker"] = json!({
+        "cpu_cores": docker_cpu_cores,
+        "ram_gb": docker_ram_gb,
+        "source": "container",
+    });
+    resp["system"] = json!({
+        "gpu_name": hw.gpu_name,
+        "vram_gb": hw.vram_gb,
+        "nvidia_toolkit": hw.nvidia_toolkit,
+        "ram_gb": host_ram_gb,
+        "ram_source": if host_ram_gb.is_some() { "installer" } else { "unknown" },
+    });
     resp["gpu_rescan"] = json!("install-time only");
     Ok(Json(resp))
 }
@@ -1114,7 +1142,7 @@ async fn list_runtimes(
                 "description":  "Bundled vLLM engine. Maximum throughput for NVIDIA GPUs with ≥8 GB VRAM (nvidia-container-toolkit required).",
             },
             {
-                "id":           "openai_compatible",
+                "id":           "external",
                 "label":        "OpenAI-compatible endpoint",
                 "kind":         "openai_compatible",
                 "needs_base_url": true,
@@ -1393,13 +1421,9 @@ async fn run_switch_runtime(
             // 1. Resolve model arg (default: qwen2.5-3b)
             let model_id = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
                 .unwrap_or("qwen2.5-3b");
-            let hf_arg = match resolve_model_arg(model_id, "llamacpp") {
-                Some(a) => a,
-                None => {
-                    send("error", json!({ "message": format!("Unknown model id '{model_id}'. Valid: qwen2.5-3b, qwen2.5-7b, llama-3.2-3b") }));
-                    return;
-                }
-            };
+            // Accept a catalog id (qwen2.5-3b…) OR any raw model ref (a GGUF HF
+            // arg / tag) so custom / dynamically-picked models work too.
+            let hf_arg = resolve_model_arg(model_id, "llamacpp").unwrap_or_else(|| model_id.to_string());
 
             if !std::path::Path::new("/var/run/docker.sock").exists() {
                 send("error", json!({ "message": "Docker socket not accessible — cannot launch llama.cpp container" }));
@@ -1488,13 +1512,9 @@ async fn run_switch_runtime(
             // 1. Resolve model HF repo (default: qwen2.5-3b → Qwen/Qwen2.5-3B-Instruct)
             let model_id = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
                 .unwrap_or("qwen2.5-3b");
-            let hf_repo = match resolve_model_arg(model_id, "vllm") {
-                Some(r) => r,
-                None => {
-                    send("error", json!({ "message": format!("Unknown model id '{model_id}'. Valid: qwen2.5-3b, qwen2.5-7b, llama-3.2-3b") }));
-                    return;
-                }
-            };
+            // Accept a catalog id (qwen2.5-3b…) OR any raw HF repo so custom /
+            // dynamically-picked models work (e.g. Qwen/Qwen2.5-7B-Instruct-AWQ).
+            let hf_repo = resolve_model_arg(model_id, "vllm").unwrap_or_else(|| model_id.to_string());
 
             if !std::path::Path::new("/var/run/docker.sock").exists() {
                 send("error", json!({ "message": "Docker socket not accessible — cannot launch vLLM container" }));

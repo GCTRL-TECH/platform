@@ -73,6 +73,11 @@ services:
       # (pull + recreate). Without it the update executor can't reach docker
       # (matches deploy/compose-template.yml, which already mounts it).
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host hardware profile (true host RAM/GPU). Host RAM is unknowable from
+      # inside the container (/proc only sees the WSL2 VM), so it's supplied here.
+      # WITHOUT this mount the file is lost on every container recreate and the
+      # Settings "System (host)" view + Re-scan go blank. See deploy/hardware.json.
+      - ./deploy/hardware.json:/app/hardware.json:ro
     networks:
       - GCTRL
       - ollama-net

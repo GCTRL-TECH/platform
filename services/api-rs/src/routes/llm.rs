@@ -67,6 +67,66 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/model-prefs", get(get_model_prefs).put(set_model_prefs))
         .route("/ollama/catalog", get(ollama_catalog))
         .route("/ollama/pull", post(ollama_pull))
+        // P2: models installed on a specific runtime INSTANCE (per-purpose picker).
+        .route("/instance-models", get(instance_models))
+}
+
+#[derive(Deserialize)]
+struct InstanceModelsQuery {
+    provider: Option<String>,
+    base: Option<String>,
+}
+
+/// GET /api/llm/instance-models?provider=&base= — list the models available on a
+/// specific runtime INSTANCE, so the per-purpose picker can show what THAT
+/// instance (bundled Ollama, native Ollama, or a custom /v1 endpoint) actually
+/// serves. Empty base → the user's configured/bundled Ollama. SSRF-guarded.
+async fn instance_models(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    axum::extract::Query(q): axum::extract::Query<InstanceModelsQuery>,
+) -> Result<Json<Value>> {
+    let provider = q.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("ollama").to_string();
+    // Resolve the base: explicit (validated) or the user's bundled/configured Ollama.
+    let base = match q.base.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => {
+            let v = crate::services::llm::validate_llm_base(&provider, Some(b))
+                .map_err(|e| AppError::BadRequest(format!("Invalid base URL: {e}")))?;
+            crate::services::llm::containerize_ollama_base(v.as_str().trim_end_matches('/'))
+        }
+        None => resolve_user_ollama(&state.db, claims.sub).await.0,
+    };
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
+
+    let is_openai = matches!(provider.as_str(), "openai_compatible" | "openai" | "openrouter");
+    let url = if is_openai {
+        format!("{}/v1/models", base.trim_end_matches('/'))
+    } else {
+        format!("{}/api/tags", base.trim_end_matches('/'))
+    };
+
+    let mut models: Vec<String> = Vec::new();
+    let mut reachable = false;
+    if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(5)).send().await {
+        if resp.status().is_success() {
+            reachable = true;
+            if let Ok(j) = resp.json::<Value>().await {
+                let arr = if is_openai { j["data"].as_array() } else { j["models"].as_array() };
+                if let Some(list) = arr {
+                    for m in list {
+                        let name = if is_openai { m["id"].as_str() } else { m["name"].as_str() };
+                        if let Some(n) = name { models.push(n.to_string()); }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({ "provider": provider, "base": base, "reachable": reachable, "models": models })))
 }
 
 // ── Recommended model catalog ───────────────────────────────────────────────
@@ -527,6 +587,15 @@ struct ModelPrefsRow {
     distill_model: Option<String>,
     agent_model: Option<String>,
     rag_model: Option<String>,
+    // P2 per-purpose runtime: provider + base_url per purpose (NULL = inherit).
+    relation_provider: Option<String>,
+    relation_base_url: Option<String>,
+    distill_provider: Option<String>,
+    distill_base_url: Option<String>,
+    agent_provider: Option<String>,
+    agent_base_url: Option<String>,
+    rag_provider: Option<String>,
+    rag_base_url: Option<String>,
 }
 
 /// GET /api/llm/model-prefs — the user's per-purpose model choices, with the
@@ -538,7 +607,9 @@ async fn get_model_prefs(
 ) -> Result<Json<Value>> {
     let row: ModelPrefsRow = sqlx::query_as(
         "SELECT embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model,
-                agent_model, rag_model
+                agent_model, rag_model,
+                relation_provider, relation_base_url, distill_provider, distill_base_url,
+                agent_provider, agent_base_url, rag_provider, rag_base_url
          FROM user_model_prefs WHERE user_id = $1",
     )
     .bind(claims.sub)
@@ -554,6 +625,16 @@ async fn get_model_prefs(
         "distillModel":     row.distill_model.unwrap_or_else(|| default_model_for("distill").into()),
         "agentModel":       row.agent_model.unwrap_or_else(|| default_model_for("agent").into()),
         "ragModel":         row.rag_model.unwrap_or_else(|| default_model_for("rag").into()),
+        // Per-purpose runtime overrides. NULL provider = "inherit global runtime"
+        // — the UI renders that as the default; a set value re-points the purpose.
+        "relationProvider": row.relation_provider,
+        "relationBaseUrl":  row.relation_base_url,
+        "distillProvider":  row.distill_provider,
+        "distillBaseUrl":   row.distill_base_url,
+        "agentProvider":    row.agent_provider,
+        "agentBaseUrl":     row.agent_base_url,
+        "ragProvider":      row.rag_provider,
+        "ragBaseUrl":       row.rag_base_url,
     })))
 }
 
@@ -566,6 +647,31 @@ struct SetPrefsReq {
     #[serde(rename = "distillModel")]      distill_model:      Option<String>,
     #[serde(rename = "agentModel")]        agent_model:        Option<String>,
     #[serde(rename = "ragModel")]          rag_model:          Option<String>,
+    // P2 per-purpose runtime overrides (NULL/empty = inherit global runtime).
+    #[serde(rename = "relationProvider")]  relation_provider:  Option<String>,
+    #[serde(rename = "relationBaseUrl")]   relation_base_url:  Option<String>,
+    #[serde(rename = "distillProvider")]   distill_provider:   Option<String>,
+    #[serde(rename = "distillBaseUrl")]    distill_base_url:   Option<String>,
+    #[serde(rename = "agentProvider")]     agent_provider:     Option<String>,
+    #[serde(rename = "agentBaseUrl")]      agent_base_url:     Option<String>,
+    #[serde(rename = "ragProvider")]       rag_provider:       Option<String>,
+    #[serde(rename = "ragBaseUrl")]        rag_base_url:       Option<String>,
+}
+
+/// SSRF-validate an optional per-purpose base URL against its provider. Empty →
+/// None. Cloud providers are pinned to their official host; an arbitrary host
+/// (e.g. a cloud-metadata IP) is rejected with 400. Returns the normalized
+/// (trailing-slash-stripped) URL. Unset provider defaults to openai_compatible.
+fn validate_opt_base(provider: Option<&str>, base: Option<String>) -> Result<Option<String>> {
+    match base.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(b) => {
+            let prov = provider.unwrap_or("openai_compatible");
+            let v = crate::services::llm::validate_llm_base(prov, Some(&b))
+                .map_err(|e| AppError::BadRequest(format!("Invalid base URL: {e}")))?;
+            Ok(Some(v.as_str().trim_end_matches('/').to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// PUT /api/llm/model-prefs — upsert the per-purpose model choices. Empty string
@@ -576,13 +682,18 @@ async fn set_model_prefs(
     Json(req): Json<SetPrefsReq>,
 ) -> Result<Json<Value>> {
     let norm = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    // Providers per purpose (NULL = inherit the global runtime).
     let emb_provider = norm(req.embedding_provider);
-    // SSRF guard: the embedding base is fetched server-side by the KEX worker, so
-    // validate it through the same defense as the Ollama base BEFORE persisting.
-    // Cloud providers (openai/anthropic/openrouter) are pinned to their official
-    // host — an arbitrary host (e.g. http://169.254.169.254 metadata) is rejected
-    // with 400. ollama/nim/local are allowed on http/https LAN but reject embedded
-    // credentials and non-http(s) schemes. Empty → NULL (use the user's Ollama).
+    let rel_provider = norm(req.relation_provider);
+    let dis_provider = norm(req.distill_provider);
+    let agt_provider = norm(req.agent_provider);
+    let rag_provider = norm(req.rag_provider);
+
+    // SSRF guard on every per-purpose base URL: these are fetched server-side by
+    // the workers / chat layer, so validate through the same defense as the Ollama
+    // base BEFORE persisting. Empty → NULL. (Embedding keeps its ollama default
+    // for back-compat; the rest default to openai_compatible when a base is given.)
     let emb_base = match norm(req.embedding_base_url) {
         Some(b) => {
             let prov = emb_provider.as_deref().unwrap_or("ollama");
@@ -592,11 +703,18 @@ async fn set_model_prefs(
         }
         None => None,
     };
+    let rel_base = validate_opt_base(rel_provider.as_deref(), req.relation_base_url)?;
+    let dis_base = validate_opt_base(dis_provider.as_deref(), req.distill_base_url)?;
+    let agt_base = validate_opt_base(agt_provider.as_deref(), req.agent_base_url)?;
+    let rag_base = validate_opt_base(rag_provider.as_deref(), req.rag_base_url)?;
+
     sqlx::query(
         "INSERT INTO user_model_prefs
-            (user_id, embedding_model, embedding_provider, embedding_base_url, relation_model, distill_model,
-             agent_model, rag_model, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            (user_id, embedding_model, embedding_provider, embedding_base_url,
+             relation_model, distill_model, agent_model, rag_model,
+             relation_provider, relation_base_url, distill_provider, distill_base_url,
+             agent_provider, agent_base_url, rag_provider, rag_base_url, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
          ON CONFLICT (user_id) DO UPDATE SET
             embedding_model    = $2,
             embedding_provider = $3,
@@ -605,6 +723,14 @@ async fn set_model_prefs(
             distill_model      = $6,
             agent_model        = $7,
             rag_model          = $8,
+            relation_provider  = $9,
+            relation_base_url  = $10,
+            distill_provider   = $11,
+            distill_base_url   = $12,
+            agent_provider     = $13,
+            agent_base_url     = $14,
+            rag_provider       = $15,
+            rag_base_url       = $16,
             updated_at         = now()",
     )
     .bind(claims.sub)
@@ -615,6 +741,14 @@ async fn set_model_prefs(
     .bind(norm(req.distill_model))
     .bind(norm(req.agent_model))
     .bind(norm(req.rag_model))
+    .bind(rel_provider)
+    .bind(rel_base)
+    .bind(dis_provider)
+    .bind(dis_base)
+    .bind(agt_provider)
+    .bind(agt_base)
+    .bind(rag_provider)
+    .bind(rag_base)
     .execute(&state.db)
     .await?;
 

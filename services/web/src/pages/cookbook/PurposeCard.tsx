@@ -36,6 +36,15 @@ export interface ModelPrefs {
   distillModel: string
   agentModel: string
   ragModel: string
+  // P2 per-purpose runtime overrides (null/empty = inherit the global runtime).
+  relationProvider?: string | null
+  relationBaseUrl?: string | null
+  distillProvider?: string | null
+  distillBaseUrl?: string | null
+  agentProvider?: string | null
+  agentBaseUrl?: string | null
+  ragProvider?: string | null
+  ragBaseUrl?: string | null
 }
 
 /** 1..5 level bar (speed / quality) — minimal vector dots, mirrors Settings → AI Models. */
@@ -59,8 +68,10 @@ interface Props {
   catalog: CatalogResponse | null
   /** Current selection for this purpose (already resolved with the recommended default). */
   selected: string
-  /** Install (if needed) then persist this model as the purpose's pref. */
-  onApply: (modelName: string) => Promise<void>
+  /** Install (if needed) then persist this model as the purpose's pref.
+   *  `provider` is set for cloud-hosted picks (e.g. 'ollama_cloud') — the model
+   *  name alone would resolve against LOCAL Ollama and 404. */
+  onApply: (modelName: string, provider?: string) => Promise<void>
   /** Reset this purpose back to the recommended default. */
   onReset: () => Promise<void>
   /** Called after a successful install so the parent can refresh the catalog. */
@@ -72,6 +83,12 @@ interface Props {
   ollamaOverrideUrl?: string | null | undefined
   /** Every model GET /llm/models can currently address (Ollama + connected cloud), for the open "All installed models" selection. */
   installedModels?: InstalledModelEntry[]
+  /** P2 per-purpose runtime override (current value). null/empty = inherit global. */
+  runtimeProvider?: string | null
+  runtimeBaseUrl?: string | null
+  /** When provided, renders a per-purpose Runtime override row that saves
+   *  {provider, baseUrl, model} for this purpose. */
+  onSetRuntime?: (provider: string, baseUrl: string, model?: string) => Promise<void>
 }
 
 /**
@@ -82,6 +99,7 @@ interface Props {
 export function PurposeCard({
   purpose, title, blurb, catalog, selected, onApply, onReset, onPulled,
   activeRuntime = null, ollamaOverrideUrl, installedModels = [],
+  runtimeProvider, runtimeBaseUrl, onSetRuntime,
 }: Props) {
   const [applying, setApplying] = useState<string | null>(null)
   const [pulling, setPulling] = useState<string | null>(null)
@@ -137,12 +155,12 @@ export function PurposeCard({
   // Everything AllInstalledModelsRow lists is already installed/reachable —
   // apply directly, no pull step (unlike pullThenApply, used by the curated
   // cards where "Install & apply" may need to pull first).
-  async function selectInstalled(name: string) {
+  async function selectInstalled(name: string, provider?: string) {
     if (!name || busy) return
     setApplying(name)
     setMsg(null)
     try {
-      await onApply(name)
+      await onApply(name, provider)
       setMsg({ ok: true, text: `Applied ${name}.` })
     } catch {
       setMsg({ ok: false, text: 'Apply failed.' })
@@ -184,6 +202,10 @@ export function PurposeCard({
         </button>
       </div>
       <p className="mb-3 text-xs text-slate-500">{blurb}</p>
+
+      {onSetRuntime && (
+        <RuntimeOverrideRow provider={runtimeProvider} baseUrl={runtimeBaseUrl} model={selected} onSet={onSetRuntime} />
+      )}
 
       {runtimeId && (
         <div className="mb-3 rounded-md border border-indigo-800/30 bg-indigo-950/10 p-3">
@@ -291,7 +313,7 @@ export function PurposeCard({
         ollamaInstalled={installedList}
         cloudModels={installedModels}
         selected={selected}
-        onSelect={(name) => void selectInstalled(name)}
+        onSelect={(name, provider) => void selectInstalled(name, provider)}
       />
 
       {/* Pull any tag by name — installs then applies it for this purpose. */}
@@ -321,5 +343,135 @@ export function PurposeCard({
         </button>
       </div>
     </section>
+  )
+}
+
+const OLLAMA_HOST = 'http://host.docker.internal:11434'
+
+/** Per-purpose Runtime + Model (P2). Choose which INSTANCE this purpose runs on —
+ *  inherit the global runtime, bundled Ollama (CPU), native Ollama (GPU on this
+ *  host), or a custom /v1 endpoint (local vLLM, LM Studio, Ollama cloud) — and
+ *  then pick a model from THAT instance's installed models. So e.g. KEX embedding
+ *  can run on native GPU Ollama while chat rides a cloud endpoint. Keyless local
+ *  endpoints only for the batch workers (KEX/FUSE). */
+function RuntimeOverrideRow({
+  provider, baseUrl, model, onSet,
+}: {
+  provider?: string | null
+  baseUrl?: string | null
+  model?: string
+  onSet: (provider: string, baseUrl: string, model?: string) => Promise<void>
+}) {
+  const derived = !provider ? 'inherit'
+    : (provider === 'ollama' && baseUrl === OLLAMA_HOST) ? 'native'
+    : (provider === 'ollama') ? 'bundled'
+    : 'custom'
+  const [mode, setMode] = useState(derived)
+  const [customUrl, setCustomUrl] = useState(provider === 'ollama' ? '' : (baseUrl ?? ''))
+  const [instModels, setInstModels] = useState<string[]>([])
+  const [instLoading, setInstLoading] = useState(false)
+  const [instErr, setInstErr] = useState('')
+  const [pickModel, setPickModel] = useState(model ?? '')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => { setMode(derived) }, [derived])
+  useEffect(() => { setPickModel(model ?? '') }, [model])
+
+  function target(m: string): { provider: string; base: string } | null {
+    if (m === 'inherit') return null
+    if (m === 'bundled') return { provider: 'ollama', base: '' }
+    if (m === 'native') return { provider: 'ollama', base: OLLAMA_HOST }
+    return { provider: 'openai_compatible', base: customUrl.trim() }
+  }
+
+  async function loadInstance(t: { provider: string; base: string }) {
+    setInstLoading(true); setInstErr(''); setInstModels([])
+    try {
+      const { data } = await api.get<{ reachable: boolean; models: string[] }>(
+        `/llm/instance-models?provider=${encodeURIComponent(t.provider)}&base=${encodeURIComponent(t.base)}`
+      )
+      setInstModels(data.models ?? [])
+      if (!data.reachable) setInstErr('Instance not reachable — is it running?')
+    } catch { setInstErr('Could not load models') } finally { setInstLoading(false) }
+  }
+
+  // Load the instance's models whenever a concrete (non-custom-without-url) override is active.
+  useEffect(() => {
+    const t = target(mode)
+    if (t && !(mode === 'custom' && !t.base)) void loadInstance(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
+
+  async function commit(prov: string, base: string, mdl?: string) {
+    setSaving(true)
+    try { await onSet(prov, base, mdl) } finally { setSaving(false) }
+  }
+
+  return (
+    <div className="mb-3 space-y-2 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 text-[11px] font-medium text-slate-400">Runtime</span>
+        <select
+          value={mode}
+          disabled={saving}
+          onChange={(e) => {
+            const v = e.target.value
+            setMode(v)
+            if (v === 'inherit') void commit('', '') // clear override, keep the model picked below
+            // bundled/native/custom: load the instance's models, then Save applies {provider, base, model}
+          }}
+          style={{ colorScheme: 'dark' }}
+          className="flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[12px] text-slate-200 focus:border-indigo-500 focus:outline-none disabled:opacity-50"
+        >
+          <option value="inherit">Inherit global runtime</option>
+          <option value="bundled">Ollama — bundled (CPU)</option>
+          <option value="native">Ollama — native (this host, GPU)</option>
+          <option value="custom">Custom /v1 endpoint…</option>
+        </select>
+      </div>
+
+      {mode === 'custom' && (
+        <input
+          value={customUrl}
+          onChange={(e) => setCustomUrl(e.target.value)}
+          onBlur={() => { const t = target('custom'); if (t?.base) void loadInstance(t) }}
+          placeholder="http://host:port/v1  (vLLM, LM Studio, Ollama cloud…)"
+          className="w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 font-mono text-[11px] text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+        />
+      )}
+
+      {mode !== 'inherit' && (
+        <div className="flex items-center gap-2">
+          <span className="shrink-0 text-[11px] font-medium text-slate-400">Model</span>
+          {instLoading ? (
+            <span className="flex items-center gap-1 text-[11px] text-slate-500"><Loader2 size={11} className="animate-spin" /> Loading models…</span>
+          ) : (
+            <select
+              value={pickModel}
+              onChange={(e) => setPickModel(e.target.value)}
+              style={{ colorScheme: 'dark' }}
+              className="flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[12px] text-slate-200 focus:border-indigo-500 focus:outline-none"
+            >
+              <option value="">{instModels.length ? 'Select a model…' : 'No models on this instance'}</option>
+              {instModels.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          )}
+          <button
+            onClick={() => { const t = target(mode); if (t) void commit(t.provider, t.base, pickModel || undefined) }}
+            disabled={saving || (mode === 'custom' && !customUrl.trim())}
+            className="shrink-0 rounded bg-indigo-500/20 px-2.5 py-1 text-[11px] font-medium text-indigo-300 hover:bg-indigo-500/30 disabled:opacity-50"
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      )}
+
+      {instErr && <p className="text-[10px] text-amber-400">{instErr}</p>}
+      <p className="text-[10px] text-slate-500">
+        {mode === 'inherit'
+          ? 'Follows the global runtime. Pick a specific instance to run this purpose there — e.g. native Ollama for GPU.'
+          : 'Model list = what that instance has installed. Keyless local endpoints only for the batch workers (KEX/FUSE).'}
+      </p>
+    </div>
   )
 }

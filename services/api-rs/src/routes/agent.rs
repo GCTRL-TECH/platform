@@ -1728,13 +1728,19 @@ async fn chat(
         None
     };
     let effective_model = req.llm_model.clone().or(purpose_model);
-    let target = crate::services::llm::resolve_for_user(
-        &state.db,
-        claims.sub,
-        req.llm_provider.as_deref(),
-        effective_model.as_deref(),
-    )
-    .await;
+    // P2 per-purpose RUNTIME: with no request-level provider, honor an "agent"
+    // runtime override (keyless local Ollama/custom); otherwise inherit the full
+    // chain (per-user provider WITH key → global → Ollama). The effective model
+    // (request → Cookbook agent pref) always wins over the runtime default.
+    let target = if req.llm_provider.is_some() {
+        crate::services::llm::resolve_for_user(
+            &state.db, claims.sub, req.llm_provider.as_deref(), effective_model.as_deref(),
+        ).await
+    } else {
+        let mut t = crate::services::llm::resolve_purpose(&state.db, claims.sub, "agent").await;
+        if let Some(m) = effective_model.clone() { t.model = m; }
+        t
+    };
 
     // Private Memory: is this turn's model a cloud endpoint? Gates the
     // per-tool-result enforcement below (local_only refusal / cloaking). See

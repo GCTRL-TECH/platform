@@ -54,6 +54,17 @@ const PURPOSES: PurposeMeta[] = [
   },
 ]
 
+// Per-purpose RUNTIME override columns (P2). All five purposes are wired: the
+// KEX/FUSE workers via resolve_purpose injection, agent/rag via the interactive
+// resolve_purpose chain (keyless local; cloud stays on the per-user provider).
+const RUNTIME_KEYS: Record<CatalogModel['purpose'], { p: keyof ModelPrefs; b: keyof ModelPrefs }> = {
+  embedding: { p: 'embeddingProvider', b: 'embeddingBaseUrl' },
+  relation: { p: 'relationProvider', b: 'relationBaseUrl' },
+  distill: { p: 'distillProvider', b: 'distillBaseUrl' },
+  agent: { p: 'agentProvider', b: 'agentBaseUrl' },
+  rag: { p: 'ragProvider', b: 'ragBaseUrl' },
+}
+
 /**
  * Cookbook — hardware-aware model tuning. Shows detected hardware, a runtime
  * recommendation (when it differs from what's active), and a per-purpose model
@@ -115,6 +126,16 @@ export function CookbookPage() {
       distillModel: next.distillModel,
       agentModel: next.agentModel,
       ragModel: next.ragModel,
+      // P2 per-purpose runtime overrides (empty = inherit; sent every time so the
+      // full-overwrite PUT never wipes another purpose's saved override).
+      relationProvider: next.relationProvider || '',
+      relationBaseUrl: next.relationBaseUrl || '',
+      distillProvider: next.distillProvider || '',
+      distillBaseUrl: next.distillBaseUrl || '',
+      agentProvider: next.agentProvider || '',
+      agentBaseUrl: next.agentBaseUrl || '',
+      ragProvider: next.ragProvider || '',
+      ragBaseUrl: next.ragBaseUrl || '',
     })
     setPrefs(next)
   }
@@ -158,7 +179,9 @@ export function CookbookPage() {
 
           <section className="space-y-4">
             <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Models per purpose</p>
-            {PURPOSES.map((p) => (
+            {PURPOSES.map((p) => {
+              const rk = RUNTIME_KEYS[p.id]
+              return (
               <PurposeCard
                 key={p.id}
                 purpose={p.id}
@@ -169,10 +192,37 @@ export function CookbookPage() {
                 activeRuntime={activeRuntime}
                 ollamaOverrideUrl={ollamaOverrideUrl}
                 installedModels={installedModels}
-                onApply={async (name) => {
+                runtimeProvider={rk ? (prefs?.[rk.p] as string | null | undefined) : undefined}
+                runtimeBaseUrl={rk ? (prefs?.[rk.b] as string | null | undefined) : undefined}
+                onSetRuntime={rk ? async (provider, baseUrl, model) => {
                   if (!prefs) return
-                  await persistPrefs({ ...prefs, [p.prefKey]: name })
-                  if (p.id === 'agent') setAgentModelLocal(name)
+                  const next = { ...prefs, [rk.p]: provider, [rk.b]: baseUrl } as ModelPrefs
+                  if (model !== undefined) {
+                    ;(next as unknown as Record<string, unknown>)[p.prefKey] = model
+                    if (p.id === 'agent') setAgentModelLocal(model)
+                    if (p.id === 'rag') setRagModelLocal(model)
+                  }
+                  await persistPrefs(next)
+                } : undefined}
+                onApply={async (name, provider) => {
+                  if (!prefs) return
+                  const next = { ...prefs, [p.prefKey]: name } as ModelPrefs
+                  // A cloud-hosted pick must persist its provider alongside the
+                  // model — the name alone resolves against LOCAL Ollama and
+                  // 404s ("model not found"). Conversely, picking a local model
+                  // while an ollama_cloud override is stored would be the same
+                  // mismatch in reverse, so clear it. Other runtime overrides
+                  // (custom base URL etc.) are left untouched.
+                  if (rk) {
+                    const cur = String(prefs[rk.p] ?? '')
+                    if (provider === 'ollama_cloud') {
+                      ;(next as unknown as Record<string, unknown>)[rk.p] = 'ollama_cloud'
+                    } else if (cur === 'ollama_cloud') {
+                      ;(next as unknown as Record<string, unknown>)[rk.p] = ''
+                    }
+                  }
+                  await persistPrefs(next)
+                  if (p.id === 'agent') setAgentModelLocal(name, provider)
                   if (p.id === 'rag') setRagModelLocal(name)
                 }}
                 onReset={async () => {
@@ -182,7 +232,7 @@ export function CookbookPage() {
                 }}
                 onPulled={() => { void loadModels(); void reloadInstalledModels() }}
               />
-            ))}
+            )})}
           </section>
         </>
       )}

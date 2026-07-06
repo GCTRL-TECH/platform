@@ -64,11 +64,16 @@ export function isValidChatSelection(model: string | null | undefined, models: L
 // chain (see services/llm.rs `resolve_purpose_model`).
 
 const LS_AGENT_MODEL = 'gctrl.agent.llmModel'
+const LS_AGENT_PROVIDER = 'gctrl.agent.llmProvider'
 const LS_RAG_MODEL = 'gctrl.rag.model'
 
-export function setAgentModelLocal(model: string): void {
+export function setAgentModelLocal(model: string, provider = 'ollama'): void {
   try {
     localStorage.setItem(LS_AGENT_MODEL, model)
+    // The agent widget sends BOTH provider and model per request — syncing only
+    // the model would pair a cloud model with the stale 'ollama' provider (or
+    // vice versa) and every chat turn would 404 with "model not found".
+    localStorage.setItem(LS_AGENT_PROVIDER, provider)
   } catch {
     /* ignore — private mode / storage disabled */
   }

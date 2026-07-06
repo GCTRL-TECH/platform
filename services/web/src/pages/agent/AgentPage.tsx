@@ -125,6 +125,14 @@ export function AgentPage() {
   // lands on a local model that crashes the Ollama runner on this machine.
   useEffect(() => {
     if (models.length === 0) return
+    // Pair repair: the model itself is valid but stored under a DIFFERENT
+    // provider (e.g. Cookbook applied an ollama_cloud model while the widget's
+    // provider stayed 'ollama') — re-point the provider, keep the model.
+    const pairValid = models.some((m) => m.provider === llmProvider && m.model === llmModel && m.available)
+    if (!pairValid && isValidChatSelection(llmModel, models)) {
+      const entry = models.find((m) => m.model === llmModel && m.available)
+      if (entry) { setLlmProvider(entry.provider); return }
+    }
     if (!isValidChatSelection(llmModel, models)) {
       const configured = (providersData?.providers ?? [])
         .find((p) => p.connected && p.defaultModel)?.defaultModel

@@ -1,0 +1,9 @@
+{
+  "cpu_cores": 32,
+  "ram_gb": 63.1,
+  "gpu_name": "NVIDIA GeForce RTX 3080 Ti",
+  "vram_gb": 12.0,
+  "nvidia_toolkit": true,
+  "arch": "x86_64",
+  "os": "windows"
+}

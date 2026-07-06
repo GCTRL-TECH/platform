@@ -186,11 +186,21 @@ export function RuntimeCard({ hardware, recommendation, activeRuntime, isAdmin, 
       </div>
 
       <div className="rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2.5">
-        <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Currently running</p>
+        <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Primary · currently running</p>
         <p className="mt-0.5 font-mono text-sm text-indigo-300">{label}</p>
         {activeRuntime?.model && (
           <p className="mt-0.5 text-[11px] text-slate-500">Model: <span className="font-mono text-slate-400">{activeRuntime.model}</span></p>
         )}
+      </div>
+
+      {/* Fallback: the onboard CPU Ollama always backs the primary — the runtime
+          guardrail auto-reverts here if the primary goes unhealthy, so inference
+          never fully stops. Purposes set to "Inherit" ultimately land here too. */}
+      <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-slate-800 bg-slate-950/20 px-3 py-2">
+        <Cpu size={12} className="shrink-0 text-slate-500" />
+        <span className="text-[10px] font-medium uppercase tracking-wide text-slate-500">Fallback</span>
+        <span className="font-mono text-[12px] text-slate-400">Onboard CPU Ollama</span>
+        <span className="ml-auto text-[10px] text-slate-600">used automatically if the primary is unreachable</span>
       </div>
 
       {/* Hardware + recommendation context, one line each */}

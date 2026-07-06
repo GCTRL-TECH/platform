@@ -90,7 +90,7 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
     }
   }, [activeRuntime, selectedKind])
 
-  const selectedEntry = catalog.find((e) => e.kind === selectedKind || e.id === selectedKind)
+  const selectedEntry = catalog.find((e) => e.id === selectedKind)
   const vllmEntry = catalog.find((e) => e.id === 'vllm' || e.kind === 'vllm')
   const needsBaseUrl = selectedEntry?.needs_base_url ?? false
   const needsGpu = selectedEntry?.needs_gpu ?? false
@@ -277,7 +277,7 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                       const isVllm = entry.id === 'vllm' || entry.kind === 'vllm'
                       const disabled = isVllm && !gpuAvailable
                       return (
-                        <option key={entry.id} value={entry.kind || entry.id} disabled={disabled}>
+                        <option key={entry.id} value={entry.id} disabled={disabled}>
                           {entry.label}
                           {disabled ? ' (requires NVIDIA GPU + toolkit)' : ''}
                         </option>

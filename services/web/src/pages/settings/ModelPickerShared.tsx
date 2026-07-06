@@ -146,7 +146,7 @@ export function AllInstalledModelsRow({
   ollamaInstalled: string[]
   cloudModels: InstalledModelEntry[]
   selected: string
-  onSelect: (name: string) => void
+  onSelect: (name: string, provider?: string) => void
 }) {
   const isEmbedding = purpose === 'embedding'
   const localOthers = ollamaInstalled
@@ -179,7 +179,7 @@ export function AllInstalledModelsRow({
         {cloudOthers.map((m) => (
           <button
             key={`${m.provider}:${m.model}`}
-            onClick={() => onSelect(m.model)}
+            onClick={() => onSelect(m.model, m.provider)}
             title={m.name}
             className={cn(
               'rounded-md border px-2 py-1 font-mono text-[11px] transition-colors',

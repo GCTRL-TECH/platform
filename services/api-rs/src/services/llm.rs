@@ -499,6 +499,94 @@ pub fn apply_generation_overrides(target: &LlmTarget, map: &mut serde_json::Map<
     // generation_api_key is NOT inserted — no plaintext secret in Redis.
 }
 
+/// P2 per-purpose runtime resolver. A purpose can override its own
+/// `{provider, base_url, model}`; with the provider override unset it INHERITS
+/// the normal chain (per-user provider → global runtime → bundled Ollama).
+///
+/// Mismatch fix: when inheriting a NON-ollama runtime, a purpose-level model
+/// (typically an Ollama tag) does NOT apply — we follow the runtime's own model,
+/// so a purpose inheriting a vLLM runtime no longer receives an Ollama tag as its
+/// model string. To force a specific model on a specific runtime, set a
+/// per-purpose provider override.
+///
+/// `purpose` ∈ `"agent" | "rag" | "relation" | "distill" | "embedding"`.
+/// No per-purpose key column yet: keyless local/bundled runtimes are the target;
+/// authed-cloud per-purpose for the batch workers is a follow-up.
+pub async fn resolve_purpose(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    purpose: &str,
+) -> LlmTarget {
+    let (prov_col, base_col, model_col) = match purpose {
+        "relation"  => ("relation_provider", "relation_base_url", "relation_model"),
+        "distill"   => ("distill_provider",  "distill_base_url",  "distill_model"),
+        "agent"     => ("agent_provider",    "agent_base_url",    "agent_model"),
+        "rag"       => ("rag_provider",      "rag_base_url",      "rag_model"),
+        "embedding" => ("embedding_provider","embedding_base_url","embedding_model"),
+        _           => ("", "", ""),
+    };
+
+    // Column names come from the static allowlist above (never user input), so the
+    // formatted query is safe from injection.
+    let (ov_provider, ov_base, ov_model): (Option<String>, Option<String>, Option<String>) =
+        if prov_col.is_empty() {
+            (None, None, None)
+        } else {
+            let sql = format!(
+                "SELECT {prov_col}, {base_col}, {model_col} FROM user_model_prefs WHERE user_id = $1"
+            );
+            sqlx::query_as(&sql)
+                .bind(user_id)
+                .fetch_optional(db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or((None, None, None))
+        };
+
+    let nz = |o: &Option<String>| {
+        o.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    };
+
+    // The inherit chain (per-user provider → global runtime → bundled Ollama).
+    let inherited = resolve_for_user(db, user_id, None, None).await;
+
+    match nz(&ov_provider) {
+        // `ollama_cloud` is a logical provider (ollama.com + the stored Ollama
+        // key). The generic branch below would build a keyless target with the
+        // wrong wire provider, so delegate to resolve_for_user, which pins the
+        // base, loads the key and normalizes the provider for the chat layer.
+        // The per-purpose base_url is deliberately ignored (cloud is pinned).
+        Some(provider) if provider == "ollama_cloud" => {
+            let model = nz(&ov_model);
+            resolve_for_user(db, user_id, Some("ollama_cloud"), model.as_deref()).await
+        }
+        // Explicit per-purpose override: target from the stored provider/base
+        // (SSRF-validated); model = purpose model else the inherited runtime's.
+        Some(provider) => {
+            let base = nz(&ov_base).and_then(|b| {
+                validate_llm_base(&provider, Some(&b))
+                    .ok()
+                    .map(|u| containerize_ollama_base(u.as_str().trim_end_matches('/')))
+            });
+            let model = nz(&ov_model).unwrap_or_else(|| inherited.model.clone());
+            LlmTarget { provider, model, base_url: base, api_key: None }
+        }
+        // Inherit the whole chain. A purpose-level model applies ONLY when the
+        // inherited runtime is Ollama (tags interchangeable); otherwise follow the
+        // runtime's model to avoid a provider/model mismatch.
+        None => {
+            let mut t = inherited;
+            if let Some(m) = nz(&ov_model) {
+                if t.provider == "ollama" {
+                    t.model = m;
+                }
+            }
+            t
+        }
+    }
+}
+
 /// Inject the owner's runtime Ollama endpoint into a KEX `kex:jobs` payload so the
 /// extraction worker honors the Settings → Infrastructure base URL for THIS job
 /// (relation extraction + embedding) instead of its container-baked env defaults.
@@ -516,9 +604,9 @@ pub async fn inject_ollama_overrides(
 
     // Per-purpose model selection (Settings → AI Models → Models). NULLs mean
     // "use the engine's env defaults", so existing installs are untouched.
-    let prefs: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+    let prefs: Option<(Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as(
-            "SELECT embedding_model, embedding_provider, embedding_base_url, relation_model
+            "SELECT embedding_model, embedding_provider, embedding_base_url
              FROM user_model_prefs WHERE user_id = $1",
         )
         .bind(user_id)
@@ -526,8 +614,8 @@ pub async fn inject_ollama_overrides(
         .await
         .ok()
         .flatten();
-    let (emb_model, emb_provider, emb_base_pref, rel_model) =
-        prefs.unwrap_or((None, None, None, None));
+    let (emb_model, emb_provider, emb_base_pref) =
+        prefs.unwrap_or((None, None, None));
     let nz = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     if let Some(map) = payload.as_object_mut() {
@@ -555,12 +643,15 @@ pub async fn inject_ollama_overrides(
         if let Some(p) = nz(emb_provider) {
             map.insert("embedding_provider".into(), json!(p));
         }
-        if let Some(m) = nz(rel_model) {
-            map.insert("relex_model".into(), json!(m));
-        }
-        // ── Generation runtime (openai_compatible → inject generation_* fields)
-        let gen = resolve_for_user(db, user_id, None, None).await;
-        apply_generation_overrides(&gen, map);
+        // ── Relation extraction runtime (P2 per-purpose) ──────────────────────
+        // RELATION resolves independently: it can point at its own runtime
+        // (vLLM/llama.cpp/external/ollama) or inherit the global one. Always send
+        // the resolved model as relex_model (fixes the old mismatch where a vLLM
+        // runtime still received an Ollama relex tag); inject generation_* when
+        // that runtime is openai_compatible.
+        let rel = resolve_purpose(db, user_id, "relation").await;
+        map.insert("relex_model".into(), json!(rel.model));
+        apply_generation_overrides(&rel, map);
 
         // ── Part 6.1: Pinned embedding override ───────────────────────────────
         // When the active runtime is the bundled llama.cpp (gctrl-llamacpp:8080)
@@ -640,19 +731,13 @@ pub async fn resolve_distill_overrides(
     db: &sqlx::PgPool,
     user_id: uuid::Uuid,
 ) -> (Option<String>, Option<String>) {
-    let distill_model: Option<String> = sqlx::query_scalar(
-        "SELECT distill_model FROM user_model_prefs WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .map(|s: String| s.trim().to_string())
-    .filter(|s| !s.is_empty());
-
+    // P2: distill resolves its own per-purpose runtime. Use the resolved model so
+    // a purpose inheriting a non-ollama runtime adopts that runtime's model
+    // (mismatch fix) while an explicit per-purpose distill model is still honored.
+    // Bundled-ollama-unset resolves to "llama3.2" — identical to the old env default.
+    let target = resolve_purpose(db, user_id, "distill").await;
     let ollama_base = resolve_ollama_base_for_user(db, user_id).await;
-    (distill_model, ollama_base)
+    (Some(target.model), ollama_base)
 }
 
 /// Resolve the generation-runtime overrides for FUSE distill jobs.
@@ -665,7 +750,8 @@ pub async fn resolve_distill_generation_overrides(
     db: &sqlx::PgPool,
     user_id: uuid::Uuid,
 ) -> Option<LlmTarget> {
-    let gen = resolve_for_user(db, user_id, None, None).await;
+    // P2: follow the DISTILL purpose's own runtime, not just the global one.
+    let gen = resolve_purpose(db, user_id, "distill").await;
     if gen.provider == "openai_compatible" {
         Some(gen)
     } else {

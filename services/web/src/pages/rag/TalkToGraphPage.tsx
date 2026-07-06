@@ -515,6 +515,9 @@ function TracePanel({
 }) {
   const [cypherCopied, setCypherCopied] = useState(false)
   const [cypherExpanded, setCypherExpanded] = useState(false)
+  // Sources with no recognized entity have no graph node — clicking expands the
+  // full cited passage inline instead of opening an unfocused graph.
+  const [expandedSrc, setExpandedSrc] = useState<Set<number>>(new Set())
   const { neo4jBrowser } = usePublicConfig()
   const { isExpert } = useUiMode()
 
@@ -559,9 +562,25 @@ function TracePanel({
               {message.sources.map((src, i) => (
                 <div
                   key={i}
-                  onClick={() => onTraceSource(src, message.sourceCompilationId)}
+                  onClick={() => {
+                    // Traceable (has entity nodes) → open the graph focused there.
+                    // Otherwise (raw chunk, no entity) → expand the full passage
+                    // inline so the citation is readable rather than opening an
+                    // unfocused graph of every node.
+                    if ((src.entityMentions?.length ?? 0) > 0) {
+                      onTraceSource(src, message.sourceCompilationId)
+                      return
+                    }
+                    setExpandedSrc((prev) => {
+                      const n = new Set(prev)
+                      if (n.has(i)) n.delete(i); else n.add(i)
+                      return n
+                    })
+                  }}
                   role="button"
-                  title="Open in the graph viewer to trace where this came from"
+                  title={(src.entityMentions?.length ?? 0) > 0
+                    ? 'Open in the graph viewer to trace where this came from'
+                    : 'Read the full cited passage'}
                   className="group cursor-pointer rounded-xl border border-white/5 bg-white/[0.03] p-3 transition-all duration-150 hover:border-blue-500/30 hover:bg-blue-500/5"
                 >
                   <div className="flex items-start gap-2.5">
@@ -593,7 +612,7 @@ function TracePanel({
 
                       {/* Text excerpt (document chunks) */}
                       {(src.text || src.excerpt) && (
-                        <p className="mb-1.5 text-[11px] leading-relaxed text-slate-400 line-clamp-3">
+                        <p className={cn('mb-1.5 text-[11px] leading-relaxed text-slate-400', expandedSrc.has(i) ? 'whitespace-pre-wrap' : 'line-clamp-3')}>
                           {src.text || src.excerpt}
                         </p>
                       )}
@@ -642,9 +661,13 @@ function TracePanel({
                         </span>
                       </div>
 
-                      {/* Click-to-trace cue (revealed on hover) */}
+                      {/* Click cue (revealed on hover) */}
                       <p className="mt-1.5 text-[10px] text-blue-400/0 group-hover:text-blue-400/90 transition-colors">
-                        → Open in graph viewer to trace this source
+                        {(src.entityMentions?.length ?? 0) > 0
+                          ? '→ Open in graph viewer to trace this source'
+                          : expandedSrc.has(i)
+                          ? '↑ Collapse passage'
+                          : '→ Read the full cited passage'}
                       </p>
                     </div>
                   </div>
