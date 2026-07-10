@@ -161,6 +161,11 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/setup",  routes::setup::router())
         .nest("/api/public", routes::kg::public_router())
         .merge(routes::connectors::public_router())
+        // Cloaking LLM gateway: OpenAI-compatible POST /v1/chat/completions. Mounted
+        // OUTSIDE the auth middleware — it does its own auth so it can accept a gctrl
+        // token sent as either `ApiKey <t>` or `Bearer <t>` (some OpenAI clients force
+        // Bearer). See routes::llm_gateway.
+        .merge(routes::llm_gateway::router())
         .merge(protected)
         .merge(optional)
         .layer(tower_http::cors::CorsLayer::permissive())

@@ -27,6 +27,9 @@
 //! enforcement is; see those modules for the honest caveats.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 // ── Privacy mode resolution ───────────────────────────────────────────────────
@@ -231,6 +234,96 @@ pub fn candidates_from_entity_mentions(mentions_arrays: &[serde_json::Value]) ->
         }
     }
     out
+}
+
+// ── Free-chat cloak dictionary (LLM gateway) ─────────────────────────────────
+//
+// The RAG/agent paths cloak using the entity mentions of the CHUNKS they just
+// retrieved. The OpenAI-compatible LLM gateway (`routes::llm_gateway`) has no
+// retrieval step — it's a raw chat proxy — so it needs a per-user dictionary of
+// the entities worth hiding: every entity name KEX ever extracted from that
+// user's own documents. We pull those from `text_chunks.entity_mentions` (keyed
+// by `user_id`, which is exactly "the compilations this user owns"), dedup by
+// name, and cap the dictionary so a huge corpus can't make each request O(n).
+
+/// PURE: dedup a raw candidate list by (case-folded) name and keep the `cap`
+/// most useful entries — ranked by mention frequency, then by longer name
+/// (longer surface forms are more specific and safer to pseudonymize). First
+/// seen casing + kind wins for each key. No DB, no IO — unit-tested below.
+fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCandidate> {
+    let mut agg: HashMap<String, (usize, EntityCandidate)> = HashMap::new();
+    for c in candidates {
+        let key = lower_key(c.name.trim());
+        if key.chars().count() < 2 {
+            continue;
+        }
+        let entry = agg.entry(key).or_insert_with(|| (0, c.clone()));
+        entry.0 += 1;
+    }
+    let mut items: Vec<(usize, EntityCandidate)> = agg.into_values().collect();
+    items.sort_by(|a, b| {
+        b.0
+            .cmp(&a.0)
+            .then_with(|| b.1.name.chars().count().cmp(&a.1.name.chars().count()))
+    });
+    items.into_iter().take(cap).map(|(_, c)| c).collect()
+}
+
+/// PURE: build a capped, deduped cloak dictionary straight from raw
+/// `text_chunks.entity_mentions` JSONB arrays. Extracted so it's testable with a
+/// fake mentions array (no DB).
+pub fn candidates_from_mentions_capped(
+    mentions_arrays: &[serde_json::Value],
+    cap: usize,
+) -> Vec<EntityCandidate> {
+    dedup_and_cap(candidates_from_entity_mentions(mentions_arrays), cap)
+}
+
+/// How many distinct entity names to keep in a user's free-chat cloak dictionary.
+/// Bounds per-request substitution cost regardless of corpus size.
+const CANDIDATE_CAP: usize = 2000;
+/// In-memory TTL for the per-user dictionary — rebuilding it hits Postgres, and a
+/// user's extracted-entity set changes slowly, so a short cache keeps the gateway
+/// hop cheap without going stale for long.
+const CANDIDATE_TTL: Duration = Duration::from_secs(600);
+
+#[allow(clippy::type_complexity)]
+static CANDIDATE_CACHE: Lazy<Mutex<HashMap<Uuid, (Instant, Arc<Vec<EntityCandidate>>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Build the free-chat cloak dictionary for `user_id`: every entity name KEX
+/// extracted from the documents this user owns (`text_chunks.entity_mentions`
+/// scoped by `user_id`), deduped by name and capped at [`CANDIDATE_CAP`]. Cached
+/// in-process per user for [`CANDIDATE_TTL`]. The PII regex fallback baked into
+/// `collect_candidates` still runs at cloak time, so emails/IBANs/phones are
+/// covered even when they were never extracted as named entities.
+pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Vec<EntityCandidate> {
+    // Fast path: a fresh cache entry.
+    if let Some(hit) = {
+        let guard = CANDIDATE_CACHE.lock().unwrap();
+        guard
+            .get(&user_id)
+            .filter(|(t, _)| t.elapsed() < CANDIDATE_TTL)
+            .map(|(_, v)| v.clone())
+    } {
+        return (*hit).clone();
+    }
+
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT COALESCE(entity_mentions, '[]'::jsonb) FROM text_chunks \
+         WHERE user_id = $1 AND entity_mentions IS NOT NULL AND entity_mentions <> '[]'::jsonb",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let capped = Arc::new(candidates_from_mentions_capped(&rows, CANDIDATE_CAP));
+    CANDIDATE_CACHE
+        .lock()
+        .unwrap()
+        .insert(user_id, (Instant::now(), capped.clone()));
+    (*capped).clone()
 }
 
 /// The result of a `cloak()` call: the pseudonym → canonical-original map
@@ -690,6 +783,52 @@ mod tests {
         assert_eq!(bucket_template(Some("email")), ("EMAIL", true));
         assert_eq!(bucket_template(None), ("Term", false));
         assert_eq!(bucket_template(Some("unknown-weird-type")), ("Term", false));
+    }
+
+    // ── free-chat dictionary: dedup + cap ────────────────────────────────
+
+    fn mentions(items: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|(name, kind)| serde_json::json!({ "name": name, "type": kind }))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn dictionary_dedups_by_name_across_chunks() {
+        // "Fabio" appears in three chunks with different casing → one entry.
+        let arrays = vec![
+            mentions(&[("Fabio", "person"), ("Cyberiade", "organization")]),
+            mentions(&[("FABIO", "person")]),
+            mentions(&[("fabio", "person")]),
+        ];
+        let out = candidates_from_mentions_capped(&arrays, 2000);
+        let fabio_count = out.iter().filter(|c| lower_key(&c.name) == "fabio").count();
+        assert_eq!(fabio_count, 1, "case variants of one entity collapse to one dictionary entry");
+        assert_eq!(out.len(), 2, "Fabio + Cyberiade");
+    }
+
+    #[test]
+    fn dictionary_cap_keeps_most_frequent() {
+        // "Common" mentioned 3×, "Rare" once; cap=1 must keep the frequent one.
+        let arrays = vec![
+            mentions(&[("Common", "person"), ("Rare", "person")]),
+            mentions(&[("Common", "person")]),
+            mentions(&[("Common", "person")]),
+        ];
+        let out = candidates_from_mentions_capped(&arrays, 1);
+        assert_eq!(out.len(), 1, "cap is honoured");
+        assert_eq!(lower_key(&out[0].name), "common", "the most-mentioned entity survives the cap");
+    }
+
+    #[test]
+    fn dictionary_drops_blank_and_single_char_names() {
+        let arrays = vec![mentions(&[("", "person"), ("X", "person"), ("Ok", "person")])];
+        let out = candidates_from_mentions_capped(&arrays, 2000);
+        assert_eq!(out.len(), 1, "empty and <2-char names are excluded");
+        assert_eq!(out[0].name, "Ok");
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod connector_configs;
 pub mod ontologies;
 pub mod agent;
 pub mod agent_gateway;
+pub mod llm_gateway;
 pub mod skills;
 pub mod classification;
 pub mod audit;
