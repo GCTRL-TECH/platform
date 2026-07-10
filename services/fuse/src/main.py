@@ -547,12 +547,26 @@ class DossierRequest(BaseModel):
 async def dossier_build_endpoint(req: DossierRequest):
     """Build/refresh entity dossier(s) — the HOT memory tier.
 
-    Two modes:
-      • entity_name set → compile/refresh ONE dossier on-demand (returns it, or
-        404 when the user owns no node with that name).
-      • compilation_id + source_job_ids set → refresh the top-N god-node dossiers.
+    Three modes:
+      • entity_name + source_job_ids set → KB-SCOPED single build: compile ONE
+        dossier confined to the granted jobs and store it under `user_id` (the scoped
+        caller). Used by the agent GET /dossier path for colleague tokens so a scoped
+        user gets a HOT dossier for its granted KB — leak-safe by construction.
+      • entity_name set (no source_job_ids) → OWNER single build on-demand (returns
+        it, or 404 when the user owns no node with that name).
+      • compilation_id + source_job_ids set (no entity_name) → refresh top-N god-nodes.
     """
     try:
+        if req.entity_name and req.source_job_ids:
+            result = dossier.build_dossier_for_name_scoped(
+                req.user_id, req.entity_name, req.source_job_ids,
+            )
+            if result is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No granted entity named '{req.entity_name}'",
+                )
+            return result
         if req.entity_name:
             result = dossier.build_dossier_for_name(req.user_id, req.entity_name)
             if result is None:

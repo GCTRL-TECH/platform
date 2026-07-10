@@ -411,6 +411,66 @@ const READ_TOOLS: &[&str] = &[
     "list_models",
 ];
 
+/// Cypher WHERE-fragment that authorizes ONE graph node bound to `alias`, given the
+/// token's scope (`crate::routes::kg::api_key_scoped_jobs`). This is the single source
+/// of truth for the node-level authorization boundary, so the graph read tools
+/// (search_entities / get_entity / get_neighbors / shortest_path / schema) cannot drift.
+///
+///   scoped (`Some(jobs)`)   → `alias._source_job IN $jobs`
+///       The granted source-jobs ARE the authorization boundary. NO `_owner`/`user_id`
+///       requirement — that is exactly what lets a KB-scoped COLLEAGUE token read the
+///       granted knowledge base (whose nodes are owned by someone else) and nothing
+///       outside it. Caller MUST bind `$jobs`.
+///   unscoped (`None`)       → `(alias._owner = $uid OR alias.user_id = $uid)`
+///       Owner/JWT token — legacy behavior, unchanged. Caller MUST bind `$uid`.
+///
+/// This returns ONLY the identity predicate; callers keep their own
+/// `coalesce(alias._min_rank,0) <= $rank` clearance clause inline (clearance is
+/// orthogonal to scope and already correct at every call site). Empty-grant
+/// (`Some(vec![])`) is handled by each caller returning early BEFORE building the query.
+fn node_auth_clause(alias: &str, scoped: &Option<Vec<String>>) -> String {
+    if scoped.is_some() {
+        format!("{alias}._source_job IN $jobs")
+    } else {
+        format!("({alias}._owner = $uid OR {alias}.user_id = $uid)")
+    }
+}
+
+#[cfg(test)]
+mod node_auth_clause_tests {
+    use super::node_auth_clause;
+
+    #[test]
+    fn scoped_uses_source_job_boundary_without_owner() {
+        // A KB-scoped (colleague) token authorizes on the granted jobs ONLY — no
+        // `_owner`/`user_id` clause, so it can read granted data owned by someone else.
+        let scoped = Some(vec!["job-a".to_string(), "job-b".to_string()]);
+        assert_eq!(node_auth_clause("n", &scoped), "n._source_job IN $jobs");
+        assert_eq!(node_auth_clause("m", &scoped), "m._source_job IN $jobs");
+        // Must never fall back to ownership when scoped (the leak/robustness invariant).
+        assert!(!node_auth_clause("n", &scoped).contains("_owner"));
+        assert!(!node_auth_clause("n", &scoped).contains("user_id"));
+    }
+
+    #[test]
+    fn unscoped_uses_owner_boundary_unchanged() {
+        // An owner/JWT token keeps the legacy owner predicate, byte-identical.
+        let unscoped: Option<Vec<String>> = None;
+        assert_eq!(node_auth_clause("n", &unscoped), "(n._owner = $uid OR n.user_id = $uid)");
+        assert_eq!(node_auth_clause("a", &unscoped), "(a._owner = $uid OR a.user_id = $uid)");
+        // Must never reference $jobs when unscoped (no stray bind).
+        assert!(!node_auth_clause("n", &unscoped).contains("$jobs"));
+    }
+
+    #[test]
+    fn empty_grant_is_still_scoped_shape() {
+        // Empty grant is `Some(vec![])` — callers return early BEFORE building the
+        // query, but the clause itself must stay on the scoped (job) branch.
+        let empty = Some(Vec::<String>::new());
+        assert_eq!(node_auth_clause("n", &empty), "n._source_job IN $jobs");
+    }
+}
+
 pub(crate) async fn execute_tool(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
@@ -472,11 +532,11 @@ pub(crate) async fn execute_tool(
             // knowledge base(s); scoped-but-ungranted returns nothing.
             let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
             if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entities": [] }); }
-            let job_clause = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let nauth = node_auth_clause("n", &scoped);
             let cypher = format!("MATCH (n) \
                 WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
-                  AND (n._owner = $uid OR n.user_id = $uid) \
-                  AND coalesce(n._min_rank,0) <= $rank {job_clause} \
+                  AND {nauth} \
+                  AND coalesce(n._min_rank,0) <= $rank \
                 RETURN n.name AS name, n.label AS label, n._classification AS cls LIMIT $limit");
             let mut nq = neo4rs::query(&cypher).param("q", query).param("uid", uid).param("rank", rank as i64).param("limit", limit);
             if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
@@ -514,10 +574,10 @@ pub(crate) async fn execute_tool(
             if matches!(&scoped, Some(j) if j.is_empty()) {
                 return json!({ "error": "not found or insufficient clearance" });
             }
-            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let nauth = node_auth_clause("n", &scoped);
             let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
             let cypher = format!("MATCH (n {{name: $name}}) \
-                WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank {njob} \
+                WHERE {nauth} AND coalesce(n._min_rank,0) <= $rank \
                 OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank {mjob} \
                 WITH n, [x IN collect(DISTINCT CASE WHEN r IS NULL THEN NULL ELSE \
                     {{t: type(r), m: coalesce(m.name,''), a: coalesce(r._authority,''), \
@@ -603,16 +663,31 @@ pub(crate) async fn execute_tool(
         "get_dossier" => {
             let name = args["name"].as_str().unwrap_or("").to_string();
             if name.trim().is_empty() { return json!({ "error": "name is required" }); }
-            // SCOPED read: KB-scoped tokens get nothing; a dossier whose facts exceed
-            // the caller's clearance is withheld. Build on-the-fly only when TRULY
-            // absent (not merely withheld) and the caller isn't KB-scoped.
+            // SCOPED read: a KB-scoped colleague token gets its OWN confined dossier
+            // (built scoped-to-grant, leak-safe); an unscoped/owner token gets the
+            // owner dossier. A dossier whose facts exceed the caller's clearance is
+            // withheld. Build on-the-fly only when TRULY absent (not merely withheld).
             let mut row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
             if row.is_none() {
-                let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
-                let kb_scoped = crate::routes::kg::api_key_scope(&state.db, claims).await.is_some();
-                if truly_absent && !kb_scoped {
-                    if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
-                        row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+                match crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await {
+                    // KB-scoped: confined on-demand build (jobs = the auth boundary).
+                    Some(jobs) if !jobs.is_empty() => {
+                        let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+                        if truly_absent {
+                            if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse_scoped(state, claims.sub, &name, &jobs).await {
+                                row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+                            }
+                        }
+                    }
+                    Some(_) => {} // scoped but granted nothing
+                    // Unscoped/owner: existing owner-build behaviour.
+                    None => {
+                        let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+                        if truly_absent {
+                            if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
+                                row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+                            }
+                        }
                     }
                 }
             }
@@ -1090,14 +1165,16 @@ pub(crate) async fn execute_tool(
             if matches!(&scoped, Some(j) if j.is_empty()) {
                 return json!({ "entityTypes": [], "relationTypes": [] });
             }
-            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+            let nauth = node_auth_clause("n", &scoped);
+            // The relation query's far endpoint `m` keeps a bare `mjob`: unscoped it stays
+            // unconstrained (byte-identical to before); scoped it is confined to $jobs.
             let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
             let cypher_e = format!(
-                "MATCH (n) WHERE (n._owner=$uid OR n.user_id=$uid) AND coalesce(n._min_rank,0)<=$rank {njob} \
+                "MATCH (n) WHERE {nauth} AND coalesce(n._min_rank,0)<=$rank \
                  WITH coalesce(n.coarse_type, n.type, n.label) AS t WHERE t IS NOT NULL AND t <> '' \
                  RETURN t AS ty, count(*) AS cnt ORDER BY cnt DESC LIMIT 50");
             let cypher_r = format!(
-                "MATCH (n)-[r]->(m) WHERE (n._owner=$uid OR n.user_id=$uid) AND coalesce(r._min_rank,0)<=$rank {njob} {mjob} \
+                "MATCH (n)-[r]->(m) WHERE {nauth} AND coalesce(r._min_rank,0)<=$rank {mjob} \
                  RETURN type(r) AS ty, count(*) AS cnt ORDER BY cnt DESC LIMIT 50");
             let run = |cypher: String| {
                 let neo = state.neo.clone();
@@ -1289,16 +1366,18 @@ pub(crate) async fn execute_tool(
             let uid = claims.sub.to_string();
             let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
             if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entity": name, "neighbors": [] }); }
-            let njob = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
-            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            let (nauth, mauth) = (node_auth_clause("n", &scoped), node_auth_clause("m", &scoped));
             // Variable-length expansion, clearance- AND KB-scope-filtered on every hop.
+            // `size(r)` (NOT `length`): `r` from `[r*1..N]` is a LIST<RELATIONSHIP>, and
+            // Neo4j 2026's `length()` only accepts a PATH (else 22N27) — `size()` returns
+            // the hop count of the relationship list.
             let cypher = format!(
                 "MATCH (n {{name: $name}}) \
-                   WHERE (n._owner = $uid OR n.user_id = $uid) AND coalesce(n._min_rank,0) <= $rank {njob} \
+                   WHERE {nauth} AND coalesce(n._min_rank,0) <= $rank \
                  MATCH (n)-[r*1..{depth}]-(m) \
-                   WHERE (m._owner = $uid OR m.user_id = $uid) AND coalesce(m._min_rank,0) <= $rank {mjob} \
+                   WHERE {mauth} AND coalesce(m._min_rank,0) <= $rank \
                  RETURN DISTINCT m.name AS name, coalesce(m.coarse_type, m.label, m.type) AS type, \
-                        length(r) AS hops \
+                        size(r) AS hops \
                  ORDER BY hops ASC, name ASC LIMIT 100"
             );
             let mut out: Vec<Value> = Vec::new();
@@ -1332,8 +1411,11 @@ pub(crate) async fn execute_tool(
             // caller's clearance OR outside its granted knowledge base(s) — no leaking a
             // connection THROUGH classified or out-of-scope nodes.
             let pathjob = if scoped.is_some() { "AND all(x IN nodes(p) WHERE x._source_job IN $jobs)" } else { "" };
+            let (aauth, bauth) = (node_auth_clause("a", &scoped), node_auth_clause("b", &scoped));
+            // `length(p)` below is VALID: `p` is a real PATH from shortestPath(...), not
+            // a relationship list — leave it (only `[r*..N]` lists need `size`).
             let cypher = format!("MATCH (a {{name: $from}}), (b {{name: $to}}) \
-                  WHERE (a._owner = $uid OR a.user_id = $uid) AND (b._owner = $uid OR b.user_id = $uid) \
+                  WHERE {aauth} AND {bauth} \
                   MATCH p = shortestPath((a)-[*..8]-(b)) \
                   WHERE all(x IN nodes(p) WHERE coalesce(x._min_rank,0) <= $rank) {pathjob} \
                   RETURN [x IN nodes(p) | x.name] AS names, \

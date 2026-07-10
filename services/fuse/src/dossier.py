@@ -115,6 +115,65 @@ def _fetch_entity_facts(driver, user_id: str, entity_name: str) -> Optional[dict
         rec = session.run(
             query, name=entity_name, uid=user_id, structural=list(_STRUCTURAL_RELS)
         ).single()
+    return _parse_entity_record(rec, entity_name)
+
+
+def _fetch_entity_facts_scoped(
+    driver, entity_name: str, job_ids: list[str]
+) -> Optional[dict]:
+    """KB-SCOPED variant of `_fetch_entity_facts`: authorizes on the GRANTED
+    source-jobs instead of ownership, and confines the canonical node AND every
+    neighbour to `_source_job IN $job_ids`. This is what lets a colleague token get
+    a HOT dossier for an entity in its granted knowledge base — leak-safe BY
+    CONSTRUCTION: no node, edge, or neighbour name from outside the grant can enter
+    the compiled facts. Returns None when the entity has no node inside the grant."""
+    if not job_ids:
+        return None
+    # Mirror of the owner query, but every MATCH endpoint is gated on the granted
+    # jobs (the grant IS the authorization boundary — no `_owner`/`user_id` clause).
+    query = """
+    MATCH (n {name: $name})
+      WHERE n._source_job IN $job_ids
+    OPTIONAL MATCH (n)-[ro]->(o)
+      WHERE NOT type(ro) IN $structural AND o._source_job IN $job_ids
+    OPTIONAL MATCH (i)-[ri]->(n)
+      WHERE NOT type(ri) IN $structural AND i._source_job IN $job_ids
+    WITH n,
+         count(DISTINCT o) + count(DISTINCT i) AS degree,
+         count(DISTINCT CASE WHEN ro.confidence IS NOT NULL THEN o END)
+           + count(DISTINCT CASE WHEN ri.confidence IS NOT NULL THEN i END) AS conf_edges,
+         CASE WHEN n._source_job IS NOT NULL THEN 1 ELSE 0 END AS has_prov,
+         collect(DISTINCT {dir: 'out', rel: type(ro), name: o.name,
+                           type: coalesce(o.coarse_type, o.type),
+                           confidence: ro.confidence,
+                           authority: ro._authority,
+                           superseded_by_doc: ro._superseded_by_doc})[..40] AS outs,
+         collect(DISTINCT {dir: 'in', rel: type(ri), name: i.name,
+                           type: coalesce(i.coarse_type, i.type),
+                           confidence: ri.confidence,
+                           authority: ri._authority,
+                           superseded_by_doc: ri._superseded_by_doc})[..40] AS ins
+    ORDER BY has_prov DESC, conf_edges DESC, degree DESC, id(n) ASC
+    RETURN n.name AS name,
+           coalesce(n.coarse_type, n.type, 'entity') AS type,
+           n._source_job AS source_job,
+           n._origin AS origin,
+           n.uri AS uri,
+           outs, ins
+    LIMIT 1
+    """
+    with driver.session() as session:
+        rec = session.run(
+            query, name=entity_name, job_ids=job_ids,
+            structural=list(_STRUCTURAL_RELS),
+        ).single()
+    return _parse_entity_record(rec, entity_name)
+
+
+def _parse_entity_record(rec, entity_name: str) -> Optional[dict]:
+    """Shared record → facts/neighbors/source_jobs projection for both the owner
+    (`_fetch_entity_facts`) and the KB-scoped (`_fetch_entity_facts_scoped`)
+    fetchers, so the two can't drift."""
     if not rec:
         return None
 
@@ -434,6 +493,79 @@ def build_dossier_for_name(user_id: str, entity_name: str) -> Optional[dict]:
     conn = _pg_connect()
     try:
         return _compile_one(driver, conn, user_id, entity_name)
+    finally:
+        driver.close()
+        conn.close()
+
+
+def _resolve_origin_files_scoped(conn, source_jobs: list[str], granted_jobs: set) -> list[str]:
+    """Origin-file resolution for a KB-scoped build. Resolves ONLY jobs inside the
+    grant (the granted set is the authorization boundary) and does NOT filter by
+    user_id — the jobs belong to the KB owner, but the caller is explicitly granted
+    them, so their fileName/sourceRef is in-scope. Skips any job not in the grant."""
+    files: list[str] = []
+    for sj in source_jobs or []:
+        if str(sj) not in granted_jobs:
+            continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(input->>'fileName', input->>'sourceRef', "
+                    "        left(input->>'text', 60)) "
+                    "FROM jobs WHERE id = %s::uuid",
+                    (sj,),
+                )
+                row = cur.fetchone()
+        except Exception:
+            conn.rollback()
+            continue
+        if row and row[0] and row[0] not in files:
+            files.append(row[0])
+    return files
+
+
+def build_dossier_for_name_scoped(
+    user_id: str, entity_name: str, source_job_ids: list[str]
+) -> Optional[dict]:
+    """On-demand KB-SCOPED build: compile the dossier for `entity_name` confined to
+    the caller's granted `source_job_ids`, and store it under `user_id` (the scoped
+    caller — NOT the KB owner) so the colleague's confined dossier never mixes with,
+    nor pollutes, the owner's cross-KB aggregate. Leak-safe by construction: the
+    facts, neighbours and origin files come ONLY from the granted jobs. Returns None
+    when the grant contains no node with that name."""
+    logger.info(
+        f"[dossier] scoped on-demand build '{entity_name}' for user {user_id} "
+        f"({len(source_job_ids)} granted job(s))"
+    )
+    if not source_job_ids:
+        return None
+    granted = {str(j) for j in source_job_ids}
+    driver = _neo_driver()
+    conn = _pg_connect()
+    try:
+        entity = _fetch_entity_facts_scoped(driver, entity_name, list(granted))
+        if entity is None:
+            return None
+        origin_files = _resolve_origin_files_scoped(conn, entity["source_jobs"], granted)
+        timeline = _build_timeline(entity["facts"])
+        summary = _build_summary(entity, conn)
+        uri = _entity_uri(entity)
+        with conn:
+            action = _upsert_dossier(
+                conn, user_id,
+                entity_uri=uri, entity_name=entity["name"], summary=summary,
+                key_facts=entity["facts"], origin_files=origin_files, timeline=timeline,
+            )
+        return {
+            "entity_uri": uri,
+            "entity_name": entity["name"],
+            "summary": summary,
+            "key_facts": entity["facts"],
+            "origin_files": origin_files,
+            "timeline": timeline,
+            "trust": DOSSIER_TRUST,
+            "action": action,
+        }
     finally:
         driver.close()
         conn.close()

@@ -2232,11 +2232,24 @@ pub(crate) async fn fetch_dossier_row_scoped(
     claims: &JwtClaims,
     name: &str,
 ) -> Option<Dossier> {
-    if api_key_scope(&state.db, claims).await.is_some() {
-        return None;
-    }
-    let d = fetch_dossier_row(&state.db, claims.sub, name).await?;
     let caller_rank = get_user_clearance_rank(&state.db, claims).await;
+    // KB-SCOPED token: serve ONLY the caller's OWN confined dossiers — the ones built
+    // scoped-to-grant and stored under `claims.sub` (see build_dossier_via_fuse_scoped).
+    // These contain facts exclusively from the granted jobs (leak-safe by construction).
+    // The owner's cross-KB aggregate dossiers are NEVER surfaced to a scoped token.
+    // Empty grant → nothing. Clearance ceiling is computed over the granted jobs only.
+    if let Some(jobs) = api_key_scoped_jobs(&state.db, claims).await {
+        if jobs.is_empty() {
+            return None;
+        }
+        let d = fetch_dossier_row(&state.db, claims.sub, name).await?;
+        if dossier_required_rank_scoped(state, name, &jobs).await > caller_rank {
+            return None;
+        }
+        return Some(d);
+    }
+    // UNSCOPED (owner/JWT) — unchanged.
+    let d = fetch_dossier_row(&state.db, claims.sub, name).await?;
     if dossier_required_rank(state, claims.sub, name).await > caller_rank {
         return None;
     }
@@ -2267,6 +2280,79 @@ pub(crate) async fn build_dossier_via_fuse(
         return Err(AppError::Internal(format!("FUSE dossier build failed ({st}): {body}")));
     }
     Ok(Some(()))
+}
+
+/// KB-SCOPED on-demand dossier build for a colleague token. Asks FUSE to compile the
+/// dossier for `name` CONFINED to the caller's granted `source_jobs` (no cross-KB
+/// fusion) and store it under `user_id` (the scoped caller — so the colleague's
+/// confined dossier never mixes with, nor pollutes, the KB owner's cross-KB aggregate).
+/// Leak-safe by construction: FUSE authorizes every node/edge/neighbour on
+/// `_source_job IN source_jobs`, so no fact from outside the grant can enter the
+/// compiled dossier. Returns Ok(Some) when built, Ok(None) when the grant has no such
+/// entity. Passing `entity_name` + `source_job_ids` selects FUSE's scoped build mode.
+pub(crate) async fn build_dossier_via_fuse_scoped(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    name: &str,
+    source_jobs: &[String],
+) -> Result<Option<()>> {
+    if source_jobs.is_empty() {
+        return Ok(None);
+    }
+    let url = format!("{}/dossier/build", state.cfg.fuse_url);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&json!({
+            "user_id": user_id.to_string(),
+            "entity_name": name,
+            "source_job_ids": source_jobs,
+        }))
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("FUSE unreachable: {e}")))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("FUSE scoped dossier build failed ({st}): {body}")));
+    }
+    Ok(Some(()))
+}
+
+/// Clearance ceiling for a KB-SCOPED dossier read: the max `_min_rank` across the
+/// entity's node and its relations, computed ONLY over the caller's granted jobs
+/// (`_source_job IN $jobs`) rather than by ownership. Mirrors `dossier_required_rank`
+/// but for a colleague token; fails CLOSED (i32::MAX) on a Neo4j error so a hiccup
+/// never leaks a confined dossier to a low-clearance caller.
+pub(crate) async fn dossier_required_rank_scoped(
+    state: &Arc<crate::models::AppState>,
+    name: &str,
+    jobs: &[String],
+) -> i32 {
+    if jobs.is_empty() {
+        return i32::MAX; // no grant → nothing readable
+    }
+    let cypher = "MATCH (n) WHERE toLower(n.name) = toLower($name) \
+                    AND n._source_job IN $jobs \
+                  OPTIONAL MATCH (n)-[r]-(m) WHERE m._source_job IN $jobs \
+                  RETURN coalesce(max(coalesce(r._min_rank,0)),0) AS relmax, \
+                         coalesce(max(coalesce(n._min_rank,0)),0) AS nodemax";
+    match state.neo.execute(
+        neo4rs::query(cypher).param("name", name).param("jobs", jobs.to_vec()),
+    ).await {
+        Ok(mut res) => {
+            if let Ok(Some(row)) = res.next().await {
+                let relmax = row.get::<i64>("relmax").unwrap_or(0) as i32;
+                let nodemax = row.get::<i64>("nodemax").unwrap_or(0) as i32;
+                return relmax.max(nodemax);
+            }
+            0
+        }
+        Err(_) => i32::MAX, // fail closed
+    }
 }
 
 /// Bump heat / access_count / last_accessed on a dossier that was just injected
@@ -2302,12 +2388,30 @@ async fn get_dossier(
     //    token). 3. Re-read scoped.
     let mut row = fetch_dossier_row_scoped(&state, &claims, &name).await;
     if row.is_none() {
-        let truly_absent = fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
-        let kb_scoped = api_key_scope(&state.db, &claims).await.is_some();
-        if truly_absent && !kb_scoped {
-            match build_dossier_via_fuse(&state, claims.sub, &name).await? {
-                Some(()) => { row = fetch_dossier_row_scoped(&state, &claims, &name).await; }
-                None => return Err(AppError::NotFound),
+        match api_key_scoped_jobs(&state.db, &claims).await {
+            // KB-SCOPED token: build on-demand CONFINED to the granted jobs (leak-safe),
+            // stored under this caller; then re-read scoped. `truly_absent` distinguishes
+            // "no confined dossier yet" from "exists but withheld above clearance" so we
+            // never rebuild just to withhold again. Empty grant builds nothing.
+            Some(jobs) if !jobs.is_empty() => {
+                let truly_absent = fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+                if truly_absent {
+                    match build_dossier_via_fuse_scoped(&state, claims.sub, &name, &jobs).await? {
+                        Some(()) => { row = fetch_dossier_row_scoped(&state, &claims, &name).await; }
+                        None => return Err(AppError::NotFound),
+                    }
+                }
+            }
+            Some(_) => {} // scoped but granted nothing → NotFound below
+            // UNSCOPED (owner/JWT): existing owner-build behaviour.
+            None => {
+                let truly_absent = fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
+                if truly_absent {
+                    match build_dossier_via_fuse(&state, claims.sub, &name).await? {
+                        Some(()) => { row = fetch_dossier_row_scoped(&state, &claims, &name).await; }
+                        None => return Err(AppError::NotFound),
+                    }
+                }
             }
         }
     }
