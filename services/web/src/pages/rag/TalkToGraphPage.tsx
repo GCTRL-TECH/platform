@@ -36,6 +36,8 @@ import {
   Mic,
   MicOff,
   ShieldCheck,
+  Loader2,
+  AlertCircle,
 } from 'lucide-react'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
@@ -1087,6 +1089,11 @@ export function TalkToGraphPage() {
   const [droppedFile, setDroppedFile] = useState<File | null>(null)
   const [isExtracting, setIsExtracting] = useState(false)
   const [extractionResult, setExtractionResult] = useState<string | null>(null)
+  // Import tracking: once a drop-to-import KEX job is created we poll its status
+  // so the notification updates to done/failed and dismisses itself instead of
+  // lingering as a static "Extraction started" message.
+  const [extractionPhase, setExtractionPhase] = useState<'running' | 'done' | 'failed' | null>(null)
+  const [trackedJobId, setTrackedJobId] = useState<string | null>(null)
   // Per-message feedback. A4: a 👍/👎 adjusts the referenced dossier's TRUST via
   // POST /rag/feedback (down → trust 0, up → raise toward 1). UI state is the
   // instant optimistic part; the API call is best-effort (never blocks the UI).
@@ -1531,6 +1538,8 @@ export function TalkToGraphPage() {
       if (files[0]) {
         setDroppedFile(files[0])
         setExtractionResult(null)
+        setExtractionPhase(null)
+        setTrackedJobId(null)
       }
     },
   })
@@ -1544,6 +1553,8 @@ export function TalkToGraphPage() {
       if (file) {
         setDroppedFile(file)
         setExtractionResult(null)
+        setExtractionPhase(null)
+        setTrackedJobId(null)
       }
     }
     input.click()
@@ -1571,7 +1582,11 @@ export function TalkToGraphPage() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = (await res.json()) as KexFromChatResponse
 
-      setExtractionResult(`Extraction started — Job ID: ${data.jobId}`)
+      // Show a live "importing" notice and start polling the job to completion
+      // (the poll effect below flips this to done/failed and auto-dismisses).
+      setExtractionResult(`Importing "${droppedFile.name}"…`)
+      setExtractionPhase('running')
+      setTrackedJobId(data.jobId)
       setDroppedFile(null)
 
       // Add a system message to the chat
@@ -1587,11 +1602,61 @@ export function TalkToGraphPage() {
         setStandardMessages((prev) => [...prev, sysMsg])
       }
     } catch (err) {
+      setTrackedJobId(null)
+      setExtractionPhase('failed')
       setExtractionResult(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`)
     } finally {
       setIsExtracting(false)
     }
   }
+
+  // Poll the tracked import job until it reaches a terminal state. Resilient to
+  // transient fetch errors (keeps polling); stops only on completed/failed, on a
+  // new import replacing this one, or on unmount. Backend terminal statuses are
+  // `completed` (success) and `failed` — matching the KEX job model everywhere else.
+  useEffect(() => {
+    if (!trackedJobId) return
+    let cancelled = false
+    const BASE_URL =
+      (import.meta.env as Record<string, string | undefined>)['VITE_API_URL'] || '/api'
+    const token = getToken()
+    const poll = async () => {
+      try {
+        const res = await fetch(`${BASE_URL}/kex/jobs/${trackedJobId}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        if (!res.ok) return // transient (e.g. job not visible yet) — keep polling
+        const data = (await res.json()) as { job?: { status?: string; error?: string } }
+        const status = data.job?.status
+        if (cancelled) return
+        if (status === 'completed') {
+          setExtractionPhase('done')
+          setExtractionResult('Import complete — knowledge graph updated.')
+          setTrackedJobId(null)
+        } else if (status === 'failed') {
+          setExtractionPhase('failed')
+          setExtractionResult(`Import failed: ${data.job?.error || 'extraction error'}`)
+          setTrackedJobId(null)
+        }
+      } catch {
+        /* transient network error — keep polling */
+      }
+    }
+    void poll()
+    const interval = setInterval(() => void poll(), 3000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [trackedJobId])
+
+  // Auto-dismiss the notification once the import settles. Success clears quickly;
+  // a failure lingers a little longer so the error is readable, then clears too.
+  useEffect(() => {
+    if (extractionPhase !== 'done' && extractionPhase !== 'failed') return
+    const t = setTimeout(() => {
+      setExtractionResult(null)
+      setExtractionPhase(null)
+    }, extractionPhase === 'done' ? 6000 : 12000)
+    return () => clearTimeout(t)
+  }, [extractionPhase])
 
   // ── Render ──
 
@@ -1753,13 +1818,40 @@ export function TalkToGraphPage() {
           />
         )}
 
-        {/* Extraction result notification */}
+        {/* Import status notification — tracks the drop-to-import job to
+            completion (running → done/failed) and auto-dismisses. */}
         {extractionResult && !droppedFile && (
-          <div className="mx-4 mb-3 flex items-center gap-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 backdrop-blur-sm px-4 py-2 animate-slide-up">
-            <Check size={14} className="text-emerald-400 shrink-0" />
-            <p className="text-xs text-emerald-400">{extractionResult}</p>
+          <div
+            className={cn(
+              'mx-4 mb-3 flex items-center gap-2 rounded-xl border backdrop-blur-sm px-4 py-2 animate-slide-up',
+              extractionPhase === 'failed'
+                ? 'border-red-500/20 bg-red-500/5'
+                : extractionPhase === 'running'
+                  ? 'border-blue-500/20 bg-blue-500/5'
+                  : 'border-emerald-500/20 bg-emerald-500/5',
+            )}
+          >
+            {extractionPhase === 'failed' ? (
+              <AlertCircle size={14} className="text-red-400 shrink-0" />
+            ) : extractionPhase === 'running' ? (
+              <Loader2 size={14} className="text-blue-400 shrink-0 animate-spin" />
+            ) : (
+              <Check size={14} className="text-emerald-400 shrink-0" />
+            )}
+            <p
+              className={cn(
+                'text-xs',
+                extractionPhase === 'failed'
+                  ? 'text-red-400'
+                  : extractionPhase === 'running'
+                    ? 'text-blue-300'
+                    : 'text-emerald-400',
+              )}
+            >
+              {extractionResult}
+            </p>
             <button
-              onClick={() => setExtractionResult(null)}
+              onClick={() => { setExtractionResult(null); setExtractionPhase(null); setTrackedJobId(null) }}
               className="ml-auto text-slate-600 hover:text-slate-400 transition-colors"
             >
               <X size={12} />
