@@ -657,10 +657,33 @@ pub async fn cloak(
         return (text.to_string(), session);
     }
 
+    // ROUNDTRIP 1 (the hot-path win): batch-fetch every already-assigned
+    // pseudonym for the seen keys in ONE query. A warm graph (entities recur
+    // across chat turns) resolves fully here — turning the old N sequential
+    // per-entity SELECTs (the ~1 s cloak TTFT overhead) into a single read.
+    let keys: Vec<String> = seen.keys().cloned().collect();
+    let existing: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT entity_key, pseudonym FROM cloak_maps WHERE compilation_id=$1 AND entity_key = ANY($2)",
+    )
+    .bind(primary)
+    .bind(&keys)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
     let mut key_to_pseudonym: HashMap<String, String> = HashMap::with_capacity(seen.len());
     for (key, (kind, canonical)) in &seen {
-        let (prefix, bracketed) = bucket_template(kind.as_deref());
-        let pseudonym = next_pseudonym(db, primary, key, prefix, bracketed).await;
+        let pseudonym = if let Some(p) = existing.get(key) {
+            p.clone()
+        } else {
+            // First time this entity is seen in this compilation — assign now
+            // (per-key, concurrency-safe). Only ever runs once per entity's
+            // lifetime, so it's off the recurring hot path.
+            let (prefix, bracketed) = bucket_template(kind.as_deref());
+            next_pseudonym(db, primary, key, prefix, bracketed).await
+        };
         session.map.insert(pseudonym.clone(), canonical.clone());
         key_to_pseudonym.insert(key.clone(), pseudonym);
     }
