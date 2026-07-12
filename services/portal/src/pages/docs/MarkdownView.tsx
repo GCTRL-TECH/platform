@@ -14,6 +14,10 @@ function toText(node: ReactNode): string {
 }
 
 export function MarkdownView({ content }: { content: string }) {
+  // Strip HTML comments so machine markers (e.g. the update-history post-routine's
+  // anchor / baseline-sha / draft blocks) never render as visible text. Applies to
+  // every docs page; comments are for source tooling, not readers.
+  const clean = content.replace(/<!--[\s\S]*?-->/g, '')
   return (
     <div className="max-w-none">
       <ReactMarkdown
@@ -85,7 +89,7 @@ export function MarkdownView({ content }: { content: string }) {
           td: ({ children }) => <td className="border-b border-slate-800/60 px-4 py-2.5 align-top text-slate-300">{children}</td>,
         }}
       >
-        {content}
+        {clean}
       </ReactMarkdown>
     </div>
   )

@@ -1,8 +1,12 @@
 # Update History
 
-What each GCTRL release added. We make our improvements transparent — so you can
-see the platform is actively maintained and exactly what changed. Every entry is
-authored by the **[GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)**.
+GCTRL gets better with every release — and we ship in the open. Below is the running
+record of what's new: fresh capabilities, faster extraction and retrieval, and
+continuous hardening. Every change earns its place, proven against our benchmarks and
+automated shipping gate before it reaches you.
+
+Transparency is part of the product. A knowledge platform you build on should visibly
+keep improving — so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: c9ded03 -->
