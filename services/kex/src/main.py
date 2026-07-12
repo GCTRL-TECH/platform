@@ -461,6 +461,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
         logger.info(f"Worker: received job from queue")
 
         job_id = "unknown"
+        hb_stop = None  # heartbeat stop event — set in finally so it never outlives the job
         try:
             payload = json.loads(raw_payload)
             job_id = payload.get("job_id", "unknown")
@@ -497,6 +498,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
+            hb_stop = _start_job_heartbeat(job_id)
             # Publish 'processing' status immediately so the UI shows it
             try:
                 r.publish("kex:results", json.dumps({"job_id": job_id, "status": "processing"}))
@@ -620,8 +622,45 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
         except Exception as exc:
             logger.error(f"Worker: job {job_id} failed: {exc}\n{traceback.format_exc()}")
             _publish_error(r, job_id, str(exc))
+        finally:
+            if hb_stop is not None:
+                hb_stop.set()
 
     logger.info(f"KEX worker-{worker_id} stopped")
+
+
+def _start_job_heartbeat(job_id: str) -> threading.Event:
+    """Keep jobs.updated_at fresh while a long pipeline runs.
+
+    api-rs recover_stale_jobs() fails any 'processing' job whose updated_at is
+    older than 5 minutes — meant to catch dead workers, but a healthy LARGE
+    extraction trips it too (Phoenix-measured: a 64 KB document spends ~5-7 min
+    in NER alone, during which nothing touches updated_at — so big ingests
+    failed or survived purely by watchdog-tick timing). A tiny daemon thread
+    beats every 60 s while the job is processing; the returned Event stops it
+    (set in the worker loop's finally). Best-effort: a failed beat is logged
+    and skipped, never fatal. The status='processing' guard means a beat can
+    never resurrect a job the watchdog (or anyone) already finalized.
+    """
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(60.0):
+            try:
+                import psycopg2
+                conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE jobs SET updated_at=NOW() WHERE id=%s AND status='processing'",
+                            (job_id,),
+                        )
+                conn.close()
+            except Exception as exc:
+                logger.debug(f"[{job_id}] heartbeat skipped: {exc}")
+
+    threading.Thread(target=_beat, daemon=True, name=f"job-hb-{job_id[:8]}").start()
+    return stop
 
 
 def _update_job_status(job_id: str, status: str, result: dict | None = None, error: str | None = None) -> None:
