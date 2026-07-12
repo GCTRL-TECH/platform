@@ -457,9 +457,19 @@ pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) 
             }
             let window: String = lower_chars[i..i + klen].iter().collect();
             if &window == *key {
-                out.push_str(&key_to_pseudonym[key.as_str()]);
-                i += klen;
-                continue 'outer;
+                // WORD-BOUNDARY guard: a key must never match INSIDE a word. Without
+                // this, a short graph entity like "LAN" cloaked the middle of "plant"
+                // → "pTerm-781t", and an "…EUR"-suffixed amount entity ate "Eur" out
+                // of "Euro" → "[AMOUNT-156]o" — garbling the text the cloud model has
+                // to reason over AND leaking word-shape structure. (Both observed
+                // live in the mock-cloud gateway proof.)
+                let before_ok = i == 0 || !chars[i - 1].is_alphanumeric();
+                let after_ok = i + klen >= chars.len() || !chars[i + klen].is_alphanumeric();
+                if before_ok && after_ok {
+                    out.push_str(&key_to_pseudonym[key.as_str()]);
+                    i += klen;
+                    continue 'outer;
+                }
             }
         }
         out.push(chars[i]);
@@ -501,16 +511,42 @@ pub fn decloak_stream_chunk(session: &CloakSession, buffer: &mut String, chunk: 
     if session.map.is_empty() {
         return std::mem::take(buffer);
     }
+    let chars: Vec<char> = buffer.chars().collect();
+    let total = chars.len();
     let max_len = session.map.keys().map(|k| k.chars().count()).max().unwrap_or(0);
     let hold = max_len.saturating_sub(1);
-    let total = buffer.chars().count();
     if total <= hold {
         return String::new();
     }
-    let split_at_char = total - hold;
+    // Candidate cut: emit everything except the last `hold` chars. That alone
+    // only protects a pseudonym STARTING in the tail — one that starts in the
+    // emitted prefix and crosses the cut gets split ("Term-2|74") and the raw
+    // prefix half leaks to the client (observed live: "Term-274 wird von …").
+    // So: slide the cut LEFT onto the start of any pseudonym(-prefix) that
+    // crosses it; that occurrence is then emitted complete on a later push
+    // (or by decloak_stream_finish).
+    let mut cut = total - hold;
+    let keys: Vec<Vec<char>> = session.map.keys().map(|k| k.chars().collect()).collect();
+    let scan_from = cut.saturating_sub(hold);
+    'scan: for j in scan_from..cut {
+        let avail = total - j;
+        for k in &keys {
+            if k.len() <= cut - j {
+                continue; // liegt vollständig vor dem Cut — decloak(ready) ersetzt es
+            }
+            let take = avail.min(k.len());
+            if take > 0 && chars[j..j + take] == k[..take] {
+                cut = j;
+                break 'scan;
+            }
+        }
+    }
+    if cut == 0 {
+        return String::new();
+    }
     let split_byte = buffer
         .char_indices()
-        .nth(split_at_char)
+        .nth(cut)
         .map(|(b, _)| b)
         .unwrap_or(buffer.len());
     let ready = buffer[..split_byte].to_string();
@@ -829,6 +865,55 @@ mod tests {
         let out = candidates_from_mentions_capped(&arrays, 2000);
         assert_eq!(out.len(), 1, "empty and <2-char names are excluded");
         assert_eq!(out[0].name, "Ok");
+    }
+
+    #[test]
+    fn apply_pseudonyms_respects_word_boundaries() {
+        let mut map = HashMap::new();
+        map.insert("lan".to_string(), "Term-1".to_string());
+        map.insert("12,5 mio. eur".to_string(), "[AMOUNT-2]".to_string());
+        map.insert("tom arenstam".to_string(), "Person-3".to_string());
+        // Inside-word matches must NOT fire ("plant" contains "lan"; "Euro" ends
+        // beyond the "…EUR" key) — the mock-cloud proof caught both garbling text.
+        let out = apply_pseudonyms("Tom Arenstam plant 12,5 Mio. Euro im LAN.", &map);
+        assert_eq!(out, "Person-3 plant 12,5 Mio. Euro im Term-1.");
+        // Whole-word / punctuation-bounded matches still fire.
+        assert_eq!(apply_pseudonyms("LAN", &map), "Term-1");
+        assert_eq!(apply_pseudonyms("(lan)", &map), "(Term-1)");
+        assert_eq!(apply_pseudonyms("Budget: 12,5 Mio. EUR heute", &map), "Budget: [AMOUNT-2] heute");
+    }
+
+    #[test]
+    fn decloak_stream_never_leaks_a_cut_straddling_pseudonym() {
+        // Live-observed leak: "Term-274" split at the hold boundary emitted
+        // "Term-2" raw. Fuzz EVERY possible 2-chunk split of a response whose
+        // pseudonyms sit at the start, middle and end — output must always
+        // decloak completely, regardless of where the SSE chunking cuts.
+        let mut map = HashMap::new();
+        map.insert("Term-274".to_string(), "ScanModule".to_string());
+        map.insert("Person-27".to_string(), "Tom Arenstam".to_string());
+        let session = CloakSession { map };
+        let text = "Term-274 wird von Person-27 entwickelt und Person-27 pflegt Term-274";
+        let want = "ScanModule wird von Tom Arenstam entwickelt und Tom Arenstam pflegt ScanModule";
+        let n = text.chars().count();
+        for split in 0..=n {
+            let a: String = text.chars().take(split).collect();
+            let b: String = text.chars().skip(split).collect();
+            let mut buffer = String::new();
+            let mut out = String::new();
+            out.push_str(&decloak_stream_chunk(&session, &mut buffer, &a));
+            out.push_str(&decloak_stream_chunk(&session, &mut buffer, &b));
+            out.push_str(&decloak_stream_finish(&session, &mut buffer));
+            assert_eq!(out, want, "leak at split {split}");
+        }
+        // Und in Einzelzeichen-Chunks (worst case).
+        let mut buffer = String::new();
+        let mut out = String::new();
+        for c in text.chars() {
+            out.push_str(&decloak_stream_chunk(&session, &mut buffer, &c.to_string()));
+        }
+        out.push_str(&decloak_stream_finish(&session, &mut buffer));
+        assert_eq!(out, want, "leak in single-char streaming");
     }
 
     #[test]
