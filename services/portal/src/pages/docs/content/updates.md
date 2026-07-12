@@ -5,7 +5,7 @@ see the platform is actively maintained and exactly what changed. Every entry is
 authored by the **[GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)**.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 80eb0ae -->
+<!-- baseline-sha: c9ded03 -->
 
 ## v0.6.0 — Observability, GPU extraction & hardened cloaking
 
