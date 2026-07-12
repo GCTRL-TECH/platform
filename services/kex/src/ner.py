@@ -5,6 +5,7 @@ Uses Wikidata QID mapping for structured knowledge graph output.
 """
 
 import logging
+import os
 import re
 import threading
 from typing import Optional
@@ -31,6 +32,7 @@ class NERPipeline:
 
     def __init__(self) -> None:
         self._model = None
+        self._is_bi_encoder = False
 
     def _get_model(self):
         # Double-checked locking: load exactly once even when several worker
@@ -44,12 +46,22 @@ class NERPipeline:
 
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     logger.info(f"Loading GLiNER model: {config.GLINER_MODEL} on {device}")
-                    model = GLiNER.from_pretrained(config.GLINER_MODEL)
+                    local = os.path.isdir(config.GLINER_MODEL)
+                    model = GLiNER.from_pretrained(config.GLINER_MODEL, local_files_only=local)
                     if device == "cuda":
                         model = model.to(device)
+                    # BI-ENCODER detection (knowledgator gliner-bi-*): such models
+                    # encode LABELS separately from the text, so label count barely
+                    # affects cost or accuracy — extract_entities then runs ONE
+                    # sweep with ALL labels instead of the 20-per-batch sweeps a
+                    # uni-encoder needs (403 default labels = 21 full-document
+                    # passes ≈ 5.2 s/chunk vs 0.26 s/chunk measured). Uni models
+                    # have no `labels_encoder` in their config → behaviour unchanged.
+                    self._is_bi_encoder = bool(getattr(getattr(model, "config", None), "labels_encoder", None))
                     self._model = model
                     logger.info(
                         f"GLiNER loaded — {len(config.DEFAULT_ENTITY_TYPES)} default entity types"
+                        f" ({'bi-encoder: single label sweep' if self._is_bi_encoder else 'uni-encoder: batched label sweeps'})"
                     )
         return self._model
 
@@ -80,21 +92,31 @@ class NERPipeline:
         if not text:
             return []
 
-        thr = threshold if threshold is not None else config.NER_THRESHOLD
-
         labels = entity_types or config.DEFAULT_ENTITY_TYPES
-        model = self._get_model()
+        model = self._get_model()  # resolves _is_bi_encoder — needed for the threshold default
 
-        # GLiNER performance degrades with too many labels at once.
-        # Process in label batches for accuracy, then merge results.
-        # Sweet spot: ~20 labels per batch for speed/accuracy balance.
+        # Threshold precedence: per-call > explicit NER_THRESHOLD env > model-
+        # dependent default. Bi-encoder models are calibrated lower and over-
+        # predict at 0.3; the benchmarked sweet spot is 0.5 (NER_THRESHOLD_BI).
+        if threshold is not None:
+            thr = threshold
+        elif config.NER_THRESHOLD_EXPLICIT or not self._is_bi_encoder:
+            thr = config.NER_THRESHOLD
+        else:
+            thr = config.NER_THRESHOLD_BI
+
+        # UNI-encoder GLiNER degrades with too many labels at once (labels share
+        # the text's attention), so it needs label batches — every batch is a
+        # FULL pass over the document. A BI-encoder encodes labels separately:
+        # one sweep with ALL labels, no accuracy penalty, near-flat label-count
+        # scaling — the property that lets ontologies grow without bounds.
         LABEL_BATCH_SIZE = 20
         all_raw = []
 
-        if len(labels) <= LABEL_BATCH_SIZE:
+        if self._is_bi_encoder or len(labels) <= LABEL_BATCH_SIZE:
             all_raw = self._extract_with_chunking(model, text, labels, thr)
         else:
-            # Batch labels to keep GLiNER accurate
+            # Batch labels to keep uni-encoder GLiNER accurate
             for i in range(0, len(labels), LABEL_BATCH_SIZE):
                 batch_labels = labels[i : i + LABEL_BATCH_SIZE]
                 batch_entities = self._extract_with_chunking(

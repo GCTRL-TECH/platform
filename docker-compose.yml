@@ -118,6 +118,8 @@ services:
       - KEX_ENTITY_VERIFY=${KEX_ENTITY_VERIFY:-false}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
       - PHOENIX_SERVICE_NAME=gctrl-kex
+      - GLINER_MODEL=${GLINER_MODEL:-urchade/gliner_medium-v2.1}
+      - NER_THRESHOLD_BI=${NER_THRESHOLD_BI:-0.5}
     volumes:
       - kex-models:/app/models
     depends_on:

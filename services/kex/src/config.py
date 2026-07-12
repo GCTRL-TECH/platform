@@ -103,7 +103,15 @@ GLINER_MODEL: str = os.environ.get("GLINER_MODEL", "urchade/gliner_medium-v2.1")
 # Previously hardcoded at 0.3 in ner.py's signature — now a tunable env knob so
 # a per-install recall/precision tradeoff doesn't require a code change. A
 # per-call `threshold=` argument still overrides this (see ner.py).
-NER_THRESHOLD: float = float(os.environ.get("NER_THRESHOLD", "0.3"))
+_ner_thr_env = os.environ.get("NER_THRESHOLD", "").strip()
+NER_THRESHOLD: float = float(_ner_thr_env) if _ner_thr_env else 0.3
+# True when the operator explicitly set NER_THRESHOLD — then it wins for EVERY
+# model. Unset -> model-dependent default: 0.3 (uni) / NER_THRESHOLD_BI (bi).
+NER_THRESHOLD_EXPLICIT: bool = bool(_ner_thr_env)
+# Tuned default for BI-encoder GLiNER models (score-calibration differs from the
+# uni models). Benchmarked on the gold corpus + CrossNER: bi @0.5 beats uni @0.3
+# on both (house v2-F1 0.8755 vs 0.8654; external typed F1 0.525 vs 0.479).
+NER_THRESHOLD_BI: float = float(os.environ.get("NER_THRESHOLD_BI", "0.5"))
 
 # Format-based NER pre-pass (see format_ner.py): deterministic regex detection
 # of German/EN temporal ("01.03.2026", "12. März 2026") and financial
