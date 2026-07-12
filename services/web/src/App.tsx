@@ -5,7 +5,6 @@ import { api, apiGet } from '@/lib/api'
 import ActivationWizard from '@/pages/onboarding/ActivationWizard'
 import { AppShell } from '@/components/layout/AppShell'
 import { LoginPage } from '@/pages/auth/LoginPage'
-import { UpdatesPage } from '@/pages/updates/UpdatesPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
 import { ForgotPasswordPage } from '@/pages/auth/ForgotPasswordPage'
 import { ResetPasswordPage } from '@/pages/auth/ResetPasswordPage'
@@ -261,9 +260,6 @@ export function App() {
             <Route path="/settings/sso" element={<SSOPage />} />
           </Route>
 
-          {/* Public update history (maintenance transparency) — reachable by anyone,
-              no auth wrapper, placed before the catch-all so it isn't swallowed. */}
-          <Route path="/updates" element={<UpdatesPage />} />
 
           {/* Root and catch-all: unauthenticated → /login via ProtectedRoute, authenticated → /dashboard */}
           <Route path="/" element={<Navigate to="/dashboard" replace />} />

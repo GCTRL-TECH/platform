@@ -72,6 +72,12 @@ export const DOC_GROUPS: DocGroup[] = [
       { slug: 'faq', title: 'FAQ & Troubleshooting' },
     ],
   },
+  {
+    group: 'Release notes',
+    pages: [
+      { slug: 'updates', title: 'Update History' },
+    ],
+  },
 ]
 
 export const DEFAULT_SLUG = 'introduction'

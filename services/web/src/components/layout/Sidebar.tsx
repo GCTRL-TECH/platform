@@ -8,7 +8,6 @@ import {
   BookOpenText,
   MessageSquare,
   Settings,
-  History,
   Timer,
   LogOut,
   ChevronRight,
@@ -250,18 +249,6 @@ export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
           <NavItemLink item={{ label: 'Settings', icon: Settings, to: '/settings' }} collapsed={collapsed} isExpert={isExpert} />
         </div>
 
-        {/* Update-Verlauf: standalone public page → open in a new tab so the app
-            shell/state isn't replaced. Discovery point for maintenance transparency. */}
-        <a
-          href="/updates"
-          target="_blank"
-          rel="noopener noreferrer"
-          title="Update-Verlauf"
-          className={`btn-ghost mb-1 text-slate-500 hover:text-slate-300 ${collapsed ? 'justify-center p-2' : 'flex-1 justify-start'}`}
-        >
-          <History size={15} />
-          {!collapsed && <span>Update-Verlauf</span>}
-        </a>
 
         {collapsed ? (
           <div className="flex flex-col items-center gap-1">

@@ -140,12 +140,6 @@ export function LoginPage() {
             Create account
           </Link>
         </p>
-
-        <p className="mt-3 text-center text-xs text-slate-600">
-          <Link to="/updates" className="hover:text-slate-400 transition-colors">
-            Update-Verlauf
-          </Link>
-        </p>
       </div>
     </div>
   )
