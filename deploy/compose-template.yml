@@ -58,6 +58,8 @@ services:
       # Internal trust boundary: /search takes a caller-supplied user_id, so when set
       # it requires this shared secret (api-rs sends it). Empty = grace (no check).
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-kex
       # Opt-in NER precision tier: an extra LLM pass verifies/retypes GLiNER
       # candidates (drops over-extraction junk) using the configured generation
       # model. Default OFF — it trades ~5pt detection-recall for precision and
@@ -109,6 +111,8 @@ services:
       # `postgres`/`qdrant` and distill can't read sources or enrich pages.
       - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-fuse
     depends_on:
       gctrl-agent:
         condition: service_healthy

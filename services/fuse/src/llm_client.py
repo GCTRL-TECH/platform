@@ -23,8 +23,35 @@ Per-caller timeout and options contract:
 import httpx
 import requests
 
+from . import telemetry
+
 
 def complete(
+    prompt: str,
+    model: str,
+    base: str,
+    kind: str,
+    api_key=None,
+    options=None,
+    timeout=120,
+) -> str:
+    """Traced wrapper around ``_complete_impl`` — one OpenInference LLM span per
+    generation call (no-op unless PHOENIX_OTLP_URL is set). Exceptions propagate
+    unchanged so callers' degradation handling behaves exactly as before."""
+    with telemetry.span(
+        "llm.complete",
+        "LLM",
+        {"llm.model_name": model, "llm.provider": kind, "input.value": telemetry.trunc(prompt)},
+    ) as sp:
+        out = _complete_impl(prompt, model, base, kind, api_key=api_key, options=options, timeout=timeout)
+        try:
+            sp.set_attribute("output.value", telemetry.trunc(out, 4000))
+        except Exception:
+            pass
+        return out
+
+
+def _complete_impl(
     prompt: str,
     model: str,
     base: str,

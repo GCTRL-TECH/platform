@@ -48,6 +48,7 @@ import psycopg2.extras
 import requests
 from neo4j import GraphDatabase
 
+from . import telemetry
 from . import config
 from . import llm_client
 
@@ -533,6 +534,28 @@ def _content_hash(entity: dict, citations: list[dict]) -> str:
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def distill(
+    compilation_id: str,
+    user_id: str,
+    limit: int = 15,
+    model: Optional[str] = None,
+    ollama_base: Optional[str] = None,
+    kind: str = "ollama",
+    api_key=None,
+) -> dict:
+    """Traced wrapper around ``_distill_impl`` — one CHAIN span per wiki
+    distillation run (llm.complete child spans nest under it). No-op unless
+    PHOENIX_OTLP_URL is set."""
+    with telemetry.span(
+        "fuse.distill", "CHAIN",
+        {"gctrl.compilation_id": compilation_id, "user_id": user_id, "llm.model_name": model},
+    ):
+        return _distill_impl(
+            compilation_id, user_id, limit=limit, model=model,
+            ollama_base=ollama_base, kind=kind, api_key=api_key,
+        )
+
+
+def _distill_impl(
     compilation_id: str,
     user_id: str,
     limit: int = 15,

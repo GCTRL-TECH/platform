@@ -27,3 +27,7 @@ faster-whisper==1.0.3
 pydantic==2.9.0
 qdrant-client>=1.11.0
 psycopg2-binary>=2.9.9
+
+# Optional LLM observability (self-hosted Arize Phoenix; no-op unless PHOENIX_OTLP_URL is set)
+opentelemetry-sdk>=1.25
+opentelemetry-exporter-otlp-proto-http>=1.25

@@ -128,6 +128,8 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - KEX_WORKER_THREADS=${KEX_WORKER_THREADS:-1}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-kex
     healthcheck:
       test: ["CMD", "python3", "-c", "import requests; r=requests.get('http://localhost:4010/health'); exit(0 if r.ok else 1)"]
       interval: 60s
@@ -166,6 +168,8 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD}
       - PG_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
       - QDRANT_URL=http://qdrant:6333
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-fuse
     depends_on:
       redis:
         condition: service_healthy

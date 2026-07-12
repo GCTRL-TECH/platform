@@ -7,3 +7,7 @@ requests==2.32.0
 pydantic==2.9.0
 numpy==1.26.4
 psycopg2-binary>=2.9.9
+
+# Optional LLM observability (self-hosted Arize Phoenix; no-op unless PHOENIX_OTLP_URL is set)
+opentelemetry-sdk>=1.25
+opentelemetry-exporter-otlp-proto-http>=1.25

@@ -30,6 +30,7 @@ from qdrant_client.models import (
 )
 
 from . import config
+from . import telemetry
 from .chunking import get_chunker
 from .classification import resolve_classification
 from .code_parser import parse_python_repo
@@ -129,7 +130,32 @@ def get_search_pg():
 
 # ── Core extraction pipeline ─────────────────────────────────────────
 
-def run_pipeline(
+def run_pipeline(*args, **kwargs):
+    """Traced wrapper around the extraction pipeline (see _run_pipeline_impl).
+
+    One CHAIN span per job — the phase spans inside the impl (ner/relex/kg/
+    chunk/embed/store) nest under it, so Phoenix shows where a slow or degraded
+    extraction actually spent its time. No-op unless PHOENIX_OTLP_URL is set.
+    """
+    text = kwargs.get("text", args[0] if len(args) > 0 else "")
+    job_id = kwargs.get("job_id", args[1] if len(args) > 1 else "")
+    user_id = kwargs.get("user_id", args[2] if len(args) > 2 else "")
+    with telemetry.span(
+        "kex.pipeline",
+        "CHAIN",
+        {"gctrl.job_id": job_id, "user_id": user_id, "kex.input_chars": len(text or "")},
+    ) as sp:
+        result = _run_pipeline_impl(*args, **kwargs)
+        try:
+            sp.set_attribute("kex.entities", len(result.get("entities") or []))
+            sp.set_attribute("kex.relations", len(result.get("relations") or []))
+            sp.set_attribute("kex.degraded", bool(result.get("degraded")))
+        except Exception:
+            pass
+        return result
+
+
+def _run_pipeline_impl(
     text: str,
     job_id: str,
     user_id: str,
@@ -194,7 +220,9 @@ def run_pipeline(
     # document yields the lock between chunks instead of blocking the whole
     # worker pool for minutes (no doc-level lock held here anymore).
     ner = get_ner_pipeline()
-    entities = ner.extract_entities(text, entity_types=entity_types)
+    with telemetry.span("kex.ner", "CHAIN", {"kex.input_chars": len(text)}) as _sp:
+        entities = ner.extract_entities(text, entity_types=entity_types)
+        _sp.set_attribute("kex.entities", len(entities))
     logger.info(f"[{job_id}] NER: {len(entities)} entities")
 
     # 2. Relation Extraction (Ollama HTTP — can run in parallel)
@@ -209,13 +237,14 @@ def run_pipeline(
         # Use generation_base for the generation step when provided;
         # otherwise fall through to ollama_base (default install unchanged).
         relex_base = generation_base if generation_base else ollama_base
-        relex_result = relex.extract_relations(
-            text, entities,
-            ollama_base=relex_base,
-            model=relex_model,
-            kind=generation_kind,
-            api_key=generation_api_key,
-        )
+        with telemetry.span("kex.relex", "LLM", {"llm.model_name": relex_model, "llm.provider": generation_kind}):
+            relex_result = relex.extract_relations(
+                text, entities,
+                ollama_base=relex_base,
+                model=relex_model,
+                kind=generation_kind,
+                api_key=generation_api_key,
+            )
         # extract_relations returns (relations, report) tuple.
         if isinstance(relex_result, tuple) and len(relex_result) == 2:
             relations, extraction_report = relex_result
@@ -265,12 +294,13 @@ def run_pipeline(
         origin = (preview + "…") if len(text) > 120 else preview
     source_modified_at_ms = iso_to_ms(source_modified_at)
     kg = get_kg_builder()
-    stats = kg.build_graph(
-        job_id, user_id, entities, relations,
-        classification=classification, origin=origin,
-        source_document_id=source_document_id,
-        source_modified_at_ms=source_modified_at_ms,
-    )
+    with telemetry.span("kex.kg_write", "TOOL", {"kex.entities": len(entities), "kex.relations": len(relations)}):
+        stats = kg.build_graph(
+            job_id, user_id, entities, relations,
+            classification=classification, origin=origin,
+            source_document_id=source_document_id,
+            source_modified_at_ms=source_modified_at_ms,
+        )
     logger.info(f"[{job_id}] KG: {stats}")
 
     # 3b. Annotate each entity mention with its graph URI (P2a — grounded nodes).
@@ -296,11 +326,13 @@ def run_pipeline(
     # 4. Chunk text for vector store
     logger.info(f"[{job_id}] Chunker: starting on {len(text)} chars")
     chunker = get_chunker()
-    try:
-        chunks = chunker.chunk(text)
-    except Exception as exc:
-        logger.error(f"[{job_id}] Chunker FAILED: {exc}", exc_info=True)
-        chunks = [{"content": text[:8000], "start_char": 0, "end_char": min(8000, len(text)), "chunk_sequence": 0}]
+    with telemetry.span("kex.chunk", "CHAIN", {"kex.input_chars": len(text)}) as _sp:
+        try:
+            chunks = chunker.chunk(text)
+        except Exception as exc:
+            logger.error(f"[{job_id}] Chunker FAILED: {exc}", exc_info=True)
+            chunks = [{"content": text[:8000], "start_char": 0, "end_char": min(8000, len(text)), "chunk_sequence": 0}]
+        _sp.set_attribute("kex.chunks", len(chunks))
     logger.info(f"[{job_id}] Chunked: {len(chunks)} chunks")
 
     # 5. Embed chunks (graceful degradation: failed embeddings become None)
@@ -310,8 +342,10 @@ def run_pipeline(
         ollama_base=ollama_base,
         embedding_model=embedding_model,
     )
-    embeddings = embedder.embed_batch([c["content"] for c in chunks])
-    successful_embeddings = sum(1 for v in embeddings if v is not None)
+    with telemetry.span("kex.embed", "CHAIN", {"kex.chunks": len(chunks), "llm.model_name": embedding_model}) as _sp:
+        embeddings = embedder.embed_batch([c["content"] for c in chunks])
+        successful_embeddings = sum(1 for v in embeddings if v is not None)
+        _sp.set_attribute("kex.embedded", successful_embeddings)
     logger.info(f"[{job_id}] Embedded: {successful_embeddings}/{len(embeddings)} vectors")
 
     # 6. Map entity mentions to chunks by character offset
@@ -332,16 +366,17 @@ def run_pipeline(
     chunks_stored = 0
     try:
         vs = get_vector_store()
-        chunks_stored = vs.store_chunks(
-            chunks,
-            embeddings,
-            job_id,
-            user_id,
-            compilation_id=None,  # set later by API result handler
-            entity_mentions=chunk_entities,
-            source_document_id=source_document_id,
-            classification=classification,
-        )
+        with telemetry.span("kex.vector_store", "TOOL", {"kex.chunks": len(chunks)}):
+            chunks_stored = vs.store_chunks(
+                chunks,
+                embeddings,
+                job_id,
+                user_id,
+                compilation_id=None,  # set later by API result handler
+                entity_mentions=chunk_entities,
+                source_document_id=source_document_id,
+                classification=classification,
+            )
         logger.info(f"[{job_id}] Vector store: {chunks_stored} chunks stored")
     except Exception as exc:
         logger.warning(f"[{job_id}] Vector store failed (non-fatal): {exc}")

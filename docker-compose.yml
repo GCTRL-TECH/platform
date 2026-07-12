@@ -116,6 +116,8 @@ services:
       - PORT=4010
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}
       - KEX_ENTITY_VERIFY=${KEX_ENTITY_VERIFY:-false}
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-kex
     volumes:
       - kex-models:/app/models
     depends_on:
@@ -150,6 +152,8 @@ services:
       - OLLAMA_BASE=http://ollama:11434
       - GCTRL_DISTILL_PROVIDER=${GCTRL_DISTILL_PROVIDER:-ollama}
       - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-fuse
     depends_on:
       redis:
         condition: service_started

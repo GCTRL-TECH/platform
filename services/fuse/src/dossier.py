@@ -36,6 +36,8 @@ import psycopg2
 import psycopg2.extras
 from neo4j import GraphDatabase
 
+from . import telemetry
+
 from . import config
 from . import distiller
 
@@ -492,7 +494,8 @@ def build_dossier_for_name(user_id: str, entity_name: str) -> Optional[dict]:
     driver = _neo_driver()
     conn = _pg_connect()
     try:
-        return _compile_one(driver, conn, user_id, entity_name)
+        with telemetry.span("fuse.dossier", "CHAIN", {"input.value": entity_name, "user_id": user_id}):
+            return _compile_one(driver, conn, user_id, entity_name)
     finally:
         driver.close()
         conn.close()
@@ -543,7 +546,11 @@ def build_dossier_for_name_scoped(
     driver = _neo_driver()
     conn = _pg_connect()
     try:
-        entity = _fetch_entity_facts_scoped(driver, entity_name, list(granted))
+        with telemetry.span(
+            "fuse.dossier_scoped", "CHAIN",
+            {"input.value": entity_name, "user_id": user_id, "fuse.granted_jobs": len(granted)},
+        ):
+            entity = _fetch_entity_facts_scoped(driver, entity_name, list(granted))
         if entity is None:
             return None
         origin_files = _resolve_origin_files_scoped(conn, entity["source_jobs"], granted)
