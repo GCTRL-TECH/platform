@@ -45,9 +45,29 @@ class NERPipeline:
                     import torch
 
                     device = "cuda" if torch.cuda.is_available() else "cpu"
-                    logger.info(f"Loading GLiNER model: {config.GLINER_MODEL} on {device}")
-                    local = os.path.isdir(config.GLINER_MODEL)
-                    model = GLiNER.from_pretrained(config.GLINER_MODEL, local_files_only=local)
+                    # Primary (default: the bi-encoder BUNDLED into the image) with
+                    # automatic fallback to the uni model — extraction must never go
+                    # dark because a model artifact is missing/corrupt or an operator
+                    # override points somewhere broken. The fallback is last so an
+                    # explicit GLINER_MODEL override is always tried first.
+                    candidates = [config.GLINER_MODEL]
+                    if config.GLINER_FALLBACK_MODEL and config.GLINER_FALLBACK_MODEL != config.GLINER_MODEL:
+                        candidates.append(config.GLINER_FALLBACK_MODEL)
+                    model = None
+                    last_exc = None  # deliberately unannotated — Cython prod build strictness
+                    for i, cand in enumerate(candidates):
+                        try:
+                            logger.info(f"Loading GLiNER model: {cand} on {device}")
+                            model = GLiNER.from_pretrained(cand, local_files_only=os.path.isdir(cand))
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            if i + 1 < len(candidates):
+                                logger.error(
+                                    f"GLiNER load FAILED for '{cand}' ({exc}) — falling back to '{candidates[i + 1]}'"
+                                )
+                    if model is None:
+                        raise RuntimeError(f"No GLiNER model loadable (tried {candidates}): {last_exc}")
                     if device == "cuda":
                         model = model.to(device)
                     # BI-ENCODER detection (knowledgator gliner-bi-*): such models
@@ -56,7 +76,8 @@ class NERPipeline:
                     # sweep with ALL labels instead of the 20-per-batch sweeps a
                     # uni-encoder needs (403 default labels = 21 full-document
                     # passes ≈ 5.2 s/chunk vs 0.26 s/chunk measured). Uni models
-                    # have no `labels_encoder` in their config → behaviour unchanged.
+                    # have no `labels_encoder` in their config → behaviour unchanged,
+                    # including the 0.3 threshold default (see extract_entities).
                     self._is_bi_encoder = bool(getattr(getattr(model, "config", None), "labels_encoder", None))
                     self._model = model
                     logger.info(

@@ -97,7 +97,14 @@ PG_URL: str = os.environ.get("PG_URL", "postgresql://GCTRL:GCTRL@postgres:5432/G
 WORKER_THREADS: int = int(os.environ.get("KEX_WORKER_THREADS", "1"))
 
 # GLiNER model
-GLINER_MODEL: str = os.environ.get("GLINER_MODEL", "urchade/gliner_medium-v2.1")
+# DEFAULT = the bi-encoder model BUNDLED into the image (label-count-independent
+# NER: one sweep for the whole ontology — quality-gated at v2-F1 0.8755 vs the
+# uni baseline's 0.8654, CrossNER 0.525 vs 0.479, 20x faster). Operators can
+# override with any hub id or local dir. If the primary fails to load for any
+# reason, ner.py falls back to GLINER_FALLBACK_MODEL (uni medium, runtime
+# download) so extraction NEVER goes dark because of a model artifact.
+GLINER_MODEL: str = (os.environ.get("GLINER_MODEL") or "").strip() or "/app/bundled-models/gliner-bi"
+GLINER_FALLBACK_MODEL: str = (os.environ.get("GLINER_FALLBACK_MODEL") or "").strip() or "urchade/gliner_medium-v2.1"
 
 # NER confidence threshold (GLiNER `predict_entities(..., threshold=...)`).
 # Previously hardcoded at 0.3 in ner.py's signature — now a tunable env knob so
@@ -109,9 +116,14 @@ NER_THRESHOLD: float = float(_ner_thr_env) if _ner_thr_env else 0.3
 # model. Unset -> model-dependent default: 0.3 (uni) / NER_THRESHOLD_BI (bi).
 NER_THRESHOLD_EXPLICIT: bool = bool(_ner_thr_env)
 # Tuned default for BI-encoder GLiNER models (score-calibration differs from the
-# uni models). Benchmarked on the gold corpus + CrossNER: bi @0.5 beats uni @0.3
-# on both (house v2-F1 0.8755 vs 0.8654; external typed F1 0.525 vs 0.479).
-NER_THRESHOLD_BI: float = float(os.environ.get("NER_THRESHOLD_BI", "0.5"))
+# uni models). Threshold sweep vs the uni@0.3 baseline (house 0.8654 / ext 0.479):
+#   0.40 -> house 0.8575 (BELOW baseline)      / ext 0.530
+#   0.45 -> house 0.8681 / ext 0.535 (best ext) + best short-text recall
+#   0.50 -> house 0.8755 (best house)          / ext 0.525
+# 0.45 wins overall: above baseline on BOTH benchmarks, best external
+# generalization, and single-sentence stores (Jarvis memory writes!) keep
+# entities that score 0.45-0.5 — at 0.5 they were dropped.
+NER_THRESHOLD_BI: float = float((os.environ.get("NER_THRESHOLD_BI") or "").strip() or "0.45")  # compose passes "" when unset
 
 # Format-based NER pre-pass (see format_ner.py): deterministic regex detection
 # of German/EN temporal ("01.03.2026", "12. März 2026") and financial

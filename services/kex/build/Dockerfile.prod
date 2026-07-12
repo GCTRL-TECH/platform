@@ -19,6 +19,14 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir -r requirements.txt lxml_html_clean
 
+# Bundle the DEFAULT bi-encoder GLiNER model INTO the image ("alles by default
+# mitbringen"): the default install must never depend on Hugging Face being
+# reachable at runtime. Deliberately NOT under /app/models — that path is
+# shadowed by the models volume at runtime; the bundle lives in the image layer.
+# The uni fallback (GLINER_FALLBACK_MODEL) still runtime-downloads, but only
+# ever runs if the bundled model is missing/corrupt or an operator override fails.
+RUN HF_HUB_DISABLE_XET=1 HF_HUB_DOWNLOAD_TIMEOUT=60 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('knowledgator/gliner-bi-small-v1.0', local_dir='/app/bundled-models/gliner-bi', allow_patterns=['*.json','spm.model','pytorch_model.bin'])"
+
 # Copy source, compile the engine to native .so, strip the .py source. Every
 # module is compiled EXCEPT the FastAPI entrypoint (main.py — runtime
 # introspection) and package __init__.py files. Cython is removed afterwards.
