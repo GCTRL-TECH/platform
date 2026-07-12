@@ -1,0 +1,16 @@
+# Opt-in NVIDIA GPU passthrough for KEX (NER on GPU — RTX/CUDA). The default
+# install is CPU-only (most customer boxes have no GPU), so this is a separate
+# override you enable explicitly:
+#   docker compose -f docker-compose.yml -f compose.gpu.yml up -d kex
+# The kex code auto-selects CUDA when torch sees a device (src/ner.py), so no
+# app change is needed — this just hands the container the GPU. Requires the
+# NVIDIA Container Toolkit (Docker Desktop WSL2 GPU support) on the host.
+services:
+  kex:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

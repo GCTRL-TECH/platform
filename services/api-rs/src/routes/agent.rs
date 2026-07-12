@@ -502,7 +502,33 @@ mod node_auth_clause_tests {
     }
 }
 
+/// Thin traced wrapper around `execute_tool_inner`: one OpenInference TOOL span
+/// per MCP tool call (name, truncated args, error flag), exported to Phoenix
+/// when enabled. Delegating keeps the big match's early-returns intact and lets
+/// the error flag be read off the returned Value. No-op cost when tracing is off.
 pub(crate) async fn execute_tool(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    tool_name: &str,
+    args: &Value,
+) -> Value {
+    use tracing::Instrument;
+    let span = tracing::info_span!(
+        "gctrl.tool",
+        "openinference.span.kind" = "TOOL",
+        "gctrl.tool" = tool_name,
+        "input.value" = tracing::field::Empty,
+        "gctrl.is_error" = tracing::field::Empty,
+    );
+    span.record("input.value", crate::services::telemetry::trunc(&args.to_string()).as_str());
+    let result = execute_tool_inner(state, claims, tool_name, args)
+        .instrument(span.clone())
+        .await;
+    span.record("gctrl.is_error", result.get("error").is_some());
+    result
+}
+
+async fn execute_tool_inner(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
     tool_name: &str,

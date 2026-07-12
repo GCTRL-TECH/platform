@@ -8,4 +8,5 @@ pub mod obsidian;
 pub mod privacy;
 pub mod redis;
 pub mod source_docs;
+pub mod telemetry;
 pub mod usage;

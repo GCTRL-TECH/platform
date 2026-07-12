@@ -48,6 +48,8 @@ services:
     restart: unless-stopped
     environment:
       - NODE_ENV=production
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-api
       - PORT=4000
       - DATABASE_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
       - REDIS_URL=redis://redis:6379

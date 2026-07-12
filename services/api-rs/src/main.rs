@@ -19,9 +19,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Tracing init: plain fmt by default; adds an OTLP→Phoenix layer when
+    // PHOENIX_OTLP_URL is set (services::telemetry, off by default).
+    services::telemetry::init();
 
     let cfg   = Arc::new(config::Config::from_env());
 

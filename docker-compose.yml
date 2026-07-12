@@ -8,6 +8,8 @@ services:
       - "4000:4000"
     environment:
       - NODE_ENV=development
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-api
       - PORT=4000
       - RUST_LOG=${RUST_LOG:-info,gctrl_api=debug}
       - DATABASE_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL

@@ -26,6 +26,13 @@ reqwest         = { version = "0.12", features = ["json", "rustls-tls", "stream"
 dotenvy         = "0.15"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Optional LLM-observability export to a self-hosted Arize Phoenix (OTLP/HTTP).
+# Off unless PHOENIX_OTLP_URL is set — see services::telemetry. Version trio is
+# mutually pinned (tracing-opentelemetry 0.28 → opentelemetry 0.27).
+opentelemetry   = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "reqwest-rustls"], default-features = false }
+tracing-opentelemetry = "0.28"
 thiserror       = "1"
 bytes           = "1"
 base64          = "0.22"

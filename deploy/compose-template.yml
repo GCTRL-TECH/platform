@@ -134,6 +134,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - NODE_ENV=production
+      - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
+      - PHOENIX_SERVICE_NAME=gctrl-api
       - PORT=4000
       - DATABASE_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - REDIS_URL=redis://gctrl-redis:6379

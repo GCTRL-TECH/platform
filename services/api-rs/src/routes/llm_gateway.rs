@@ -191,7 +191,34 @@ async fn cloak_namespace(state: &Arc<crate::models::AppState>, user_id: uuid::Uu
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
+/// Traced wrapper: one CHAIN span per gateway request (model, whether cloaking
+/// engaged, resulting HTTP status), exported to Phoenix when enabled. Delegates
+/// so the inner handler's many early-return paths are all captured. No-op when
+/// tracing is off.
 async fn chat_completions(
+    state: axum::extract::State<Arc<crate::models::AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use tracing::Instrument;
+    let model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    let cloak_on = model_targets_cloud(&model) && !cloak_disabled(&headers);
+    let span = tracing::info_span!(
+        "gctrl.cloak_gateway",
+        "openinference.span.kind" = "CHAIN",
+        "llm.model_name" = %model,
+        "gctrl.cloaked" = cloak_on,
+        "http.status_code" = tracing::field::Empty,
+    );
+    let resp = chat_completions_inner(state, headers, body).instrument(span.clone()).await;
+    span.record("http.status_code", resp.status().as_u16());
+    resp
+}
+
+async fn chat_completions_inner(
     axum::extract::State(state): axum::extract::State<Arc<crate::models::AppState>>,
     headers: HeaderMap,
     body: Bytes,
