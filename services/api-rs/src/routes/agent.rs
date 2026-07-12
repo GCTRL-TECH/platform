@@ -428,6 +428,37 @@ const READ_TOOLS: &[&str] = &[
 /// `coalesce(alias._min_rank,0) <= $rank` clearance clause inline (clearance is
 /// orthogonal to scope and already correct at every call site). Empty-grant
 /// (`Some(vec![])`) is handled by each caller returning early BEFORE building the query.
+/// Lowercase, alphanumeric-only normal form for fuzzy entity matching
+/// ("Scan-Module " -> "scanmodule"). Mirrors exactly what speech input mangles:
+/// casing, spacing, hyphens/underscores.
+fn norm_entity_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Plain Levenshtein distance — candidate sets are small (<=3k names, one query),
+/// so the O(a*b) DP is microseconds; no crate needed.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 fn node_auth_clause(alias: &str, scoped: &Option<Vec<String>>) -> String {
     if scoped.is_some() {
         format!("{alias}._source_job IN $jobs")
@@ -533,12 +564,15 @@ pub(crate) async fn execute_tool(
             let scoped = crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await;
             if matches!(&scoped, Some(j) if j.is_empty()) { return json!({ "entities": [] }); }
             let nauth = node_auth_clause("n", &scoped);
+            // Stage 1 — case-INSENSITIVE substring. The old raw `CONTAINS` was
+            // case-sensitive, so speech-shaped queries ("flowbridge", "scan")
+            // silently missed FlowBridge/ScanModule entirely.
             let cypher = format!("MATCH (n) \
-                WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
+                WHERE (toLower(n.name) CONTAINS toLower($q) OR toLower(n.label) CONTAINS toLower($q)) \
                   AND {nauth} \
                   AND coalesce(n._min_rank,0) <= $rank \
                 RETURN n.name AS name, n.label AS label, n._classification AS cls LIMIT $limit");
-            let mut nq = neo4rs::query(&cypher).param("q", query).param("uid", uid).param("rank", rank as i64).param("limit", limit);
+            let mut nq = neo4rs::query(&cypher).param("q", query.clone()).param("uid", uid.clone()).param("rank", rank as i64).param("limit", limit);
             if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
             let mut out: Vec<Value> = Vec::new();
             if let Ok(mut stream) = state.neo.execute(nq).await {
@@ -549,6 +583,39 @@ pub(crate) async fn execute_tool(
                         "classification": row.get::<String>("cls").unwrap_or_default(),
                     }));
                 }
+            }
+            // Stage 2 — FUZZY fallback (only when stage 1 found nothing): pull the
+            // scope's candidate names once (same auth clause, capped) and rank by
+            // edit distance on the alnum-lowercase normal form. Resolves the
+            // mis-heard-entity class ("skan module" -> ScanModule) that substring
+            // matching can never catch. Normal-form containment counts as distance
+            // 0 ("scanmodul" ⊂ "scanmodule"); threshold scales with query length.
+            let qn = norm_entity_name(&query);
+            if out.is_empty() && qn.len() >= 3 {
+                let cypher2 = format!("MATCH (n) WHERE {nauth} AND coalesce(n._min_rank,0) <= $rank \
+                    RETURN DISTINCT n.name AS name, n.label AS label, n._classification AS cls LIMIT 3000");
+                let mut nq2 = neo4rs::query(&cypher2).param("uid", uid).param("rank", rank as i64);
+                if let Some(jobs) = &scoped { nq2 = nq2.param("jobs", jobs.clone()); }
+                let max_d = 1 + qn.len() / 5;
+                let mut scored: Vec<(usize, Value)> = Vec::new();
+                if let Ok(mut stream) = state.neo.execute(nq2).await {
+                    while let Ok(Some(row)) = stream.next().await {
+                        let name = row.get::<String>("name").unwrap_or_default();
+                        let nn = norm_entity_name(&name);
+                        if nn.is_empty() { continue; }
+                        let d = if nn.contains(&qn) || qn.contains(&nn) { 0 } else { levenshtein(&qn, &nn) };
+                        if d <= max_d {
+                            scored.push((d, json!({
+                                "name": name,
+                                "type": row.get::<String>("label").unwrap_or_default(),
+                                "classification": row.get::<String>("cls").unwrap_or_default(),
+                                "fuzzy": true,
+                            })));
+                        }
+                    }
+                }
+                scored.sort_by_key(|(d, _)| *d);
+                out = scored.into_iter().take(limit as usize).map(|(_, v)| v).collect();
             }
             crate::services::audit::log_access(&state.db, claims, "agent.search_entities", "graph", "*", rank, None, true, None).await;
             json!({ "entities": out })
