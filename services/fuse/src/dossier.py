@@ -432,7 +432,12 @@ def _upsert_dossier(
     summary: str, key_facts: list[dict], origin_files: list[str], timeline: list[dict],
 ) -> str:
     """Upsert a dossier (refresh in place on rebuild). Preserves pin/heat/access
-    counters across rebuilds — only the compiled content + updated_at change."""
+    counters across rebuilds — only the compiled content + updated_at change.
+
+    A rebuild also REVIVES a soft-archived row (archived → false, same semantics
+    as bump_dossier_heat): a fresh on-demand build proves the entity is relevant
+    again, and fetch_dossier_row filters archived=false — without the revive a
+    decayed entity could be rebuilt over and over yet stay invisible forever."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -446,6 +451,7 @@ def _upsert_dossier(
                 key_facts    = EXCLUDED.key_facts,
                 origin_files = EXCLUDED.origin_files,
                 timeline     = EXCLUDED.timeline,
+                archived     = false,
                 updated_at   = NOW()
             RETURNING (xmax = 0) AS inserted
             """,

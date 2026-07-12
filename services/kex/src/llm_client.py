@@ -20,6 +20,8 @@ Per-caller timeout and options contract:
     e71ecaf).  When provided, it is sent as-is — no baked-in defaults, no merge.
 """
 
+import os
+
 import httpx
 import requests
 
@@ -88,6 +90,11 @@ def _complete_impl(
             body = {"model": model, "prompt": prompt, "stream": False, "options": options}
         else:
             body = {"model": model, "prompt": prompt, "stream": False}
+        # Keep the generation model resident between jobs. Ollama's default keep_alive
+        # is 5 min; after any longer idle the NEXT extraction pays the full model load
+        # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
+        # Env-tunable for RAM-tight boxes; "0" unloads immediately, "5m" = Ollama default.
+        body["keep_alive"] = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
         resp = requests.post(
             f"{base}/api/generate",
             json=body,
@@ -146,6 +153,11 @@ async def acomplete(
             body = {"model": model, "prompt": prompt, "stream": False, "options": options}
         else:
             body = {"model": model, "prompt": prompt, "stream": False}
+        # Keep the generation model resident between jobs. Ollama's default keep_alive
+        # is 5 min; after any longer idle the NEXT extraction pays the full model load
+        # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
+        # Env-tunable for RAM-tight boxes; "0" unloads immediately, "5m" = Ollama default.
+        body["keep_alive"] = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{base}/api/generate",

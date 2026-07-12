@@ -667,14 +667,28 @@ pub(crate) async fn execute_tool(
             // (built scoped-to-grant, leak-safe); an unscoped/owner token gets the
             // owner dossier. A dossier whose facts exceed the caller's clearance is
             // withheld. Build on-the-fly only when TRULY absent (not merely withheld).
+            //
+            // The on-demand FUSE build is DETACHED (tokio::spawn) with a short inline
+            // budget: previously the handler awaited the build inline (up to 180 s),
+            // which (a) stalled a recall's whole dossier layer behind one slow build
+            // and (b) meant an impatient client abort DROPPED the handler future and
+            // cancelled the build — so it never got stored and every later call
+            // stalled again. Now a fast build still returns in THIS call; a slow one
+            // keeps running in the background (spawn survives disconnect), gets
+            // stored, and the NEXT call hits the stored dossier instantly.
             let mut row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
             if row.is_none() {
+                const BUILD_INLINE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
                 match crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await {
                     // KB-scoped: confined on-demand build (jobs = the auth boundary).
                     Some(jobs) if !jobs.is_empty() => {
                         let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
                         if truly_absent {
-                            if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse_scoped(state, claims.sub, &name, &jobs).await {
+                            let (st, sub, nm) = (state.clone(), claims.sub, name.clone());
+                            let build = tokio::spawn(async move {
+                                crate::routes::kg::build_dossier_via_fuse_scoped(&st, sub, &nm, &jobs).await
+                            });
+                            if let Ok(Ok(Ok(Some(())))) = tokio::time::timeout(BUILD_INLINE_BUDGET, build).await {
                                 row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
                             }
                         }
@@ -684,7 +698,11 @@ pub(crate) async fn execute_tool(
                     None => {
                         let truly_absent = crate::routes::kg::fetch_dossier_row(&state.db, claims.sub, &name).await.is_none();
                         if truly_absent {
-                            if let Ok(Some(())) = crate::routes::kg::build_dossier_via_fuse(state, claims.sub, &name).await {
+                            let (st, sub, nm) = (state.clone(), claims.sub, name.clone());
+                            let build = tokio::spawn(async move {
+                                crate::routes::kg::build_dossier_via_fuse(&st, sub, &nm).await
+                            });
+                            if let Ok(Ok(Ok(Some(())))) = tokio::time::timeout(BUILD_INLINE_BUDGET, build).await {
                                 row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
                             }
                         }
