@@ -1,12 +1,12 @@
 import { Link } from 'react-router-dom'
-import { Workflow, GitMerge, Layers, Bot } from 'lucide-react'
-import type { LucideIcon } from 'lucide-react'
+import type { ComponentType } from 'react'
+import { IngestVignette, FuseVignette, LayersVignette, ServeVignette } from './vignettes/CardVignettes'
 
 type Step = {
   num: string
   title: string
   body: string
-  icon: LucideIcon
+  Vignette: ComponentType
   gradient: string
 }
 
@@ -15,28 +15,28 @@ const STEPS: Step[] = [
     num: '01',
     title: 'Ingest',
     body: 'Connect any source — SharePoint, Google Drive, email archives, databases, APIs. A governed ingestion layer classifies and tags everything on the way in.',
-    icon: Workflow,
+    Vignette: IngestVignette,
     gradient: 'from-indigo-500 to-indigo-400',
   },
   {
     num: '02',
     title: 'Resolve & fuse',
     body: 'FUSE collapses duplicates and contradictions across every source into one clean, canonical knowledge graph — no conflicting copies, one version of the truth.',
-    icon: GitMerge,
+    Vignette: FuseVignette,
     gradient: 'from-violet-500 to-violet-400',
   },
   {
     num: '03',
     title: 'Organise into memory',
     body: 'Facts land in layered memory — hot dossiers, warm chunks, the cold graph, and a curated Wiki — on top of your swappable Neo4j + Qdrant.',
-    icon: Layers,
+    Vignette: LayersVignette,
     gradient: 'from-fuchsia-500 to-cyan-400',
   },
   {
     num: '04',
     title: 'Serve to agents',
     body: 'Your agents query it over MCP — clearance-filtered and fully audited — returning grounded answers with provenance, not guesses.',
-    icon: Bot,
+    Vignette: ServeVignette,
     gradient: 'from-cyan-500 to-cyan-400',
   },
 ]
@@ -66,7 +66,6 @@ export function HowItWorksSection() {
           </div>
 
           {STEPS.map((step, i) => {
-            const Icon = step.icon
             return (
               <div key={step.num} className={`group reveal reveal-delay-${i + 1} relative`}>
                 <div className="feature-card-landing flex h-full flex-col">
@@ -76,8 +75,8 @@ export function HowItWorksSection() {
                     >
                       {step.num}
                     </div>
-                    <Icon className="h-5 w-5 text-slate-500 transition-colors duration-300 group-hover:text-indigo-300" strokeWidth={1.75} />
                   </div>
+                  <step.Vignette />
                   <h3 className="mb-2 font-semibold text-white">{step.title}</h3>
                   <p className="text-sm leading-relaxed text-slate-400">{step.body}</p>
                 </div>

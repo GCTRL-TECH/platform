@@ -1,27 +1,19 @@
-import { Boxes, Copy, ShieldAlert, type LucideIcon } from 'lucide-react'
+import type { ComponentType } from 'react'
+import { SilosVignette, ConflictVignette, GovernanceVignette } from './vignettes/CardVignettes'
 
-const ICON_CLS: Record<string, string> = {
-  indigo: 'border-indigo-500/20 bg-indigo-500/10 text-indigo-300',
-  violet: 'border-violet-500/20 bg-violet-500/10 text-violet-300',
-  cyan: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300',
-}
-
-const PROBLEMS: { Icon: LucideIcon; color: keyof typeof ICON_CLS; title: string; body: string }[] = [
+const PROBLEMS: { Vignette: ComponentType; title: string; body: string }[] = [
   {
-    Icon: Boxes,
-    color: 'cyan',
+    Vignette: SilosVignette,
     title: 'Locked in silos & legacy systems',
     body: 'The knowledge your AI needs is scattered across SharePoint, old mailservers, legacy SQL, and orphaned file shares. Before anything is useful, you have to reach it — and just reaching it is a project of its own.',
   },
   {
-    Icon: Copy,
-    color: 'violet',
+    Vignette: ConflictVignette,
     title: 'Messy, duplicated, contradictory',
     body: 'Garbage in, garbage out. Point an LLM at raw, unresolved data and it learns from noise: the same entity under ten names, stale records, conflicting versions. The answers look confident and are quietly wrong.',
   },
   {
-    Icon: ShieldAlert,
-    color: 'indigo',
+    Vignette: GovernanceVignette,
     title: 'Governance is overwhelming',
     body: 'Even once you can reach the data — who is allowed to see what? Classification, clearance, and an audit trail across every source is a task most teams start, dread, and never finish.',
   },
@@ -49,9 +41,7 @@ export function ProblemSection() {
         <div className="grid gap-6 md:grid-cols-3">
           {PROBLEMS.map((p, i) => (
             <div key={p.title} className={`feature-card-landing reveal reveal-delay-${i + 1} p-8`}>
-              <div className={`mb-4 flex h-11 w-11 items-center justify-center rounded-xl border ${ICON_CLS[p.color]}`}>
-                <p.Icon className="h-5 w-5" strokeWidth={1.75} />
-              </div>
+              <p.Vignette />
               <h3 className="mb-2 text-lg font-semibold text-white">{p.title}</h3>
               <p className="text-sm leading-relaxed text-slate-400">{p.body}</p>
             </div>

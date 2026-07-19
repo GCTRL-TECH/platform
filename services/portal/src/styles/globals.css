@@ -429,6 +429,166 @@
     .story-scope-grow, .story-scope-fill { animation: none; }
   }
 
+  /* ─── Card micro-vignettes (Problem + How-It-Works cards) ─────────
+     The fusion-story language shrunk to card size: dots + hairline
+     edges + slate chips acting out each card's message in one calm 6s
+     loop. Convention: BASE styles are the resolved end state, and the
+     keyframes carry every transient state — so reduced-motion (or a
+     dropped animation) degrades to a meaningful static diagram, never
+     an empty canvas. Per-instance geometry comes in via --x0/--x1/--y1
+     custom properties (percent-of-canvas units, same as the story). */
+
+  /* Trapped dot darts at the silo wall, squishes on impact, retreats. */
+  @keyframes vig-escape {
+    0%, 22% { left: var(--x0); transform: translate(-50%, -50%) scaleX(1); }
+    38%     { left: var(--x1); transform: translate(-50%, -50%) scaleX(1); }
+    43%     { left: var(--x1); transform: translate(-50%, -50%) scaleX(0.65); }
+    60%     { left: var(--x0); transform: translate(-50%, -50%) scaleX(1); }
+    100%    { left: var(--x0); transform: translate(-50%, -50%) scaleX(1); }
+  }
+  .vig-escape { animation: vig-escape 6s ease-in-out infinite; }
+
+  /* The wall the dot hits flashes faint amber at the impact moment. */
+  @keyframes vig-wall-flash {
+    0%, 36%, 52%, 100% { border-color: rgba(51, 65, 85, 0.7); box-shadow: none; }
+    40%, 46% { border-color: rgba(252, 211, 77, 0.55); box-shadow: 0 0 10px rgba(252, 211, 77, 0.25); }
+  }
+  .vig-wall-flash { animation: vig-wall-flash 6s ease-in-out infinite; }
+
+  /* Restless dots inside the silos — tiny drift, never at peace. */
+  @keyframes vig-jitter {
+    0%, 100% { margin-left: 0; margin-top: 0; }
+    25%      { margin-left: 2px; margin-top: -1.5px; }
+    50%      { margin-left: -1.5px; margin-top: 1px; }
+    75%      { margin-left: 1px; margin-top: 1.5px; }
+  }
+  .vig-jitter { animation: vig-jitter 5s ease-in-out infinite; }
+
+  /* Contradiction chips: two values claim the same fact in turn.
+     Second chip runs the same animation with delay -3s (anti-phase). */
+  @keyframes vig-alt {
+    0%, 44%  { opacity: 1; }
+    50%, 94% { opacity: 0; }
+    100%     { opacity: 1; }
+  }
+  .vig-alt { animation: vig-alt 6s ease-in-out infinite; }
+
+  /* Unstable glitch on the duplicate edge — stepped, not smooth. */
+  @keyframes vig-flicker {
+    0%, 100% { opacity: 0.7; }
+    12% { opacity: 0.25; } 16% { opacity: 0.7; }
+    54% { opacity: 0.2; }  58% { opacity: 0.65; }
+    82% { opacity: 0.35; } 86% { opacity: 0.7; }
+  }
+  .vig-flicker { animation: vig-flicker 3s steps(1) infinite; }
+
+  /* Governance ring: draws ~70% around the cluster, gives up, retries.
+     Base state (reduced motion) = the incomplete ring, faintly held. */
+  @keyframes vig-ring-fail {
+    0%       { stroke-dashoffset: 1;   opacity: 0.85; }
+    48%      { stroke-dashoffset: 0.3; opacity: 0.85; }
+    60%      { stroke-dashoffset: 0.3; opacity: 0.85; }
+    70%      { stroke-dashoffset: 0.3; opacity: 0; }
+    78%, 100%{ stroke-dashoffset: 1;   opacity: 0; }
+  }
+  .vig-ring-fail { animation: vig-ring-fail 6s ease-in-out infinite; }
+
+  /* Ingest dot: crosses the classification gate and gains its ring. */
+  @keyframes vig-gate-dot {
+    0%       { left: var(--x0); opacity: 0; box-shadow: none; }
+    8%       { opacity: 1; }
+    40%      { left: var(--gx); box-shadow: none; }
+    50%      { box-shadow: 0 0 0 2.5px var(--ring, rgba(34, 211, 238, 0.4)); }
+    86%      { left: var(--x1); opacity: 1; box-shadow: 0 0 0 2.5px var(--ring, rgba(34, 211, 238, 0.4)); }
+    100%     { left: var(--x1); opacity: 0; box-shadow: 0 0 0 2.5px var(--ring, rgba(34, 211, 238, 0.4)); }
+  }
+  .vig-gate-dot { animation: vig-gate-dot 6s ease-in-out infinite; }
+
+  /* Fuse: the two duplicates slide to the centre and wink out… */
+  @keyframes vig-merge-dot {
+    0%, 18% { left: var(--x0); opacity: 1; }
+    42%     { left: 50%;       opacity: 1; }
+    46%     { left: 50%;       opacity: 0; }
+    100%    { left: 50%;       opacity: 0; }
+  }
+  .vig-merge-dot { animation: vig-merge-dot 6s ease-in infinite; }
+
+  /* …and the merged node flashes into being where they met. */
+  @keyframes vig-merge-result {
+    0%, 42% { opacity: 0; transform: translate(-50%, -50%) scale(0.4); filter: brightness(1); }
+    48%     { opacity: 1; transform: translate(-50%, -50%) scale(1.7); filter: brightness(2.2); }
+    58%     { opacity: 1; transform: translate(-50%, -50%) scale(1);   filter: brightness(1); }
+    92%     { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    100%    { opacity: 0; transform: translate(-50%, -50%) scale(1); }
+  }
+  .vig-merge-result { animation: vig-merge-result 6s ease-out infinite; }
+
+  /* Two-phase labels (≠ before the event, = after). Base = phase B,
+     the resolved state. */
+  @keyframes vig-phase-a {
+    0%, 40%   { opacity: 1; }
+    46%, 100% { opacity: 0; }
+  }
+  .vig-phase-a { animation: vig-phase-a 6s linear infinite; }
+  @keyframes vig-phase-b {
+    0%, 46%  { opacity: 0; }
+    54%, 92% { opacity: 1; }
+    100%     { opacity: 0; }
+  }
+  .vig-phase-b { animation: vig-phase-b 6s linear infinite; }
+
+  /* Memory layers: dots fall in and settle on their shelf (staggered
+     per-dot via animation-delay). */
+  @keyframes vig-drop {
+    0%       { top: -10%; opacity: 0; }
+    8%       { opacity: 1; }
+    30%      { top: var(--y1); }
+    37%      { top: calc(var(--y1) - 8%); }
+    44%      { top: var(--y1); }
+    88%      { top: var(--y1); opacity: 1; }
+    96%, 100%{ top: var(--y1); opacity: 0; }
+  }
+  .vig-drop { animation: vig-drop 6s cubic-bezier(0.3, 0, 0.4, 1) infinite; }
+
+  /* Serve: answer dot travels from the graph back to the agent chip. */
+  @keyframes vig-answer-dot {
+    0%, 30% { left: var(--x0); opacity: 0; }
+    36%     { opacity: 1; }
+    64%     { left: var(--x1); opacity: 1; }
+    74%     { left: var(--x1); opacity: 0; }
+    100%    { left: var(--x1); opacity: 0; }
+  }
+  .vig-answer-dot { animation: vig-answer-dot 6s ease-in-out infinite; }
+
+  /* Query edge pulses alive while the answer is in flight. */
+  @keyframes vig-edge-cycle {
+    0%       { stroke-dashoffset: 1; opacity: 0.4; }
+    22%      { stroke-dashoffset: 0; opacity: 0.9; }
+    78%      { stroke-dashoffset: 0; opacity: 0.9; }
+    90%, 100%{ stroke-dashoffset: 0; opacity: 0.3; }
+  }
+  .vig-edge-cycle { animation: vig-edge-cycle 6s ease-in-out infinite; }
+
+  /* Late one-shot pop per loop (audit tick, provenance badge). */
+  @keyframes vig-pop-late {
+    0%, 58%  { opacity: 0; transform: scale(0.6); }
+    66%      { opacity: 1; transform: scale(1.12); }
+    72%      { opacity: 1; transform: scale(1); }
+    92%      { opacity: 1; transform: scale(1); }
+    100%     { opacity: 0; transform: scale(1); }
+  }
+  .vig-pop-late { animation: vig-pop-late 6s ease-out infinite; }
+
+  /* Offscreen vignettes freeze (IntersectionObserver toggles this). */
+  .vig-paused *, .vig-paused { animation-play-state: paused !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .vig-escape, .vig-wall-flash, .vig-jitter, .vig-alt, .vig-flicker,
+    .vig-ring-fail, .vig-gate-dot, .vig-merge-dot, .vig-merge-result,
+    .vig-phase-a, .vig-phase-b, .vig-drop, .vig-answer-dot,
+    .vig-edge-cycle, .vig-pop-late { animation: none; }
+  }
+
   /* Header baseline — declares the bottom border as transparent so the
      scroll transition can interpolate to the scrolled colour cleanly. */
   .landing-nav {
