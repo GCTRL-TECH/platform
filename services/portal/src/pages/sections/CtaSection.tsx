@@ -1,4 +1,23 @@
 import { Link } from 'react-router-dom'
+import { Terminal, Plug2, FolderSync } from 'lucide-react'
+
+const STEPS: { icon: typeof Terminal; title: string; desc: string }[] = [
+  {
+    icon: Terminal,
+    title: '1 · Install locally — free',
+    desc: 'One command, fully self-hosted. Unlimited tokens from day one.',
+  },
+  {
+    icon: Plug2,
+    title: '2 · Connect your AI',
+    desc: 'Claude Code, Codex, Cursor or any MCP client — one config block.',
+  },
+  {
+    icon: FolderSync,
+    title: '3 · Scale with connectors',
+    desc: 'Business keeps SharePoint, Drive & more syncing in automatically.',
+  },
+]
 
 export function CtaSection() {
   return (
@@ -24,6 +43,16 @@ export function CtaSection() {
         <p className="mx-auto mb-10 max-w-xl text-lg text-slate-400 reveal">
           Stop building on unstructured noise. GCTRL gives your enterprise AI the knowledge foundation it needs to be accurate, explainable, and trustworthy.
         </p>
+
+        <div className="mb-12 grid gap-4 text-left sm:grid-cols-3 reveal">
+          {STEPS.map((s) => (
+            <div key={s.title} className="rounded-2xl border border-slate-800 bg-slate-900/50 p-5 backdrop-blur-sm">
+              <s.icon className="mb-3 h-5 w-5 text-indigo-400" strokeWidth={1.75} />
+              <p className="text-sm font-semibold text-white">{s.title}</p>
+              <p className="mt-1.5 text-sm leading-relaxed text-slate-400">{s.desc}</p>
+            </div>
+          ))}
+        </div>
 
         <div className="flex flex-wrap items-center justify-center gap-4 reveal">
           <Link to="/register" className="btn-cta-primary px-8 py-3.5 text-base" data-umami-event="cta_register">

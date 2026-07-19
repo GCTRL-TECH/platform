@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom'
 import { Github } from 'lucide-react'
 
-const GITHUB_URL = 'https://github.com/GCTRL-TECH/deploy'
+const GITHUB_URL = 'https://github.com/GCTRL-TECH/platform'
 
 const COLUMNS: { title: string; links: [label: string, href: string][] }[] = [
   {

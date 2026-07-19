@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
+import { Github } from 'lucide-react'
+
+const GITHUB_URL = 'https://github.com/GCTRL-TECH/platform'
 
 // Section anchors use `/#id` so they work from any page (docs / use-cases
 // navigate back to the landing page and scroll). Page links are real routes.
@@ -115,6 +118,16 @@ export function SiteHeader() {
         </nav>
 
         <div className="hidden items-center gap-3 md:flex">
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noreferrer"
+            aria-label="GCTRL on GitHub"
+            className="text-slate-400 transition-colors hover:text-white"
+            data-umami-event="header_github"
+          >
+            <Github className="h-[18px] w-[18px]" strokeWidth={1.75} />
+          </a>
           <Link to="/login" className="text-sm text-slate-400 transition-colors hover:text-white">
             Sign In
           </Link>

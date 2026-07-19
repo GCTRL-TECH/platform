@@ -653,25 +653,24 @@ export function HeroSection() {
           </span>
         </h1>
 
-        {/* Crisp category line — complements the "Sovereign Knowledge
-            Infrastructure" eyebrow badge above with the plain-language
-            positioning term (also read by search + LLM crawlers). */}
-        <p className="mb-6 text-lg font-medium text-slate-300 md:text-xl">
-          The enterprise memory layer for AI.
+        {/* Crisp category line — the plain-language "what is this" statement.
+            Deliberately prominent: brand poetry lives in the headline above,
+            this line does the explaining (also read by search + LLM crawlers). */}
+        <p className="mb-6 text-xl font-semibold text-white md:text-2xl">
+          The sovereign memory layer for AI agents.
         </p>
 
         {/* Glass-card backdrop gives the paragraph solid readability over the
-            mission-control imagery without darkening the hero. Mirrors the
-            iced-glass language used on the trust signals further down. */}
+            mission-control imagery without darkening the hero. One idea only —
+            everything else has its own section below. */}
         <div className="mx-auto mb-10 max-w-2xl rounded-2xl border border-white/10 bg-slate-950/45 px-6 py-4 backdrop-blur-md">
           <p className="text-base leading-relaxed text-slate-200 md:text-lg">
-            <strong className="font-semibold text-white">Running at the speed of trust.</strong>{' '}
-            Your company's knowledge — every source, every team, every agent session — fused into{' '}
-            <span className="text-indigo-300">one governed knowledge fabric you own</span>, on your own
-            infrastructure. Agents and tools will come and go. Your knowledge infrastructure stays.{' '}
+            Every document, drive and agent session — fused into{' '}
+            <span className="text-indigo-300">one governed knowledge graph</span> on your own
+            infrastructure.{' '}
             <span className="font-semibold text-white">
-              <span className="whitespace-nowrap">No vendor lock-in.</span>{' '}
-              <span className="whitespace-nowrap">No token tax.</span>
+              <span className="whitespace-nowrap">Unlimited tokens,</span>{' '}
+              <span className="whitespace-nowrap">because inference runs local.</span>
             </span>
           </p>
         </div>

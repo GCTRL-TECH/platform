@@ -4,15 +4,14 @@ import { SiteFooter } from '@/components/site/SiteFooter'
 import { Seo } from '@/components/Seo'
 import { landingJsonLd } from '@/lib/seo-schema'
 import { HeroSection } from './sections/HeroSection'
+import { WorksWithSection } from './sections/WorksWithSection'
 import { ArchitectureSection } from './sections/ArchitectureSection'
 import { ProblemSection } from './sections/ProblemSection'
-import { FusionStorySection } from './sections/FusionStorySection'
 import { SpeedOfTrustSection } from './sections/SpeedOfTrustSection'
 import { HowItWorksSection } from './sections/HowItWorksSection'
-import { ExplainabilitySection } from './sections/ExplainabilitySection'
 import { IntegrationsSection } from './sections/IntegrationsSection'
 import { BenchmarksSection } from './sections/BenchmarksSection'
-import { VisionSection } from './sections/VisionSection'
+import { PricingTeaserSection } from './sections/PricingTeaserSection'
 import { CtaSection } from './sections/CtaSection'
 
 export function LandingPage() {
@@ -29,15 +28,14 @@ export function LandingPage() {
       <SiteHeader />
       <main>
         <HeroSection />
-        <section id="architecture"><ArchitectureSection /></section>
+        <WorksWithSection />
         <ProblemSection />
-        <FusionStorySection />
-        <section id="trust"><SpeedOfTrustSection /></section>
         <section id="how-it-works"><HowItWorksSection /></section>
-        <ExplainabilitySection />
+        <section id="architecture"><ArchitectureSection /></section>
+        <section id="trust"><SpeedOfTrustSection /></section>
         <section id="integrations"><IntegrationsSection /></section>
         <section id="benchmarks"><BenchmarksSection /></section>
-        <VisionSection />
+        <PricingTeaserSection />
         <CtaSection />
       </main>
       <SiteFooter />

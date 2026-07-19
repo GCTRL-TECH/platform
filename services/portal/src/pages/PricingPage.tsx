@@ -22,48 +22,50 @@ type Tier = {
 const TIERS: Tier[] = [
   {
     name: 'Free',
-    tagline: 'For non-commercial private users.',
-    price: 'Free',
+    tagline: 'For private, non-commercial use.',
+    price: '€0',
     priceNote: 'forever',
     cta: { label: 'Get started free', href: '/register', event: 'pricing_free' },
     features: [
+      'Unlimited tokens — inference runs on your hardware, no token tax',
       'All four modules — KEX, FUSE, Knowledge Graphs, Talk-to-Graph',
-      '100% local & self-hosted',
-      'Local Ollama inference — GDPR by design',
-      'MCP gateway — connect Claude Code, Cursor, Codex',
-      'Graph-native memory layer + auto-wiki',
+      '100% local & self-hosted — GDPR by design',
+      'MCP gateway — Claude Code, Codex, Cursor & any MCP client',
+      'Ingestion: single files, added by hand via your AI',
       'Community support',
     ],
     foot: 'Non-commercial, private use only.',
   },
   {
     name: 'Business',
-    tagline: 'For teams and companies.',
-    price: 'Coming soon',
-    priceNote: 'pricing to be announced',
+    tagline: 'For teams whose knowledge should flow in automatically.',
+    price: '€29',
+    priceNote: 'per user / month · billed annually',
     featured: true,
-    badge: 'Coming soon',
+    badge: 'Most popular',
     cta: { label: 'Get in touch', href: `${CONTACT}?subject=GCTRL%20Business`, event: 'pricing_business' },
     features: [
       'Everything in Free — licensed for commercial use',
+      'Connectors: continuously sync entire drives — SharePoint, Google Drive, OneDrive, Confluence & more',
+      'Scheduled refresh & incremental re-sync — your graph stays current on its own',
       'Team access control & per-element classification',
       'Scoped colleague tokens — airtight project isolation',
-      'Tuned entity-resolution profile',
       'Priority support',
     ],
+    foot: 'Unlimited tokens included — no usage metering, ever.',
   },
   {
     name: 'Individual',
-    tagline: 'Tailored to your organization.',
+    tagline: 'Tailored deployment for your organization.',
     price: "Let's talk",
     priceNote: 'custom',
     cta: { label: 'Reach out to us', href: `${CONTACT}?subject=GCTRL%20Individual`, event: 'pricing_individual' },
     features: [
       'Everything in Business',
+      'Cloud deployment — managed by us, or in your own cloud',
+      'Custom integrations & connectors built for your stack',
       'On-prem / air-gapped & sovereign deployment',
-      'TISAX & ISO 27001-aware hardening',
-      'SSO / SCIM',
-      'Custom integrations & connectors',
+      'TISAX & ISO 27001-aware hardening, SSO / SCIM',
       'Dedicated support & SLAs',
     ],
   },
@@ -96,7 +98,7 @@ export function PricingPage() {
     <div className="min-h-screen bg-[#020617]">
       <Seo
         title="Pricing — GCTRL"
-        description="GCTRL is free forever for non-commercial private use, fully self-hosted with local inference. Business and Individual tiers add team access control and sovereign deployment."
+        description="Unlimited tokens on every plan — inference runs on your own hardware. Free forever for private use; Business adds always-on connectors for SharePoint, Google Drive & more; Individual adds tailored cloud deployment."
         path="/pricing"
       />
       <SiteHeader />
@@ -114,8 +116,9 @@ export function PricingPage() {
             pricing
           </h1>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
-            Free forever for private use. Built to run entirely on your own infrastructure — your data never
-            leaves your machine, on any plan.
+            <span className="font-semibold text-slate-200">Unlimited tokens on every plan</span> — inference
+            runs on your own hardware, so we never meter your usage. You pay for what actually matters:
+            keeping your company&apos;s knowledge flowing in automatically.
           </p>
         </div>
       </section>
@@ -166,9 +169,19 @@ export function PricingPage() {
           ))}
         </div>
 
-        <p className="mx-auto mt-12 max-w-2xl text-center text-sm text-slate-500">
-          Every plan is fully self-hosted with local inference — DSGVO/GDPR by design. Questions about
-          licensing or volume?{' '}
+        <div className="mx-auto mt-14 max-w-3xl rounded-2xl border border-slate-800 bg-slate-900/40 px-8 py-6 text-center backdrop-blur-sm">
+          <p className="text-base font-semibold text-white">
+            Unlimited tokens. On every plan. Really.
+          </p>
+          <p className="mt-2 text-sm leading-relaxed text-slate-400">
+            Cloud memory platforms charge per million tokens processed. GCTRL runs inference on your own
+            infrastructure, so there is nothing to meter — extract, fuse and chat as much as your hardware
+            can handle. Fully self-hosted, DSGVO/GDPR by design.
+          </p>
+        </div>
+
+        <p className="mx-auto mt-10 max-w-2xl text-center text-sm text-slate-500">
+          Questions about licensing or volume?{' '}
           <a href={`${CONTACT}?subject=GCTRL%20Pricing`} className="text-indigo-400 hover:text-indigo-300">
             Talk to us
           </a>
