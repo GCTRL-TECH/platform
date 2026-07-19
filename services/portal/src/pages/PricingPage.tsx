@@ -41,7 +41,7 @@ const TIERS: Tier[] = [
     name: 'Business',
     tagline: 'One access token per colleague - you decide what each one can see.',
     price: '€29',
-    priceNote: 'per user - one scoped access token / month · billed annually',
+    priceNote: 'per user - one scoped access token / month · billed monthly',
     featured: true,
     badge: 'Most popular',
     cta: { label: 'Get in touch', href: `${CONTACT}?subject=GCTRL%20Business`, event: 'pricing_business' },
