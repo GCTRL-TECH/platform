@@ -25,6 +25,7 @@ export const DOC_GROUPS: DocGroup[] = [
       { slug: 'gpu', title: 'Use Your GPU (native Ollama)' },
       { slug: 'performance', title: 'Performance Guide' },
       { slug: 'cookbook', title: 'Cookbook: Model Tuning' },
+      { slug: 'observability', title: 'Observability & Tracing (Phoenix)' },
     ],
   },
   {
