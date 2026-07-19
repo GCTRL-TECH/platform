@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Ground Control (GCTRL) Installer
 # Usage: curl -fsSL https://gctrl.tech/install | bash
-# No license key required — enter your key at http://localhost:3001 after install
+# No license key required - enter your key at http://localhost:3001 after install
 set -euo pipefail
 
 GCTRL_VERSION="${GCTRL_VERSION:-latest}"
@@ -32,13 +32,13 @@ check_prereqs() {
 
   if ! docker info &>/dev/null; then
     if command -v systemctl &>/dev/null; then
-      warn "Docker daemon not running — attempting to start..."
+      warn "Docker daemon not running - attempting to start..."
       sudo systemctl start docker 2>/dev/null || true
       sleep 2
     fi
 
     if ! docker info &>/dev/null; then
-      warn "Waiting for Docker to start — please open Docker Desktop..."
+      warn "Waiting for Docker to start - please open Docker Desktop..."
       local waited=0
       while ! docker info &>/dev/null; do
         sleep 3; waited=$((waited + 3)); printf "."
@@ -86,11 +86,11 @@ CHAT_MODEL=""     # generation model chosen by choose_model() ("" = skip / pick 
 
 # ── GPU Detection ─────────────────────────────────────────────────────────────
 # Detection strategy:
-#   NVIDIA — nvidia-smi reports only discrete NVIDIA GPUs (no Intel integrated).
+#   NVIDIA - nvidia-smi reports only discrete NVIDIA GPUs (no Intel integrated).
 #             Requires nvidia-container-toolkit for Docker GPU passthrough.
-#   AMD    — rocm-smi or /dev/kfd presence signals an AMD GPU.
+#   AMD    - rocm-smi or /dev/kfd presence signals an AMD GPU.
 #             Requires ROCm and /dev/kfd + /dev/dri for Docker passthrough.
-#   CPU    — fallback when no discrete GPU (or toolkit) is detected.
+#   CPU    - fallback when no discrete GPU (or toolkit) is detected.
 detect_gpu() {
   # ── NVIDIA ────────────────────────────────────────────────────────────────
   if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
@@ -100,7 +100,7 @@ detect_gpu() {
     if command -v nvidia-ctk &>/dev/null || docker info 2>/dev/null | grep -qi "nvidia"; then
       GPU_ENABLED=true
       GPU_TYPE="nvidia"
-      success "GPU detected: ${gpu_name} — KEX will use NVIDIA GPU acceleration"
+      success "GPU detected: ${gpu_name} - KEX will use NVIDIA GPU acceleration"
       return
     else
       warn "NVIDIA GPU found (${gpu_name}) but nvidia-container-toolkit is not installed"
@@ -115,7 +115,7 @@ detect_gpu() {
 
   # ── AMD ───────────────────────────────────────────────────────────────────
   # rocm-smi is the AMD equivalent of nvidia-smi.
-  # /dev/kfd is the AMD GPU kernel fusion driver — present when ROCm is installed.
+  # /dev/kfd is the AMD GPU kernel fusion driver - present when ROCm is installed.
   local amd_detected=false
   local amd_name="AMD GPU"
 
@@ -132,15 +132,15 @@ detect_gpu() {
     if [ -e /dev/kfd ] && [ -e /dev/dri ]; then
       GPU_ENABLED=true
       GPU_TYPE="amd"
-      success "GPU detected: ${amd_name} — KEX will use AMD ROCm acceleration"
+      success "GPU detected: ${amd_name} - KEX will use AMD ROCm acceleration"
     else
-      warn "AMD GPU found but /dev/kfd or /dev/dri not accessible — KEX will run on CPU"
+      warn "AMD GPU found but /dev/kfd or /dev/dri not accessible - KEX will run on CPU"
       warn "To enable AMD GPU, install ROCm: https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html"
     fi
     return
   fi
 
-  info "No discrete GPU detected — KEX will run on CPU"
+  info "No discrete GPU detected - KEX will run on CPU"
 }
 
 detect_services() {
@@ -151,33 +151,33 @@ detect_services() {
 
   if probe_tcp 7687; then
     NEO4J_URI="bolt://host.docker.internal:7687"
-    success "Neo4j detected on :7687 — will connect to existing instance"
+    success "Neo4j detected on :7687 - will connect to existing instance"
   else
     PROFILES+=("bundled-neo4j")
     NEO4J_URI="bolt://gctrl-neo4j:7687"
-    info "Neo4j not found — will deploy bundled container"
+    info "Neo4j not found - will deploy bundled container"
   fi
 
   if probe_tcp 6333; then
     QDRANT_URL="http://host.docker.internal:6333"
-    success "Qdrant detected on :6333 — will connect to existing instance"
+    success "Qdrant detected on :6333 - will connect to existing instance"
   else
     PROFILES+=("bundled-qdrant")
     QDRANT_URL="http://gctrl-qdrant:6333"
-    info "Qdrant not found — will deploy bundled container"
+    info "Qdrant not found - will deploy bundled container"
   fi
 
   if probe_tcp 11434; then
     if ollama_bound_all_ifaces; then
       OLLAMA_BASE="http://host.docker.internal:11434"
-      success "Ollama detected on :11434 — connecting to your native instance (GPU-capable)"
+      success "Ollama detected on :11434 - connecting to your native instance (GPU-capable)"
     else
       # Native Ollama listens on localhost only → the GCTRL containers can't reach
       # it. Bundle the CPU Ollama so the platform works out of the box; the user can
       # switch to native (GPU) later by exposing it.
       PROFILES+=("bundled-ollama")
       OLLAMA_BASE="http://gctrl-ollama:11434"
-      warn "Native Ollama found, but it listens on localhost only — Docker can't reach it."
+      warn "Native Ollama found, but it listens on localhost only - Docker can't reach it."
       warn "→ Using the bundled (CPU) Ollama so GCTRL works out of the box."
       warn "  For GPU: set OLLAMA_HOST=0.0.0.0 on your Ollama, then switch in the"
       warn "  dashboard (Settings → AI Models). Guide: https://gctrl.tech/docs/gpu"
@@ -185,12 +185,12 @@ detect_services() {
   else
     PROFILES+=("bundled-ollama")
     OLLAMA_BASE="http://gctrl-ollama:11434"
-    info "Ollama not found — will deploy bundled container"
+    info "Ollama not found - will deploy bundled container"
   fi
 
   echo ""
   if [ ${#PROFILES[@]} -eq 0 ]; then
-    success "All infrastructure already present — GCTRL will connect to your existing stack"
+    success "All infrastructure already present - GCTRL will connect to your existing stack"
   else
     info "Will deploy bundled: ${PROFILES[*]}"
   fi
@@ -211,7 +211,7 @@ choose_model() {
     return
   fi
 
-  # Total RAM in GB — for a sensible recommendation (best-effort, 0 if unknown).
+  # Total RAM in GB - for a sensible recommendation (best-effort, 0 if unknown).
   local ram_gb=0
   if [ "$(uname)" = "Darwin" ]; then
     ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
@@ -224,7 +224,7 @@ choose_model() {
   # No interactive terminal (piped/non-interactive) → take the default silently.
   if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
     CHAT_MODEL="$default_choice"
-    info "Non-interactive — default model ${CHAT_MODEL} (override with GCTRL_MODEL=...)"
+    info "Non-interactive - default model ${CHAT_MODEL} (override with GCTRL_MODEL=...)"
     return
   fi
 
@@ -232,12 +232,12 @@ choose_model() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   [ "$ram_gb" -gt 0 ] && info "Detected RAM: ${ram_gb} GB"
   echo "  Choose the local model GCTRL uses for extraction & RAG:"
-  echo "    1) llama3.2:3b   — lightweight, fast         (~2 GB)   [default]"
-  echo "    2) qwen2.5:7b    — best extraction quality   (~5 GB)"
-  echo "    3) qwen2.5:14b   — higher quality            (~9 GB,  16 GB+ RAM)"
-  echo "    4) qwen2.5:32b   — max quality               (~20 GB, 32 GB+ RAM)"
-  echo "    5) custom        — enter any Ollama tag"
-  echo "    6) skip          — choose later in the dashboard"
+  echo "    1) llama3.2:3b   - lightweight, fast         (~2 GB)   [default]"
+  echo "    2) qwen2.5:7b    - best extraction quality   (~5 GB)"
+  echo "    3) qwen2.5:14b   - higher quality            (~9 GB,  16 GB+ RAM)"
+  echo "    4) qwen2.5:32b   - max quality               (~20 GB, 32 GB+ RAM)"
+  echo "    5) custom        - enter any Ollama tag"
+  echo "    6) skip          - choose later in the dashboard"
   echo "  (Tip: the bundled Ollama runs on CPU. For GPU speed, point GCTRL at a"
   echo "   native Ollama in Settings → Infrastructure, then pick a bigger model.)"
   local choice=""
@@ -256,7 +256,7 @@ choose_model() {
   if [ -n "$CHAT_MODEL" ]; then
     info "Model: ${CHAT_MODEL}"
   else
-    info "Skipping model download — pick one later in Settings → Models"
+    info "Skipping model download - pick one later in Settings → Models"
   fi
   echo ""
 }
@@ -329,7 +329,7 @@ write_gpu_override() {
   if [ "${GPU_TYPE}" = "nvidia" ]; then
     info "Writing NVIDIA GPU override (docker-compose.override.yml)..."
     cat > "${INSTALL_DIR}/docker-compose.override.yml" <<'OVERRIDE'
-# Auto-generated by GCTRL installer — NVIDIA GPU detected.
+# Auto-generated by GCTRL installer - NVIDIA GPU detected.
 # Delete this file to switch back to CPU mode, then run: docker compose up -d
 services:
   gctrl-fuse:
@@ -363,7 +363,7 @@ OVERRIDE
   elif [ "${GPU_TYPE}" = "amd" ]; then
     info "Writing AMD ROCm GPU override (docker-compose.override.yml)..."
     cat > "${INSTALL_DIR}/docker-compose.override.yml" <<'OVERRIDE'
-# Auto-generated by GCTRL installer — AMD GPU detected.
+# Auto-generated by GCTRL installer - AMD GPU detected.
 # Delete this file to switch back to CPU mode, then run: docker compose up -d
 services:
   gctrl-fuse:
@@ -469,7 +469,7 @@ finalize() {
 
 # ── Hardware Detection ────────────────────────────────────────────────────────
 # Detects host hardware natively and writes <INSTALL_DIR>/hardware.json.
-# Never fails the install — defaults to 0/"" on any detection error.
+# Never fails the install - defaults to 0/"" on any detection error.
 # Idempotent: overwrites on re-run.
 detect_hardware() {
   local cpu_cores=0 ram_gb=0 gpu_name="" vram_gb=0 nvidia_toolkit=false
@@ -540,7 +540,7 @@ detect_hardware() {
     local apple_gpu
     apple_gpu="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -i "Chipset Model" | head -1 | awk -F': ' '{print $2}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "")"
     gpu_name="${apple_gpu:-}"
-    # Apple Silicon VRAM is shared; not reliably queryable — leave at 0
+    # Apple Silicon VRAM is shared; not reliably queryable - leave at 0
     vram_gb=0
     nvidia_toolkit=false
   fi
@@ -563,7 +563,7 @@ detect_hardware() {
   [ -z "$arch_name" ]  && arch_name="unknown"
   [ -z "$os_name" ]    && os_name="linux"
 
-  # Emit strict JSON — numbers unquoted, strings quoted
+  # Emit strict JSON - numbers unquoted, strings quoted
   cat > "${INSTALL_DIR}/hardware.json" <<JSON
 {
   "cpu_cores": ${cpu_cores},
@@ -609,7 +609,7 @@ choose_runtime() {
   local gpu_ok
   gpu_ok="$(awk "BEGIN{print ($vram >= 8) ? \"yes\" : \"no\"}")"
   if [ "$gpu_ok" != "yes" ]; then
-    warn "NVIDIA GPU detected but VRAM ${vram} GB < 8 GB — vLLM requires ≥8 GB VRAM; skipping vLLM offer"
+    warn "NVIDIA GPU detected but VRAM ${vram} GB < 8 GB - vLLM requires ≥8 GB VRAM; skipping vLLM offer"
     return 0
   fi
 
@@ -632,15 +632,15 @@ choose_runtime() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   info "NVIDIA GPU with ${vram} GB VRAM detected (nvidia-container-toolkit present)"
   echo "  Optional: enable vLLM for maximum GPU throughput"
-  echo "    1) No  — use bundled Ollama (default, always works)"
-  echo "    2) Yes — enable vLLM (pulls vllm/vllm-openai:latest, ~10 GB)"
+  echo "    1) No  - use bundled Ollama (default, always works)"
+  echo "    2) Yes - enable vLLM (pulls vllm/vllm-openai:latest, ~10 GB)"
   local rt_choice=""
   read -rp "  Enable vLLM? [1]: " rt_choice </dev/tty || rt_choice=""
   case "${rt_choice:-1}" in
     2)
       VLLM_SELECTED=true
       PROFILES+=("bundled-vllm")
-      success "vLLM selected — will deploy gctrl-vllm container"
+      success "vLLM selected - will deploy gctrl-vllm container"
       ;;
     *)
       info "Keeping bundled Ollama (vLLM can be enabled later in Settings → Infrastructure)"
@@ -653,13 +653,13 @@ choose_runtime() {
 # Pull the local models KEX requires into the bundled Ollama container. Idempotent
 # (Ollama skips already-present models). Keeps the platform zero-cost-local.
 pull_ollama_models() {
-  echo "  Ollama    : bundled — pulling required local models (one-time)..."
+  echo "  Ollama    : bundled - pulling required local models (one-time)..."
   local models=("nomic-embed-text")
   [ -n "${CHAT_MODEL}" ] && models=("${CHAT_MODEL}" "${models[@]}")
   for model in "${models[@]}"; do
     echo "              pulling ${model} ..."
     docker exec gctrl-ollama ollama pull "${model}" \
-      || echo "              WARN: failed to pull ${model} — pull manually: docker exec gctrl-ollama ollama pull ${model}"
+      || echo "              WARN: failed to pull ${model} - pull manually: docker exec gctrl-ollama ollama pull ${model}"
   done
 }
 
@@ -667,7 +667,7 @@ pull_ollama_models() {
 main() {
   check_prereqs
   detect_gpu
-  detect_services      # auto-decides Ollama (native if reachable, else bundled — never conflicts)
+  detect_services      # auto-decides Ollama (native if reachable, else bundled - never conflicts)
   generate_config      # .env written with a sensible default model placeholder; INSTALL_DIR created
   detect_hardware      # writes hardware.json to INSTALL_DIR for Settings → Infrastructure
   choose_runtime       # GPU-gate: offer vLLM only when nvidia_toolkit=true AND vram_gb >= 8

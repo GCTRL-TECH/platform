@@ -8,7 +8,7 @@ GCTRL is designed for regulated and enterprise environments where *where your da
 
 ## Audit Trail
 
-Every access to the knowledge graph is logged — **including every denied access.** Each entry records:
+Every access to the knowledge graph is logged - **including every denied access.** Each entry records:
 
 | Field | What it captures |
 |-------|------------------|
@@ -18,9 +18,9 @@ Every access to the knowledge graph is logged — **including every denied acces
 | **Clearance used** | The effective clearance applied to the request |
 | **Outcome** | `GRANTED` or `DENIED` |
 
-Because denials are logged just as carefully as grants, the audit trail answers both "who saw this?" and "who *tried* to see this and was stopped?" — the second question is usually the one auditors care about.
+Because denials are logged just as carefully as grants, the audit trail answers both "who saw this?" and "who *tried* to see this and was stopped?" - the second question is usually the one auditors care about.
 
-The trail is **queryable and filterable** — by token, by action, by resource, by clearance, by outcome, and by time window — so you can reconstruct exactly what any token did, or surface every denied attempt against a sensitive compilation.
+The trail is **queryable and filterable** - by token, by action, by resource, by clearance, by outcome, and by time window - so you can reconstruct exactly what any token did, or surface every denied attempt against a sensitive compilation.
 
 ```text
 Filter examples
@@ -39,14 +39,14 @@ GCTRL keeps personal and conversational data minimal by design, with explicit us
 
 ### Incognito query mode
 
-Incognito mode keeps a query session **in browser memory only.** The session and its context are **never persisted server-side** — close the tab and it is gone. This is the default posture for sensitive or ad-hoc questions where no record should remain.
+Incognito mode keeps a query session **in browser memory only.** The session and its context are **never persisted server-side** - close the tab and it is gone. This is the default posture for sensitive or ad-hoc questions where no record should remain.
 
 ### Opt-in personalization profile
 
 GCTRL can build a personalization profile to improve results over time, but:
 
-- It is **opt-in** — off until the user explicitly enables it.
-- It is built **only from standard-mode history** — incognito sessions never contribute to it, by construction.
+- It is **opt-in** - off until the user explicitly enables it.
+- It is built **only from standard-mode history** - incognito sessions never contribute to it, by construction.
 
 ### Right to be forgotten
 
@@ -54,9 +54,9 @@ A user can **erase their personalization profile** at any time. Right-to-be-forg
 
 | Mode | Stored server-side? | Feeds personalization? |
 |------|---------------------|------------------------|
-| Incognito | No — browser memory only | No |
+| Incognito | No - browser memory only | No |
 | Standard | Yes | Only if personalization is opted in |
-| Personalization profile | Yes, until erased | n/a — it *is* the profile |
+| Personalization profile | Yes, until erased | n/a - it *is* the profile |
 
 ---
 
@@ -66,7 +66,7 @@ GCTRL runs **entirely on your own hardware.** With local **Ollama** providing in
 
 - **No data leaves your network.** Prompts, documents, graph content, and answers all stay inside your perimeter.
 - **Zero token cost.** Local inference means no per-token billing and no external API dependency.
-- **Full data sovereignty.** You control the hardware, the storage volumes, and the model — there is no third party in the data path.
+- **Full data sovereignty.** You control the hardware, the storage volumes, and the model - there is no third party in the data path.
 
 This is what makes the GDPR and audit posture credible end-to-end: it is not "we promise not to look," it is "the data physically never leaves." For self-hosting details and pointing GCTRL at native Ollama or your own model, see the Infrastructure settings and the **FAQ / Troubleshooting** page.
 
@@ -76,9 +76,9 @@ This is what makes the GDPR and audit posture credible end-to-end: it is not "we
 
 GCTRL's design posture targets enterprise and regulated use:
 
-- **ISO 27001-aware design** — access control, audit logging, and least-privilege tokens are built in rather than bolted on.
-- **TISAX-readiness as a north star** — the architecture is shaped with industrial/automotive information-security expectations in mind.
-- **Data sovereignty by default** — on-prem deployment and local inference keep the entire data lifecycle inside your control.
+- **ISO 27001-aware design** - access control, audit logging, and least-privilege tokens are built in rather than bolted on.
+- **TISAX-readiness as a north star** - the architecture is shaped with industrial/automotive information-security expectations in mind.
+- **Data sovereignty by default** - on-prem deployment and local inference keep the entire data lifecycle inside your control.
 
 Again: these describe how the system is engineered, not a formal certification. They are the design targets that explain *why* the audit trail, clearance model, and local-first architecture exist.
 
@@ -86,6 +86,6 @@ Again: these describe how the system is engineered, not a formal certification. 
 
 ## See also
 
-- **Access Control & Multi-Tenancy** — ownership, clearance ranks, grants, and KB-scoped tokens.
-- **Benchmarks** — including the ~0 ms cost of enforcing access control on every query.
-- **FAQ / Troubleshooting** — local Ollama, data locations, and what (never) goes to the cloud.
+- **Access Control & Multi-Tenancy** - ownership, clearance ranks, grants, and KB-scoped tokens.
+- **Benchmarks** - including the ~0 ms cost of enforcing access control on every query.
+- **FAQ / Troubleshooting** - local Ollama, data locations, and what (never) goes to the cloud.

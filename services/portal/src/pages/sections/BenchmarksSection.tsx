@@ -10,12 +10,12 @@ const STATS = [
       { value: '0.978', unit: 'recall', label: 'NER detection (bilingual)' },
     ],
   },
-  { key: 'latency', value: '<50', unit: 'ms p95', label: 'Memory retrieval latency', sub: '7–27 ms median' },
+  { key: 'latency', value: '<50', unit: 'ms p95', label: 'Memory retrieval latency', sub: '7-27 ms median' },
   { key: 'acl', value: '≈0', unit: 'ms', label: 'Access-control overhead', sub: 'compliance is effectively free' },
   { key: 'throughput', value: '2,750', unit: '/s', label: 'Matching-engine throughput', sub: 'sub-quadratic ~O(n^1.5)' },
 ]
 
-// Competitor figures are CITED from published papers on the same public datasets —
+// Competitor figures are CITED from published papers on the same public datasets -
 // not head-to-heads we ran. GCTRL numbers are measured on our testbench.
 const COMPARE = [
   { dataset: 'DBLP-ACM', gctrl: '0.97', note: 'no training', sota: 'Ditto 0.989 · DeepMatcher 0.985' },
@@ -35,7 +35,7 @@ export function BenchmarksSection() {
             </span>
           </h2>
           <p className="mt-4 text-lg text-slate-400">
-            Measured on standard public benchmarks and our own testbench — fully local, no labelled data.
+            Measured on standard public benchmarks and our own testbench - fully local, no labelled data.
           </p>
         </div>
 
@@ -73,7 +73,7 @@ export function BenchmarksSection() {
 
         <div className="reveal mt-10 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/40">
           <div className="border-b border-slate-800 px-5 py-3 text-xs font-semibold uppercase tracking-wider text-slate-400">
-            Entity linking F1 — vs published SOTA on the same datasets
+            Entity linking F1 - vs published SOTA on the same datasets
           </div>
           <table className="w-full text-sm">
             <thead>
@@ -98,7 +98,7 @@ export function BenchmarksSection() {
           </table>
           <p className="border-t border-slate-800 px-5 py-3 text-xs text-slate-500">
             Supervised baselines are cited from their published papers (Ditto, DeepMatcher) on the identical public
-            datasets — GCTRL reaches comparable quality with no labelled training data. Head-to-heads vs other
+            datasets - GCTRL reaches comparable quality with no labelled training data. Head-to-heads vs other
             GraphRAG systems are in progress.
           </p>
         </div>
@@ -106,7 +106,7 @@ export function BenchmarksSection() {
         <div className="reveal mt-8 flex flex-col items-center justify-between gap-4 rounded-2xl border border-cyan-500/20 bg-cyan-500/5 px-6 py-5 sm:flex-row">
           <p className="text-sm text-slate-300">
             <span className="font-semibold text-cyan-300">Performance tip:</span> vector search is the slowest retrieval
-            step (~44 ms vs ~7 ms for graph). Qdrant is <span className="font-medium text-slate-100">swappable</span> —
+            step (~44 ms vs ~7 ms for graph). Qdrant is <span className="font-medium text-slate-100">swappable</span> -
             point GCTRL at a faster vector store to cut query latency further.
           </p>
           <Link to="/docs/benchmarks" className="btn-cta-secondary shrink-0">

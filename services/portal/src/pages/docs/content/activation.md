@@ -20,10 +20,10 @@ GCTRL-XXXX-XXXX-XXXX-XXXX-XXXX
 
 ## What the license unlocks
 
-The license **activates the platform**. For licensed tiers it also **unlocks the tuned entity-resolution profile** delivered to your deployment — a resolution configuration matched to your data and use case.
+The license **activates the platform**. For licensed tiers it also **unlocks the tuned entity-resolution profile** delivered to your deployment - a resolution configuration matched to your data and use case.
 
 - **With a license:** FUSE runs the tuned entity-resolution profile shipped to your deployment.
-- **Without a license:** the platform runs on **safe generic defaults** — fully functional, using a conservative baseline resolution configuration.
+- **Without a license:** the platform runs on **safe generic defaults** - fully functional, using a conservative baseline resolution configuration.
 
 ## Hardware-bound activation
 
@@ -31,7 +31,7 @@ Activation is **hardware-bound**: the license is tied to the deployment it is ac
 
 ## Everything stays local
 
-Activation does **not** send your data anywhere. License validation concerns the license itself — **your ingested content, graphs, and memory never leave the machine**. GCTRL remains fully on-prem before and after activation.
+Activation does **not** send your data anywhere. License validation concerns the license itself - **your ingested content, graphs, and memory never leave the machine**. GCTRL remains fully on-prem before and after activation.
 
 ## Next steps
 

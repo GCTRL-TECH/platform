@@ -127,7 +127,7 @@ function ProjectIsolationDiagram() {
       {/* Wall note */}
       <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-center">
         <p className="text-sm font-semibold text-slate-200">No cross-project bleed</p>
-        <p className="text-xs text-slate-500">an agent on one project can’t see, cite, or leak another — by accident or otherwise</p>
+        <p className="text-xs text-slate-500">an agent on one project can’t see, cite, or leak another - by accident or otherwise</p>
       </div>
     </div>
   )
@@ -148,8 +148,8 @@ export function UseCasesPage() {
   return (
     <div className="min-h-screen bg-[#020617]">
       <Seo
-        title="Use Cases — GCTRL"
-        description="Shared agentic team memory, airtight per-project isolation, and activating legacy data — how enterprises use GCTRL's governed knowledge graph day to day."
+        title="Use Cases - GCTRL"
+        description="Shared agentic team memory, airtight per-project isolation, and activating legacy data - how enterprises use GCTRL's governed knowledge graph day to day."
         path="/use-cases"
       />
       <SiteHeader />
@@ -167,7 +167,7 @@ export function UseCasesPage() {
           </h1>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
             Three ways organizations put GCTRL to work as the shared, access-controlled memory layer for their
-            entire AI workforce — from live team knowledge to airtight client projects to decades of locked-away
+            entire AI workforce - from live team knowledge to airtight client projects to decades of locked-away
             legacy data.
           </p>
           <div className="mt-8 flex flex-wrap justify-center gap-3">
@@ -203,12 +203,12 @@ export function UseCasesPage() {
               <p className="mt-5 text-lg leading-relaxed text-slate-400">
                 Run <span className="font-medium text-slate-200">one central GCTRL</span>, on your own hardware. Every
                 colleague drops an individual <span className="font-medium text-slate-200">scoped token</span> into their
-                Codex, Claude or Hermes. Each gets their own Wiki-LLM base and their own knowledge graph — and the
+                Codex, Claude or Hermes. Each gets their own Wiki-LLM base and their own knowledge graph - and the
                 knowledge of all employees can be merged into one company-wide KG and Wiki.
               </p>
               <p className="mt-4 text-lg leading-relaxed text-slate-400">
                 When people of different clearance query that shared graph,{' '}
-                <span className="font-medium text-slate-200">classification stays intact</span> — everyone sees exactly
+                <span className="font-medium text-slate-200">classification stays intact</span> - everyone sees exactly
                 what they're cleared for, nothing more. Full audit trail. GDPR-compliant. Fully on-prem. A real push for
                 data sovereignty.
               </p>
@@ -225,17 +225,17 @@ export function UseCasesPage() {
               Plenty of tools let an agent <em>have</em> a memory and write to it. But{' '}
               <span className="font-medium text-slate-200">none of them ingest at scale.</span> GCTRL gives you the raw
               storage for deterministic context <span className="font-medium text-slate-200">and</span>, in parallel,
-              every organised memory layer — including a curated Wiki-LLM of company knowledge — on a high-performance
+              every organised memory layer - including a curated Wiki-LLM of company knowledge - on a high-performance
               graph + vector core.
             </p>
             <div className="mt-7 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
               {[
-                ['Per-employee scoped tokens', 'Each colleague connects their own agent with their own KB scope — own wiki, own graph.'],
+                ['Per-employee scoped tokens', 'Each colleague connects their own agent with their own KB scope - own wiki, own graph.'],
                 ['One merged company brain', 'Fuse everyone’s knowledge into a single company KG + Wiki, deduplicated and cross-linked.'],
-                ['Classification-preserving queries', 'Clearance is enforced at query time on the merged graph — same data, different views per person.'],
+                ['Classification-preserving queries', 'Clearance is enforced at query time on the merged graph - same data, different views per person.'],
                 ['Full audit trail', 'Every access and every denial is logged with token, action, resource and outcome.'],
                 ['GDPR by design', 'Incognito sessions stay in browser memory; personalization is opt-in and erasable.'],
-                ['On-prem & sovereign', 'Local inference, your storage, your network — no data leaves the building.'],
+                ['On-prem & sovereign', 'Local inference, your storage, your network - no data leaves the building.'],
               ].map(([title, body]) => (
                 <div key={title}>
                   <p className="font-semibold text-slate-100">{title}</p>
@@ -280,17 +280,17 @@ export function UseCasesPage() {
                 </span>
               </h2>
               <p className="mt-5 text-lg leading-relaxed text-slate-400">
-                Run your whole agency on <span className="font-medium text-slate-200">one platform</span> — a single
+                Run your whole agency on <span className="font-medium text-slate-200">one platform</span> - a single
                 source of truth instead of a sprawl of disconnected tools per client. Every project and client gets its
                 own walled knowledge base, and every colleague or agent connects with a{' '}
                 <span className="font-medium text-slate-200">token scoped to exactly the projects they’re on</span>.
               </p>
               <p className="mt-4 text-lg leading-relaxed text-slate-400">
                 Classification and fine-grained access control mean project knowledge{' '}
-                <span className="font-medium text-slate-200">can never get mixed up — not even by accident</span>. An
+                <span className="font-medium text-slate-200">can never get mixed up - not even by accident</span>. An
                 agent working Client A’s project literally can’t retrieve, cite, or leak Client B’s data: over-clearance
                 queries return nothing, and <span className="font-medium text-slate-200">every node, edge, chunk and
-                wiki page</span> is gated at query time. One source of truth, zero cross-project bleed — with a full
+                wiki page</span> is gated at query time. One source of truth, zero cross-project bleed - with a full
                 audit trail on every access.
               </p>
             </div>
@@ -303,20 +303,20 @@ export function UseCasesPage() {
           <div className="reveal mt-16 rounded-2xl border border-slate-800 bg-slate-900/40 p-8">
             <h3 className="text-xl font-semibold text-white">Why nothing else does this</h3>
             <p className="mt-3 max-w-3xl leading-relaxed text-slate-400">
-              Folder permissions and per-client workspaces rely on someone never making a mistake — one wrong share, one
+              Folder permissions and per-client workspaces rely on someone never making a mistake - one wrong share, one
               pasted doc, one agent with too-broad context, and a client’s data ends up where it shouldn’t. GCTRL makes
               isolation <span className="font-medium text-slate-200">structural</span>: clearance lives on the data
-              itself and is enforced at retrieval, so a leak across projects isn’t <em>discouraged</em> — it’s{' '}
+              itself and is enforced at retrieval, so a leak across projects isn’t <em>discouraged</em> - it’s{' '}
               <span className="font-medium text-slate-200">not representable</span>.
             </p>
             <div className="mt-7 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
               {[
-                ['Per-element classification', 'Every node, edge, chunk and wiki page carries its own clearance — gating is on the data, not a folder rule someone can forget.'],
-                ['Enforced at query time', 'Over-clearance results vanish during retrieval — an agent can’t surface what its token isn’t cleared for, even with a perfect prompt.'],
+                ['Per-element classification', 'Every node, edge, chunk and wiki page carries its own clearance - gating is on the data, not a folder rule someone can forget.'],
+                ['Enforced at query time', 'Over-clearance results vanish during retrieval - an agent can’t surface what its token isn’t cleared for, even with a perfect prompt.'],
                 ['Project-scoped tokens', 'A token is bound to its project’s knowledge bases; every other project is invisible, not merely hidden.'],
-                ['Accidental-leak proof', 'If it’s out of scope it can’t be retrieved, cited, or fused into another project — there is no “oops, wrong client.”'],
-                ['One platform, not ten', 'A single source of truth and one ops surface — instead of a siloed tool per client that never compounds into shared value.'],
-                ['Audit every access', 'Token, action, resource and outcome — every grant and every denial is logged, for your client and your auditor.'],
+                ['Accidental-leak proof', 'If it’s out of scope it can’t be retrieved, cited, or fused into another project - there is no “oops, wrong client.”'],
+                ['One platform, not ten', 'A single source of truth and one ops surface - instead of a siloed tool per client that never compounds into shared value.'],
+                ['Audit every access', 'Token, action, resource and outcome - every grant and every denial is logged, for your client and your auditor.'],
               ].map(([title, body]) => (
                 <div key={title}>
                   <p className="font-semibold text-slate-100">{title}</p>
@@ -362,15 +362,15 @@ export function UseCasesPage() {
                 </span>
               </h2>
               <p className="mt-5 text-lg leading-relaxed text-slate-400">
-                Every enterprise sits on decades of locked-away knowledge —{' '}
+                Every enterprise sits on decades of locked-away knowledge -{' '}
                 <span className="font-medium text-slate-200">old mailservers and email archives</span>, a decade-old
                 SharePoint, <span className="font-medium text-slate-200">legacy SQL databases</span>, orphaned file
                 shares and network drives. It's exactly the data your AI needs, and exactly the data nobody can use.
               </p>
               <p className="mt-4 text-lg leading-relaxed text-slate-400">
                 GCTRL ingests that mess <span className="font-medium text-slate-200">at scale</span>.{' '}
-                <span className="font-medium text-slate-200">FUSE</span> resolves the duplicates and contradictions —
-                matching records that describe the same entity across systems and reconciling them — into{' '}
+                <span className="font-medium text-slate-200">FUSE</span> resolves the duplicates and contradictions -
+                matching records that describe the same entity across systems and reconciling them - into{' '}
                 <span className="font-medium text-slate-200">one clean, canonical knowledge graph</span>, and serves it
                 to your agents with <span className="font-medium text-slate-200">provenance, lineage and retention
                 preserved</span>, and clearance enforced at query time.
@@ -386,16 +386,16 @@ export function UseCasesPage() {
             <h3 className="text-xl font-semibold text-white">Why nothing else does this</h3>
             <p className="mt-3 max-w-3xl leading-relaxed text-slate-400">
               Most “chat with your data” tools <span className="font-medium text-slate-200">choke on messy legacy at
-              volume</span> — they index a handful of clean docs and call it done. GCTRL is built to ingest the{' '}
+              volume</span> - they index a handful of clean docs and call it done. GCTRL is built to ingest the{' '}
               <em>mess</em> and resolve it <span className="font-medium text-slate-200">deterministically</span> into
-              structured, queryable knowledge — turning a liability into a moat, without breaking compliance.
+              structured, queryable knowledge - turning a liability into a moat, without breaking compliance.
             </p>
             <div className="mt-7 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
               {[
-                ['Ingest at volume', 'Decades of mailservers, SharePoint, SQL and file shares — pulled in at scale, not a sample.'],
+                ['Ingest at volume', 'Decades of mailservers, SharePoint, SQL and file shares - pulled in at scale, not a sample.'],
                 ['Deterministic entity resolution', 'FUSE matches records describing the same entity across systems and merges them, repeatably.'],
                 ['Contradictions reconciled', 'Conflicting and duplicate facts collapse into one canonical, trustworthy version.'],
-                ['Provenance & lineage', 'Every fact traces back to its source system and document — nothing is a black box.'],
+                ['Provenance & lineage', 'Every fact traces back to its source system and document - nothing is a black box.'],
                 ['Retention preserved', 'Original retention and deletion rules carry through, so compliance stays intact.'],
                 ['Clearance enforced', 'The resulting graph is queried under the same classification rules as the rest of GCTRL.'],
               ].map(([title, body]) => (

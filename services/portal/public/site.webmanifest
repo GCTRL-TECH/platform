@@ -1,7 +1,7 @@
 {
-  "name": "GCTRL — Ground Control",
+  "name": "GCTRL - Ground Control",
   "short_name": "GCTRL",
-  "description": "The Enterprise Memory Layer for AI — self-hosted knowledge graphs and governed memory for AI agents.",
+  "description": "The Enterprise Memory Layer for AI - self-hosted knowledge graphs and governed memory for AI agents.",
   "start_url": "/",
   "icons": [
     { "src": "/favicon/favicon-192.png", "sizes": "192x192", "type": "image/png" },

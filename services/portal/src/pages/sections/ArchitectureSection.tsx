@@ -63,7 +63,7 @@ export function ArchitectureSection() {
             </span>
           </h2>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
-            Sources flow in, agents plug in, and access control governs both — while GCTRL organises everything into
+            Sources flow in, agents plug in, and access control governs both - while GCTRL organises everything into
             layered memory on top of <span className="font-medium text-slate-200">swappable</span> storage. Bundled for
             a one-line install; point it at your own Neo4j, Qdrant and Postgres anytime. No lock-in.
           </p>
@@ -71,8 +71,8 @@ export function ArchitectureSection() {
           <ul className="mt-7 space-y-4">
             {[
               ['Ingest from any source', 'SharePoint, Google Drive, email archives and other silos stream in through a governed ingestion layer.'],
-              ['Full classification control', 'Per-element clearance on nodes, edges and chunks. Scoped tokens for every user and agent. Merge everyone’s knowledge into one graph and classification still holds — each person sees only what they’re cleared for. Granular, auditable, on every read and write.'],
-              ['Parallel memory layers', 'Hot dossiers, warm chunks, the cold graph, and a curated Wiki — each backed by its own store, organised on a high-performance core.'],
+              ['Full classification control', 'Per-element clearance on nodes, edges and chunks. Scoped tokens for every user and agent. Merge everyone’s knowledge into one graph and classification still holds - each person sees only what they’re cleared for. Granular, auditable, on every read and write.'],
+              ['Parallel memory layers', 'Hot dossiers, warm chunks, the cold graph, and a curated Wiki - each backed by its own store, organised on a high-performance core.'],
               ['Your agents plug in over MCP', 'Claude, Codex, Hermes and more gain durable, access-controlled memory as a team member.'],
             ].map(([title, body]) => (
               <li key={title} className="flex gap-3">

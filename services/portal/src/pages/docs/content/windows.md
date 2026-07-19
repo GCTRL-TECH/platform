@@ -2,7 +2,7 @@
 
 This guide walks through a complete installation of GCTRL on Windows. GCTRL runs as Docker containers; on Windows those containers run through **Docker Desktop with the WSL 2 backend**. You run the installer from inside a WSL 2 (Ubuntu) terminal and access the dashboard from your normal Windows browser.
 
-For full performance you also install **native Ollama for Windows** (GPU-accelerated) and point GCTRL at it — see [Infrastructure](infrastructure.md) for the why behind this. The general install flow mirrors [Installation](installation.md), adapted for Windows.
+For full performance you also install **native Ollama for Windows** (GPU-accelerated) and point GCTRL at it - see [Infrastructure](infrastructure.md) for the why behind this. The general install flow mirrors [Installation](installation.md), adapted for Windows.
 
 ## Overview
 
@@ -25,7 +25,7 @@ For full performance you also install **native Ollama for Windows** (GPU-acceler
 | **16 GB+ RAM** | Minimum. Larger models need more. |
 | **NVIDIA GPU (recommended)** | Used via native Ollama for full performance. |
 
-## Step 1 — Install Docker Desktop
+## Step 1 - Install Docker Desktop
 
 1. Download Docker Desktop for Windows from https://www.docker.com/products/docker-desktop and install it.
 2. Launch Docker Desktop.
@@ -34,7 +34,7 @@ For full performance you also install **native Ollama for Windows** (GPU-acceler
 
 > Docker Desktop must be running whenever you use GCTRL. If it is stopped, the platform will not start.
 
-## Step 2 — Install WSL 2 and Ubuntu
+## Step 2 - Install WSL 2 and Ubuntu
 
 1. Open **PowerShell as Administrator**.
 2. Install WSL with the default Ubuntu distribution:
@@ -49,9 +49,9 @@ For full performance you also install **native Ollama for Windows** (GPU-acceler
 
 This lets Docker Desktop run containers inside the WSL 2 environment that your Ubuntu shell talks to.
 
-## Step 3 — Install native Ollama for Windows
+## Step 3 - Install native Ollama for Windows
 
-This step unlocks GPU acceleration. The Ollama bundled inside Docker is **CPU-only** — Docker cannot reach your NVIDIA GPU. Installing Ollama natively on Windows lets GCTRL use the GPU for both the RAG/agent path and KEX extraction and embeddings. See [Infrastructure](infrastructure.md) for more detail.
+This step unlocks GPU acceleration. The Ollama bundled inside Docker is **CPU-only** - Docker cannot reach your NVIDIA GPU. Installing Ollama natively on Windows lets GCTRL use the GPU for both the RAG/agent path and KEX extraction and embeddings. See [Infrastructure](infrastructure.md) for more detail.
 
 1. Download **Ollama for Windows** (native, NVIDIA-GPU accelerated) from https://ollama.com/download.
 2. Install and run it.
@@ -65,7 +65,7 @@ This step unlocks GPU acceleration. The Ollama bundled inside Docker is **CPU-on
 
 You connect GCTRL to this native Ollama in step 6.
 
-## Step 4 — Run the GCTRL installer
+## Step 4 - Run the GCTRL installer
 
 1. Open an **Ubuntu (WSL) terminal** (search "Ubuntu" in the Start menu, or run `wsl` in PowerShell).
 2. Run the installer:
@@ -94,7 +94,7 @@ GCTRL_MODEL=qwen2.5:7b curl -fsSL https://gctrl.tech/install | bash
 | FUSE (fusion / entity resolution) | `4020` |
 | License agent | `7070` |
 
-## Step 5 — Create your account and activate
+## Step 5 - Create your account and activate
 
 1. Open **http://localhost:3001** in your Windows browser.
 2. Create your admin account.
@@ -106,7 +106,7 @@ GCTRL_MODEL=qwen2.5:7b curl -fsSL https://gctrl.tech/install | bash
 
 For more on licensing, see [Activation](activation.md).
 
-## Step 6 — Point GCTRL at native Ollama
+## Step 6 - Point GCTRL at native Ollama
 
 This repoints **both** the RAG/agent path **and** KEX extraction and embeddings to your native, GPU-accelerated Ollama.
 
@@ -121,7 +121,7 @@ This repoints **both** the RAG/agent path **and** KEX extraction and embeddings 
 
 `host.docker.internal` is how containers reach a service running on your Windows host, so this points the in-container GCTRL at the native Windows Ollama from step 3.
 
-Without this switch, GCTRL keeps using the bundled CPU-only Ollama — fine to start, slow for real work. See [Infrastructure](infrastructure.md) for details on the inference path.
+Without this switch, GCTRL keeps using the bundled CPU-only Ollama - fine to start, slow for real work. See [Infrastructure](infrastructure.md) for details on the inference path.
 
 ## Troubleshooting
 
@@ -135,6 +135,6 @@ Without this switch, GCTRL keeps using the bundled CPU-only Ollama — fine to s
 
 ## Next steps
 
-- [Activation](activation.md) — create your admin account and enter your license key.
-- [Infrastructure](infrastructure.md) — native Ollama, GPU, and swappable backing stores.
-- [Quickstart](quickstart.md) — your first extraction and graph.
+- [Activation](activation.md) - create your admin account and enter your license key.
+- [Infrastructure](infrastructure.md) - native Ollama, GPU, and swappable backing stores.
+- [Quickstart](quickstart.md) - your first extraction and graph.

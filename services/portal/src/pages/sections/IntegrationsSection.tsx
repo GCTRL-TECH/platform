@@ -9,7 +9,7 @@ const WHITE = 'FFFFFF'
 
 // Microsoft pulled its brand marks from simpleicons (sharepoint/office/azure/
 // onedrive all 404 there now), so the Microsoft tile is an inline white
-// 4-square mark instead — renders reliably and matches the monochrome style.
+// 4-square mark instead - renders reliably and matches the monochrome style.
 function MicrosoftLogo() {
   return (
     <svg viewBox="0 0 23 23" className="h-8 w-8" aria-hidden="true" fill="#FFFFFF">

@@ -21,7 +21,7 @@ export function LandingPage() {
   return (
     <div className="min-h-screen bg-[#020617]">
       <Seo
-        title="GCTRL — The Enterprise Memory Layer for AI"
+        title="GCTRL - The Enterprise Memory Layer for AI"
         description="GCTRL (Ground Control) is the self-hosted knowledge graph and governed memory layer for AI agents. On-prem, local inference, no vendor lock-in, no token tax."
         path="/"
         jsonLd={landingJsonLd}

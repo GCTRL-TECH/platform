@@ -26,12 +26,12 @@ For teams that want frontier models or higher throughput, GCTRL also supports:
 
 Connect providers in **Settings → connect provider**:
 
-- **Cloud keys are encrypted at rest** and are **never returned** by the API — once saved, a key cannot be read back out.
-- **Cloud base URLs are pinned and SSRF-guarded** — GCTRL only talks to the provider's known endpoint, preventing request forgery to internal hosts.
+- **Cloud keys are encrypted at rest** and are **never returned** by the API - once saved, a key cannot be read back out.
+- **Cloud base URLs are pinned and SSRF-guarded** - GCTRL only talks to the provider's known endpoint, preventing request forgery to internal hosts.
 
 ## Embeddings
 
-Embeddings default to **`nomic-embed-text`**, run **locally**. This keeps the vector index — and the content it represents — on your machine regardless of which generation provider you select.
+Embeddings default to **`nomic-embed-text`**, run **locally**. This keeps the vector index - and the content it represents - on your machine regardless of which generation provider you select.
 
 ## Choosing for data sovereignty
 
@@ -39,5 +39,5 @@ Embeddings default to **`nomic-embed-text`**, run **locally**. This keeps the ve
 
 ## See also
 
-- [Infrastructure](infrastructure.md) — switch to native GPU-accelerated Ollama for a major speedup
-- [Performance](performance.md) — pick the right model for your hardware
+- [Infrastructure](infrastructure.md) - switch to native GPU-accelerated Ollama for a major speedup
+- [Performance](performance.md) - pick the right model for your hardware

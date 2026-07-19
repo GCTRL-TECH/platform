@@ -13,25 +13,25 @@ const PILLARS: { Icon: LucideIcon; color: keyof typeof ICON_CLS; title: string; 
     Icon: SlidersHorizontal,
     color: 'indigo',
     title: 'Per-element classification',
-    body: 'Nodes, edges, and chunks each carry their own clearance markings. Sensitivity travels with the data, not the schema — so it survives every merge, query, and export.',
+    body: 'Nodes, edges, and chunks each carry their own clearance markings. Sensitivity travels with the data, not the schema - so it survives every merge, query, and export.',
   },
   {
     Icon: KeyRound,
     color: 'violet',
     title: 'Scoped tokens for users AND agents',
-    body: 'Issue narrow, time-bound, revocable capabilities to a person or an AI agent. Every retrieval is filtered server-side against the caller’s scope — never a client-side hint that can be ignored.',
+    body: 'Issue narrow, time-bound, revocable capabilities to a person or an AI agent. Every retrieval is filtered server-side against the caller’s scope - never a client-side hint that can be ignored.',
   },
   {
     Icon: ScrollText,
     color: 'cyan',
     title: 'Forensic audit trail',
-    body: 'Every access, every denial, every scope grant — captured with the caller, the context, and the verdict. The receipts your CISO, auditors, and DPO accept before procurement signs.',
+    body: 'Every access, every denial, every scope grant - captured with the caller, the context, and the verdict. The receipts your CISO, auditors, and DPO accept before procurement signs.',
   },
   {
     Icon: Network,
     color: 'indigo',
     title: 'Granular orchestration',
-    body: 'Merge the whole organisation’s knowledge into one graph — and classification still holds. Two people of different clearance query the same data and each sees only what they’re cleared for.',
+    body: 'Merge the whole organisation’s knowledge into one graph - and classification still holds. Two people of different clearance query the same data and each sees only what they’re cleared for.',
   },
 ]
 
@@ -51,8 +51,8 @@ export function SpeedOfTrustSection() {
           </h2>
           <p className="mx-auto mt-6 max-w-2xl text-lg leading-relaxed text-slate-300">
             Anyone can bolt an LLM onto a database. The hard, unglamorous part is controlling exactly
-            who — human or agent — can touch which fact, and proving it forever after.
-            We built GCTRL knowing that in the enterprise, <span className="font-medium text-white">compliance isn’t a feature — it’s the permission to exist.</span>
+            who - human or agent - can touch which fact, and proving it forever after.
+            We built GCTRL knowing that in the enterprise, <span className="font-medium text-white">compliance isn’t a feature - it’s the permission to exist.</span>
           </p>
         </div>
 
@@ -83,14 +83,14 @@ export function SpeedOfTrustSection() {
           ))}
         </div>
 
-        {/* Proof tie-in — the moat costs nothing at query time */}
+        {/* Proof tie-in - the moat costs nothing at query time */}
         <a
           href="#benchmarks"
           className="reveal mt-8 flex flex-col items-center justify-between gap-3 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 px-6 py-5 transition-colors hover:border-emerald-500/40 sm:flex-row"
         >
           <p className="text-sm text-slate-300">
             <span className="font-semibold text-emerald-300">And it’s effectively free.</span> Classification and scope
-            enforcement add <span className="font-medium text-white">≈ 0 ms</span> to retrieval — security with no
+            enforcement add <span className="font-medium text-white">≈ 0 ms</span> to retrieval - security with no
             performance tax.
           </p>
           <span className="shrink-0 text-sm font-medium text-emerald-300">See the facts ↓</span>

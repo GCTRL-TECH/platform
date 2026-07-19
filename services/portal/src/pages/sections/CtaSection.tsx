@@ -4,13 +4,13 @@ import { Terminal, Plug2, FolderSync } from 'lucide-react'
 const STEPS: { icon: typeof Terminal; title: string; desc: string }[] = [
   {
     icon: Terminal,
-    title: '1 · Install locally — free',
+    title: '1 · Install locally - free',
     desc: 'One command, fully self-hosted. Unlimited tokens from day one.',
   },
   {
     icon: Plug2,
     title: '2 · Connect your AI',
-    desc: 'Claude Code, Codex, Cursor or any MCP client — one config block.',
+    desc: 'Claude Code, Codex, Cursor or any MCP client - one config block.',
   },
   {
     icon: FolderSync,
@@ -29,7 +29,7 @@ export function CtaSection() {
 
       <div className="relative z-10 mx-auto max-w-3xl text-center">
         <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-wider text-indigo-300 reveal">
-          Ground Control — Ready for Launch
+          Ground Control - Ready for Launch
         </div>
 
         <h2 className="mb-6 text-4xl font-bold leading-tight text-white md:text-5xl reveal">

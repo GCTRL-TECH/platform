@@ -8,7 +8,7 @@ function toText(node: ReactNode): string {
   if (node == null || node === false) return ''
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(toText).join('')
-  // @ts-expect-error – React element children
+  // @ts-expect-error - React element children
   if (node?.props?.children) return toText(node.props.children)
   return ''
 }

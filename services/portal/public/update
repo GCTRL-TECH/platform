@@ -28,11 +28,11 @@ needs_update() {
   local_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null | sed 's/.*@//' || echo "")
 
   if [ -z "$local_digest" ]; then
-    return 0  # not pulled yet — definitely needs pull
+    return 0  # not pulled yet - definitely needs pull
   fi
 
   # Remote INDEX digest = sha256 of the raw manifest-list bytes. NOTE: the old
-  # check grep'd the FIRST child "digest" out of `docker manifest inspect` — for a
+  # check grep'd the FIRST child "digest" out of `docker manifest inspect` - for a
   # multi-arch image that's a per-platform digest, never the index digest, so it
   # NEVER matched and every service always showed "update available". Hashing the
   # raw index manifest gives the same digest the daemon stores locally.
@@ -41,7 +41,7 @@ needs_update() {
 
   # buildx missing / image unreachable → sha256 of empty input. Can't check → pull.
   if [ -z "$remote_digest" ] || [ "$remote_digest" = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]; then
-    return 0  # can't check — pull to be safe
+    return 0  # can't check - pull to be safe
   fi
 
   if [ "$local_digest" = "$remote_digest" ]; then
@@ -52,7 +52,7 @@ needs_update() {
 }
 
 # ── Collect services from compose file ────────────────────────────────────────
-# Only check the core GCTRL services — skip bundled infra (postgres, redis, etc.)
+# Only check the core GCTRL services - skip bundled infra (postgres, redis, etc.)
 SERVICES=(
   "gctrl-agent:ghcr.io/gctrl-tech/agent:latest"
   "gctrl-api:ghcr.io/gctrl-tech/api:latest"

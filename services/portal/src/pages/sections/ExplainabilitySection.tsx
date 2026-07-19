@@ -10,17 +10,17 @@ type Point = {
 const POINTS: Point[] = [
   {
     title: 'Every answer is traceable',
-    body: 'Vectors only tell you how similar two chunks are. The graph reconstructs the exact path — query to entities to source documents — so every answer comes with timestamps and a confidence score.',
+    body: 'Vectors only tell you how similar two chunks are. The graph reconstructs the exact path - query to entities to source documents - so every answer comes with timestamps and a confidence score.',
     icon: Route,
   },
   {
     title: 'Audit-ready by default',
-    body: 'GDPR Article 22 and ISO 27001 demand explainable decisions. The graph layer hands compliance teams that audit trail out of the box — no custom tooling required.',
+    body: 'GDPR Article 22 and ISO 27001 demand explainable decisions. The graph layer hands compliance teams that audit trail out of the box - no custom tooling required.',
     icon: ShieldCheck,
   },
   {
     title: 'Sovereign and on-prem',
-    body: 'Run Neo4j, Qdrant, and the full GCTRL stack inside your own perimeter. No data leaves, no vendor lock-in — total sovereignty.',
+    body: 'Run Neo4j, Qdrant, and the full GCTRL stack inside your own perimeter. No data leaves, no vendor lock-in - total sovereignty.',
     icon: ServerCog,
   },
 ]
@@ -51,7 +51,7 @@ export function ExplainabilitySection() {
           </h2>
           <p className="mx-auto mt-4 max-w-2xl leading-relaxed text-slate-400">
             Vectors tell you <em>how similar</em> two chunks are. The knowledge graph tells you <em>why</em> an answer is
-            correct — and proves it with a reasoning path you can follow all the way back to the source.
+            correct - and proves it with a reasoning path you can follow all the way back to the source.
           </p>
         </div>
 

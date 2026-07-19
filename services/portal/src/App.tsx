@@ -63,7 +63,7 @@ function LandingRoute() {
 // Query client + auth context used to live in main.tsx wrapping <BrowserRouter>.
 // vite-react-ssg builds its own router directly from the `routes` data below
 // (no <BrowserRouter> element to wrap), so the same provider nesting now
-// lives in this root layout route instead — one root route wrapping every
+// lives in this root layout route instead - one root route wrapping every
 // other route via <Outlet/>, functionally identical to the old JSX tree.
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -123,7 +123,7 @@ export const routes: RouteRecord[] = [
 
       { path: '/', element: <LandingRoute /> },
 
-      // Public marketing pages — viewable regardless of auth. Prerendered by
+      // Public marketing pages - viewable regardless of auth. Prerendered by
       // vite-react-ssg (see vite.config.ts ssgOptions.includedRoutes).
       { path: '/docs', element: <DocsPage /> },
       {

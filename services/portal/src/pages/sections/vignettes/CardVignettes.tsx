@@ -2,7 +2,7 @@ import { useEffect, useRef, type CSSProperties, type ReactNode } from 'react'
 import { Check } from 'lucide-react'
 
 /**
- * Card micro-vignettes — the fusion-story visual language (glowing dots,
+ * Card micro-vignettes - the fusion-story visual language (glowing dots,
  * hairline edges, slate chips, percent-native canvas) shrunk into small
  * looping scenes that act out each card's message. All timing lives in the
  * shared 6s `vig-*` keyframes (globals.css); geometry comes in per instance
@@ -11,7 +11,7 @@ import { Check } from 'lucide-react'
  * Convention (mirrors the CSS): BASE inline styles are the resolved END
  * state of each scene. The keyframes carry every transient state, so with
  * reduced motion (animation: none) each canvas still shows a meaningful
- * static diagram — never an empty box.
+ * static diagram - never an empty box.
  */
 
 /** Pause all loops while the vignette is offscreen. */
@@ -59,7 +59,7 @@ function VDot({
 }) {
   return (
     // Only the dot is in-flow (translate(-50%,-50%) centres it on x/y);
-    // the label hangs below without shifting the anchor — same trick as
+    // the label hangs below without shifting the anchor - same trick as
     // the fusion story's Node.
     <div
       className={`absolute -translate-x-1/2 -translate-y-1/2 ${className}`}
@@ -109,7 +109,7 @@ function Edges({ children }: { children: ReactNode }) {
   )
 }
 
-/* ── Problem 1: Locked in silos — dots trapped in boxes; one keeps
+/* ── Problem 1: Locked in silos - dots trapped in boxes; one keeps
       trying to cross the wall and bounces off. ─────────────────────── */
 export function SilosVignette() {
   return (
@@ -141,7 +141,7 @@ export function SilosVignette() {
   )
 }
 
-/* ── Problem 2: Messy & contradictory — the canonical duplicate pair
+/* ── Problem 2: Messy & contradictory - the canonical duplicate pair
       plus one fact flickering between two values. ──────────────────── */
 export function ConflictVignette() {
   return (
@@ -159,7 +159,7 @@ export function ConflictVignette() {
       <span className="vig-flicker absolute left-1/2 top-[30%] -translate-x-1/2 -translate-y-1/2 text-xs font-semibold text-amber-300" style={{ animationDelay: '-1.2s' }}>
         ≠
       </span>
-      {/* Same fact, two truths — chips stacked on one spot, anti-phase */}
+      {/* Same fact, two truths - chips stacked on one spot, anti-phase */}
       <VChip x={50} y={78} tone="slate" className="vig-alt">Revenue: €1.2M</VChip>
       <VChip x={50} y={78} tone="amber" className="vig-alt" style={{ animationDelay: '-3s', opacity: 0 }}>
         Revenue: €2.1M
@@ -168,7 +168,7 @@ export function ConflictVignette() {
   )
 }
 
-/* ── Problem 3: Governance overwhelming — the clearance ring that
+/* ── Problem 3: Governance overwhelming - the clearance ring that
       never manages to close around the cluster. ────────────────────── */
 export function GovernanceVignette() {
   return (
@@ -196,7 +196,7 @@ export function GovernanceVignette() {
   )
 }
 
-/* ── Step 01: Ingest — dots cross the classification gate and come out
+/* ── Step 01: Ingest - dots cross the classification gate and come out
       wearing their clearance ring. ─────────────────────────────────── */
 export function IngestVignette() {
   const ring = 'rgba(129, 140, 248, 0.45)'
@@ -230,12 +230,12 @@ export function IngestVignette() {
   )
 }
 
-/* ── Step 02: Resolve & fuse — the duplicate pair from Problem 2 slides
+/* ── Step 02: Resolve & fuse - the duplicate pair from Problem 2 slides
       together and flashes into one canonical node; ≠ becomes =. ─────── */
 export function FuseVignette() {
   return (
     <Canvas>
-      {/* No labels on the sliding pair — they'd smear across each other
+      {/* No labels on the sliding pair - they'd smear across each other
           mid-flight; the merged node carries the canonical name. */}
       <VDot y={46} color="violet" className="vig-merge-dot" style={{ left: '50%', opacity: 0, ['--x0' as string]: '22%' }} />
       <VDot y={46} color="violet" className="vig-merge-dot" style={{ left: '50%', opacity: 0, ['--x0' as string]: '78%' }} />
@@ -250,7 +250,7 @@ export function FuseVignette() {
   )
 }
 
-/* ── Step 03: Organise into memory — dots settle into their layer.
+/* ── Step 03: Organise into memory - dots settle into their layer.
       (The tetris beat: falling pieces finding their place.) ─────────── */
 export function LayersVignette() {
   const SHELVES = [
@@ -284,7 +284,7 @@ export function LayersVignette() {
   )
 }
 
-/* ── Step 04: Serve to agents — a query edge lights up, the answer dot
+/* ── Step 04: Serve to agents - a query edge lights up, the answer dot
       travels back to the agent, audited and with provenance. ────────── */
 export function ServeVignette() {
   return (

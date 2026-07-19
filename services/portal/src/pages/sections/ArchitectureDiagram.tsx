@@ -56,7 +56,7 @@ export function ArchitectureDiagram() {
   return (
     <div className="relative flex h-full w-full items-center justify-center px-2 py-4">
       <div className="w-full max-w-sm">
-        {/* Layer 1 — Sources & Agents */}
+        {/* Layer 1 - Sources & Agents */}
         <Panel caption="Sources & Agents">
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
@@ -80,14 +80,14 @@ export function ArchitectureDiagram() {
           <Lane color={CI.violet} dir="both" />
         </div>
 
-        {/* Layer 2 — GCTRL Middleware (access control + core + memory) */}
+        {/* Layer 2 - GCTRL Middleware (access control + core + memory) */}
         <Panel caption="GCTRL · Middleware" emphasized>
           <div className="grid grid-cols-2 gap-3">
             <Chip label="Ingestion" sub="classify" accent={CI.indigo} />
             <Chip label="Access rights" sub="clearance" accent={CI.indigo} />
           </div>
 
-          {/* core — centered, with a slow, subtle pulse behind it */}
+          {/* core - centered, with a slow, subtle pulse behind it */}
           <div className="relative mx-auto mt-3 w-2/5">
             <div
               className="arch-glow-pulse pointer-events-none absolute -inset-6 rounded-full"
@@ -118,7 +118,7 @@ export function ArchitectureDiagram() {
           {MEM.map((m) => <Lane key={m.label} color={m.color} dir="both" />)}
         </div>
 
-        {/* Layer 3 — Your Infrastructure */}
+        {/* Layer 3 - Your Infrastructure */}
         <Panel caption="Your Infrastructure · swappable">
           <div className="grid grid-cols-4 gap-1.5">
             {STORE.map((s, i) => <Chip key={`${s}-${i}`} label={s} accent={CI.sky} />)}

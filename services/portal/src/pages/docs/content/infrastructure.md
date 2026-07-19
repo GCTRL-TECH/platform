@@ -17,7 +17,7 @@ HTTP services (Qdrant, Ollama) re-target on the fly. Pooled database connections
 
 ## The big one: switch to native Ollama for GPU acceleration
 
-The bundled Ollama runs **inside Docker**. On **macOS / Apple Silicon, Docker cannot access the Apple GPU (Metal)** — so the containerized Ollama runs **CPU-only**, leaving the machine's GPU and unified memory completely unused. On a capable Mac this is the difference between sluggish and fast.
+The bundled Ollama runs **inside Docker**. On **macOS / Apple Silicon, Docker cannot access the Apple GPU (Metal)** - so the containerized Ollama runs **CPU-only**, leaving the machine's GPU and unified memory completely unused. On a capable Mac this is the difference between sluggish and fast.
 
 **The fix: run Ollama natively on the host and point GCTRL at it.** One setting repoints **both** the RAG/agent path **and** KEX extraction/embeddings to the GPU-accelerated native Ollama.
 
@@ -50,7 +50,7 @@ That **one switch** routes **both**:
 - the **RAG / agent path** (Talk-to-Graph generation), **and**
 - **KEX extraction and embeddings**
 
-to the native, GPU-accelerated Ollama — recovering the Apple GPU and unified memory the Docker path could never touch.
+to the native, GPU-accelerated Ollama - recovering the Apple GPU and unified memory the Docker path could never touch.
 
 ### Linux
 
@@ -58,5 +58,5 @@ The same idea applies on Linux: run a **host-native Ollama with a GPU** (e.g. an
 
 ## See also
 
-- [Performance](performance.md) — the full best-performance guide, where native Ollama is the biggest lever
-- [LLM Providers](llm-providers.md) — model and provider selection
+- [Performance](performance.md) - the full best-performance guide, where native Ollama is the biggest lever
+- [LLM Providers](llm-providers.md) - model and provider selection

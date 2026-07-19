@@ -39,13 +39,13 @@ export const DOC_GROUPS: DocGroup[] = [
   {
     group: 'Technology',
     pages: [
-      { slug: 'tech-kex', title: 'KEX — Knowledge Extraction' },
-      { slug: 'tech-fuse', title: 'FUSE — Knowledge Fusion' },
+      { slug: 'tech-kex', title: 'KEX - Knowledge Extraction' },
+      { slug: 'tech-fuse', title: 'FUSE - Knowledge Fusion' },
       { slug: 'tech-classification', title: 'Classification & Access Control' },
       { slug: 'tech-multi-agent-fabric', title: 'Multi-Agent Fabric' },
-      { slug: 'tech-cloaking', title: 'Cloaking — Private Memory for Cloud Models' },
+      { slug: 'tech-cloaking', title: 'Cloaking - Private Memory for Cloud Models' },
       { slug: 'tech-sovereign', title: 'Sovereign & On-Prem' },
-      { slug: 'tech-talk-to-graph', title: 'Talk to Graph — Grounded, GDPR-Compliant RAG' },
+      { slug: 'tech-talk-to-graph', title: 'Talk to Graph - Grounded, GDPR-Compliant RAG' },
       { slug: 'tech-memory-layer', title: 'Why a Memory Layer' },
     ],
   },

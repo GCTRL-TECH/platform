@@ -31,7 +31,7 @@ function LegalLayout({
   }, [])
   return (
     <div className="min-h-screen bg-[#020617]">
-      <Seo title={`${title} — GCTRL`} description={description} path={path} />
+      <Seo title={`${title} - GCTRL`} description={description} path={path} />
       <SiteHeader />
       <section className="px-6 pt-32 pb-24">
         <div className="mx-auto max-w-3xl">

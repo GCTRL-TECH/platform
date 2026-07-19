@@ -14,28 +14,28 @@ const STEPS: Step[] = [
   {
     num: '01',
     title: 'Ingest',
-    body: 'Connect any source — SharePoint, Google Drive, email archives, databases, APIs. A governed ingestion layer classifies and tags everything on the way in.',
+    body: 'Connect any source - SharePoint, Google Drive, email archives, databases, APIs. A governed ingestion layer classifies and tags everything on the way in.',
     Vignette: IngestVignette,
     gradient: 'from-indigo-500 to-indigo-400',
   },
   {
     num: '02',
     title: 'Resolve & fuse',
-    body: 'FUSE collapses duplicates and contradictions across every source into one clean, canonical knowledge graph — no conflicting copies, one version of the truth.',
+    body: 'FUSE collapses duplicates and contradictions across every source into one clean, canonical knowledge graph - no conflicting copies, one version of the truth.',
     Vignette: FuseVignette,
     gradient: 'from-violet-500 to-violet-400',
   },
   {
     num: '03',
     title: 'Organise into memory',
-    body: 'Facts land in layered memory — hot dossiers, warm chunks, the cold graph, and a curated Wiki — on top of your swappable Neo4j + Qdrant.',
+    body: 'Facts land in layered memory - hot dossiers, warm chunks, the cold graph, and a curated Wiki - on top of your swappable Neo4j + Qdrant.',
     Vignette: LayersVignette,
     gradient: 'from-fuchsia-500 to-cyan-400',
   },
   {
     num: '04',
     title: 'Serve to agents',
-    body: 'Your agents query it over MCP — clearance-filtered and fully audited — returning grounded answers with provenance, not guesses.',
+    body: 'Your agents query it over MCP - clearance-filtered and fully audited - returning grounded answers with provenance, not guesses.',
     Vignette: ServeVignette,
     gradient: 'from-cyan-500 to-cyan-400',
   },
@@ -87,7 +87,7 @@ export function HowItWorksSection() {
 
         <div className="mt-14 flex flex-col items-center gap-4 text-center reveal reveal-delay-5">
           <p className="text-sm text-slate-400">
-            One governed flow — ingestion to answer — with provenance preserved at every hop.
+            One governed flow - ingestion to answer - with provenance preserved at every hop.
           </p>
           <Link to="/docs/architecture" className="btn-cta-secondary">
             Explore the architecture

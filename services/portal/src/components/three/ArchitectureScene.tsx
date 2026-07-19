@@ -4,7 +4,7 @@ import { EffectComposer, Bloom } from '@react-three/postprocessing'
 import * as THREE from 'three'
 
 // A smooth, slowly-rotating spiral galaxy in the CI palette (indigo → violet →
-// cyan). Pure background visual — the readable architecture sits on top as DOM.
+// cyan). Pure background visual - the readable architecture sits on top as DOM.
 function Galaxy() {
   const ref = useRef<THREE.Points>(null)
 

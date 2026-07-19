@@ -132,7 +132,7 @@ export function DocsPage() {
     <div className="min-h-screen bg-[#020617]">
       {content ? (
         <Seo
-          title={`${title} — GCTRL Docs`}
+          title={`${title} - GCTRL Docs`}
           description={getDocDescription(slug)}
           path={`/docs/${slug}`}
           type="article"
@@ -145,7 +145,7 @@ export function DocsPage() {
           }}
         />
       ) : (
-        <Seo title="Page not found — GCTRL Docs" description="No documentation page matches this URL." path={`/docs/${slug}`} noindex />
+        <Seo title="Page not found - GCTRL Docs" description="No documentation page matches this URL." path={`/docs/${slug}`} noindex />
       )}
       <SiteHeader />
       <div className="mx-auto max-w-7xl px-6 pt-24">

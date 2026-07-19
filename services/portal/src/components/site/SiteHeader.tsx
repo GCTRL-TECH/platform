@@ -14,13 +14,13 @@ const NAV: [label: string, href: string][] = [
 
 const USE_CASES: [label: string, href: string, desc: string][] = [
   ['Agentic Team Memory', '/use-cases#agentic-team-memory', 'Shared, access-controlled memory for your AI team'],
-  ['Airtight Client Projects', '/use-cases#project-isolation', 'One source of truth, per-project isolation — nothing mixes, even by accident'],
+  ['Airtight Client Projects', '/use-cases#project-isolation', 'One source of truth, per-project isolation - nothing mixes, even by accident'],
   ['Activate Your Legacy Data', '/use-cases#legacy-revival', 'Turn old mailservers, SharePoint & SQL into a clean graph'],
 ]
 
 const TECHNOLOGY: [label: string, href: string, desc: string][] = [
-  ['KEX — Knowledge Extraction', '/docs/tech-kex', 'Unstructured docs to structured graph, locally and fast'],
-  ['FUSE — Knowledge Fusion', '/docs/tech-fuse', 'One governed graph from many silos, zero training'],
+  ['KEX - Knowledge Extraction', '/docs/tech-kex', 'Unstructured docs to structured graph, locally and fast'],
+  ['FUSE - Knowledge Fusion', '/docs/tech-fuse', 'One governed graph from many silos, zero training'],
   ['Classification & Access Control', '/docs/tech-classification', 'Clearance-gated knowledge, built in rather than bolted on'],
   ['Multi-Agent Fabric', '/docs/tech-multi-agent-fabric', 'One governed memory layer for every agent framework'],
   ['Cloaking', '/docs/tech-cloaking', 'Use frontier cloud models without exposing your identities'],

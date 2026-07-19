@@ -138,7 +138,7 @@ export function LicenseDetailPage() {
               <p className="text-slate-200 flex items-center gap-1">
                 {license.lastHeartbeatAt
                   ? <><Clock size={12} /> {formatDistanceToNow(new Date(license.lastHeartbeatAt), { addSuffix: true })}</>
-                  : '—'}
+                  : '-'}
               </p>
             </div>
             <div>
@@ -175,7 +175,7 @@ export function LicenseDetailPage() {
       {/* Usage chart */}
       <div className="card space-y-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-slate-300">Usage — last 30 days</h2>
+          <h2 className="text-sm font-semibold text-slate-300">Usage - last 30 days</h2>
           <div className="flex items-center gap-4 text-xs text-slate-400">
             <span><span className="text-white font-medium">{totalCredits.toLocaleString()}</span> credits</span>
             <span><span className="text-white font-medium">{totalOps}</span> operations</span>

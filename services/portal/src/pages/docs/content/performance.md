@@ -16,9 +16,9 @@ Match the model to the hardware and to whether you are on the CPU or GPU path:
 
 | Model | Best for |
 |-------|----------|
-| **llama3.2:3b** | Small / fast — the **bundled CPU path**, where a lightweight model keeps latency usable |
+| **llama3.2:3b** | Small / fast - the **bundled CPU path**, where a lightweight model keeps latency usable |
 | **qwen2.5:7b** | **Strong extraction quality** for KEX once you have GPU acceleration |
-| **14b / 32b** | **Big-RAM machines** with a capable GPU — highest quality |
+| **14b / 32b** | **Big-RAM machines** with a capable GPU - highest quality |
 | **nomic-embed-text** | Embeddings (default, local) |
 
 Rule of thumb: small model on the CPU path, larger model once native GPU Ollama is in place.
@@ -36,7 +36,7 @@ Qdrant is **swappable**. If query latency matters, point GCTRL at a **faster vec
 
 ## 4. Scale ingest throughput at the graph layer
 
-Ingest throughput is bound by **graph (Neo4j) write speed**, **not** the matching engine. The entity-matching engine sustains **~2,750 entities/s** — the bottleneck on large ingests is how fast Neo4j can absorb writes.
+Ingest throughput is bound by **graph (Neo4j) write speed**, **not** the matching engine. The entity-matching engine sustains **~2,750 entities/s** - the bottleneck on large ingests is how fast Neo4j can absorb writes.
 
 For very large ingests:
 
@@ -59,5 +59,5 @@ In production, prefer pointing GCTRL at your **own managed Neo4j and Qdrant** (a
 
 ## See also
 
-- [Infrastructure](infrastructure.md) — how to make the changes above
-- [LLM Providers](llm-providers.md) — provider and model selection
+- [Infrastructure](infrastructure.md) - how to make the changes above
+- [LLM Providers](llm-providers.md) - provider and model selection

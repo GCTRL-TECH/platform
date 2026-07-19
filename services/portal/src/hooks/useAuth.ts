@@ -61,7 +61,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // On the client this starts `true` exactly as before (checked via effect
   // below). During SSG/prerendering there is no window/localStorage to check
   // and no effects run during the static render pass, so start `false` there
-  // — otherwise every route (including the public landing page) would only
+  // - otherwise every route (including the public landing page) would only
   // ever prerender its loading spinner instead of real content.
   const [isLoading, setIsLoading] = useState(() => typeof window !== 'undefined')
 

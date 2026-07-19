@@ -5,7 +5,7 @@ const PROBLEMS: { Vignette: ComponentType; title: string; body: string }[] = [
   {
     Vignette: SilosVignette,
     title: 'Locked in silos & legacy systems',
-    body: 'The knowledge your AI needs is scattered across SharePoint, old mailservers, legacy SQL, and orphaned file shares. Before anything is useful, you have to reach it — and just reaching it is a project of its own.',
+    body: 'The knowledge your AI needs is scattered across SharePoint, old mailservers, legacy SQL, and orphaned file shares. Before anything is useful, you have to reach it - and just reaching it is a project of its own.',
   },
   {
     Vignette: ConflictVignette,
@@ -15,7 +15,7 @@ const PROBLEMS: { Vignette: ComponentType; title: string; body: string }[] = [
   {
     Vignette: GovernanceVignette,
     title: 'Governance is overwhelming',
-    body: 'Even once you can reach the data — who is allowed to see what? Classification, clearance, and an audit trail across every source is a task most teams start, dread, and never finish.',
+    body: 'Even once you can reach the data - who is allowed to see what? Classification, clearance, and an audit trail across every source is a task most teams start, dread, and never finish.',
   },
 ]
 
@@ -26,7 +26,7 @@ export function ProblemSection() {
         <div className="mb-16 text-center reveal">
           <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-indigo-400">The real problem</p>
           <h2 className="mx-auto max-w-3xl text-4xl font-bold text-white md:text-5xl">
-            Your AI is only as good as your data —{' '}
+            Your AI is only as good as your data -{' '}
             <span className="bg-gradient-to-r from-indigo-400 via-violet-400 to-cyan-400 bg-clip-text text-transparent">
               and most data isn’t ready.
             </span>
@@ -34,7 +34,7 @@ export function ProblemSection() {
           <p className="mx-auto mt-5 max-w-2xl text-slate-400">
             Garbage in, garbage out. Before AI can deliver, your knowledge has to be{' '}
             <span className="text-slate-200">accessible</span>, <span className="text-slate-200">clean</span>, and{' '}
-            <span className="text-slate-200">governed</span> — and in most enterprises it’s none of the three.
+            <span className="text-slate-200">governed</span> - and in most enterprises it’s none of the three.
           </p>
         </div>
 
@@ -50,7 +50,7 @@ export function ProblemSection() {
 
         <p className="mx-auto mt-12 max-w-2xl text-center text-base text-slate-500 reveal">
           GCTRL exists to fix exactly this: it makes the messy, scattered, sensitive data your AI needs{' '}
-          <span className="text-slate-300">accessible, clean, and governed</span> — so what goes in is worth what comes out.
+          <span className="text-slate-300">accessible, clean, and governed</span> - so what goes in is worth what comes out.
         </p>
       </div>
     </section>

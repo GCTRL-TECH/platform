@@ -2,14 +2,14 @@ import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { MousePointer2, Plug2, Terminal } from 'lucide-react'
 
-// Same recolouring CDN trick as IntegrationsSection — /FFFFFF suffix returns
+// Same recolouring CDN trick as IntegrationsSection - /FFFFFF suffix returns
 // a white version of the mark server-side.
 const CDN = 'https://cdn.simpleicons.org'
 const WHITE = 'FFFFFF'
 
 const CLIENTS: { name: string; logo: string | null; node?: ReactNode }[] = [
   { name: 'Claude Code',   logo: `${CDN}/claude/${WHITE}` },
-  // OpenAI pulled its mark from simpleicons (404s) — lucide Terminal instead.
+  // OpenAI pulled its mark from simpleicons (404s) - lucide Terminal instead.
   { name: 'Codex',         logo: null, node: <Terminal className="h-5 w-5 text-white" strokeWidth={1.75} /> },
   { name: 'Cursor',        logo: null, node: <MousePointer2 className="h-5 w-5 text-white" strokeWidth={1.75} /> },
   { name: 'GitHub Copilot', logo: `${CDN}/githubcopilot/${WHITE}` },
@@ -20,7 +20,7 @@ const CLIENTS: { name: string; logo: string | null; node?: ReactNode }[] = [
 /**
  * Slim compatibility strip directly under the hero. One job: make it obvious
  * within the first scroll that GCTRL plugs into the AI tools people already
- * use — before any architecture talk.
+ * use - before any architecture talk.
  */
 export function WorksWithSection() {
   return (
@@ -42,7 +42,7 @@ export function WorksWithSection() {
         </div>
 
         <p className="mt-8 text-sm text-slate-500 reveal">
-          Your AI already speaks GCTRL — connect over MCP with one config block.{' '}
+          Your AI already speaks GCTRL - connect over MCP with one config block.{' '}
           <Link to="/integrations" className="text-indigo-400 transition-colors hover:text-indigo-300">
             See all integrations →
           </Link>

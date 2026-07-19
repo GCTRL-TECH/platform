@@ -1,6 +1,6 @@
 # Networking & Ports
 
-GCTRL's Docker stack is built around one rule: **expose exactly one port.** Everything the app needs — the UI, the REST API, the MCP-over-HTTP gateway, agent tool calls, graph embeds — rides through it. This page maps every port in the stack and shows the supported ways to reach that one port remotely.
+GCTRL's Docker stack is built around one rule: **expose exactly one port.** Everything the app needs - the UI, the REST API, the MCP-over-HTTP gateway, agent tool calls, graph embeds - rides through it. This page maps every port in the stack and shows the supported ways to reach that one port remotely.
 
 ## The one-port model
 
@@ -12,9 +12,9 @@ GCTRL's Docker stack is built around one rule: **expose exactly one port.** Ever
 | FUSE (fusion) | `gctrl-fuse` | 4020 | Loopback (`127.0.0.1`) | Entity resolution / fusion worker. Same rule. |
 | License agent | `gctrl-agent` | 7070 | Loopback (`127.0.0.1`) | Talks to `api.gctrl.tech` for license heartbeats; local status only. |
 | Ollama (bundled) | `gctrl-ollama` | 11434 | Loopback (`127.0.0.1`) | Local model inference. |
-| Postgres / Redis / Neo4j / Qdrant / resolver | `gctrl-postgres`, `gctrl-redis`, `gctrl-neo4j`, `gctrl-qdrant`, `gctrl-resolver` | — | Docker-network-internal only | No host port published at all — reachable only from other containers on the `gctrl` network. |
+| Postgres / Redis / Neo4j / Qdrant / resolver | `gctrl-postgres`, `gctrl-redis`, `gctrl-neo4j`, `gctrl-qdrant`, `gctrl-resolver` | - | Docker-network-internal only | No host port published at all - reachable only from other containers on the `gctrl` network. |
 
-Everything marked "loopback" is bound to `127.0.0.1:<port>` in the shipped compose file — reachable from processes on the host, but not from the network or the internet, even if you don't touch the firewall.
+Everything marked "loopback" is bound to `127.0.0.1:<port>` in the shipped compose file - reachable from processes on the host, but not from the network or the internet, even if you don't touch the firewall.
 
 ```
         internet / LAN                    host (127.0.0.1)              gctrl network
@@ -31,7 +31,7 @@ Everything marked "loopback" is bound to `127.0.0.1:<port>` in the shipped compo
                                      └──────────────────────┘  postgres/redis/neo4j/qdrant
 ```
 
-Because nginx proxies all of `/api/*` — the app UI, the REST API, the MCP-over-HTTP gateway (`/api/agent/mcp`), direct agent tool calls (`/api/agent/tools/*`), and graph embeds (`/embed/graph/...`, `/api/public/embed/...`) — a remote agent or browser needs nothing but this one origin plus an access token. There is no second port to open for "the API" or "the agent."
+Because nginx proxies all of `/api/*` - the app UI, the REST API, the MCP-over-HTTP gateway (`/api/agent/mcp`), direct agent tool calls (`/api/agent/tools/*`), and graph embeds (`/embed/graph/...`, `/api/public/embed/...`) - a remote agent or browser needs nothing but this one origin plus an access token. There is no second port to open for "the API" or "the agent."
 
 ## Remote access options
 
@@ -47,11 +47,11 @@ your-domain.com {
 }
 ```
 
-nginx or Traefik work the same way — proxy `443 → 127.0.0.1:3001`. Websockets and streaming responses need `Upgrade`/`Connection` headers forwarded; `services/web/nginx.conf` already sets these on its own `/api/` proxy, so as long as your outer proxy forwards them too (standard for nginx/Caddy/Traefik), MCP-over-HTTP and long-running extraction requests work unmodified.
+nginx or Traefik work the same way - proxy `443 → 127.0.0.1:3001`. Websockets and streaming responses need `Upgrade`/`Connection` headers forwarded; `services/web/nginx.conf` already sets these on its own `/api/` proxy, so as long as your outer proxy forwards them too (standard for nginx/Caddy/Traefik), MCP-over-HTTP and long-running extraction requests work unmodified.
 
 ### 2. Tailscale / VPN (recommended for private installs)
 
-No public port at all — the install stays off the internet entirely, reachable only to devices on your tailnet. This is the best default for a VPS you don't want publicly listed. See [Private access with Tailscale](tailscale.md) for exact commands.
+No public port at all - the install stays off the internet entirely, reachable only to devices on your tailnet. This is the best default for a VPS you don't want publicly listed. See [Private access with Tailscale](tailscale.md) for exact commands.
 
 ### 3. Plain LAN on port 3001
 
@@ -59,18 +59,18 @@ For a trusted local network only (e.g. a home lab or an isolated office VLAN), y
 
 ## What NOT to expose
 
-Never forward or publish 4000 (API), 4010 (KEX), 4020 (FUSE), 7070 (agent), 11434 (Ollama), or any database port (Postgres 5432, Neo4j 7474/7687, Qdrant 6333) — to the LAN or the internet.
+Never forward or publish 4000 (API), 4010 (KEX), 4020 (FUSE), 7070 (agent), 11434 (Ollama), or any database port (Postgres 5432, Neo4j 7474/7687, Qdrant 6333) - to the LAN or the internet.
 
 Two independent reasons:
 
-- **They're loopback-by-design.** The compose file binds them to `127.0.0.1`, not `0.0.0.0` — this is a deliberate trust boundary, not an oversight. Forwarding them (e.g. rebinding the compose or port-forwarding a router) removes that boundary.
+- **They're loopback-by-design.** The compose file binds them to `127.0.0.1`, not `0.0.0.0` - this is a deliberate trust boundary, not an oversight. Forwarding them (e.g. rebinding the compose or port-forwarding a router) removes that boundary.
 - **Internal trust, not user auth.** Calls between the API, KEX, and FUSE containers are gated by a shared `INTERNAL_API_SECRET`, not by the per-user access tokens that protect `/api/*` at the nginx layer. Exposing 4010/4020 directly bypasses that layer's authentication entirely.
 
-If you need direct database access remotely (a Neo4j Browser session, a Postgres client), tunnel over SSH or Tailscale — never open the port. See [Securing Your Deployment](security.md).
+If you need direct database access remotely (a Neo4j Browser session, a Postgres client), tunnel over SSH or Tailscale - never open the port. See [Securing Your Deployment](security.md).
 
 ## Outbound requirements
 
-GCTRL only needs a handful of outbound connections — no inbound port beyond 3001 (or your TLS/tailnet front door) is ever required for the platform to function:
+GCTRL only needs a handful of outbound connections - no inbound port beyond 3001 (or your TLS/tailnet front door) is ever required for the platform to function:
 
 | Destination | Purpose |
 |---|---|
@@ -79,7 +79,7 @@ GCTRL only needs a handful of outbound connections — no inbound port beyond 30
 | `api.gctrl.tech` | License heartbeat |
 | Your chosen cloud LLM provider (optional) | Only if you configure a cloud model instead of local Ollama |
 
-**Air-gapped note:** with no cloud LLM provider configured, the only outbound traffic GCTRL generates is updates and the license heartbeat — everything else (extraction, fusion, RAG, graph storage) runs fully offline against the bundled or self-hosted models and databases.
+**Air-gapped note:** with no cloud LLM provider configured, the only outbound traffic GCTRL generates is updates and the license heartbeat - everything else (extraction, fusion, RAG, graph storage) runs fully offline against the bundled or self-hosted models and databases.
 
 ## Firewall quick reference
 

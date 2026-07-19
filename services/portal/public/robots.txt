@@ -1,4 +1,4 @@
-# GCTRL — https://gctrl.tech
+# GCTRL - https://gctrl.tech
 # Open by design: we want GCTRL discoverable by search engines AND by LLM
 # crawlers/agents (the product is built to be used by AI agents, so being
 # findable and citable by them is part of the point).
@@ -13,7 +13,7 @@ Allow: /
 User-agent: Bingbot
 Allow: /
 
-# AI / LLM crawlers and training bots — explicitly allowed
+# AI / LLM crawlers and training bots - explicitly allowed
 User-agent: GPTBot
 Allow: /
 

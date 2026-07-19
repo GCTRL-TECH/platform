@@ -7,9 +7,9 @@
 # Default mode stops GCTRL and removes its images but PRESERVES your data
 # (Postgres / Neo4j / Qdrant volumes + ~/gctrl/data) so you can reinstall later.
 #
-# --purge (a.k.a. --all, or GCTRL_PURGE=1) does a COMPLETE removal — every
+# --purge (a.k.a. --all, or GCTRL_PURGE=1) does a COMPLETE removal - every
 # container, named volume (ALL knowledge-graph data), image, the docker network,
-# and the entire install directory — leaving the host as if GCTRL was never
+# and the entire install directory - leaving the host as if GCTRL was never
 # installed. Use this to test a clean from-zero reinstall.
 set -euo pipefail
 
@@ -36,7 +36,7 @@ for arg in "$@"; do
 done
 
 # Ask for a typed confirmation word. Reads from /dev/tty so it also works when
-# the script itself arrives on stdin (curl ... | bash) — a plain `read` would
+# the script itself arrives on stdin (curl ... | bash) - a plain `read` would
 # consume the next script line there and silently abort. GCTRL_YES=1 (or
 # --yes) skips the prompt for scripted/CI use.
 confirm_word() { # $1=prompt  $2=required word
@@ -57,9 +57,9 @@ confirm_word() { # $1=prompt  $2=required word
 echo -e "${RED}Ground Control Uninstaller${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if [ "$PURGE" = "1" ]; then
-  echo -e "${RED}PURGE MODE — this DESTROYS EVERYTHING:${NC}"
+  echo -e "${RED}PURGE MODE - this DESTROYS EVERYTHING:${NC}"
   echo -e "  • all containers + images"
-  echo -e "  • ${RED}all data volumes (Postgres, Neo4j, Qdrant, models) — UNRECOVERABLE${NC}"
+  echo -e "  • ${RED}all data volumes (Postgres, Neo4j, Qdrant, models) - UNRECOVERABLE${NC}"
   echo -e "  • the docker network and ${INSTALL_DIR} (incl. config + data)"
   echo ""
   confirm_word "Type 'purge' to permanently delete everything: " "purge" || { echo "Aborted."; exit 0; }
@@ -97,7 +97,7 @@ if [ ${#COMPOSE_ARGS[@]} -gt 0 ]; then
     docker compose "${COMPOSE_ARGS[@]}" images -q 2>/dev/null | sort -u | xargs -r docker rmi -f 2>/dev/null || true
   fi
 else
-  warn "No docker-compose.yml at ${INSTALL_DIR} — falling back to name-based cleanup."
+  warn "No docker-compose.yml at ${INSTALL_DIR} - falling back to name-based cleanup."
 fi
 
 # ── Belt-and-suspenders: remove anything named gctrl-* even if compose state is
@@ -126,7 +126,7 @@ fi
 
 echo ""
 if [ "$PURGE" = "1" ]; then
-  success "✅ GCTRL completely removed — host is clean."
+  success "✅ GCTRL completely removed - host is clean."
   echo "  Verify: docker ps -a | grep gctrl    (should be empty)"
   echo "          docker volume ls | grep gctrl (should be empty)"
   echo "          ls ${INSTALL_DIR}             (should not exist)"

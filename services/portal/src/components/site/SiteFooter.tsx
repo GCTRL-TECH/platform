@@ -78,7 +78,7 @@ export function SiteFooter() {
         </div>
 
         <div className="mt-12 flex flex-col items-center justify-between gap-4 border-t border-slate-800 pt-8 text-xs text-slate-600 sm:flex-row">
-          <p>© {new Date().getFullYear()} Cinque Monti Ltd. — GCTRL (Ground Control). All rights reserved.</p>
+          <p>© {new Date().getFullYear()} Cinque Monti Ltd. - GCTRL (Ground Control). All rights reserved.</p>
           <div className="flex items-center gap-4">
             <Link to="/imprint" className="transition-colors hover:text-slate-300">Imprint</Link>
             <Link to="/privacy" className="transition-colors hover:text-slate-300">Privacy Policy</Link>

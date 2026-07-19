@@ -5,7 +5,7 @@ import { Helmet } from 'react-helmet-async'
 export const SITE_URL = 'https://gctrl.tech'
 
 export interface SeoProps {
-  /** Page <title>. Keep unique per route — this is what shows in search results and browser tabs. */
+  /** Page <title>. Keep unique per route - this is what shows in search results and browser tabs. */
   title: string
   /** ~150-160 char meta description. Unique per route. */
   description: string
@@ -15,7 +15,7 @@ export interface SeoProps {
   image?: string
   /** Open Graph type. Defaults to "website"; docs/article pages should pass "article". */
   type?: 'website' | 'article'
-  /** Optional JSON-LD structured data — pass one object or an array of objects (e.g. @graph members). */
+  /** Optional JSON-LD structured data - pass one object or an array of objects (e.g. @graph members). */
   jsonLd?: Record<string, unknown> | Record<string, unknown>[]
   /** Set to true to keep a page out of search indexes (e.g. auth-gated app screens). Defaults to indexable. */
   noindex?: boolean

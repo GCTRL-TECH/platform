@@ -8,14 +8,14 @@ import { Link } from 'react-router-dom'
 const STARS_BACK_FACTOR    = 0.10  // tiny far-away stars, barely move
 const STARS_MID_FACTOR     = 0.20  // mid-depth stars
 const STARS_FRONT_FACTOR   = 0.30  // larger near stars (behind image)
-const IMAGE_FACTOR         = 0.18  // gentle drift — keeps the full image in-frame
-const STARS_OVERLAY_FACTOR = 0.55  // fastest layer — sits OVER the image, top half only
+const IMAGE_FACTOR         = 0.18  // gentle drift - keeps the full image in-frame
+const STARS_OVERLAY_FACTOR = 0.55  // fastest layer - sits OVER the image, top half only
 
 // Hand-picked star positions across a 1600×900 layer. Each layer is split into
 // three stride-3 chunks so the stars can run independent animations without
 // the field pulsing in sync.
 // Curated positions across a 1600×900 layer. Right side (x > 1100) is
-// intentionally denser — gives the constellation more weight on the side
+// intentionally denser - gives the constellation more weight on the side
 // opposite the operators in the image.
 const STARS_BACK_RAW = [
   '40px 80px', '180px 220px', '320px 60px', '510px 410px', '720px 130px',
@@ -54,7 +54,7 @@ const STARS_FRONT_RAW = [
   '1305px 405px', '1395px 305px', '1465px 555px', '1540px 425px',
 ]
 
-// Foreground layer — over the image, upper portion only. Most prominent of all.
+// Foreground layer - over the image, upper portion only. Most prominent of all.
 const STARS_OVERLAY_RAW = [
   '215px 75px', '385px 120px', '545px 50px', '710px 165px', '880px 80px',
   '1055px 145px', '1235px 95px', '1410px 175px', '1565px 110px',
@@ -88,7 +88,7 @@ function tileWide(positions: string[], tiles = 3, tileW = 1700, yJitter = 40): s
     for (const p of positions) {
       const [xRaw, yRaw] = p.split(' ')
       const x = parseInt(xRaw, 10) + t * tileW
-      // Pseudorandom jitter from tile index + base coord — stable, breaks the grid.
+      // Pseudorandom jitter from tile index + base coord - stable, breaks the grid.
       const dy = ((t * 53 + parseInt(xRaw, 10) * 7) % (yJitter * 2)) - yJitter
       const y = parseInt(yRaw, 10) + dy
       out.push(`${x}px ${y}px`)
@@ -101,7 +101,7 @@ function tileWide(positions: string[], tiles = 3, tileW = 1700, yJitter = 40): s
  * Each star layer gets three "ambient" sub-groups + a list of "shine" stars.
  * Ambient stars are dim and rendered via box-shadow (one div = many stars,
  * cheap). Shine stars are rendered as individual divs so each can wear its
- * own pulsing box-shadow halo — `filter: drop-shadow` doesn't work on
+ * own pulsing box-shadow halo - `filter: drop-shadow` doesn't work on
  * box-shadow-rendered stars because the filter region is clipped to the
  * element's box, leaving far-away box-shadows un-glowed.
  */
@@ -116,7 +116,7 @@ function parsePos(p: string): { x: string; y: string } {
 }
 
 function makeLayer(raw: string[]): { subs: SubGroup[]; shineStars: ShineStar[] } {
-  // Shine stars come from the ORIGINAL un-tiled positions only — keeps the
+  // Shine stars come from the ORIGINAL un-tiled positions only - keeps the
   // bright flares centred where the user's gaze lives, not way out at the
   // edge of a 3440-pixel monitor.
   const baseShine = [raw[0], raw[5], raw[12], raw[18], raw[3], raw[10]].filter(Boolean)
@@ -144,18 +144,18 @@ function makeLayer(raw: string[]): { subs: SubGroup[]; shineStars: ShineStar[] }
 }
 
 // Each shooting star carries its own randomised path. Spawned on a long,
-// random interval (one every ~7-15s) so the sky stays calm — but every once
+// random interval (one every ~7-15s) so the sky stays calm - but every once
 // in a while a streak shoots across.
 //
-// Spawn region is constrained to the LEFT or RIGHT sky band — the horizontal
+// Spawn region is constrained to the LEFT or RIGHT sky band - the horizontal
 // fade regions of the hero image where the dark background shows through.
 // The streaks sit at -z-[5] (above the starfields, behind the image), so they
 // wouldn't be visible in the opaque middle anyway; we just don't waste them there.
 type ShootingStar = {
   id: number
-  x: number        // start position in PIXELS — viewport-aware
+  x: number        // start position in PIXELS - viewport-aware
   y: number        // start position in PIXELS
-  angle: number    // rotation in degrees — drives translateX direction
+  angle: number    // rotation in degrees - drives translateX direction
   distance: number // px the streak travels along its rotated +x axis
   duration: number // ms the animation lasts
 }
@@ -165,7 +165,7 @@ type ShootingStar = {
  *
  * Why WAAPI instead of a CSS @keyframes shoot? Because CSS keyframes that
  * reference custom properties inside `transform` only interpolate cleanly
- * when those props are registered via @property — and even then a few
+ * when those props are registered via @property - and even then a few
  * browsers misbehave when the function list contains a `var()`. Passing
  * the literal transform strings to element.animate() side-steps all of it.
  */
@@ -195,7 +195,7 @@ function ShootingStarEl({ s, cls = 'shooting-star' }: { s: ShootingStar; cls?: s
 }
 
 // ── Hero headline typewriter ─────────────────────────────────────────
-// The second headline line is typed and deleted like a terminal prompt —
+// The second headline line is typed and deleted like a terminal prompt -
 // one rotating sovereignty statement in the big gradient type.
 const TYPED_PHRASES = [
   'Command Your Data.',
@@ -204,7 +204,7 @@ const TYPED_PHRASES = [
 ]
 
 function useTypewriter(phrases: string[]) {
-  // The first phrase is fully rendered from the very first paint — the page
+  // The first phrase is fully rendered from the very first paint - the page
   // never loads with an empty headline. Rotation (delete → type next) only
   // starts after an initial hold.
   const [text, setText] = useState(phrases[0])
@@ -260,7 +260,7 @@ export function HeroSection() {
   const typed = useTypewriter(TYPED_PHRASES)
 
   // Scroll parallax is continuous work (rAF-throttled setState on every
-  // scroll frame, driving translate3d on 5 layered elements) — mobile GPUs
+  // scroll frame, driving translate3d on 5 layered elements) - mobile GPUs
   // feel this as jank. Disable it under prefers-reduced-motion (mirrors the
   // typewriter/shooting-star guards above) AND on small viewports, where the
   // effect is barely visible anyway. Reacts live to OS setting changes and to
@@ -309,7 +309,7 @@ export function HeroSection() {
   }, [parallaxEnabled])
 
   // Shooting-star spawner. Respects prefers-reduced-motion. Each star is
-  // self-cleaning — removed from state after its animation completes.
+  // self-cleaning - removed from state after its animation completes.
   useEffect(() => {
     if (typeof window === 'undefined') return
     if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
@@ -325,12 +325,12 @@ export function HeroSection() {
       const vh = window.innerHeight
 
       // Estimate the sky band width on each side of the hero image. The image
-      // is h-full w-auto with intrinsic ratio 1.86 — band width = (vw - vh*1.86)/2.
+      // is h-full w-auto with intrinsic ratio 1.86 - band width = (vw - vh*1.86)/2.
       // On ultrawide the bands are huge; on 16:9 they're thin or even 0.
       const imageW = Math.min(vh * 1.86, vw)
       const bandW = Math.max(120, (vw - imageW) / 2)
 
-      // Streaks must stay in the hero's upper half — the lower half of the
+      // Streaks must stay in the hero's upper half - the lower half of the
       // image reads as "ground", and a meteor passing in front of the ground
       // looks wrong. Spawn high and cap the travel distance so the head
       // never sinks below ~48% of the viewport height.
@@ -341,7 +341,7 @@ export function HeroSection() {
         : 30 + Math.random() * 22  // 30°-52° → down-right
       const maxDrop = Math.max(60, vh * 0.48 - y)
       // Distance scales with the band so the streak actually crosses the
-      // visible sky — clamped by the vertical budget above.
+      // visible sky - clamped by the vertical budget above.
       const dist = Math.min(
         280 + Math.random() * Math.min(bandW * 0.7, 500),
         maxDrop / Math.abs(Math.sin((angle * Math.PI) / 180)),
@@ -375,7 +375,7 @@ export function HeroSection() {
     }
   }, [])
 
-  // Rare LONG shooting star — sweeps across the WHOLE hero width, behind the
+  // Rare LONG shooting star - sweeps across the WHOLE hero width, behind the
   // image (-z-[5]): it disappears behind the building and re-emerges on the
   // other side. Deliberately infrequent (~every 14-26s) so it stays a small
   // event rather than becoming noise.
@@ -424,7 +424,7 @@ export function HeroSection() {
     }
   }, [])
 
-  // Memoised once — pure string work, but no need to redo per render.
+  // Memoised once - pure string work, but no need to redo per render.
   const back    = useMemo(() => makeLayer(STARS_BACK_RAW),    [])
   const mid     = useMemo(() => makeLayer(STARS_MID_RAW),     [])
   const front   = useMemo(() => makeLayer(STARS_FRONT_RAW),   [])
@@ -443,7 +443,7 @@ export function HeroSection() {
         willChange: 'transform',
       }}
     >
-      {/* Ambient stars — many positions packed into one box-shadow string */}
+      {/* Ambient stars - many positions packed into one box-shadow string */}
       {layer.subs.map((s, i) => (
         <div
           key={i}
@@ -451,7 +451,7 @@ export function HeroSection() {
           style={{ boxShadow: s.shadow, animationDelay: s.delay }}
         />
       ))}
-      {/* Shine stars — each is its own div so its animated box-shadow halo
+      {/* Shine stars - each is its own div so its animated box-shadow halo
           glows around the star directly (no filter-region clipping issues). */}
       {layer.shineStars.map((s, i) => (
         <div
@@ -467,12 +467,12 @@ export function HeroSection() {
 
   return (
     <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#020617] px-6 pt-20">
-      {/* ── Background starfields (3 depths) — sit behind everything ──────── */}
+      {/* ── Background starfields (3 depths) - sit behind everything ──────── */}
       {renderStarLayer(back,  STARS_BACK_FACTOR,  { zClass: '-z-10', dotSize: 'h-[1px] w-[1px]',     shineSize: 'h-[3px] w-[3px]', heightClass: 'h-[180vh]' })}
       {renderStarLayer(mid,   STARS_MID_FACTOR,   { zClass: '-z-10', dotSize: 'h-[1.5px] w-[1.5px]', shineSize: 'h-[3px] w-[3px]', heightClass: 'h-[180vh]' })}
       {renderStarLayer(front, STARS_FRONT_FACTOR, { zClass: '-z-10', dotSize: 'h-[2px] w-[2px]',     shineSize: 'h-[4px] w-[4px]', heightClass: 'h-[180vh]' })}
 
-      {/* ── Hero image — full ratio visible, dissolves smoothly into the bg ── */}
+      {/* ── Hero image - full ratio visible, dissolves smoothly into the bg ── */}
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 -z-0 flex items-center justify-center"
@@ -536,9 +536,9 @@ export function HeroSection() {
         heightClass: 'h-[100vh]',
       })}
 
-      {/* ── Shooting stars — rare diagonal streaks across the upper sky.
+      {/* ── Shooting stars - rare diagonal streaks across the upper sky.
           Sit at -z-[5]: in FRONT of all three starfields (-z-10) but BEHIND
-          the hero image (-z-0), so a streak can never cross the building —
+          the hero image (-z-0), so a streak can never cross the building -
           it peeks through the faded sky at the image edges. The h-[55vh]
           overflow clip is a hard backstop for the "upper half only" rule
           (the lower half of the hero reads as ground). */}
@@ -548,7 +548,7 @@ export function HeroSection() {
         ))}
       </div>
 
-      {/* Rare long streak — sweeps the whole hero width at the same -z-[5]
+      {/* Rare long streak - sweeps the whole hero width at the same -z-[5]
           depth: it vanishes behind the opaque image centre and re-emerges on
           the far side, which is exactly what a real meteor would do. Same
           upper-half clip as the edge streaks. */}
@@ -607,14 +607,14 @@ export function HeroSection() {
         >
           <span className="text-shadow-hero">Ground Your AI.</span>
           <br />
-          {/* Typewriter line — rotating sovereignty statements, typed and
+          {/* Typewriter line - rotating sovereignty statements, typed and
               deleted like a terminal prompt. Screen readers get the static
               aria-label above instead of the churn.
               `bg-clip-text` makes the fill transparent, so a CSS `text-shadow`
               would render the shadow THROUGH the transparent letters and read
               as a shadow inside the glyphs. `filter: drop-shadow(...)` instead
               traces the shape of the rendered (gradient-filled) glyphs and
-              drops the shadow behind them — which is what we want. The caret
+              drops the shadow behind them - which is what we want. The caret
               lives inside the gradient span (so it's gradient-tinted too) and
               is always rendered, which keeps the line from ever collapsing.
 
@@ -625,7 +625,7 @@ export function HeroSection() {
               copy of every phrase in the same CSS grid cell as the visible
               one (`grid-area:1/1`). Grid auto-sizes the shared row to the
               TALLEST item, so the box always reserves the worst-case (2-line)
-              height up front — no JS measurement, adapts to every breakpoint
+              height up front - no JS measurement, adapts to every breakpoint
               automatically, and the visible phrase just overlays on top. */}
           <span className="relative grid">
             {TYPED_PHRASES.map((phrase) => (
@@ -653,7 +653,7 @@ export function HeroSection() {
           </span>
         </h1>
 
-        {/* Crisp category line — the plain-language "what is this" statement.
+        {/* Crisp category line - the plain-language "what is this" statement.
             Deliberately prominent: brand poetry lives in the headline above,
             this line does the explaining (also read by search + LLM crawlers). */}
         <p className="mb-6 text-xl font-semibold text-white md:text-2xl">
@@ -661,16 +661,17 @@ export function HeroSection() {
         </p>
 
         {/* Glass-card backdrop gives the paragraph solid readability over the
-            mission-control imagery without darkening the hero. One idea only —
+            mission-control imagery without darkening the hero. One idea only -
             everything else has its own section below. */}
         <div className="mx-auto mb-10 max-w-2xl rounded-2xl border border-white/10 bg-slate-950/45 px-6 py-4 backdrop-blur-md">
           <p className="text-base leading-relaxed text-slate-200 md:text-lg">
-            Every document, drive and agent session — fused into{' '}
+            Every document, drive and agent session - fused into{' '}
             <span className="text-indigo-300">one governed knowledge graph</span> on your own
             infrastructure.{' '}
             <span className="font-semibold text-white">
-              <span className="whitespace-nowrap">Unlimited tokens,</span>{' '}
-              <span className="whitespace-nowrap">because inference runs local.</span>
+              <span className="whitespace-nowrap">Unlimited tokens.</span>{' '}
+              <span className="whitespace-nowrap">No vendor lock-in.</span>{' '}
+              <span className="whitespace-nowrap">Run locally, own your data.</span>
             </span>
           </p>
         </div>

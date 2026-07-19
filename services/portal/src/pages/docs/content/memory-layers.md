@@ -1,6 +1,6 @@
 # Memory Layers
 
-GCTRL organises memory into **four parallel tiers**. Each tier is a different *representation* of the same knowledge, optimised for a different kind of read. Agents pull from the tier that fits the question — and write conclusions back — so memory **compounds** instead of going stale.
+GCTRL organises memory into **four parallel tiers**. Each tier is a different *representation* of the same knowledge, optimised for a different kind of read. Agents pull from the tier that fits the question - and write conclusions back - so memory **compounds** instead of going stale.
 
 ## Why four tiers
 
@@ -8,51 +8,51 @@ A single store cannot serve every need. An authoritative one-line answer, the ra
 
 | Tier | Name | Backing store | Best read for |
 |------|------|---------------|---------------|
-| **HOT** | Entity Dossiers | Postgres / graph | Authoritative summary — answer with confidence |
+| **HOT** | Entity Dossiers | Postgres / graph | Authoritative summary - answer with confidence |
 | **WARM** | Text Chunks | Qdrant (+ source) | Evidence passages for grounded answers |
 | **COLD** | Knowledge Graph | Neo4j | Structure, relationships, provenance |
 | **WIKI** | Curated Prose | Wiki view | Human-readable explanation |
 
-## HOT — Entity Dossiers
+## HOT - Entity Dossiers
 
 Compiled, **authoritative summaries** for important entities, distilled by FUSE.
 
-- **Pinnable** — operators can pin a dossier so it is never decayed or evicted.
-- **Trust-scored** — each dossier carries a trust signal so consumers know how reliable it is.
-- **Direct answer.** When an agent reads a dossier, it has the canonical view — it should *state* the fact, not hedge.
+- **Pinnable** - operators can pin a dossier so it is never decayed or evicted.
+- **Trust-scored** - each dossier carries a trust signal so consumers know how reliable it is.
+- **Direct answer.** When an agent reads a dossier, it has the canonical view - it should *state* the fact, not hedge.
 
-## WARM — Text Chunks
+## WARM - Text Chunks
 
 The **source passages** plus their embeddings, written by KEX into the vector store.
 
-- **Evidence layer** — these are the actual snippets that back an answer and supply citations.
-- **Heat-tracked** — usage is measured; frequently retrieved chunks run "hotter."
-- **Used in answers** — Talk-to-Graph retrieves chunks here for grounded, cited responses.
+- **Evidence layer** - these are the actual snippets that back an answer and supply citations.
+- **Heat-tracked** - usage is measured; frequently retrieved chunks run "hotter."
+- **Used in answers** - Talk-to-Graph retrieves chunks here for grounded, cited responses.
 
-## COLD — Knowledge Graph
+## COLD - Knowledge Graph
 
 The **structured entities and relationships** in Neo4j.
 
-- **Permanent** — the durable backbone of all knowledge.
-- **Clearance-gated** — traversal and reads respect access control.
-- **Provenance** — the graph is where you trace how facts connect and where they came from.
+- **Permanent** - the durable backbone of all knowledge.
+- **Clearance-gated** - traversal and reads respect access control.
+- **Provenance** - the graph is where you trace how facts connect and where they came from.
 
-## WIKI — Curated Prose
+## WIKI - Curated Prose
 
 **LLM-distilled, cross-linked** human-readable pages built by FUSE over the graph.
 
-- **Readable** — narrative prose rather than triples or vectors.
-- **Cross-linked** — pages reference related entities for navigation.
-- **For explanation** — the right layer when a human (or agent) needs context, not just a fact.
+- **Readable** - narrative prose rather than triples or vectors.
+- **Cross-linked** - pages reference related entities for navigation.
+- **For explanation** - the right layer when a human (or agent) needs context, not just a fact.
 
 ## Memory governance
 
 Tiers stay healthy through an **automatic governance cycle** that runs continuously and can also be triggered on demand:
 
-- **Decay** — stale, unused items lose heat and are aged out.
-- **Dedup** — near-duplicate chunks are collapsed to keep the warm tier lean.
-- **Promote** — frequently-used **warm → hot**: chunks that keep proving useful get compiled into dossiers.
-- **Evict** — distrusted or cold items are removed so noise does not accumulate.
+- **Decay** - stale, unused items lose heat and are aged out.
+- **Dedup** - near-duplicate chunks are collapsed to keep the warm tier lean.
+- **Promote** - frequently-used **warm → hot**: chunks that keep proving useful get compiled into dossiers.
+- **Evict** - distrusted or cold items are removed so noise does not accumulate.
 
 ### Health snapshot
 

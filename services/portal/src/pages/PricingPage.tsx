@@ -22,37 +22,39 @@ type Tier = {
 const TIERS: Tier[] = [
   {
     name: 'Free',
-    tagline: 'For private, non-commercial use.',
+    tagline: 'Own your data. No lock-in, no token choke.',
     price: '€0',
     priceNote: 'forever',
     cta: { label: 'Get started free', href: '/register', event: 'pricing_free' },
     features: [
-      'Unlimited tokens — inference runs on your hardware, no token tax',
-      'All four modules — KEX, FUSE, Knowledge Graphs, Talk-to-Graph',
-      '100% local & self-hosted — GDPR by design',
-      'MCP gateway — Claude Code, Codex, Cursor & any MCP client',
-      'Ingestion: single files, added by hand via your AI',
-      'Community support',
+      'Unlimited tokens - inference runs on your hardware. No metering, no token choke.',
+      'No vendor lock-in - your graph, your files, your models. Export or walk away anytime.',
+      'Own your data - 100% local & self-hosted, GDPR by design.',
+      'All four modules - KEX, FUSE, Knowledge Graphs, Talk to Graph',
+      'Wiki-LLM - one federated wiki over all your graphs: entity & concept pages, backlinks, a live index and changelog. Auto-distilled locally, grounded in the graph.',
+      'MCP gateway - Claude Code, Codex, Cursor & any MCP client',
+      'One full-access access token - scoped colleague tokens are a Business feature',
     ],
     foot: 'Non-commercial, private use only.',
   },
   {
     name: 'Business',
-    tagline: 'For teams whose knowledge should flow in automatically.',
+    tagline: 'One access token per colleague - you decide what each one can see.',
     price: '€29',
-    priceNote: 'per user / month · billed annually',
+    priceNote: 'per user - one scoped access token / month · billed annually',
     featured: true,
     badge: 'Most popular',
     cta: { label: 'Get in touch', href: `${CONTACT}?subject=GCTRL%20Business`, event: 'pricing_business' },
     features: [
-      'Everything in Free — licensed for commercial use',
-      'Connectors: continuously sync entire drives — SharePoint, Google Drive, OneDrive, Confluence & more',
-      'Scheduled refresh & incremental re-sync — your graph stays current on its own',
-      'Team access control & per-element classification',
-      'Scoped colleague tokens — airtight project isolation',
+      'Everything in Free - licensed for commercial use',
+      'Scoped colleague tokens - one per seat. Pick exactly which knowledge bases and which classification level each token can reach.',
+      "Structure your company's knowledge by access - airtight project isolation, nothing mixes even by accident",
+      'Revoke or expire any token instantly - access ends the moment someone leaves',
+      'Connectors: continuously sync entire drives - SharePoint, Google Drive, OneDrive, Confluence & more',
+      'Scheduled refresh & incremental re-sync - your graph stays current on its own',
       'Priority support',
     ],
-    foot: 'Unlimited tokens included — no usage metering, ever.',
+    foot: 'Unlimited inference tokens included - no usage metering, ever.',
   },
   {
     name: 'Individual',
@@ -62,7 +64,7 @@ const TIERS: Tier[] = [
     cta: { label: 'Reach out to us', href: `${CONTACT}?subject=GCTRL%20Individual`, event: 'pricing_individual' },
     features: [
       'Everything in Business',
-      'Cloud deployment — managed by us, or in your own cloud',
+      'Cloud deployment - managed by us, or in your own cloud',
       'Custom integrations & connectors built for your stack',
       'On-prem / air-gapped & sovereign deployment',
       'TISAX & ISO 27001-aware hardening, SSO / SCIM',
@@ -97,8 +99,8 @@ export function PricingPage() {
   return (
     <div className="min-h-screen bg-[#020617]">
       <Seo
-        title="Pricing — GCTRL"
-        description="Unlimited tokens on every plan — inference runs on your own hardware. Free forever for private use; Business adds always-on connectors for SharePoint, Google Drive & more; Individual adds tailored cloud deployment."
+        title="Pricing - GCTRL"
+        description="Unlimited tokens on every plan - inference runs on your own hardware, so we never meter you. Free forever for private use: own your data, no vendor lock-in, plus a federated Wiki-LLM over your graphs. Business is one scoped access token per colleague, so you structure company knowledge by who may see what."
         path="/pricing"
       />
       <SiteHeader />
@@ -116,9 +118,11 @@ export function PricingPage() {
             pricing
           </h1>
           <p className="mt-5 text-lg leading-relaxed text-slate-400">
-            <span className="font-semibold text-slate-200">Unlimited tokens on every plan</span> — inference
-            runs on your own hardware, so we never meter your usage. You pay for what actually matters:
-            keeping your company&apos;s knowledge flowing in automatically.
+            <span className="font-semibold text-slate-200">Unlimited tokens on every plan</span> - inference
+            runs on your own hardware, so we never meter your usage. Free gives you the whole platform for
+            yourself. You pay only when knowledge has to reach{' '}
+            <span className="font-semibold text-slate-200">other people</span> - one scoped access token per
+            colleague.
           </p>
         </div>
       </section>
@@ -175,8 +179,25 @@ export function PricingPage() {
           </p>
           <p className="mt-2 text-sm leading-relaxed text-slate-400">
             Cloud memory platforms charge per million tokens processed. GCTRL runs inference on your own
-            infrastructure, so there is nothing to meter — extract, fuse and chat as much as your hardware
+            infrastructure, so there is nothing to meter - extract, fuse and chat as much as your hardware
             can handle. Fully self-hosted, DSGVO/GDPR by design.
+          </p>
+        </div>
+
+        {/* What a "user" actually is - the Business story. Deliberately contrasts
+            the two senses of "token" the page uses, so they never blur. */}
+        <div className="mx-auto mt-6 max-w-3xl rounded-2xl border border-indigo-500/20 bg-indigo-500/[0.06] px-8 py-6 text-center backdrop-blur-sm">
+          <p className="text-base font-semibold text-white">One seat = one access token.</p>
+          <p className="mt-2 text-sm leading-relaxed text-slate-400">
+            On Business, a &ldquo;user&rdquo; is an <span className="font-medium text-slate-200">access
+            token</span> you issue. As admin you create one scoped token per colleague and grant it exactly
+            the knowledge bases it may reach, at the classification level you choose - that is how you
+            structure your company&apos;s knowledge. Nothing outside a token&apos;s scope is visible to it,
+            and you can revoke or expire any token instantly.
+          </p>
+          <p className="mt-3 text-xs text-slate-500">
+            Not to be confused with the tokens above: those are inference units, and they stay unlimited.
+            Free includes one full-access token for yourself.
           </p>
         </div>
 

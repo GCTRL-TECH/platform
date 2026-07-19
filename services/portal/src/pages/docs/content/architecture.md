@@ -1,6 +1,6 @@
 # Architecture
 
-**GCTRL** is a **stateless orchestration middleware** for knowledge graphs and agent memory. It does not replace your databases — it sits *on top* of them, turning unstructured sources into a queryable graph plus organised memory layers, then serving that memory to your agents.
+**GCTRL** is a **stateless orchestration middleware** for knowledge graphs and agent memory. It does not replace your databases - it sits *on top* of them, turning unstructured sources into a queryable graph plus organised memory layers, then serving that memory to your agents.
 
 ## Core idea: middleware, not a database
 
@@ -13,7 +13,7 @@ GCTRL coordinates four storage engines but holds no durable state of its own. Ev
 | **Relational** | Postgres | Accounts, licensing, job metadata, audit, provenance | Yes |
 | **Cache / queue** | Redis | Job queues, coordination, ephemeral state | Yes |
 
-All four are **bundled** so a fresh install runs with one command. All four are **swappable** — point GCTRL at your own managed Neo4j, Qdrant, or Postgres via environment variables or **Settings → Infrastructure**. Because GCTRL keeps no hidden state, repointing a store is a configuration change, not a migration of GCTRL itself.
+All four are **bundled** so a fresh install runs with one command. All four are **swappable** - point GCTRL at your own managed Neo4j, Qdrant, or Postgres via environment variables or **Settings → Infrastructure**. Because GCTRL keeps no hidden state, repointing a store is a configuration change, not a migration of GCTRL itself.
 
 ## Why stateless matters
 
@@ -21,7 +21,7 @@ All four are **bundled** so a fresh install runs with one command. All four are 
 - **No lock-in.** Swap any backing engine for your managed/cloud-hosted equivalent. The middleware contract stays the same.
 - **Deterministic raw storage.** Source chunks and graph triples are stored verbatim and reproducibly, giving agents grounded, drift-free context.
 - **Organised memory on top.** Above the raw stores, GCTRL maintains parallel memory layers (dossiers, chunks, graph, wiki) so agents read the *right* representation for each task.
-- **High-performance graph + vector combo.** A property graph (Neo4j) for structure and traversal plus a vector index (Qdrant) for semantic recall — hybrid retrieval gets both structural precision and fuzzy recall in a single query path.
+- **High-performance graph + vector combo.** A property graph (Neo4j) for structure and traversal plus a vector index (Qdrant) for semantic recall - hybrid retrieval gets both structural precision and fuzzy recall in a single query path.
 
 ## Layered architecture
 
@@ -77,11 +77,11 @@ Stores  ─▶  Manage KGs            ─▶  Talk-to-Graph         ─▶  Agen
 
 ## Benefits at a glance
 
-- **Data sovereignty** — on-prem, swap any store, nothing leaves your control.
-- **No vendor lock-in** — open backing engines, configuration-driven swaps.
-- **Grounded context** — deterministic raw storage for reproducible recall.
-- **Compounding memory** — organised layers that agents read from and write back to.
-- **Performance** — graph traversal + vector recall combined in one retrieval path.
+- **Data sovereignty** - on-prem, swap any store, nothing leaves your control.
+- **No vendor lock-in** - open backing engines, configuration-driven swaps.
+- **Grounded context** - deterministic raw storage for reproducible recall.
+- **Compounding memory** - organised layers that agents read from and write back to.
+- **Performance** - graph traversal + vector recall combined in one retrieval path.
 
 ## See also
 
