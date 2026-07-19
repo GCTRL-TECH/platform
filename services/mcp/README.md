@@ -35,34 +35,40 @@ in v2.0** — please migrate.
 | `borghive_list_extractions` | `gctrl_list_extractions` |
 | `borghive_schema` | `gctrl_schema` |
 
-## Setup for Claude Code
+## Quickstart (npm)
 
-Add to your Claude Code MCP settings (`.claude/settings.json` or via `/mcp add`):
+Published on npm as [`gctrl-mcp`](https://www.npmjs.com/package/gctrl-mcp) and in the
+official MCP Registry as `io.github.GCTRL-TECH/gctrl`. Add to your MCP client config
+(Claude Code, Claude Desktop, Cursor, Codex, …):
 
 ```json
 {
   "mcpServers": {
     "gctrl": {
-      "command": "node",
-      "args": ["/path/to/gctrl/services/mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "gctrl-mcp"],
       "env": {
-        "GCTRL_API_URL": "http://localhost:4000/api",
-        "GCTRL_API_TOKEN": "<your-jwt-token>"
+        "GCTRL_GATEWAY_URL": "http://localhost:4000/api/agent/mcp",
+        "GCTRL_API_TOKEN": "gctrl_..."
       }
     }
   }
 }
 ```
 
-## Get a Token
+Requires a running GCTRL harness ([get started](https://gctrl.tech)).
 
-```bash
-curl -s -X POST http://localhost:4000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"admin@gctrl.tech","password":"GCTRL2026"}' | jq -r '.token'
-```
+### Configuration
 
-## Build
+| Env var | Purpose |
+|---|---|
+| `GCTRL_GATEWAY_URL` | Recommended: URL of your harness's MCP gateway (`http://<host>:4000/api/agent/mcp`). The stdio server acts as a thin authenticated proxy. |
+| `GCTRL_API_URL` | Alternative direct mode: GCTRL API base URL (`http://<host>:4000/api`); tools run locally against the API. |
+| `GCTRL_API_TOKEN` | Scoped GCTRL Access Token (`gctrl_…`), created in **Settings → Access Control** with a clearance level + per-graph grants. Least privilege — the agent sees exactly what the token is cleared for. |
+
+Dev-only fallback: `GCTRL_EMAIL` + `GCTRL_PASSWORD` (full-clearance JWT). Avoid in production.
+
+## Build from source
 
 ```bash
 cd borghive/services/mcp

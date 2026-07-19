@@ -1,10 +1,35 @@
 {
   "name": "gctrl-mcp",
-  "version": "0.1.0",
+  "version": "1.0.1",
+  "mcpName": "io.github.GCTRL-TECH/gctrl",
   "license": "AGPL-3.0-or-later",
   "description": "GCTRL MCP Server — exposes KEX, FUSE, KG, and RAG as tools for AI agents",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "gctrl-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GCTRL-TECH/platform.git",
+    "directory": "services/mcp"
+  },
+  "homepage": "https://gctrl.tech",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "knowledge-graph",
+    "rag",
+    "agent-memory",
+    "gctrl"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -20,5 +45,3 @@
     "@types/node": "^20.12.0"
   }
 }
-
-

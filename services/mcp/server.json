@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.GCTRL-TECH/gctrl",
+  "description": "Governed graph-native agent memory: knowledge extraction, fusion, hybrid RAG, scoped access tokens.",
+  "repository": {
+    "url": "https://github.com/GCTRL-TECH/platform",
+    "source": "github",
+    "subfolder": "services/mcp"
+  },
+  "version": "1.0.1",
+  "websiteUrl": "https://gctrl.tech",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "gctrl-mcp",
+      "version": "1.0.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "GCTRL_GATEWAY_URL",
+          "description": "URL of your GCTRL harness MCP gateway, e.g. http://localhost:4000/api/agent/mcp (recommended mode)",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "GCTRL_API_URL",
+          "description": "Direct GCTRL API base URL (alternative to gateway mode), e.g. http://localhost:4000/api",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "GCTRL_API_TOKEN",
+          "description": "Scoped GCTRL Access Token (gctrl_…) created in Settings → Access Control",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+# Smithery configuration for the GCTRL MCP server (services/mcp, npm: gctrl-mcp)
+# https://smithery.ai/docs
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - gctrlApiToken
+    properties:
+      gctrlGatewayUrl:
+        type: string
+        default: http://localhost:4000/api/agent/mcp
+        description: URL of your GCTRL harness MCP gateway (recommended mode)
+      gctrlApiUrl:
+        type: string
+        description: Direct GCTRL API base URL (alternative to gateway mode), e.g. http://localhost:4000/api
+      gctrlApiToken:
+        type: string
+        description: Scoped GCTRL Access Token (gctrl_…) from Settings → Access Control
+  exampleConfig:
+    gctrlGatewayUrl: http://localhost:4000/api/agent/mcp
+    gctrlApiToken: gctrl_example_token
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', 'gctrl-mcp'],
+      env: {
+        ...(config.gctrlGatewayUrl ? { GCTRL_GATEWAY_URL: config.gctrlGatewayUrl } : {}),
+        ...(config.gctrlApiUrl ? { GCTRL_API_URL: config.gctrlApiUrl } : {}),
+        GCTRL_API_TOKEN: config.gctrlApiToken
+      }
+    })
