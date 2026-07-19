@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { Terminal, Plug2, FolderSync } from 'lucide-react'
+import { Terminal, Plug2, KeyRound } from 'lucide-react'
 
 const STEPS: { icon: typeof Terminal; title: string; desc: string }[] = [
   {
@@ -13,9 +13,9 @@ const STEPS: { icon: typeof Terminal; title: string; desc: string }[] = [
     desc: 'Claude Code, Codex, Cursor or any MCP client - one config block.',
   },
   {
-    icon: FolderSync,
-    title: '3 · Scale with connectors',
-    desc: 'Business keeps SharePoint, Drive & more syncing in automatically.',
+    icon: KeyRound,
+    title: '3 · Scale with scoped tokens',
+    desc: 'One scoped access token per colleague, project or agent - each sees only what you grant it.',
   },
 ]
 

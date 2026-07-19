@@ -178,6 +178,35 @@ async fn create_key(
     // clearance (grants would merely RAISE access instead of confining it).
     let kb_scoped = req.kb_scoped || !req.grants.is_empty();
 
+    // ── Packaging boundary: scoped tokens are a Business feature ──────────────
+    // Free is "one full-access token for yourself"; issuing SCOPED tokens to
+    // colleagues is what a Business seat buys. Gate CREATION only — never
+    // validation — so tokens already issued keep authenticating and no running
+    // agent setup breaks when a license lapses.
+    //
+    // Deliberately fail-OPEN: deny only for an explicit `free` tier or no active
+    // license at all. Every other tier (starter/business/individual/…) is allowed,
+    // because tier names don't map 1:1 to the pricing tiers and blocking a paying
+    // customer is far worse than letting an edge case through.
+    //
+    // This is a packaging guardrail, not DRM — GCTRL is self-hosted by design.
+    if kb_scoped {
+        let tier: Option<String> = sqlx::query_scalar(
+            "SELECT tier FROM licenses
+             WHERE user_id = $1 AND status = 'active'
+             ORDER BY activated_at DESC LIMIT 1"
+        ).bind(claims.sub).fetch_optional(&state.db).await?;
+
+        let allowed = matches!(tier.as_deref(), Some(t) if !t.eq_ignore_ascii_case("free"));
+        if !allowed {
+            return Err(AppError::Forbidden(
+                "Scoped access tokens are a Business feature. The Free plan includes one \
+                 full-access token for your own use — upgrade to issue scoped tokens to colleagues."
+                    .into(),
+            ));
+        }
+    }
+
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys
            (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only)

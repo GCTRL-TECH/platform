@@ -12,7 +12,6 @@ import { SpeedOfTrustSection } from './sections/SpeedOfTrustSection'
 import { HowItWorksSection } from './sections/HowItWorksSection'
 import { IntegrationsSection } from './sections/IntegrationsSection'
 import { BenchmarksSection } from './sections/BenchmarksSection'
-import { PricingTeaserSection } from './sections/PricingTeaserSection'
 import { CtaSection } from './sections/CtaSection'
 
 export function LandingPage() {
@@ -39,7 +38,6 @@ export function LandingPage() {
         <section id="trust"><SpeedOfTrustSection /></section>
         <section id="integrations"><IntegrationsSection /></section>
         <section id="benchmarks"><BenchmarksSection /></section>
-        <PricingTeaserSection />
         <CtaSection />
       </main>
       <SiteFooter />
