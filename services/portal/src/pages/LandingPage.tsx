@@ -7,6 +7,7 @@ import { HeroSection } from './sections/HeroSection'
 import { WorksWithSection } from './sections/WorksWithSection'
 import { ArchitectureSection } from './sections/ArchitectureSection'
 import { ProblemSection } from './sections/ProblemSection'
+import { FusionStorySection } from './sections/FusionStorySection'
 import { SpeedOfTrustSection } from './sections/SpeedOfTrustSection'
 import { HowItWorksSection } from './sections/HowItWorksSection'
 import { IntegrationsSection } from './sections/IntegrationsSection'
@@ -30,7 +31,10 @@ export function LandingPage() {
         <HeroSection />
         <WorksWithSection />
         <ProblemSection />
-        <section id="how-it-works"><HowItWorksSection /></section>
+        <section id="how-it-works">
+          <HowItWorksSection />
+          <FusionStorySection />
+        </section>
         <section id="architecture"><ArchitectureSection /></section>
         <section id="trust"><SpeedOfTrustSection /></section>
         <section id="integrations"><IntegrationsSection /></section>
