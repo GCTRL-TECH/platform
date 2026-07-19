@@ -1,5 +1,10 @@
 <div align="center">
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-horizontal-dark.svg">
+  <img src=".github/assets/logo-icon.svg" alt="GCTRL" height="96">
+</picture>
+
 # Ground Control (GCTRL)
 
 ### The knowledge-infrastructure layer for enterprise AI.

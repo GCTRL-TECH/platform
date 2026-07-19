@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-55 -55 110 110" width="512" height="512">
+<title>GCTRL Icon</title>
+<defs>
+<linearGradient id="hexG" x1="0%" y1="0%" x2="100%" y2="100%">
+<stop offset="0%" stop-color="#1F6DDC"/>
+<stop offset="60%" stop-color="#0F4FB8"/>
+<stop offset="100%" stop-color="#072858"/>
+</linearGradient>
+<radialGradient id="nodeG" cx="0.35" cy="0.35" r="0.7">
+<stop offset="0%" stop-color="#FFFFFF"/>
+<stop offset="65%" stop-color="#DBEAFE"/>
+<stop offset="100%" stop-color="#7FBFFF"/>
+</radialGradient>
+<radialGradient id="hubG" cx="0.35" cy="0.35" r="0.85">
+<stop offset="0%" stop-color="#FFFFFF"/>
+<stop offset="55%" stop-color="#9FCFFF"/>
+<stop offset="100%" stop-color="#4A95EE"/>
+</radialGradient>
+</defs>
+<g transform="translate(0, 0)">
+<polygon points="0,-48 41.6,-24 41.6,24 0,48 -41.6,24 -41.6,-24" fill="url(#hexG)" stroke="#E8F2FF" stroke-width="2" stroke-linejoin="round"/>
+<g stroke="#E8F2FF" stroke-width="1.5" fill="none" opacity="0.92" stroke-linecap="round">
+<line x1="0" y1="-48" x2="0" y2="0"/><line x1="41.6" y1="-24" x2="0" y2="0"/>
+<line x1="41.6" y1="24" x2="0" y2="0"/><line x1="0" y1="48" x2="0" y2="0"/>
+<line x1="-41.6" y1="24" x2="0" y2="0"/><line x1="-41.6" y1="-24" x2="0" y2="0"/>
+</g>
+<g fill="url(#nodeG)" stroke="#FFFFFF" stroke-width="0.5">
+<circle cx="0" cy="-48" r="4.5"/><circle cx="41.6" cy="-24" r="4.5"/>
+<circle cx="41.6" cy="24" r="4.5"/><circle cx="0" cy="48" r="4.5"/>
+<circle cx="-41.6" cy="24" r="4.5"/><circle cx="-41.6" cy="-24" r="4.5"/>
+</g>
+<circle cx="0" cy="0" r="7.5" fill="url(#hubG)" stroke="#FFFFFF" stroke-width="0.6"/>
+</g>
+</svg>
