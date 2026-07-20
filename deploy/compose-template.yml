@@ -132,6 +132,13 @@ services:
       - "127.0.0.1:4000:4000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host hardware profile (GPU name / VRAM / cores) written host-side by
+      # install.sh. The API runs in a Linux container and cannot probe the host
+      # GPU at request time — Apple Silicon / Metal is invisible to Docker, and
+      # NVIDIA needs host tooling — so the installer detects it and drops it here
+      # for the Settings "System (host)" card. Must exist before `up` (a missing
+      # bind source would create a directory); install.sh writes it in generate_config.
+      - ./hardware.json:/app/hardware.json:ro
     environment:
       - NODE_ENV=production
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}

@@ -169,6 +169,61 @@ pull_images() {
   success "Images ready"
 }
 
+# ── Host hardware profile ─────────────────────────────────────────────────────
+# The API runs inside a Linux container and cannot probe the host GPU at request
+# time — Apple Silicon (Metal) is invisible to Docker, NVIDIA needs host tooling.
+# So detect it here on the host and drop hardware.json where compose mounts it
+# (/app/hardware.json), for the Settings "System (host)" card. Struct shape must
+# match services/api-rs/src/routes/infra.rs (cpu_cores, ram_gb, gpu_name, vram_gb,
+# nvidia_toolkit, arch, os).
+write_hardware_json() {
+  local os arch cpu_cores ram_gb gpu_name vram_gb nvidia_toolkit mem_bytes
+  arch="$(uname -m)"; gpu_name=""; vram_gb=0; nvidia_toolkit=false
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    os="macos"
+    cpu_cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
+    mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    ram_gb=$(awk "BEGIN{printf \"%.1f\", ${mem_bytes:-0}/1073741824}")
+    # Apple Silicon shares memory between CPU and GPU → report unified memory as VRAM.
+    vram_gb=$ram_gb
+    # Prefer the display chipset name; fall back to the SoC brand string (both name the GPU on Apple Silicon).
+    gpu_name=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2; exit}')
+    [ -z "$gpu_name" ] && gpu_name=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple GPU")
+    local gpu_cores
+    gpu_cores=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Total Number of Cores/{print $2; exit}')
+    [ -n "$gpu_cores" ] && gpu_name="${gpu_name} (${gpu_cores}-core GPU)"
+  else
+    os="linux"
+    cpu_cores=$(nproc 2>/dev/null || echo 0)
+    ram_gb=$(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+      gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+      local vram_mib
+      vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+      [ -n "$vram_mib" ] && vram_gb=$(awk "BEGIN{printf \"%.1f\", ${vram_mib}/1024}")
+      command -v nvidia-ctk &>/dev/null && nvidia_toolkit=true
+    fi
+  fi
+
+  cat > "${INSTALL_DIR}/hardware.json" <<EOF
+{
+  "cpu_cores": ${cpu_cores:-0},
+  "ram_gb": ${ram_gb:-0},
+  "gpu_name": "${gpu_name}",
+  "vram_gb": ${vram_gb:-0},
+  "nvidia_toolkit": ${nvidia_toolkit},
+  "arch": "${arch}",
+  "os": "${os}"
+}
+EOF
+  if [ -n "$gpu_name" ]; then
+    info "Hardware profile: ${gpu_name} | ${vram_gb}GB VRAM (${os}/${arch})"
+  else
+    info "Hardware profile written (CPU mode, ${os}/${arch})"
+  fi
+}
+
 # ── Generate Config ───────────────────────────────────────────────────────────
 generate_config() {
   info "Creating ${INSTALL_DIR}..."
