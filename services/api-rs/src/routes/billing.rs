@@ -10,8 +10,9 @@ struct DaysQuery { days: Option<i64> }
 #[derive(Deserialize)]
 struct RegisterLicenseBody {
     license_key: String,
-    tier: Option<String>,
-    credits_allocated: Option<i32>,
+    // NOTE: tier / credits are deliberately NOT read from the client. They are
+    // resolved server-side from the license server (see register_license); any
+    // tier/credits fields a client sends are ignored.
 }
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
@@ -159,39 +160,56 @@ async fn register_license(
     State(state): State<Arc<crate::models::AppState>>,
     Json(body): Json<RegisterLicenseBody>,
 ) -> Result<Json<Value>> {
-    let tier = body.tier.clone().unwrap_or_else(|| "free".into());
-    let credits = body.credits_allocated.unwrap_or_else(|| tier_limit(&tier));
+    // Resolve tier + credits AUTHORITATIVELY from the license server via the agent.
+    // Client-supplied tier/credits are NEVER trusted — a logged-in user could
+    // otherwise self-grant enterprise tier / arbitrary credits by editing this
+    // request (or its localStorage source). This call also (re)activates the
+    // agent's signed JWT so KEX recognizes the license — KEX gates on that file,
+    // not this DB row.
+    let agent_resp = reqwest::Client::new()
+        .post("http://gctrl-agent:7070/activate")
+        .json(&json!({ "license_key": body.license_key }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
 
-    sqlx::query(
-        "INSERT INTO licenses (user_id, license_key, tier, credits_allocated)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (license_key) DO UPDATE
-           SET tier = EXCLUDED.tier, credits_allocated = EXCLUDED.credits_allocated, updated_at = NOW()"
-    )
-    .bind(claims.sub)
-    .bind(&body.license_key)
-    .bind(&tier)
-    .bind(credits)
-    .execute(&state.db).await?;
-
-    // (Re)activate the gctrl-agent so KEX sees the license immediately. KEX gates
-    // on the agent's signed JWT *file* (written only by the agent's own /activate),
-    // NOT this DB row. The onboarding flow reaches here via App.tsx's post-login
-    // /billing/license call, so firing /activate here closes the gap where a setup
-    // that resolved WITHOUT the agent (branches 2/3) left KEX "not activated" until
-    // a manual Settings re-entry. Best-effort: agent may be mid-start on a fresh box.
-    let key = body.license_key.clone();
-    tokio::spawn(async move {
-        if let Err(e) = reqwest::Client::new()
-            .post("http://gctrl-agent:7070/activate")
-            .json(&json!({ "license_key": key }))
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-        {
-            tracing::warn!("register_license: best-effort agent activation failed: {e}");
+    let resolved: Option<(String, i32)> = match agent_resp {
+        Ok(resp) if resp.status().is_success() => {
+            let v: Value = resp.json().await.unwrap_or_default();
+            let tier = v["tier"].as_str().unwrap_or("free").to_string();
+            let credits = v["credits_balance"].as_i64()
+                .map(|c| c as i32)
+                .unwrap_or_else(|| tier_limit(&tier));
+            Some((tier, credits))
         }
-    });
+        _ => None,
+    };
+
+    match resolved {
+        // Authoritative values from the license server → upsert them.
+        Some((tier, credits)) => {
+            sqlx::query(
+                "INSERT INTO licenses (user_id, license_key, tier, credits_allocated)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (license_key) DO UPDATE
+                   SET tier = EXCLUDED.tier, credits_allocated = EXCLUDED.credits_allocated, updated_at = NOW()"
+            )
+            .bind(claims.sub).bind(&body.license_key).bind(&tier).bind(credits)
+            .execute(&state.db).await?;
+        }
+        // Agent unreachable: register the key without trusting anyone. A brand-new
+        // row defaults to free; an existing row keeps its authoritative values (the
+        // heartbeat / a later reachable activation reconciles the real tier).
+        None => {
+            sqlx::query(
+                "INSERT INTO licenses (user_id, license_key, tier, credits_allocated)
+                 VALUES ($1, $2, 'free', $3)
+                 ON CONFLICT (license_key) DO NOTHING"
+            )
+            .bind(claims.sub).bind(&body.license_key).bind(tier_limit("free"))
+            .execute(&state.db).await?;
+        }
+    }
 
     Ok(Json(json!({ "ok": true })))
 }
