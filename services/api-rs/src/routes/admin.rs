@@ -153,10 +153,24 @@ async fn update_tokens(
     Json(body): Json<UpdateTokensBody>,
 ) -> Result<Json<Value>> {
     require_role(&claims, "admin")?;
+    // Authoritative for enforcement (KEX/FUSE debit this) and for the billing view
+    // of hosted (no-license) users.
     sqlx::query("UPDATE users SET tokens_balance = $1, updated_at = NOW() WHERE id = $2")
         .bind(body.tokens_balance)
         .bind(user_id)
         .execute(&state.db).await?;
+    // Mirror into the active license (if any) so the license-preferring billing
+    // view reflects the top-up immediately: set allocation = new balance, used = 0.
+    // NOTE: for a centrally-managed license the heartbeat later reconciles credits
+    // from the license server, so a local top-up is permanent only for hosted
+    // (no-license) users; to raise a real license's credits, change it centrally.
+    sqlx::query(
+        "UPDATE licenses SET credits_allocated = $1, credits_used = 0, updated_at = NOW() \
+         WHERE user_id = $2 AND status = 'active'"
+    )
+    .bind(body.tokens_balance)
+    .bind(user_id)
+    .execute(&state.db).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -171,6 +185,14 @@ async fn update_tier(
         .bind(&body.tier)
         .bind(user_id)
         .execute(&state.db).await?;
+    // Mirror into the active license so the license-preferring billing view (and
+    // any license-tier gating) reflects the change too.
+    sqlx::query(
+        "UPDATE licenses SET tier = $1, updated_at = NOW() WHERE user_id = $2 AND status = 'active'"
+    )
+    .bind(&body.tier)
+    .bind(user_id)
+    .execute(&state.db).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
