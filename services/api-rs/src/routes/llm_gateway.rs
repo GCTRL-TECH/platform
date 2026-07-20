@@ -369,7 +369,12 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
     let out = async_stream::stream! {
         let mut bytes = resp.bytes_stream();
         let mut line_buf = String::new();      // reassembles SSE lines across TCP chunks
-        let mut decloak_buf = String::new();   // holds partial pseudonyms across deltas
+        let mut decloak_buf = String::new();   // holds partial pseudonyms across content deltas
+        // Reasoning models stream their chain-of-thought as a SEPARATE delta field
+        // (`reasoning`/`reasoning_content`/`thinking`) that quotes the cloaked
+        // prompt — it needs its own rolling buffer, or interleaved content/
+        // reasoning deltas would corrupt each other's partial-pseudonym state.
+        let mut reasoning_buf = String::new();
 
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
@@ -391,7 +396,12 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
-                    // Flush any held-back tail as one final content delta, then [DONE].
+                    // Flush any held-back tails as final deltas, then [DONE].
+                    let r_tail = privacy::decloak_stream_finish(&session, &mut reasoning_buf);
+                    if !r_tail.is_empty() {
+                        let ev = json!({ "choices": [ { "index": 0, "delta": { "reasoning": r_tail }, "finish_reason": Value::Null } ] });
+                        yield Ok(Bytes::from(format!("data: {ev}\n\n")));
+                    }
                     let tail = privacy::decloak_stream_finish(&session, &mut decloak_buf);
                     if !tail.is_empty() {
                         let ev = json!({ "choices": [ { "index": 0, "delta": { "content": tail }, "finish_reason": Value::Null } ] });
@@ -406,10 +416,24 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
                     continue;
                 };
 
-                // De-cloak the content of each choice's delta (usually one).
+                // De-cloak each choice's delta (usually one): `content` and any
+                // reasoning-style field, each through its OWN rolling buffer.
                 if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
                     for choice in choices.iter_mut() {
                         let has_finish = choice.get("finish_reason").map(|f| !f.is_null()).unwrap_or(false);
+
+                        // Reasoning delta (whichever variant the upstream uses).
+                        for field in ["reasoning", "reasoning_content", "thinking"] {
+                            let Some(text) = choice.get("delta").and_then(|d| d.get(field)).and_then(|c| c.as_str()) else { continue };
+                            let mut emit = privacy::decloak_stream_chunk(&session, &mut reasoning_buf, text);
+                            if has_finish {
+                                emit.push_str(&privacy::decloak_stream_finish(&session, &mut reasoning_buf));
+                            }
+                            if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                                delta.insert(field.into(), json!(emit));
+                            }
+                        }
+
                         let content = choice
                             .get("delta")
                             .and_then(|d| d.get("content"))
@@ -462,10 +486,17 @@ async fn proxy_once_decloaked(body: Bytes, session: privacy::CloakSession) -> Re
     };
     if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
         for choice in choices.iter_mut() {
-            if let Some(content) = choice.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                let plain = privacy::decloak(&session, content);
-                if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
-                    msg.insert("content".into(), json!(plain));
+            // De-cloak EVERY text field the model can emit — reasoning models
+            // (gpt-oss, deepseek-r1, …) return their chain-of-thought in a
+            // `reasoning`/`reasoning_content`/`thinking` field that quotes the
+            // (cloaked) prompt, so de-cloaking only `content` leaked pseudonyms
+            // like [EMAIL-N] to the client (caught by the release cloaking gate).
+            for field in ["content", "reasoning", "reasoning_content", "thinking"] {
+                if let Some(text) = choice.get("message").and_then(|m| m.get(field)).and_then(|c| c.as_str()) {
+                    let plain = privacy::decloak(&session, text);
+                    if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
+                        msg.insert(field.into(), json!(plain));
+                    }
                 }
             }
         }
