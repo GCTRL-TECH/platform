@@ -150,7 +150,12 @@ function ProtectedRoute() {
     const key = localStorage.getItem('gctrl_license_key')
     if (!key) return
     if (localStorage.getItem('gctrl_license_linked') === key) return
-    api.post('/billing/license', { license_key: key })
+    // Forward tier + credits captured at activation so the row isn't degraded to
+    // free/3000. This also (re)activates the gctrl-agent so KEX sees the license.
+    const tier = localStorage.getItem('gctrl_license_tier') ?? undefined
+    const creditsRaw = localStorage.getItem('gctrl_license_credits')
+    const credits_allocated = creditsRaw ? Number(creditsRaw) : undefined
+    api.post('/billing/license', { license_key: key, tier, credits_allocated })
       .then(() => localStorage.setItem('gctrl_license_linked', key))
       .catch(() => {})
   }, [isAuthenticated])

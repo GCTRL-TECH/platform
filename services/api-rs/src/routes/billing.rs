@@ -174,6 +174,25 @@ async fn register_license(
     .bind(credits)
     .execute(&state.db).await?;
 
+    // (Re)activate the gctrl-agent so KEX sees the license immediately. KEX gates
+    // on the agent's signed JWT *file* (written only by the agent's own /activate),
+    // NOT this DB row. The onboarding flow reaches here via App.tsx's post-login
+    // /billing/license call, so firing /activate here closes the gap where a setup
+    // that resolved WITHOUT the agent (branches 2/3) left KEX "not activated" until
+    // a manual Settings re-entry. Best-effort: agent may be mid-start on a fresh box.
+    let key = body.license_key.clone();
+    tokio::spawn(async move {
+        if let Err(e) = reqwest::Client::new()
+            .post("http://gctrl-agent:7070/activate")
+            .json(&json!({ "license_key": key }))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            tracing::warn!("register_license: best-effort agent activation failed: {e}");
+        }
+    });
+
     Ok(Json(json!({ "ok": true })))
 }
 

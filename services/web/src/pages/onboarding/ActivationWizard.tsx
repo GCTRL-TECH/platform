@@ -26,7 +26,7 @@ export default function ActivationWizard({ onActivated }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ license_key: licenseKey.trim() }),
       })
-      const data = await res.json() as { ok?: boolean; error?: string; fusion_engine_pulling?: boolean }
+      const data = await res.json() as { ok?: boolean; error?: string; fusion_engine_pulling?: boolean; tier?: string; credits_balance?: number }
 
       if (!res.ok || !data.ok) {
         setError(data.error ?? 'Activation failed')
@@ -35,6 +35,10 @@ export default function ActivationWizard({ onActivated }: Props) {
       }
 
       localStorage.setItem('gctrl_license_key', licenseKey.trim())
+      // Stash tier + credits so the post-login /billing/license link (App.tsx)
+      // persists the real allocation instead of degrading the row to free/3000.
+      if (data.tier) localStorage.setItem('gctrl_license_tier', data.tier)
+      if (typeof data.credits_balance === 'number') localStorage.setItem('gctrl_license_credits', String(data.credits_balance))
       localStorage.setItem('gctrl_activated', 'true')
 
       if (data.fusion_engine_pulling) {
