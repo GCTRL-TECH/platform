@@ -1939,7 +1939,7 @@ async fn chat(
     // per-tool-result enforcement below (local_only refusal / cloaking). See
     // the `execute_tool` call site further down for the honest scope of what
     // this can and cannot attribute to a compilation.
-    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref());
+    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref(), Some(target.model.as_str()));
 
     // Build the effective system prompt: GCTRL base + the caller's enabled skills.
     let system_prompt = build_system_prompt(&state, &claims).await;

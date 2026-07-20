@@ -358,7 +358,7 @@ async fn enqueue_one_distill(
             .ok()
             .flatten();
             if let Some((Some(provider), base_url)) = runtime_row {
-                if crate::services::privacy::is_cloud_target(&provider, base_url.as_deref()) {
+                if crate::services::privacy::is_cloud_target(&provider, base_url.as_deref(), None) {
                     tracing::warn!(
                         "distill paused for wiki {compilation_id}: privacy mode {:?} but the active runtime ({provider}) is cloud — distill (privacy: local runtime required)",
                         decision.mode

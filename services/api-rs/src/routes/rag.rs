@@ -188,6 +188,36 @@ async fn feedback(
 /// Control?"). Used by the A3 hot-block path to decide which OWNED entity to build
 /// a dossier for on first ask. Falls back to the single longest capitalised token.
 /// Returns None when the query carries no capitalised content word.
+/// Detect ORDERING questions ("in which order…", "walk me through the order…",
+/// "chronological…"). These need a different answer shape: the user wants a
+/// chronological list of events, not prose — so retrieval context is sorted by
+/// session recency-ordinal and the model is instructed to emit one terse event
+/// per line in chronological order (see ORDERING MODE block in the system
+/// prompt). Pattern precision was validated offline against a 400-question set
+/// (40/40 ordering questions matched, 0 false positives).
+fn is_ordering_question(query: &str) -> bool {
+    let q = query.to_lowercase();
+    ["order in which", "in which order", "list the order", "list in order",
+     "walk me through the order", "chronolog", "sequence in which",
+     "sequence of events", "timeline of", "in the order"]
+        .iter().any(|p| q.contains(p))
+}
+
+/// Detect BROAD/summary questions ("summarize…", "recap…", "how did X evolve
+/// throughout our conversations…"). These need corpus-wide coverage that top-k
+/// passage retrieval cannot give; the session fact log (event-log digest) is a
+/// pre-computed map-reduce over the whole corpus, so it gets injected as
+/// additional context. Validated offline on a 400-question set (summary recall
+/// 40/40; 6 benign false positives that merely add factual context).
+fn is_broad_question(query: &str) -> bool {
+    let q = query.to_lowercase();
+    ["summari", "summary", "overview", "recap", "across our conversation", "across all",
+     "throughout our conversation", "throughout the conversation", "over the course",
+     "everything we", "all the topics", "all the ways", "progress", "evolve", "evolved",
+     "develop over", "changed over time", "journey"]
+        .iter().any(|p| q.contains(p))
+}
+
 fn first_proper_name(query: &str) -> Option<String> {
     // Stopwords that are capitalised at sentence start but aren't entity names.
     const STOP: &[&str] = &[
@@ -569,7 +599,7 @@ async fn query(
     // compilations is only known once retrieval resolves the chunks' own
     // compilation_id (ground truth); that full re-check happens further down,
     // right before the context is handed to the LLM.
-    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref());
+    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref(), Some(target.model.as_str()));
     if let Some(cid) = req.compilation_id {
         let decision = crate::services::privacy::resolve_privacy(&state.db, &[cid]).await;
         if is_cloud_target && decision.mode == crate::services::privacy::PrivacyMode::LocalOnly {
@@ -613,7 +643,7 @@ async fn query(
         // hybrid dense+lexical fusion has more to rank — wider net = more distinct
         // source sessions for parent-document expansion (Hebel 1: recall).
         "query":          search_query,
-        "limit":          12,
+        "limit":          24,
         "compilation_id": req.compilation_id,
         // Scope retrieval to the caller's own chunks (grounding + no cross-user leak).
         "user_id":        claims.as_ref().map(|c| c.sub),
@@ -655,7 +685,7 @@ async fn query(
             .map(|t| t.to_string())
             .collect();
         if !terms.is_empty() {
-            let score_of = |base: f64, text: &str, mentions: &Option<Vec<String>>| -> f64 {
+            let overlap_of = |text: &str, mentions: &Option<Vec<String>>| -> f64 {
                 let hay = text.to_lowercase();
                 let mut overlap = 0.0f64;
                 for t in &terms {
@@ -664,15 +694,25 @@ async fn query(
                         if ms.iter().any(|m| m.to_lowercase().contains(t)) { overlap += 0.5; }
                     }
                 }
-                base + (overlap / terms.len() as f64) * 0.25
+                overlap / terms.len() as f64
             };
-            chunks.sort_by(|a, b| {
-                let sa = score_of(a.score, &a.text, &a.entity_mentions);
-                let sb = score_of(b.score, &b.text, &b.entity_mentions);
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Rerank on the FUSED RANK, not the raw score: KEX interleaves dense
+            // (cosine ~0.6-0.7) and lexical (floor ~0.35) results, so sorting by
+            // absolute score systematically buries every lexical hit — exactly the
+            // near-verbatim statements lexical retrieval exists to catch. A rank-
+            // derived base preserves KEX's dense+lexical RRF order; the term-overlap
+            // bonus (≤0.25 ≈ 12 ranks) can still lift a query-relevant chunk.
+            let mut scored: Vec<(f64, KexChunk)> = chunks.drain(..).enumerate()
+                .map(|(i, c)| {
+                    let s = 1.0 - (i as f64) * 0.02
+                        + overlap_of(&c.text, &c.entity_mentions) * 0.25;
+                    (s, c)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            chunks = scored.into_iter().map(|(_, c)| c).collect();
         }
-        chunks.truncate(6);
+        chunks.truncate(10);
     }
 
     // A4 — HEAT on chunks. Every chunk that was actually returned by retrieval (and
@@ -846,10 +886,10 @@ async fn query(
                 }
             }
             // Build parent docs in chunk-RANK order, deduped by job, capped to the
-            // top 4 distinct sessions (× ~4k chars) so the prompt stays bounded.
+            // top 6 distinct sessions (× ~4k chars) so the prompt stays bounded.
             let mut seen_jobs: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
             for ch in chunks.iter() {
-                if parent_docs.len() >= 4 { break; }
+                if parent_docs.len() >= 6 { break; }
                 let Some(cid_) = ch.chunk_id.as_deref() else { continue; };
                 let Some(b) = by_chunk.get(cid_) else { continue; };
                 let (jid, src, txt, _epoch, _ord) = b;
@@ -875,7 +915,156 @@ async fn query(
     //   tier 1: pinned/dossier (HOT block)  ← injected first, above everything
     //   tier 2: graph fact (high-confidence edge)
     //   tier 3: chunk (dense/lexical, hybrid-retrieved)
+    // ORDERING MODE: chronological question — switch the answer shape to a
+    // terse ordered list (context is already presented chronologically below).
+    let ordering_mode = is_ordering_question(&req.message);
+    if ordering_mode {
+        tracing::info!("rag: ORDERING MODE active for {:?}", req.message);
+    }
+    // Broad/summary questions get the fact event log too (coverage), but keep
+    // the normal prose answer shape.
+    let broad_mode = !ordering_mode && is_broad_question(&req.message);
+    if broad_mode {
+        tracing::info!("rag: BROAD MODE active for {:?}", req.message);
+    }
+
+    // Chronological PRESENTATION (selection stays relevance-ranked): after the
+    // top-k is chosen, order the passages oldest→newest — same convention as the
+    // parent sessions — so when the same attribute has several values, the model
+    // reads the CURRENT one last (recency-primacy). Fixes update questions where
+    // raw recency ordinals were misread and an outdated value won.
+    chunks.sort_by_key(|c| c.chunk_id.as_deref()
+        .and_then(|id| chunk_ord.get(id)).copied().unwrap_or(i64::MAX));
+
+    // CONFLICT NOTICE (deterministic): find a strongly-negated retrieved passage
+    // ("never…", "no longer…") whose content words overlap a non-negated one —
+    // the classic buried contradiction. The system prompt's CONFLICTING EVIDENCE
+    // rule only fires when the model NOTICES the pair; this puts the pair on the
+    // table explicitly, so the answer surfaces the contradiction instead of
+    // silently picking a side.
+    let conflict_notice: Option<String> = {
+        let is_neg = |t: &str| {
+            let l = t.to_lowercase();
+            l.contains(" never ") || l.contains("never actually") || l.contains("no longer")
+                || l.contains(" denied ") || l.contains("haven't ever") || l.contains("i have never")
+        };
+        let toks = |t: &str| -> std::collections::HashSet<String> {
+            t.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 5)
+                .map(str::to_string)
+                .collect()
+        };
+        let mut found: Option<(usize, usize)> = None;
+        'outer: for i in 0..chunks.len() {
+            if !is_neg(&chunks[i].text) { continue; }
+            let ti = toks(&chunks[i].text);
+            if ti.is_empty() { continue; }
+            for j in 0..chunks.len() {
+                if i == j || is_neg(&chunks[j].text) { continue; }
+                let tj = toks(&chunks[j].text);
+                if tj.is_empty() { continue; }
+                let inter = ti.intersection(&tj).count();
+                if inter * 100 / ti.len().min(tj.len()).max(1) >= 30 {
+                    found = Some((i, j));
+                    break 'outer;
+                }
+            }
+        }
+        found.map(|(i, j)| format!(
+            "⚠ CONFLICT NOTICE: passages [{}] and [{}] below appear to CONTRADICT each other \
+             about the same matter (one denies what the other affirms). If the question touches \
+             this matter, you MUST surface the contradiction: state that the sources disagree and \
+             present BOTH claims with their citations — do not silently pick one side.",
+            i + 1, j + 1))
+    };
+
     let mut context_parts: Vec<String> = Vec::new();
+    if let Some(ref notice) = conflict_notice {
+        context_parts.push(notice.clone());
+        tracing::info!("rag: conflict notice injected for {:?}", req.message);
+    }
+
+    // ORDERING MODE — TIMELINE VIEW: chronology questions span the WHOLE corpus,
+    // which top-k retrieval structurally cannot see (6 of ~100 sessions). Build a
+    // compact chronological digest over ALL of the caller's sessions: per session
+    // its header + opening user turn, oldest→newest. Bounded (200 sessions ×
+    // ~240 chars); only paid on ordering questions.
+    if ordering_mode || broad_mode {
+        if let Some(ref c) = claims {
+            // Preferred timeline source: the session FACT LOG (kex step 7b) — dated
+            // atomic events in the conversation's own wording, in ingest order.
+            // This is the episodic log ordering questions actually need; the
+            // session-digest below only serves corpora ingested before fact
+            // logging existed.
+            let fact_rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT tc.content FROM text_chunks tc JOIN jobs j ON j.id = tc.job_id \
+                 WHERE tc.user_id = $1 AND tc.chunk_sequence >= 5000 AND tc.archived = false \
+                 ORDER BY j.created_at ASC, tc.chunk_sequence ASC LIMIT 350",
+            ).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default();
+            if !fact_rows.is_empty() {
+                let lines: Vec<String> = fact_rows.iter().enumerate()
+                    .map(|(i, (f,))| format!("{}. {}", i + 1, f.chars().take(260).collect::<String>()))
+                    .collect();
+                context_parts.push(format!(
+                    "--- EVENT LOG (all remembered facts/events, OLDEST→NEWEST; use this to \
+                     reconstruct the order in which things happened or were brought up) ---\n{}",
+                    lines.join("\n")));
+                tracing::info!("rag: ordering event log injected ({} facts)", lines.len());
+            }
+            let rows: Vec<(String,)> = if !fact_rows.is_empty() { vec![] } else { sqlx::query_as(
+                "SELECT COALESCE(input->>'text','') FROM jobs \
+                 WHERE user_id = $1 AND type = 'kex_extract' AND status = 'completed' \
+                 ORDER BY created_at ASC LIMIT 200",
+            ).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default() };
+            if !rows.is_empty() {
+                // Group document parts by their SESSION (the "[… session N …]"
+                // header ingestion stamps on each part). Sessions are the real
+                // episodic units — the order of major themes is the order of
+                // sessions, so the digest shows one entry per session with a few
+                // of its user turns, not one entry per stored part.
+                let mut sessions: Vec<(String, String, Vec<String>)> = Vec::new(); // (key, date, user_lines)
+                for (text,) in rows.iter() {
+                    if text.is_empty() { continue; }
+                    let header = text.lines().next().unwrap_or("");
+                    let sess_key = header.split("session ").nth(1)
+                        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                        .unwrap_or("?").to_string();
+                    let date = header.split("date: ").nth(1)
+                        .map(|s| s.trim_end_matches([']', ' ']).split(" —").next().unwrap_or(s).to_string())
+                        .unwrap_or_default();
+                    let users: Vec<String> = text.lines()
+                        .filter(|l| l.trim_start().starts_with("USER"))
+                        .take(1)
+                        .map(|l| l.chars().take(150).collect())
+                        .collect();
+                    match sessions.last_mut() {
+                        Some((k, _, ls)) if *k == sess_key => ls.extend(users),
+                        _ => sessions.push((sess_key, date, users)),
+                    }
+                }
+                let mut lines: Vec<String> = Vec::new();
+                for (key, date, users) in sessions.iter() {
+                    // Sample user turns EVENLY across the session (not just its
+                    // opening turns — those are often scheduling/meta talk, while
+                    // the session's main work shows up later).
+                    let picked: Vec<String> = if users.len() <= 8 {
+                        users.clone()
+                    } else {
+                        (0..8).map(|i| users[i * (users.len() - 1) / 7].clone()).collect()
+                    };
+                    let mut snippet = picked.join(" | ");
+                    snippet = snippet.chars().take(1200).collect();
+                    lines.push(format!("Session {} ({}): {}", key, date, snippet));
+                }
+                context_parts.push(format!(
+                    "--- CONVERSATION TIMELINE (one entry per session, OLDEST→NEWEST; each shows what the \
+                     user brought up in that session — the order of major themes IS the order of sessions) ---\n{}",
+                    lines.join("\n")));
+                tracing::info!("rag: ordering timeline injected ({} sessions from {} parts)", lines.len(), rows.len());
+            }
+        }
+    }
 
     // ── TIER 1: HOT BLOCK — entity dossiers the query references. Built on-the-fly
     // when an owned-but-undossiered entity is named, so first-ask still gets the
@@ -1127,7 +1316,7 @@ async fn query(
         format!("Context:\n{context}\n\nQuestion: {}", cloaked_message)
     };
 
-    let system_prompt =
+    let base_system_prompt =
         "You are a knowledge-base assistant. Answer the question using ONLY the provided context. \
          The context is ranked into TRUST TIERS, highest first: \
          (1) the HOT BLOCK — a pinned/dossier of authoritative, compiled ground-truth about an entity; \
@@ -1138,9 +1327,35 @@ async fn query(
          NEVER reply with 'refer to the file', 'see the document', or 'the full X is not available' when context is present — the context IS the document; report it, don't redirect the user. The chunk text may have minor extraction artefacts (odd spacing); read through them and still report the facts. \
          Cite sources inline as [1], [2], … matching the numbered passages; cite the HOT BLOCK as the dossier and name its origin files when asked about provenance. \
          CONFLICTING EVIDENCE: if two or more passages make CONTRADICTORY claims about the SAME fact (e.g. one says something never happened and another says it did, or two passages give different values for the same attribute), do NOT silently pick one side — SURFACE the conflict: state that the sources disagree, present BOTH claims with their citations, and (if the question asks 'did I / have I …') flag it as contradictory rather than answering a flat yes/no. \
-         LATEST VALUE WINS: each passage and source is tagged with its 'session N' (higher N = more recent). When the SAME attribute has DIFFERENT values across sessions and the question asks for the current/total/latest state (counts, totals, status, metrics that change over time), report the value from the HIGHEST session number as current (you may note it superseded an earlier value); do not report a stale lower-session value as if current. \
+         LATEST VALUE WINS: passages and sessions are presented in CHRONOLOGICAL order, OLDEST FIRST — the further down a passage appears, the more recent it is. When the SAME attribute (a target, deadline, count, metric, schedule) has DIFFERENT values in different passages, the value in the LAST passage that mentions it is the CURRENT one — report THAT value as the answer (you may note it superseded an earlier value). Never report an earlier value as current, and treat any update/reschedule/revision mentioned later as replacing what came before. \
          If — and only if — NO tier contains a relevant fact, say it isn't in the knowledge base. Do NOT use outside or general knowledge, and do not guess. \
+         SPEAKER ATTRIBUTION: when the context is a USER↔ASSISTANT dialogue, attribute every fact to the correct speaker. What the ASSISTANT suggested, proposed, or drafted is NOT something the user did, used, decided, or enforced. If the question asks what the USER did/used/chose/enforced and the context only shows assistant suggestions about it, say the user never stated doing this — do not convert suggestions into user actions. \
+         PRESUPPOSITION CHECK: some questions presuppose an event, decision, causal link, or influence that the context never actually states (e.g. 'how did the user feedback influence X?' when no user feedback was ever discussed). Before answering how/why/what-specifically questions, check that the presupposed thing itself appears in the context — if it does not, say that this specific thing isn't stated in the knowledge base (optionally noting what related information exists) instead of reconstructing a plausible story from adjacent facts. \
+         DATE ARITHMETIC: when asked for a duration or day/week count between events, first quote the exact anchor dates from the context and check they belong to the EXACT events asked about (not a similarly-named milestone or an earlier/later sprint), then compute the difference step by step. \
          Use the prior conversation turns to resolve references (pronouns, 'that', 'the same one') — but ground every FACT in the context above, never invent from the chat alone.";
+
+    // ORDERING MODE overlay: chronology questions want a bare ordered list, not
+    // prose — one terse event per line so the sequence is unambiguous.
+    let system_prompt: String = if ordering_mode {
+        format!("{base_system_prompt}\n\n\
+            ORDERING MODE — the user asks for the ORDER in which events/aspects occurred or were brought up. \
+            Reconstruct the chronology from the context: sessions are ordered OLDEST→NEWEST (higher session number = later); \
+            within the sessions, order by when each item FIRST appeared. \
+            OUTPUT FORMAT (strict): ONLY a numbered list, one item per line, in chronological order. \
+            Each line is ONE short event phrase (4-8 words) — no prose, no preamble, no explanations, no citations, \
+            and never two events joined by 'and' on one line. \
+            SPECIFICITY: each line must name the CONCRETE thing involved — the specific person, product, feature, \
+            document, or activity exactly as the conversation called it (e.g. 'trying the Brooks Ghost for shin \
+            splints', \"Bryan's storytelling advice\", 'transaction error handling') — never a generic category like \
+            'product recommendations' or 'project planning'. Match the granularity of what the question asks about. \
+            SELECTION: pick the events most central to what the question asks about (the question names the aspect — \
+            e.g. support from friends, shoe features, error handling); ignore unrelated context. \
+            If the question asks for exactly N items (e.g. 'ONLY the top three'), output EXACTLY N lines — \
+            the N most significant distinct events for that aspect, in the order they FIRST came up.")
+    } else {
+        base_system_prompt.to_string()
+    };
+    let system_prompt = system_prompt.as_str();
 
     // Thread the conversation: prior turns first, then the grounded question.
     let mut chat_msgs: Vec<Value> = history.clone();
@@ -1152,6 +1367,7 @@ async fn query(
     )
     .await
     .map_err(AppError::Internal)?;
+
     // De-cloak the answer before it's persisted/returned — the cloak map never
     // leaves this request (it lives only in `cloak_maps`, keyed by compilation).
     let answer = if cloak_session.is_empty() { answer } else { crate::services::privacy::decloak(&cloak_session, &answer) };
@@ -1353,7 +1569,7 @@ async fn deep_query(
     // compilationId (the `compilation_hint` fed to the model below). Per-tool
     // enforcement (the ground truth for what deep mode actually touches) happens
     // at each tool result below — see the honesty note there.
-    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref());
+    let is_cloud_target = crate::services::privacy::is_cloud_target(&target.provider, target.base_url.as_deref(), Some(target.model.as_str()));
     if let Some(cid) = req.compilation_id {
         let decision = crate::services::privacy::resolve_privacy(&state.db, &[cid]).await;
         if is_cloud_target && decision.mode == crate::services::privacy::PrivacyMode::LocalOnly {

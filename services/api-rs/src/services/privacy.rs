@@ -187,7 +187,18 @@ fn is_local_host(host: &str) -> bool {
 ///   (Ollama's hosted cloud models, reached via the `"ollama"` provider with a
 ///   cloud base — see `llm::resolve_for_user`'s `ollama_cloud` alias).
 /// - No `base_url` at all → local (the bundled default install target).
-pub fn is_cloud_target(provider: &str, base_url: Option<&str>) -> bool {
+pub fn is_cloud_target(provider: &str, base_url: Option<&str>, model: Option<&str>) -> bool {
+    // A hosted cloud model carries a `*-cloud` / `*:cloud` tag (Ollama Cloud). It
+    // is CLOUD even when reached through a localhost Ollama proxy — otherwise such
+    // a model served via native localhost Ollama is misclassified as local and its
+    // prompt is sent as PLAINTEXT to ollama.com, silently bypassing cloaking. The
+    // tag wins over the host heuristic (matches llm_gateway::model_targets_cloud).
+    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+        let m = m.to_ascii_lowercase();
+        if m.ends_with("-cloud") || m.ends_with(":cloud") {
+            return true;
+        }
+    }
     if matches!(
         provider.trim().to_lowercase().as_str(),
         "openai" | "anthropic" | "openrouter" | "ollama_cloud"
@@ -703,39 +714,48 @@ mod tests {
 
     #[test]
     fn cloud_providers_always_cloud() {
-        assert!(is_cloud_target("openai", None));
-        assert!(is_cloud_target("anthropic", None));
-        assert!(is_cloud_target("openrouter", None));
-        assert!(is_cloud_target("ollama_cloud", None));
-        assert!(is_cloud_target("OpenAI", None), "provider match must be case-insensitive");
+        assert!(is_cloud_target("openai", None, None));
+        assert!(is_cloud_target("anthropic", None, None));
+        assert!(is_cloud_target("openrouter", None, None));
+        assert!(is_cloud_target("ollama_cloud", None, None));
+        assert!(is_cloud_target("OpenAI", None, None), "provider match must be case-insensitive");
     }
 
     #[test]
     fn ollama_no_base_is_local() {
-        assert!(!is_cloud_target("ollama", None));
+        assert!(!is_cloud_target("ollama", None, None));
     }
 
     #[test]
     fn ollama_localhost_and_lan_are_local() {
-        assert!(!is_cloud_target("ollama", Some("http://localhost:11434")));
-        assert!(!is_cloud_target("ollama", Some("http://127.0.0.1:11434")));
-        assert!(!is_cloud_target("ollama", Some("http://10.0.0.5:11434")));
-        assert!(!is_cloud_target("ollama", Some("http://192.168.1.50:11434")));
-        assert!(!is_cloud_target("ollama", Some("http://172.16.0.9:11434")));
-        assert!(!is_cloud_target("ollama", Some("http://ollama:11434")), "docker service name (no dot) is local");
-        assert!(!is_cloud_target("openai_compatible", Some("http://gctrl-llamacpp:8080")));
+        assert!(!is_cloud_target("ollama", Some("http://localhost:11434"), None));
+        assert!(!is_cloud_target("ollama", Some("http://127.0.0.1:11434"), None));
+        assert!(!is_cloud_target("ollama", Some("http://10.0.0.5:11434"), None));
+        assert!(!is_cloud_target("ollama", Some("http://192.168.1.50:11434"), None));
+        assert!(!is_cloud_target("ollama", Some("http://172.16.0.9:11434"), None));
+        assert!(!is_cloud_target("ollama", Some("http://ollama:11434"), None), "docker service name (no dot) is local");
+        assert!(!is_cloud_target("openai_compatible", Some("http://gctrl-llamacpp:8080"), None));
     }
 
     #[test]
     fn ollama_cloud_host_is_cloud() {
-        assert!(is_cloud_target("ollama", Some("https://ollama.com")));
-        assert!(is_cloud_target("ollama", Some("https://api.ollama.com")));
+        assert!(is_cloud_target("ollama", Some("https://ollama.com"), None));
+        assert!(is_cloud_target("ollama", Some("https://api.ollama.com"), None));
+    }
+
+    #[test]
+    fn cloud_model_tag_overrides_local_host() {
+        // A `*-cloud` / `*:cloud` model served through a localhost Ollama proxy is
+        // still CLOUD — the tag wins so cloaking engages instead of leaking plaintext.
+        assert!(is_cloud_target("ollama", Some("http://localhost:11434"), Some("gpt-oss:120b-cloud")));
+        assert!(is_cloud_target("ollama", Some("http://127.0.0.1:11434"), Some("qwen3:cloud")));
+        assert!(!is_cloud_target("ollama", Some("http://localhost:11434"), Some("llama3.2")), "a plain local model stays local");
     }
 
     #[test]
     fn openai_compatible_public_host_is_cloud() {
-        assert!(is_cloud_target("openai_compatible", Some("https://my-llm.example.com")));
-        assert!(is_cloud_target("openai_compatible", Some("https://api.together.xyz")));
+        assert!(is_cloud_target("openai_compatible", Some("https://my-llm.example.com"), None));
+        assert!(is_cloud_target("openai_compatible", Some("https://api.together.xyz"), None));
     }
 
     #[test]
@@ -743,7 +763,7 @@ mod tests {
         // An unparsable base fails safe to "local" here (this heuristic never
         // blocks on its own malformed input — the SSRF guard in services::llm
         // is the layer responsible for rejecting bad URLs outright).
-        assert!(!is_cloud_target("openai_compatible", Some("not a url")));
+        assert!(!is_cloud_target("openai_compatible", Some("not a url"), None));
     }
 
     // ── apply_pseudonyms: longest-match + case-insensitive ───────────────
