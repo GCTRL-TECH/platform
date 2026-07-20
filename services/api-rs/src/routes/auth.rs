@@ -302,13 +302,19 @@ async fn seed_default_wiki(db: &sqlx::PgPool, user_id: Uuid) {
         return;
     }
 
-    // Auto-distill trigger: the cron executor re-distils this wiki every 10 min.
+    // Auto-distill trigger: change_detection (heartbeat) — re-distils ONLY when a
+    // source graph actually gained content since the last distill (checked every
+    // executor tick via wiki_has_new_content). NOT a cron: the previous */10 cron
+    // default bypassed the staleness check by design and re-distilled every idle
+    // wiki every 10 minutes — ~600 pointless LLM jobs/hour across 100 users
+    // (236k-row jobs table on the dev box). Migration 071 converts existing
+    // default triggers.
     if let Err(e) = sqlx::query(
         "INSERT INTO triggers \
             (id, user_id, name, module, type, status, cron_schedule, config, next_run_at) \
          VALUES ($1, $2, 'Auto-distill: Knowledge Wiki', \
-                 'distill'::trigger_module, 'cron'::trigger_type, 'active', \
-                 '*/10 * * * *', $3, NOW())"
+                 'distill'::trigger_module, 'change_detection'::trigger_type, 'active', \
+                 NULL, $3, NOW())"
     )
     .bind(Uuid::new_v4())
     .bind(user_id)
