@@ -4,7 +4,10 @@ import { useAuth } from './useAuth'
 export interface TokenBalance {
   balance: number
   tier: string
-  tierLimit: number
+  /** Monthly token allowance; `null` means the tier is unlimited. */
+  tierLimit: number | null
+  /** `true` for business/enterprise (and legacy starter/pro) — no metering. */
+  unlimited?: boolean
 }
 
 /**
@@ -39,7 +42,9 @@ export function useTokenBalance() {
   // Fall back to the login-time snapshot only until the first live fetch lands.
   const balance = query.data?.balance ?? user?.tokensBalance ?? 0
   const tier = query.data?.tier ?? user?.tier ?? 'free'
-  const tierLimit = query.data?.tierLimit ?? 0
+  const tierLimit = query.data?.tierLimit ?? null
+  // Defensive: treat the field as false when the backend omits it.
+  const unlimited = query.data?.unlimited === true
 
-  return { balance, tier, tierLimit, isLoading: query.isLoading, query }
+  return { balance, tier, tierLimit, unlimited, isLoading: query.isLoading, query }
 }

@@ -24,7 +24,9 @@ export interface User {
   role: 'admin' | 'editor' | 'analyst' | 'viewer'
   clearance: string
   tokensBalance: number
-  tier: 'free' | 'starter' | 'pro' | 'enterprise'
+  // Current tiers: free | business | enterprise. Legacy starter/pro kept so
+  // existing accounts still type-check until the backend migrates them.
+  tier: 'free' | 'business' | 'enterprise' | 'starter' | 'pro'
   emailVerified: boolean
   defaultOntologyId: string | null
 }

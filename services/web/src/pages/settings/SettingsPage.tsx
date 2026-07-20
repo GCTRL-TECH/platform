@@ -43,6 +43,7 @@ import {
   Gauge,
   Zap,
   Cpu,
+  Infinity as InfinityIcon,
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
@@ -2753,7 +2754,7 @@ function PersonalMemoryTab() {
 
 function AccountTab() {
   const { user, logout } = useAuth()
-  const { balance: liveBalance } = useTokenBalance()
+  const { balance: liveBalance, unlimited } = useTokenBalance()
   const navigate = useNavigate()
 
   function handleLogout() {
@@ -2763,9 +2764,11 @@ function AccountTab() {
 
   const TIER_COLORS: Record<string, string> = {
     free: 'bg-slate-800 text-slate-400',
+    business: 'bg-indigo-500/20 text-indigo-400',
+    enterprise: 'bg-amber-500/20 text-amber-400',
+    // Legacy tiers — kept so existing accounts still render styled.
     starter: 'bg-blue-500/20 text-blue-400',
     pro: 'bg-emerald-500/20 text-emerald-400',
-    enterprise: 'bg-amber-500/20 text-amber-400',
   }
 
   return (
@@ -2811,12 +2814,16 @@ function AccountTab() {
         <SectionHeader>Token Balance</SectionHeader>
         <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
           <div className="flex items-center gap-3">
-            <Coins size={20} className="text-amber-400" />
+            {unlimited
+              ? <InfinityIcon size={20} className="text-indigo-400" />
+              : <Coins size={20} className="text-amber-400" />}
             <div>
               <p className="text-xl font-semibold text-slate-100">
-                {liveBalance.toLocaleString()}
+                {unlimited ? 'Unlimited' : liveBalance.toLocaleString()}
               </p>
-              <p className="text-xs text-slate-500">tokens remaining</p>
+              <p className="text-xs text-slate-500">
+                {unlimited ? 'no monthly token limit' : 'tokens remaining'}
+              </p>
             </div>
             {user?.tier && (
               <span
@@ -3847,8 +3854,7 @@ interface CurrentLicenseResponse {
 }
 
 function LicenseTab() {
-  const { user } = useAuth()
-  const { balance: liveBalance } = useTokenBalance()
+  const { balance: liveBalance, tier: liveTier, unlimited } = useTokenBalance()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [key, setKey] = useState('')
@@ -3917,12 +3923,12 @@ function LicenseTab() {
       if (res.ok && data.ok) {
         localStorage.setItem('gctrl_license_key', key.trim())
         localStorage.setItem('gctrl_activated', 'true')
-        // Link the license to the logged-in user account
+        // Link the license to the logged-in user account. The server derives
+        // tier + allocation from the license itself, so we only send the key
+        // (client-supplied tier/credits are ignored for security).
         try {
           await api.post('/billing/license', {
             license_key: key.trim(),
-            tier: data.tier,
-            credits_allocated: data.credits_balance,
           })
         } catch { /* non-fatal — license stored locally, user can re-link later */ }
         // Invalidate dependent queries so the displayed balance + license refresh.
@@ -4002,26 +4008,60 @@ function LicenseTab() {
                   </button>
                 </div>
               </div>
-              <div className="grid grid-cols-3 gap-3 text-xs">
-                <div>
-                  <p className="text-slate-500">Allocated</p>
-                  <p className="mt-0.5 font-medium text-slate-200">
-                    {license.creditsAllocated.toLocaleString()}
-                  </p>
+              {unlimited ? (
+                <div className="flex items-center justify-between gap-3 rounded-md border border-indigo-900/40 bg-indigo-950/20 px-3 py-2.5">
+                  <div className="flex items-center gap-2.5">
+                    <InfinityIcon size={18} className="shrink-0 text-indigo-400" />
+                    <div>
+                      <p className="text-sm font-semibold text-slate-100">Unlimited tokens</p>
+                      <p className="mt-0.5 text-[11px] text-slate-500">
+                        <span className="capitalize text-slate-300">{liveTier}</span> plan
+                        {' · '}Used (tracking): {license.creditsUsed.toLocaleString()}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => navigate('/billing')}
+                    className="flex shrink-0 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
+                  >
+                    Full Usage <ChevronRight size={12} />
+                  </button>
                 </div>
-                <div>
-                  <p className="text-slate-500">Used</p>
-                  <p className="mt-0.5 font-medium text-slate-200">
-                    {Math.max(0, license.creditsAllocated - liveBalance).toLocaleString()}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-slate-500">Remaining</p>
-                  <p className="mt-0.5 font-medium text-emerald-400">
-                    {liveBalance.toLocaleString()}
-                  </p>
-                </div>
-              </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-3 gap-3 text-xs">
+                    <div>
+                      <p className="text-slate-500">Allocated</p>
+                      <p className="mt-0.5 font-medium text-slate-200">
+                        {license.creditsAllocated.toLocaleString()}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-slate-500">Used</p>
+                      <p className="mt-0.5 font-medium text-slate-200">
+                        {Math.max(0, license.creditsAllocated - liveBalance).toLocaleString()}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-slate-500">Remaining</p>
+                      <p className="mt-0.5 font-medium text-emerald-400">
+                        {liveBalance.toLocaleString()}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between border-t border-slate-800 pt-3">
+                    <p className="text-xs text-slate-500">
+                      Plan: <span className="capitalize text-slate-300">{liveTier}</span>
+                    </p>
+                    <button
+                      onClick={() => navigate('/billing')}
+                      className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
+                    >
+                      Full Usage <ChevronRight size={12} />
+                    </button>
+                  </div>
+                </>
+              )}
               <p className="text-[11px] text-slate-600">
                 Activated {new Date(license.activatedAt).toLocaleString()}
               </p>
@@ -4091,29 +4131,6 @@ function LicenseTab() {
             {activating ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
             {activating ? 'Activating…' : isActivated ? 'Replace License Key' : 'Activate License Key'}
           </button>
-        </div>
-      </section>
-
-      <section>
-        <SectionHeader>Token Balance</SectionHeader>
-        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-2xl font-bold text-slate-100">
-                {liveBalance.toLocaleString()}
-                <span className="ml-1 text-sm font-normal text-slate-500">tokens remaining</span>
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                Plan: <span className="capitalize text-slate-300">{user?.tier ?? 'free'}</span>
-              </p>
-            </div>
-            <button
-              onClick={() => navigate('/billing')}
-              className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
-            >
-              Full Usage <ChevronRight size={12} />
-            </button>
-          </div>
         </div>
       </section>
     </div>

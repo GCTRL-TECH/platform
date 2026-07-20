@@ -86,9 +86,11 @@ const CLEARANCE_COLORS: Record<string, string> = {
 
 const TIER_COLORS: Record<string, string> = {
   free:       'text-slate-400',
+  business:   'text-indigo-400',
+  enterprise: 'text-amber-400',
+  // Legacy tiers — kept so old values still render styled.
   starter:    'text-blue-400',
   pro:        'text-purple-400',
-  enterprise: 'text-amber-400',
 }
 
 // ─── License sub-row ──────────────────────────────────────────────────────────
@@ -184,7 +186,7 @@ function LicenseRows({ userId }: { userId: string }) {
                   onChange={(e) => setEditing((prev) => ({ ...prev, [lic.id]: { ...prev[lic.id], tier: e.target.value } }))}
                   className="rounded border border-slate-700 bg-slate-800 px-2 py-0.5 text-[11px] text-slate-300"
                 >
-                  {['free', 'starter', 'pro', 'enterprise'].map((t) => (
+                  {['free', 'business', 'enterprise'].map((t) => (
                     <option key={t} value={t}>{t}</option>
                   ))}
                 </select>
@@ -499,7 +501,7 @@ export default function AdminPanel() {
                             onChange={(e) => void updateTier(u.id, e.target.value)}
                             className={cn('rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] font-medium capitalize', TIER_COLORS[u.tier] ?? 'text-slate-300')}
                           >
-                            {['free', 'starter', 'pro', 'enterprise'].map((t) => (
+                            {['free', 'business', 'enterprise'].map((t) => (
                               <option key={t} value={t}>{t}</option>
                             ))}
                           </select>

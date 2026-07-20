@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react'
-import { Coins, TrendingDown, BarChart3, Clock, Zap, ArrowUpRight } from 'lucide-react'
+import { Coins, TrendingDown, BarChart3, Clock, Zap, ArrowUpRight, Infinity as InfinityIcon } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 interface BalanceData {
   balance: number
   tier: string
-  tierLimit: number
+  /** Monthly token allowance; `null` means the tier is unlimited. */
+  tierLimit: number | null
+  /** `true` for business/enterprise (and legacy starter/pro) — no metering. */
+  unlimited?: boolean
 }
 
 interface UsageSummary {
@@ -26,9 +29,11 @@ interface UsageEntry {
 
 const TIER_COLORS: Record<string, string> = {
   free: 'text-slate-400',
+  business: 'text-indigo-400',
+  enterprise: 'text-amber-400',
+  // Legacy tiers — kept so old values still render styled.
   starter: 'text-blue-400',
   pro: 'text-purple-400',
-  enterprise: 'text-amber-400',
 }
 
 const ACTION_LABELS: Record<string, string> = {
@@ -65,7 +70,8 @@ export default function TokenDashboard() {
     }
   }
 
-  const usagePercent = balance
+  const unlimited = balance?.unlimited === true
+  const usagePercent = balance && !unlimited && balance.tierLimit
     ? Math.min(100, ((balance.tierLimit - balance.balance) / balance.tierLimit) * 100)
     : 0
 
@@ -102,24 +108,30 @@ export default function TokenDashboard() {
             <Coins size={14} />
             Token Balance
           </div>
-          <p className="mt-2 text-3xl font-bold text-slate-100">
-            {balance?.balance?.toLocaleString() ?? '...'}
+          <p className="mt-2 flex items-center gap-1.5 text-3xl font-bold text-slate-100">
+            {unlimited
+              ? <><InfinityIcon size={26} className="text-indigo-400" /> Unlimited</>
+              : (balance?.balance?.toLocaleString() ?? '...')}
           </p>
-          <div className="mt-3">
-            <div className="flex justify-between text-[10px] text-slate-500">
-              <span>Used</span>
-              <span>{Math.round(usagePercent)}%</span>
+          {unlimited ? (
+            <p className="mt-3 text-[10px] text-slate-500">No monthly token limit</p>
+          ) : (
+            <div className="mt-3">
+              <div className="flex justify-between text-[10px] text-slate-500">
+                <span>Used</span>
+                <span>{Math.round(usagePercent)}%</span>
+              </div>
+              <div className="mt-1 h-1.5 rounded-full bg-slate-800">
+                <div
+                  className={cn(
+                    'h-full rounded-full transition-all',
+                    usagePercent > 80 ? 'bg-red-500' : usagePercent > 50 ? 'bg-amber-500' : 'bg-emerald-500'
+                  )}
+                  style={{ width: `${usagePercent}%` }}
+                />
+              </div>
             </div>
-            <div className="mt-1 h-1.5 rounded-full bg-slate-800">
-              <div
-                className={cn(
-                  'h-full rounded-full transition-all',
-                  usagePercent > 80 ? 'bg-red-500' : usagePercent > 50 ? 'bg-amber-500' : 'bg-emerald-500'
-                )}
-                style={{ width: `${usagePercent}%` }}
-              />
-            </div>
-          </div>
+          )}
         </div>
 
         {/* Tier */}
@@ -132,7 +144,11 @@ export default function TokenDashboard() {
             {balance?.tier ?? '...'}
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            {balance?.tierLimit?.toLocaleString() ?? '...'} tokens/month
+            {balance
+              ? (unlimited || balance.tierLimit == null
+                  ? 'Unlimited tokens/month'
+                  : `${balance.tierLimit.toLocaleString()} tokens/month`)
+              : '...'}
           </p>
         </div>
 
@@ -257,7 +273,7 @@ export default function TokenDashboard() {
       </div>
 
       {/* Upgrade CTA */}
-      {balance && balance.tier !== 'enterprise' && (
+      {balance && !unlimited && balance.tier !== 'enterprise' && (
         <div className="flex items-center justify-between rounded-xl border border-indigo-900/30 bg-indigo-950/20 p-5">
           <div>
             <h3 className="text-sm font-semibold text-slate-200">Need more tokens?</h3>
