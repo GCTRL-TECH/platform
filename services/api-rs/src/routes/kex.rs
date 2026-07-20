@@ -770,14 +770,62 @@ async fn cancel_job(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Delete an extraction job AND its cross-store footprint: its chunks (Postgres
+/// + best-effort Qdrant points, same pattern as delete_chunk_core) and its
+/// membership in every compilation's `source_job_ids` (otherwise the graph view
+/// keeps referencing a job that no longer exists). token_usage / sync-history
+/// rows survive via ON DELETE SET NULL (migration 070) — they are billing/audit
+/// history, not job data.
+///
+/// Deliberately NOT deleted: Neo4j entities. Nodes are URI-merged across jobs
+/// (`_source_job` holds only the LATEST contributor), so deleting by source job
+/// would destroy nodes other jobs also produced. Entity lifecycle belongs to
+/// compilation deletion / memory governance, not per-job deletion.
 async fn delete_job(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
+    // Owner check up front so a foreign id can't trigger any cleanup.
+    let owned: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM jobs WHERE id = $1 AND user_id = $2"
+    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
+    if owned.is_none() { return Err(AppError::NotFound); }
+
+    // Collect the job's Qdrant point ids, then drop its chunks from Postgres.
+    let point_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT qdrant_point_id FROM text_chunks
+         WHERE job_id = $1 AND user_id = $2 AND qdrant_point_id IS NOT NULL"
+    ).bind(id).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+    sqlx::query("DELETE FROM text_chunks WHERE job_id = $1 AND user_id = $2")
+        .bind(id).bind(claims.sub).execute(&state.db).await?;
+
+    // Unlink from every owning compilation so the graph stops referencing it.
+    sqlx::query(
+        "UPDATE compilations SET source_job_ids = array_remove(source_job_ids, $1), updated_at = NOW()
+         WHERE user_id = $2 AND $1 = ANY(source_job_ids)"
+    ).bind(id).bind(claims.sub).execute(&state.db).await?;
+
     sqlx::query("DELETE FROM jobs WHERE id=$1 AND user_id=$2")
         .bind(id).bind(claims.sub).execute(&state.db).await?;
-    Ok(Json(json!({ "ok": true })))
+
+    // Best-effort Qdrant cleanup (after the authoritative PG deletes).
+    let mut vectors_deleted = 0usize;
+    if !point_ids.is_empty() {
+        let collection = std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "GCTRL_chunks".into());
+        let url = format!(
+            "{}/collections/{}/points/delete?wait=true",
+            state.cfg.qdrant_url.trim_end_matches('/'),
+            collection
+        );
+        match reqwest::Client::new().post(&url).json(&json!({ "points": point_ids.clone() })).send().await {
+            Ok(r) if r.status().is_success() => vectors_deleted = point_ids.len(),
+            Ok(r) => tracing::warn!("delete_job {id}: qdrant points/delete returned {}", r.status()),
+            Err(e) => tracing::warn!("delete_job {id}: qdrant points/delete failed: {e}"),
+        }
+    }
+
+    Ok(Json(json!({ "ok": true, "chunksDeleted": point_ids.len(), "vectorsDeleted": vectors_deleted })))
 }
 
 /// Redis key the KEX worker's config-watcher polls to scale its thread pool.
