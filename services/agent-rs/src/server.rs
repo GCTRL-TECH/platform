@@ -147,6 +147,17 @@ async fn handle_activate(
     )
 }
 
+/// Tiers with UNLIMITED tokens. Mirrors api-rs routes::billing::is_unlimited_tier
+/// (agent-rs cannot import from api-rs, so the list is duplicated). starter/pro
+/// are transitional aliases of business until the central license server is
+/// redeployed with the renamed tiers.
+fn is_unlimited_tier(tier: &str) -> bool {
+    matches!(
+        tier.to_ascii_lowercase().as_str(),
+        "business" | "enterprise" | "starter" | "pro"
+    )
+}
+
 async fn handle_check(
     State(state): State<AppState>,
     Json(req): Json<CheckRequest>,
@@ -178,7 +189,12 @@ async fn handle_check(
     }
 
     let cost = credits::calculate(&req.action, req.chars);
-    if !cache.can_spend(cost) {
+    // Unlimited tiers never fail the affordability gate. Spend is still recorded
+    // identically (deduct_local below + the /report queue) so usage stays
+    // observable — the balance just can't block work, even when negative. The
+    // license-activated / update-required checks above still apply.
+    let unlimited = is_unlimited_tier(cache.tier());
+    if !unlimited && !cache.can_spend(cost) {
         return (
             StatusCode::PAYMENT_REQUIRED,
             Json(CheckResponse {

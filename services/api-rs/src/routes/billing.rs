@@ -102,14 +102,46 @@ fn mask_license_key(key: &str) -> String {
     parts.join("-")
 }
 
+/// Tiers with UNLIMITED tokens: business and enterprise. `starter`/`pro` are
+/// transitional aliases of business — migration 069 renamed local rows, but the
+/// central license server may still mint those names until it is redeployed, so
+/// they must not fall back to a metered path in the meantime.
+pub(crate) fn is_unlimited_tier(tier: &str) -> bool {
+    matches!(
+        tier.to_ascii_lowercase().as_str(),
+        "business" | "enterprise" | "starter" | "pro"
+    )
+}
+
 /// Default token allocation per tier. Must stay in sync with the license server
 /// (services/license-api/src/db/schema.ts → users.creditsBalance default = 3000).
+///
+/// Unlimited tiers have no real cap — this value is only a tracking allocation
+/// for the legacy `credits_allocated` column (register_license fallback);
+/// enforcement paths check is_unlimited_tier() and never gate on it.
 fn tier_limit(tier: &str) -> i32 {
-    match tier {
-        "starter"    => 10_000,
-        "pro"        => 50_000,
-        "enterprise" => 1_000_000,
-        _            => 1_000_000, // free — 1M/month local grant (migration 067)
+    if is_unlimited_tier(tier) {
+        return i32::MAX;
+    }
+    1_000_000 // free — 1M/month local grant (migration 067)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_tiers_and_aliases() {
+        // business/enterprise are unlimited; starter/pro are transitional
+        // aliases until the central license server ships the rename.
+        for t in ["business", "enterprise", "starter", "pro", "Business", "PRO"] {
+            assert!(is_unlimited_tier(t), "{t} should be unlimited");
+        }
+        for t in ["free", "Free", "", "individual"] {
+            assert!(!is_unlimited_tier(t), "{t} should NOT be unlimited");
+        }
+        // Free keeps the 1M monthly local grant as its cap.
+        assert_eq!(tier_limit("free"), 1_000_000);
     }
 }
 
@@ -142,19 +174,43 @@ async fn balance(
 
     if let Some((allocated, used, unsynced, tier)) = paid_license {
         let balance = (allocated - used - unsynced as i32).max(0);
+        // Unlimited tiers still report their tracking number as `balance` (the
+        // dashboard graphs spend) but no cap: tierLimit null + unlimited true.
+        if is_unlimited_tier(&tier) {
+            return Ok(Json(json!({
+                "balance": balance,
+                "tier": tier,
+                "tierLimit": Value::Null,
+                "unlimited": true,
+            })));
+        }
         return Ok(Json(json!({
             "balance": balance,
             "tier": tier,
             "tierLimit": allocated,
+            "unlimited": false,
+        })));
+    }
+
+    // No paid license row, but users.tier can still be unlimited (e.g. tier
+    // synced from the central server without a locally registered key) — the
+    // effective tier must not degrade to a metered free view in that case.
+    let tier = user_tier.unwrap_or_else(|| "free".into());
+    if is_unlimited_tier(&tier) {
+        return Ok(Json(json!({
+            "balance": local_balance.unwrap_or(0),
+            "tier": tier,
+            "tierLimit": Value::Null,
+            "unlimited": true,
         })));
     }
 
     // Free / no paid license → the local monthly grant is authoritative.
-    let tier = user_tier.unwrap_or_else(|| "free".into());
     Ok(Json(json!({
         "balance": local_balance.unwrap_or(0),
         "tier": tier,
         "tierLimit": tier_limit(&tier),
+        "unlimited": false,
     })))
 }
 

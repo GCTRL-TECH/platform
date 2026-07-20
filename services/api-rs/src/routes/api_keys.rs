@@ -184,10 +184,10 @@ async fn create_key(
     // validation — so tokens already issued keep authenticating and no running
     // agent setup breaks when a license lapses.
     //
-    // Deliberately fail-OPEN: deny only for an explicit `free` tier or no active
-    // license at all. Every other tier (starter/business/individual/…) is allowed,
-    // because tier names don't map 1:1 to the pricing tiers and blocking a paying
-    // customer is far worse than letting an edge case through.
+    // Per-tier packaging: free → none, business → 10 scoped tokens per active
+    // license (stack licenses for more seats), enterprise → unlimited. Unknown
+    // paid tiers are allowed but count-limited like business — an unrecognized
+    // tier name must not end up MORE privileged than a paying business customer.
     //
     // This is a packaging guardrail, not DRM — GCTRL is self-hosted by design.
     if kb_scoped {
@@ -197,13 +197,36 @@ async fn create_key(
              ORDER BY activated_at DESC LIMIT 1"
         ).bind(claims.sub).fetch_optional(&state.db).await?;
 
-        let allowed = matches!(tier.as_deref(), Some(t) if !t.eq_ignore_ascii_case("free"));
-        if !allowed {
+        let Some(tier) = tier.filter(|t| !t.eq_ignore_ascii_case("free")) else {
             return Err(AppError::Forbidden(
                 "Scoped access tokens are a Business feature. The Free plan includes one \
                  full-access token for your own use — upgrade to issue scoped tokens to colleagues."
                     .into(),
             ));
+        };
+
+        if !tier.eq_ignore_ascii_case("enterprise") {
+            let scoped_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND kb_scoped = true"
+            ).bind(claims.sub).fetch_one(&state.db).await?;
+
+            // starter/pro are transitional business aliases until the central
+            // license server is redeployed (see routes::billing::is_unlimited_tier).
+            let license_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM licenses
+                 WHERE user_id = $1 AND status = 'active'
+                   AND tier IN ('business','starter','pro')"
+            ).bind(claims.sub).fetch_one(&state.db).await?;
+
+            // .max(1): an active NON-free license of an unrecognized tier still
+            // buys one business-sized block of seats — count-limited, not blocked.
+            let max = 10 * license_count.max(1);
+            if scoped_count >= max {
+                return Err(AppError::Forbidden(format!(
+                    "Business includes 10 scoped tokens per license — you've used {scoped_count}/{max}. \
+                     Add another Business license for more seats, or contact us for Enterprise (unlimited)."
+                )));
+            }
         }
     }
 

@@ -598,9 +598,13 @@ async fn retry_job(
     if status != "failed" {
         return Err(AppError::BadRequest(format!("only failed jobs can be retried (current status: {status})")));
     }
-    let balance: i32 = sqlx::query_scalar("SELECT tokens_balance FROM users WHERE id = $1")
-        .bind(claims.sub).fetch_one(&state.db).await?;
-    if balance <= 0 {
+    // Unlimited tiers (business/enterprise + transitional starter/pro aliases)
+    // never block on the local balance — tokens_balance keeps tracking spend,
+    // it just can't gate work.
+    let (balance, tier): (i32, String) = sqlx::query_as(
+        "SELECT tokens_balance, tier FROM users WHERE id = $1"
+    ).bind(claims.sub).fetch_one(&state.db).await?;
+    if balance <= 0 && !crate::routes::billing::is_unlimited_tier(&tier) {
         return Err(AppError::BadRequest("Insufficient credits — top up before retrying".into()));
     }
 
@@ -630,9 +634,12 @@ async fn retry_failed(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
-    let balance: i32 = sqlx::query_scalar("SELECT tokens_balance FROM users WHERE id = $1")
-        .bind(claims.sub).fetch_one(&state.db).await?;
-    if balance <= 0 {
+    // Same unlimited-tier bypass as retry_job: never block a business/enterprise
+    // user on the local tracking balance.
+    let (balance, tier): (i32, String) = sqlx::query_as(
+        "SELECT tokens_balance, tier FROM users WHERE id = $1"
+    ).bind(claims.sub).fetch_one(&state.db).await?;
+    if balance <= 0 && !crate::routes::billing::is_unlimited_tier(&tier) {
         return Err(AppError::BadRequest("Insufficient credits — top up before retrying".into()));
     }
 
