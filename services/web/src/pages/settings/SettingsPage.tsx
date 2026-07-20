@@ -464,6 +464,15 @@ function ModelChooser({ activeRuntime, ollamaOverrideUrl }: {
     })()
   }, [loadCatalog, loadPrefs])
 
+  // Re-probe whenever the ACTIVE runtime changes (e.g. the RuntimeCard "use
+  // native" switch). The catalog's install-state is now scoped to the active
+  // Ollama, so this flips container-only models back to "Not installed" and
+  // re-surfaces their one-click Install (pull) — targeting the native instance.
+  useEffect(() => {
+    void loadCatalog()
+    void reloadInstalledModels()
+  }, [loadCatalog, reloadInstalledModels, activeRuntime?.provider, activeRuntime?.base_url, ollamaOverrideUrl])
+
   function selected(purpose: CatalogModel['purpose']): string {
     if (!prefs) return ''
     return String(prefs[PURPOSE_META[purpose].prefKey] ?? '')
@@ -4364,10 +4373,10 @@ function ConnectAgentTab() {
             <div className="relative">
               <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-3 font-mono text-[11px] text-slate-300">
 {`mkdir -p .claude/skills/gctrl
-cp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md`}
+curl -fsSL ${apiBase}/agent/skill.md -o .claude/skills/gctrl/SKILL.md`}
               </pre>
               <button
-                onClick={() => copyText('mkdir -p .claude/skills/gctrl\ncp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md', 'skill-cc')}
+                onClick={() => copyText(`mkdir -p .claude/skills/gctrl\ncurl -fsSL ${apiBase}/agent/skill.md -o .claude/skills/gctrl/SKILL.md`, 'skill-cc')}
                 className="absolute right-2 top-2 flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-[10px] text-slate-400 hover:text-slate-200"
               >
                 {copied === 'skill-cc' ? <Check size={10} /> : <Copy size={10} />}
@@ -4382,10 +4391,10 @@ cp sdk/claude-skill/gctrl/SKILL.md .claude/skills/gctrl/SKILL.md`}
             <div className="relative">
               <pre className="overflow-x-auto whitespace-pre rounded-lg bg-slate-800 p-3 font-mono text-[11px] text-slate-300">
 {`mkdir -p .cursor/rules
-cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc`}
+curl -fsSL ${apiBase}/agent/skill.md -o .cursor/rules/gctrl.mdc`}
               </pre>
               <button
-                onClick={() => copyText('mkdir -p .cursor/rules\ncp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc', 'skill-cursor')}
+                onClick={() => copyText(`mkdir -p .cursor/rules\ncurl -fsSL ${apiBase}/agent/skill.md -o .cursor/rules/gctrl.mdc`, 'skill-cursor')}
                 className="absolute right-2 top-2 flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-[10px] text-slate-400 hover:text-slate-200"
               >
                 {copied === 'skill-cursor' ? <Check size={10} /> : <Copy size={10} />}
@@ -4397,7 +4406,8 @@ cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc`}
           <div>
             <p className="mb-1 text-[11px] font-medium text-slate-400">Codex / other CLIs</p>
             <p className="text-[11px] text-slate-500">
-              Append <code className="text-slate-400">sdk/claude-skill/codex/AGENTS-snippet.md</code> to your project&apos;s <code className="text-slate-400">AGENTS.md</code>.
+              Append the skill to your project&apos;s <code className="text-slate-400">AGENTS.md</code>:{' '}
+              <code className="text-slate-400">{`curl -fsSL ${apiBase}/agent/skill.md >> AGENTS.md`}</code>
             </p>
           </div>
         </div>
@@ -4407,8 +4417,8 @@ cp sdk/claude-skill/cursor/gctrl.mdc .cursor/rules/gctrl.mdc`}
           <p className="text-[11px] text-slate-400">
             Full setup guide and smoke-test protocol:{' '}
             <a href="/docs/agents-mcp" className="text-indigo-400 hover:underline">Agents &amp; MCP docs</a>
-            {' '}· Skill source:{' '}
-            <code className="text-slate-500">sdk/claude-skill/README.md</code>
+            {' '}· Or fetch the skill directly:{' '}
+            <code className="text-slate-500">{`${apiBase}/agent/skill.md`}</code>
           </p>
         </div>
       </section>

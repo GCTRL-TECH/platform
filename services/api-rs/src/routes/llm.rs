@@ -94,7 +94,7 @@ async fn instance_models(
                 .map_err(|e| AppError::BadRequest(format!("Invalid base URL: {e}")))?;
             crate::services::llm::containerize_ollama_base(v.as_str().trim_end_matches('/'))
         }
-        None => resolve_user_ollama(&state.db, claims.sub).await.0,
+        None => resolve_user_ollama(&state.db, &state.cfg, claims.sub).await.0,
     };
 
     let client = reqwest::Client::builder()
@@ -472,9 +472,18 @@ async fn list_models(
         .map(|c| crate::services::crypto::open(&c))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let ollama_base = crate::services::llm::validate_llm_base("ollama", stored_base.as_deref())
-        .map(|u| u.as_str().trim_end_matches('/').to_string())
-        .unwrap_or_else(|_| crate::services::llm::ollama_default_base());
+    // Same precedence as resolve_user_ollama: explicit per-user base wins, else the
+    // active-runtime override (native switch), else the bundled default — so this
+    // list agrees with the catalog after a runtime switch.
+    let ollama_base = match stored_base.as_deref() {
+        Some(b) => crate::services::llm::validate_llm_base("ollama", Some(b))
+            .map(|u| u.as_str().trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| crate::services::llm::ollama_default_base()),
+        None => {
+            let eff = crate::routes::infra::effective_service_url(&state.db, &state.cfg, "ollama").await;
+            crate::services::llm::containerize_ollama_base(eff.trim_end_matches('/'))
+        }
+    };
 
     let mut tags_rb = client
         .get(format!("{}/api/tags", ollama_base.trim_end_matches('/')))
@@ -758,7 +767,13 @@ async fn set_model_prefs(
 // ── Ollama model catalog + install ──────────────────────────────────────────
 
 /// Resolve the user's effective Ollama base + (decrypted) key, re-validated.
-async fn resolve_user_ollama(db: &sqlx::PgPool, user_id: uuid::Uuid) -> (String, Option<String>) {
+///
+/// Precedence: an explicit per-user base (LLM tab) wins; otherwise honor the
+/// active-runtime override set by the RuntimeCard "use native" switch
+/// (`service_overrides`), falling back to the bundled default. Without this the
+/// catalog would always probe the container's `/api/tags`, so a model present in
+/// the container but not yet pulled natively shows up as wrongly "installed".
+async fn resolve_user_ollama(db: &sqlx::PgPool, cfg: &crate::config::Config, user_id: uuid::Uuid) -> (String, Option<String>) {
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT base_url, api_key FROM user_llm_providers WHERE user_id = $1 AND provider = 'ollama'",
     )
@@ -773,9 +788,15 @@ async fn resolve_user_ollama(db: &sqlx::PgPool, user_id: uuid::Uuid) -> (String,
         .map(|c| crate::services::crypto::open(&c))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let base = crate::services::llm::validate_llm_base("ollama", stored_base.as_deref())
-        .map(|u| crate::services::llm::containerize_ollama_base(u.as_str().trim_end_matches('/')))
-        .unwrap_or_else(|_| crate::services::llm::ollama_default_base());
+    let base = match stored_base.as_deref() {
+        Some(b) => crate::services::llm::validate_llm_base("ollama", Some(b))
+            .map(|u| crate::services::llm::containerize_ollama_base(u.as_str().trim_end_matches('/')))
+            .unwrap_or_else(|_| crate::services::llm::ollama_default_base()),
+        None => {
+            let eff = crate::routes::infra::effective_service_url(db, cfg, "ollama").await;
+            crate::services::llm::containerize_ollama_base(eff.trim_end_matches('/'))
+        }
+    };
     (base, key)
 }
 
@@ -786,7 +807,7 @@ async fn ollama_catalog(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Json<Value> {
-    let (base, key) = resolve_user_ollama(&state.db, claims.sub).await;
+    let (base, key) = resolve_user_ollama(&state.db, &state.cfg, claims.sub).await;
     // No-redirect client: a validated base must not be able to 302 onward (SSRF).
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -849,7 +870,7 @@ async fn ollama_pull(
     if model.is_empty() || model.len() > 128 || model.contains(char::is_whitespace) {
         return Err(AppError::BadRequest("invalid model name".into()));
     }
-    let (base, key) = resolve_user_ollama(&state.db, claims.sub).await;
+    let (base, key) = resolve_user_ollama(&state.db, &state.cfg, claims.sub).await;
     // No-redirect client: a validated base must not be able to 302 onward (SSRF).
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
