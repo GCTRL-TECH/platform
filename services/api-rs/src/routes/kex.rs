@@ -132,6 +132,27 @@ pub(crate) async fn link_job_to_target_or_default(
     }
 }
 
+/// Link an OWNER-ingested job (connector / Obsidian-vault sync) into its target
+/// compilation, or the owner's default KB when none was chosen. Connector syncs
+/// run under the owner's `user_id` (no scoped colleague token), so the
+/// owner-guarded linker is the correct scope. Without this the extracted entities
+/// never enter `compilation.source_job_ids` — the ONLY entity→graph mapping — so
+/// the job completes but its nodes never show up in the graph.
+pub(crate) async fn link_owned_job(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    compilation_id: Option<Uuid>,
+    job_id: Uuid,
+) {
+    let target = match compilation_id {
+        Some(cid) => Some(cid),
+        None => resolve_default_compilation(db, user_id).await,
+    };
+    if let Some(cid) = target {
+        link_job_to_compilation(db, user_id, cid, job_id).await;
+    }
+}
+
 /// A token may not ingest content classified above its own clearance ceiling.
 /// (bug-hunt W7: this check existed on `ingest_repo` and the agent's
 /// `create_extraction`, but was missing on the two most-used entry points —

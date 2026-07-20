@@ -221,6 +221,12 @@ async fn reingest_folder_vault(
             continue;
         }
 
+        // Link into the target compilation (or default KB) so the vault's extracted
+        // entities appear in the graph — membership is via compilation.source_job_ids,
+        // not a per-node compilationId. Without this the job completes but its nodes
+        // never show up in the chosen graph.
+        crate::routes::kex::link_owned_job(db, vault.user_id, opts.compilation_id, job_id).await;
+
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
             .await;
 
@@ -321,6 +327,12 @@ async fn reingest_rest_vault(
             out.failed += 1;
             continue;
         }
+
+        // Link into the target compilation (or default KB) so the vault's extracted
+        // entities appear in the graph — membership is via compilation.source_job_ids,
+        // not a per-node compilationId. Without this the job completes but its nodes
+        // never show up in the chosen graph.
+        crate::routes::kex::link_owned_job(db, vault.user_id, opts.compilation_id, job_id).await;
 
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
             .await;

@@ -1987,6 +1987,10 @@ async fn enqueue_sharepoint_file(
     .execute(db)
     .await?;
 
+    // No explicit compilation target on the SharePoint path → link into the owner's
+    // default KB so the entities aren't orphaned (invisible in the graph).
+    crate::routes::kex::link_owned_job(db, user_id, None, job_id).await;
+
     if charge {
         crate::services::usage::record_usage(db, user_id, "kex_extract", 5, Some(job_id)).await;
     }
@@ -2507,6 +2511,11 @@ async fn sync_obsidian(
             continue;
         }
 
+        // Link into the target compilation (or default KB) so the note's extracted
+        // entities appear in the graph — membership is via compilation.source_job_ids,
+        // not a per-node compilationId.
+        crate::routes::kex::link_owned_job(&state.db, claims.sub, resolved.compilation_id, job_id).await;
+
         crate::services::usage::record_usage(
             &state.db,
             claims.sub,
@@ -2809,6 +2818,10 @@ async fn sync_obsidian_folder(
             results.push(json!({ "path": rel_str, "error": format!("db insert failed: {e}") }));
             continue;
         }
+
+        // Link into the target compilation (or default KB) so the file's extracted
+        // entities appear in the graph (via compilation.source_job_ids).
+        crate::routes::kex::link_owned_job(&state.db, claims.sub, resolved.compilation_id, job_id).await;
 
         crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
@@ -3126,6 +3139,11 @@ async fn enqueue_drive_file(
     .bind(source_document_id)
     .execute(db)
     .await?;
+
+    // Link into the target compilation (or default KB) so the drive file's extracted
+    // entities appear in the graph — membership is via compilation.source_job_ids,
+    // not a per-node compilationId.
+    crate::routes::kex::link_owned_job(db, user_id, opts.compilation_id, job_id).await;
 
     // Record the sync-job row so GET /api/connectors/sync-status (and the agent
     // get_sync_status tool) can report per-connector sync health. Live status is
