@@ -109,7 +109,7 @@ fn tier_limit(tier: &str) -> i32 {
         "starter"    => 10_000,
         "pro"        => 50_000,
         "enterprise" => 1_000_000,
-        _            => 3_000, // free — matches license-api default
+        _            => 1_000_000, // free — 1M/month local grant (migration 067)
     }
 }
 
@@ -117,22 +117,30 @@ async fn balance(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
-    // Prefer active license if one exists for this user.
-    // Subtract unsynced token_usage rows so balance reflects spend immediately
+    // The free tier is a LOCAL monthly grant tracked on users.tokens_balance
+    // (migration 067 + the free-grant tick); only a PAID license is metered by the
+    // central license server. So read the local balance first and prefer it unless
+    // the user holds an active NON-free license — this is what makes the 1M free
+    // grant actually show in the dashboard instead of a stale free/3000 license.
+    let (local_balance, user_tier): (Option<i32>, Option<String>) = sqlx::query_as(
+        "SELECT tokens_balance, tier FROM users WHERE id = $1"
+    ).bind(claims.sub).fetch_one(&state.db).await?;
+
+    // Subtract unsynced token_usage so a paid balance reflects spend immediately
     // without waiting for the 60-second heartbeat round-trip to license-api.
-    let license = sqlx::query_as::<_, (i32, i32, i64, String)>(
+    let paid_license = sqlx::query_as::<_, (i32, i32, i64, String)>(
         "SELECT l.credits_allocated, l.credits_used,
                 COALESCE(SUM(tu.tokens_spent), 0)::bigint AS unsynced_spent,
                 l.tier
          FROM licenses l
          LEFT JOIN token_usage tu
            ON tu.user_id = l.user_id AND tu.synced_to_license_api = false
-         WHERE l.user_id = $1 AND l.status = 'active'
+         WHERE l.user_id = $1 AND l.status = 'active' AND l.tier <> 'free'
          GROUP BY l.id, l.credits_allocated, l.credits_used, l.tier
          ORDER BY l.activated_at DESC LIMIT 1"
     ).bind(claims.sub).fetch_optional(&state.db).await?;
 
-    if let Some((allocated, used, unsynced, tier)) = license {
+    if let Some((allocated, used, unsynced, tier)) = paid_license {
         let balance = (allocated - used - unsynced as i32).max(0);
         return Ok(Json(json!({
             "balance": balance,
@@ -141,17 +149,12 @@ async fn balance(
         })));
     }
 
-    // Fallback: users.tokens_balance
-    let row: (Option<i32>, Option<String>) = sqlx::query_as(
-        "SELECT tokens_balance, tier FROM users WHERE id = $1"
-    ).bind(claims.sub).fetch_one(&state.db).await?;
-    let (bal, tier) = row;
-    let tier = tier.unwrap_or_else(|| "free".into());
-    let limit = tier_limit(&tier);
+    // Free / no paid license → the local monthly grant is authoritative.
+    let tier = user_tier.unwrap_or_else(|| "free".into());
     Ok(Json(json!({
-        "balance": bal.unwrap_or(0),
+        "balance": local_balance.unwrap_or(0),
         "tier": tier,
-        "tierLimit": limit,
+        "tierLimit": tier_limit(&tier),
     })))
 }
 
