@@ -6,6 +6,7 @@ import { users, licenses, tokenUsage } from '../db/schema.js';
 import { eq, and, desc, gt } from 'drizzle-orm';
 import { generateLicenseKey } from '../lib/licenseKey.js';
 import { requireSession } from '../middleware/sessionAuth.js';
+import { TIER_MONTHLY_CREDITS } from '../lib/credits.js';
 
 const router = Router();
 
@@ -49,7 +50,7 @@ router.post('/v1/auth/register', async (req: Request, res: Response): Promise<vo
     passwordHash,
     role: 'viewer',
     tier: 'free',
-    creditsBalance: 3000,
+    creditsBalance: TIER_MONTHLY_CREDITS.free,
   }).returning();
 
   // Auto-issue one free license on registration

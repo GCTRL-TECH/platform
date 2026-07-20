@@ -6,7 +6,7 @@ import { users, licenses } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { generateLicenseKey } from '../lib/licenseKey.js';
 import { sendEmail } from '../lib/email.js';
-import { TIER_MONTHLY_CREDITS, TIER_OVERDRAFT_LIMITS } from '../lib/credits.js';
+import { TIER_MONTHLY_CREDITS, TIER_OVERDRAFT_LIMITS, monthlyCreditsFor } from '../lib/credits.js';
 
 const router = Router();
 
@@ -27,7 +27,7 @@ router.post('/v1/webhooks/stripe', async (req: Request, res: Response): Promise<
     if (!userId) { res.json({ ok: true }); return; }
 
     const priceId = (session as any).line_items?.data?.[0]?.price?.id ?? '';
-    const tierInfo = STRIPE_PRICES[priceId] ?? { tier: 'starter', credits: 25_000 };
+    const tierInfo = STRIPE_PRICES[priceId] ?? { tier: 'business', credits: 999_999_999 };
 
     await db.update(users)
       .set({
@@ -62,7 +62,8 @@ router.post('/v1/webhooks/stripe', async (req: Request, res: Response): Promise<
         const [user] = await db.select().from(users).where(eq(users.stripeSubscriptionId, subId)).limit(1);
         if (user) {
           await db.update(users)
-            .set({ creditsBalance: TIER_MONTHLY_CREDITS[user.tier] })
+            // monthlyCreditsFor tolerates un-migrated legacy tiers (starter/pro)
+            .set({ creditsBalance: monthlyCreditsFor(user.tier) })
             .where(eq(users.id, user.id));
         }
       }

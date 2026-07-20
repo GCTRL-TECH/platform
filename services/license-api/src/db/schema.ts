@@ -8,7 +8,7 @@ export const users = pgTable('users', {
   name: text('name').notNull().default(''),
   role: text('role').notNull().default('viewer'),
   tier: text('tier').notNull().default('free'),
-  creditsBalance: integer('credits_balance').notNull().default(3000),
+  creditsBalance: integer('credits_balance').notNull().default(1000000),
   overdraftLimit: integer('overdraft_limit').notNull().default(0),
   stripeCustomerId: text('stripe_customer_id'),
   stripeSubscriptionId: text('stripe_subscription_id'),

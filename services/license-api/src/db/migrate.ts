@@ -127,6 +127,20 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_token_usage_license_id  ON token_usage(license_id)`,
   `CREATE INDEX IF NOT EXISTS idx_token_usage_created_at  ON token_usage(created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_log_created_at    ON audit_log(created_at DESC)`,
+
+  // ── tier-model rework ───────────────────────────────────────────────────
+  // Legacy paid tiers (starter/pro) are collapsed into the single unlimited
+  // `business` tier. Idempotent: re-running matches zero rows once migrated.
+  `UPDATE users         SET tier = 'business' WHERE tier IN ('starter', 'pro')`,
+  `UPDATE licenses      SET tier = 'business' WHERE tier IN ('starter', 'pro')`,
+  `UPDATE subscriptions SET tier = 'business' WHERE tier IN ('starter', 'pro')`,
+  // Free tier now grants 1,000,000 credits/month (was 3000). Set the new column
+  // default via a fresh ALTER so we don't touch the historical CREATE TABLE /
+  // ADD COLUMN strings above (they only run on first boot of a fresh DB).
+  `ALTER TABLE users ALTER COLUMN credits_balance SET DEFAULT 1000000`,
+  // Backfill existing free users up to the new floor without ever lowering a
+  // balance (GREATEST keeps any manually-granted surplus).
+  `UPDATE users SET credits_balance = GREATEST(credits_balance, 1000000) WHERE tier = 'free'`,
 ];
 
 async function main() {
