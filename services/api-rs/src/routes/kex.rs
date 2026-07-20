@@ -164,6 +164,8 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/jobs/:id",        get(get_job).delete(delete_job))
         .route("/jobs/:id/result", get(get_result))
         .route("/jobs/:id/cancel", post(cancel_job))
+        .route("/jobs/:id/retry",  post(retry_job))
+        .route("/jobs/retry-failed", post(retry_failed))
         .route("/chunks",          get(list_chunks))
         .route("/chunks/:id",      axum::routing::delete(delete_chunk))
         .route("/queue",           get(queue_depth))
@@ -504,6 +506,153 @@ pub(crate) async fn submit_upload(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(job_id)
+}
+
+/// Re-push a FAILED text extraction. The full text is retained in `jobs.input`,
+/// so we reset the SAME row to pending and re-push the worker payload — the
+/// compilation link + source-document identity already stand, and no credit is
+/// re-charged (the original attempt already recorded the spend).
+async fn repush_text_job(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    job_id: Uuid,
+    input: &Value,
+    text: &str,
+    classification_level_id: Option<Uuid>,
+    source_document_id: Option<Uuid>,
+) -> Result<()> {
+    let requested = input["ontologyId"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+    let (ontology_id, entity_types) = resolve_ontology(&state.db, user_id, requested).await;
+    let source_path = input["sourceRef"].as_str().map(String::from).unwrap_or_else(|| {
+        let preview: String = text.chars().take(60).collect();
+        format!("text:{preview}")
+    });
+    let classification_name: Option<String> = if let Some(c) = classification_level_id {
+        sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1")
+            .bind(c).fetch_optional(&state.db).await.ok().flatten()
+    } else {
+        None
+    };
+
+    sqlx::query(
+        "UPDATE jobs SET status = 'pending', error = NULL, completed_at = NULL, updated_at = NOW() \
+         WHERE id = $1 AND user_id = $2"
+    )
+    .bind(job_id).bind(user_id).execute(&state.db).await?;
+
+    let mut payload = json!({
+        "job_id": job_id, "user_id": user_id, "type": "text",
+        "input": text, "entity_types": entity_types,
+        "ontology_id": ontology_id,
+        "classification": classification_name,
+        "classification_level_id": classification_level_id,
+        "source_document_id": source_document_id,
+        "source_path": source_path,
+        "source_modified_at": Value::Null,
+    });
+    crate::services::llm::inject_ollama_overrides(&state.db, user_id, &mut payload).await;
+    lpush(&state.redis, "kex:jobs", &payload.to_string()).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+/// POST /api/kex/jobs/:id/retry — re-run ONE failed job without re-uploading.
+/// Text extracts reset in place; connector jobs (Drive/SharePoint) re-fetch from
+/// their retained source reference. Free (no re-charge). Non-retryable types
+/// (direct upload, repo) return a clear error. Preflight balance check so a retry
+/// with no credits surfaces "insufficient credits" instead of silently re-failing.
+async fn retry_job(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let (jtype, status, input, clf, source_doc_id) = sqlx::query_as::<_, (String, String, Value, Option<Uuid>, Option<Uuid>)>(
+        "SELECT type, status, input, classification_level_id, source_document_id \
+         FROM jobs WHERE id = $1 AND user_id = $2"
+    )
+    .bind(job_id).bind(claims.sub)
+    .fetch_optional(&state.db).await?
+    .ok_or(AppError::NotFound)?;
+
+    if status != "failed" {
+        return Err(AppError::BadRequest(format!("only failed jobs can be retried (current status: {status})")));
+    }
+    let balance: i32 = sqlx::query_scalar("SELECT tokens_balance FROM users WHERE id = $1")
+        .bind(claims.sub).fetch_one(&state.db).await?;
+    if balance <= 0 {
+        return Err(AppError::BadRequest("Insufficient credits — top up before retrying".into()));
+    }
+
+    match jtype.as_str() {
+        "kex_extract" => {
+            let text = input["text"].as_str()
+                .ok_or_else(|| AppError::BadRequest("this extraction retains no text (repo/upload) — re-ingest required".into()))?;
+            repush_text_job(&state, claims.sub, job_id, &input, text, clf, source_doc_id).await?;
+            Ok(Json(json!({ "ok": true, "jobId": job_id, "status": "pending" })))
+        }
+        "kex_connector" | "kex_sharepoint" => {
+            let new_id = crate::routes::connectors::retry_connector_job(&state, claims.sub, &jtype, &input, clf).await?;
+            // Replace the failed row with the fresh pending job (keeps history clean).
+            sqlx::query("DELETE FROM jobs WHERE id = $1 AND user_id = $2")
+                .bind(job_id).bind(claims.sub).execute(&state.db).await?;
+            Ok(Json(json!({ "ok": true, "jobId": new_id, "status": "pending" })))
+        }
+        other => Err(AppError::BadRequest(format!("job type '{other}' is not retryable — re-upload required"))),
+    }
+}
+
+/// POST /api/kex/jobs/retry-failed — re-run ALL retryable failed jobs for the
+/// user. Runs in the background (a large connector batch means many synchronous
+/// re-downloads), so it returns immediately with the count queued; watch the jobs
+/// list for progress. Per-job failures are logged, not fatal.
+async fn retry_failed(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+) -> Result<Json<Value>> {
+    let balance: i32 = sqlx::query_scalar("SELECT tokens_balance FROM users WHERE id = $1")
+        .bind(claims.sub).fetch_one(&state.db).await?;
+    if balance <= 0 {
+        return Err(AppError::BadRequest("Insufficient credits — top up before retrying".into()));
+    }
+
+    let rows = sqlx::query_as::<_, (Uuid, String, Value, Option<Uuid>, Option<Uuid>)>(
+        "SELECT id, type, input, classification_level_id, source_document_id \
+         FROM jobs WHERE user_id = $1 AND status = 'failed' \
+           AND type IN ('kex_extract','kex_connector','kex_sharepoint') \
+         ORDER BY created_at DESC LIMIT 1000"
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db).await?;
+
+    let count = rows.len();
+    let st = state.clone();
+    let uid = claims.sub;
+    tokio::spawn(async move {
+        for (id, jtype, input, clf, sdoc) in rows {
+            let r: Result<()> = match jtype.as_str() {
+                "kex_extract" => match input["text"].as_str() {
+                    Some(text) => repush_text_job(&st, uid, id, &input, text, clf, sdoc).await,
+                    None => continue,
+                },
+                "kex_connector" | "kex_sharepoint" => {
+                    match crate::routes::connectors::retry_connector_job(&st, uid, &jtype, &input, clf).await {
+                        Ok(_) => {
+                            let _ = sqlx::query("DELETE FROM jobs WHERE id = $1 AND user_id = $2")
+                                .bind(id).bind(uid).execute(&st.db).await;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => continue,
+            };
+            if let Err(e) = r {
+                tracing::warn!("retry_failed: job {id} re-enqueue failed: {e}");
+            }
+        }
+    });
+
+    Ok(Json(json!({ "retrying": count })))
 }
 
 async fn list_jobs(

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Search, Loader2, Settings2, ChevronDown, ChevronRight, Clock, XCircle } from 'lucide-react'
+import { Search, Loader2, Settings2, ChevronDown, ChevronRight, Clock, XCircle, RotateCw } from 'lucide-react'
 // query client not used directly
 import { api } from '@/lib/api'
 // cn utility not needed here
@@ -95,6 +95,29 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
     } catch { /* ignore */ }
   }
 
+  function retryError(e: unknown): string {
+    return (e as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Retry failed'
+  }
+
+  async function handleRetry(jobId: string) {
+    try {
+      await api.post(`/kex/jobs/${jobId}/retry`)
+      void loadJobs(0)
+      void loadQueue()
+    } catch (e) { alert(retryError(e)) }
+  }
+
+  const [retryingAll, setRetryingAll] = useState(false)
+  async function handleRetryAllFailed() {
+    setRetryingAll(true)
+    try {
+      await api.post('/kex/jobs/retry-failed')
+      void loadJobs(0)
+      void loadQueue()
+    } catch (e) { alert(retryError(e)) }
+    finally { setRetryingAll(false) }
+  }
+
   async function handleDelete() {
     if (!deleteTarget) return
     setIsDeleting(true)
@@ -129,6 +152,18 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
           <h3 className="text-sm font-semibold text-slate-200">Your Extractions</h3>
         </div>
         <div className="flex items-center gap-2">
+          {/* Retry all failed — shown when the current view has failed jobs */}
+          {jobs.some((j) => j.status === 'failed') && (
+            <button
+              onClick={() => void handleRetryAllFailed()}
+              disabled={retryingAll}
+              className="flex items-center gap-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 transition-colors hover:text-indigo-400 disabled:opacity-50"
+              title="Retry all failed jobs (connector jobs re-fetch; direct uploads need re-upload)"
+            >
+              <RotateCw size={11} className={retryingAll ? 'animate-spin' : ''} />
+              Retry failed
+            </button>
+          )}
           {/* Search */}
           <div className="relative">
             <Search size={11} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500" />
@@ -221,6 +256,7 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
                   job={item.job}
                   onCancel={handleCancel}
                   onDelete={(id, name) => setDeleteTarget({ id, name })}
+                  onRetry={handleRetry}
                 />
               )
             )}

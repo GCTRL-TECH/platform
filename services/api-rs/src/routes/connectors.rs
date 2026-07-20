@@ -1935,6 +1935,7 @@ async fn sync_sharepoint(
             &req.drive_id,
             file_id,
             req.classification_level_id,
+            true,
         )
         .await?;
 
@@ -1964,6 +1965,9 @@ async fn enqueue_sharepoint_file(
     drive_id: &str,
     file_id: &str,
     classification_level_id: Option<Uuid>,
+    // Whether to charge the per-file credit. False on retry — the original attempt
+    // already recorded the spend, so re-running a failed job must not double-bill.
+    charge: bool,
 ) -> Result<Uuid> {
     let job_id = Uuid::new_v4();
 
@@ -1983,7 +1987,9 @@ async fn enqueue_sharepoint_file(
     .execute(db)
     .await?;
 
-    crate::services::usage::record_usage(db, user_id, "kex_extract", 5, Some(job_id)).await;
+    if charge {
+        crate::services::usage::record_usage(db, user_id, "kex_extract", 5, Some(job_id)).await;
+    }
 
     let mut payload = json!({
         "job_id":   job_id,
@@ -2203,6 +2209,7 @@ pub(crate) async fn run_sharepoint_folder_sync(
                 drive_id,
                 &f.id,
                 classification_level_id,
+                true,
             )
             .await
             {
@@ -2990,6 +2997,74 @@ async fn resolve_drive_opts(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Re-run a FAILED connector-sourced KEX job by re-fetching its source. The
+/// source reference (Drive file id / SharePoint ids) survives in `jobs.input`;
+/// the Redis payload that carried the file bytes does not — so we re-download
+/// (Drive, via a fresh OAuth token) or re-fetch worker-side (SharePoint). Free:
+/// `charge=false`, since the original attempt already recorded the spend.
+/// Returns the NEW pending job id; the caller replaces the old failed row.
+pub(crate) async fn retry_connector_job(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    job_type: &str,
+    input: &Value,
+    classification_level_id: Option<Uuid>,
+) -> Result<Uuid> {
+    let uuid_field = |k: &str| input[k].as_str().and_then(|s| Uuid::parse_str(s).ok());
+    match job_type {
+        "kex_connector" => {
+            let connector_id = uuid_field("connectorId")
+                .ok_or_else(|| AppError::BadRequest("job input missing connectorId".into()))?;
+            let drive_file_id = input["driveFileId"].as_str()
+                .ok_or_else(|| AppError::BadRequest("job input missing driveFileId".into()))?;
+            let file_name = input["fileName"].as_str().unwrap_or("file");
+            let connector = sqlx::query_as::<_, ConnectorRow>(
+                "SELECT id, provider::text, label, access_token, refresh_token, \
+                        token_expires_at, provider_email, is_active \
+                 FROM oauth_connectors WHERE id = $1 AND user_id = $2",
+            )
+            .bind(connector_id)
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
+            let http = reqwest::Client::new();
+            let token = ensure_valid_token(&connector, &http, &state.cfg, &state.db).await?;
+            let resolved = DriveExtractResolved {
+                ontology_id:             uuid_field("ontologyId"),
+                entity_types:            None,
+                discovery_mode:          input["discoveryMode"].as_str().map(String::from),
+                compilation_id:          uuid_field("compilationId"),
+                classification_level_id: classification_level_id.or_else(|| uuid_field("classificationLevelId")),
+                classification_name:     None,
+            };
+            // full_path falls back to the file name (folder path isn't retained);
+            // enqueue_drive_file does not charge, so the retry is free by construction.
+            enqueue_drive_file(
+                &state.db, &state.redis, &http, &token, user_id, connector_id,
+                drive_file_id, file_name, &resolved, file_name, None,
+            ).await
+        }
+        "kex_sharepoint" => {
+            let tenant_config_id = uuid_field("tenantConfigId")
+                .ok_or_else(|| AppError::BadRequest("job input missing tenantConfigId".into()))?;
+            let site_id = input["siteId"].as_str()
+                .ok_or_else(|| AppError::BadRequest("job input missing siteId".into()))?;
+            let drive_id = input["driveId"].as_str()
+                .ok_or_else(|| AppError::BadRequest("job input missing driveId".into()))?;
+            let file_id = input["fileId"].as_str()
+                .ok_or_else(|| AppError::BadRequest("job input missing fileId".into()))?;
+            let clf = classification_level_id.or_else(|| uuid_field("classificationLevelId"));
+            enqueue_sharepoint_file(
+                &state.db, &state.redis, user_id, tenant_config_id, site_id, drive_id, file_id, clf, false,
+            ).await
+        }
+        other => Err(AppError::BadRequest(format!(
+            "job type '{other}' cannot be retried by re-fetch — re-upload or re-sync required"
+        ))),
+    }
+}
+
 async fn enqueue_drive_file(
     db: &sqlx::PgPool,
     redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,

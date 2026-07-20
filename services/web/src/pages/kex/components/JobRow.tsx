@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { XCircle, Trash2 } from 'lucide-react'
+import { XCircle, Trash2, RotateCw } from 'lucide-react'
 import type { MouseEvent } from 'react'
 import { formatDistanceToNow } from 'date-fns'
 import { cn } from '@/lib/utils'
@@ -52,9 +52,10 @@ interface JobRowProps {
   compact?: boolean
   onCancel?: (jobId: string) => void
   onDelete?: (jobId: string, name: string) => void
+  onRetry?: (jobId: string) => void
 }
 
-export function JobRow({ job, compact, onCancel, onDelete }: JobRowProps) {
+export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProps) {
   const navigate = useNavigate()
   const badge = STATUS_BADGE[job.status] || STATUS_BADGE.pending
   const isRunning = job.status === 'pending' || job.status === 'processing'
@@ -91,7 +92,16 @@ export function JobRow({ job, compact, onCancel, onDelete }: JobRowProps) {
       </span>
 
       {/* Actions — fixed width */}
-      <div className="shrink-0 w-6 flex justify-end">
+      <div className="shrink-0 w-12 flex justify-end gap-1.5">
+        {job.status === 'failed' && onRetry && (
+          <button
+            onClick={(e: MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); onRetry(job.id) }}
+            className="text-slate-600 hover:text-indigo-400 transition-colors"
+            title="Retry"
+          >
+            <RotateCw size={12} />
+          </button>
+        )}
         {isRunning && onCancel && (
           <button
             onClick={(e: MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); onCancel(job.id) }}
