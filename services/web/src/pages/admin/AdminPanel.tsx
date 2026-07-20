@@ -314,6 +314,13 @@ export default function AdminPanel() {
     } catch { alert('Failed to update role') }
   }
 
+  async function updateTier(userId: string, tier: string) {
+    try {
+      await api.put(`/admin/users/${userId}/tier`, { tier })
+      await loadUsers()
+    } catch { alert('Failed to update tier') }
+  }
+
   async function saveTokens(userId: string) {
     const balance = editingTokens[userId]
     if (balance === undefined) return
@@ -486,8 +493,16 @@ export default function AdminPanel() {
                           )}
                         </td>
 
-                        <td className="px-4 py-3 capitalize">
-                          <span className={cn('font-medium', TIER_COLORS[u.tier] ?? 'text-slate-400')}>{u.tier}</span>
+                        <td className="px-4 py-3">
+                          <select
+                            value={u.tier}
+                            onChange={(e) => void updateTier(u.id, e.target.value)}
+                            className={cn('rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] font-medium capitalize', TIER_COLORS[u.tier] ?? 'text-slate-300')}
+                          >
+                            {['free', 'starter', 'pro', 'enterprise'].map((t) => (
+                              <option key={t} value={t}>{t}</option>
+                            ))}
+                          </select>
                         </td>
 
                         <td className="px-4 py-3">

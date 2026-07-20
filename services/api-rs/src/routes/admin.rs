@@ -18,6 +18,9 @@ struct UpdateRoleBody { role: String, clearance: Option<String> }
 struct UpdateTokensBody { tokens_balance: i32 }
 
 #[derive(Deserialize)]
+struct UpdateTierBody { tier: String }
+
+#[derive(Deserialize)]
 struct UpdateLicenseBody {
     tier: Option<String>,
     credits_allocated: Option<i32>,
@@ -30,6 +33,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/users",               get(list_users))
         .route("/users/:id/role",      put(update_role))
         .route("/users/:id/tokens",    put(update_tokens))
+        .route("/users/:id/tier",      put(update_tier))
         .route("/users/:id/licenses",  get(user_licenses))
         .route("/licenses/:id",        put(update_license))
         .route("/audit",               get(audit_log))
@@ -69,27 +73,27 @@ async fn list_users(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
     require_role(&claims, "admin")?;
-    // LATERAL join picks the most recent active license per user.
-    // Effective balance = credits_allocated - credits_used when a license exists,
-    // otherwise fall back to users.tokens_balance so admin always sees the same
-    // number as the client billing page.
+    // Tier and token balance come straight from the `users` row — that is the
+    // authoritative enforcement balance the platform debits AND exactly what the
+    // admin edits here, so a change is immediately visible (no license shadowing).
+    // The LATERAL join still surfaces any active license for the KeyRound
+    // indicator; full license details live in the expandable sub-panel.
     let rows = sqlx::query_as::<_, (
         uuid::Uuid, String, Option<String>, String, String,
         Option<String>, i32, bool, chrono::DateTime<chrono::Utc>,
-        Option<String>, Option<i32>, Option<i32>
+        Option<i32>, Option<i32>
     )>(
         "SELECT u.id, u.email, u.name,
                 u.role::TEXT AS role,
                 u.clearance::TEXT AS clearance,
                 u.tier,
-                COALESCE(l.credits_allocated - l.credits_used, u.tokens_balance, 0) AS effective_balance,
+                u.tokens_balance,
                 u.email_verified, u.created_at,
-                l.tier AS license_tier,
                 l.credits_allocated,
                 l.credits_used
          FROM users u
          LEFT JOIN LATERAL (
-             SELECT tier, credits_allocated, credits_used
+             SELECT credits_allocated, credits_used
              FROM licenses
              WHERE user_id = u.id AND status = 'active'
              ORDER BY activated_at DESC
@@ -98,7 +102,7 @@ async fn list_users(
          ORDER BY u.created_at DESC"
     ).fetch_all(&state.db).await?;
 
-    let users: Vec<Value> = rows.into_iter().map(|(id, email, name, role, clearance, tier, bal, verified, created, lic_tier, lic_alloc, lic_used)| {
+    let users: Vec<Value> = rows.into_iter().map(|(id, email, name, role, clearance, tier, bal, verified, created, lic_alloc, lic_used)| {
         let has_license = lic_alloc.is_some();
         json!({
             "id": id,
@@ -106,7 +110,7 @@ async fn list_users(
             "name": name,
             "role": role,
             "clearance": clearance,
-            "tier": lic_tier.or(tier),
+            "tier": tier,
             "tokensBalance": bal,
             "hasLicense": has_license,
             "creditsAllocated": lic_alloc,
@@ -151,6 +155,20 @@ async fn update_tokens(
     require_role(&claims, "admin")?;
     sqlx::query("UPDATE users SET tokens_balance = $1, updated_at = NOW() WHERE id = $2")
         .bind(body.tokens_balance)
+        .bind(user_id)
+        .execute(&state.db).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn update_tier(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(user_id): Path<uuid::Uuid>,
+    Json(body): Json<UpdateTierBody>,
+) -> Result<Json<Value>> {
+    require_role(&claims, "admin")?;
+    sqlx::query("UPDATE users SET tier = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&body.tier)
         .bind(user_id)
         .execute(&state.db).await?;
     Ok(Json(json!({ "ok": true })))

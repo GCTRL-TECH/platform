@@ -89,10 +89,11 @@ async fn register(
         ("viewer", "PUBLIC")
     };
 
-    // 3000 free tokens — matches license-api's default and what users see in /billing.
+    // 1,000,000 free tokens — the default monthly grant every user receives at no
+    // cost (see migration 067 + the daily top-up tick in background::spawn_all).
     sqlx::query(
         "INSERT INTO users (id, email, password_hash, name, role, clearance, tokens_balance, tier)
-         VALUES ($1, $2, $3, $4, $5, $6, 3000, 'free')"
+         VALUES ($1, $2, $3, $4, $5, $6, 1000000, 'free')"
     )
     .bind(id).bind(&req.email).bind(&hash).bind(&req.name).bind(role).bind(clearance)
     .execute(&state.db).await?;
@@ -114,7 +115,7 @@ async fn register(
         refresh_token: sign_refresh(&state.cfg, id, &req.email),
         user: UserOut { id, email: req.email, name: Some(req.name), role: role.into(),
                         clearance: Some(clearance.into()), tier: Some("free".into()),
-                        tokens_balance: Some(3000) },
+                        tokens_balance: Some(1000000) },
     }))
 }
 

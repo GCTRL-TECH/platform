@@ -45,6 +45,28 @@ pub fn spawn_all(state: Arc<AppState>) {
         }
     });
 
+    // Free monthly token grant: every user gets 1,000,000 tokens/month at no cost.
+    // A daily tick tops each user back up to the 1M floor once their rolling
+    // one-month window elapses. GREATEST never reduces a larger balance, so a
+    // manual admin top-up or heavier grant is preserved.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(90)).await; // let migrations + pool settle
+        loop {
+            match sqlx::query(
+                "UPDATE users \
+                 SET tokens_balance = GREATEST(tokens_balance, 1000000), tokens_granted_at = NOW() \
+                 WHERE tokens_granted_at < NOW() - INTERVAL '1 month'"
+            ).execute(&s.db).await {
+                Ok(r) if r.rows_affected() > 0 =>
+                    tracing::info!("free monthly grant: topped up {} user(s) to 1M", r.rows_affected()),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("free monthly grant tick failed: {e}"),
+            }
+            sleep(Duration::from_secs(86400)).await; // daily
+        }
+    });
+
     // A4/A5/A7 — Memory-governance cycle: ONE ordered pass (decay → dedup →
     // promote → evict → dossier-refresh) on a slow cadence (default 600s, env
     // GCTRL_MEMORY_TICK_SECS), independent of the 60s cron. Each run records a
