@@ -113,6 +113,8 @@ function TokenTab({ compilationId, compilationName }: { compilationId: string; c
         name: `Embed: ${compilationName}`,
         kbScoped: true,
         readOnly: true,
+        // Throwaway embed key: hidden from the Access-Token list + pruned when expired.
+        embed: true,
         maxClearanceRank: 0,
         grants: [{ compilationId, grantedRank: null }],
       })

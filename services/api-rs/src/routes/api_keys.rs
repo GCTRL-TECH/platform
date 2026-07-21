@@ -36,6 +36,12 @@ struct CreateKeyReq {
     /// middleware/auth.rs, not here — this is just the flag's origin).
     #[serde(rename = "readOnly", default)]
     read_only: bool,
+    /// Auto-minted throwaway token for an iframe graph embed (EmbedShareDialog /
+    /// Anvil). Hidden from the management list and pruned once expired. Also
+    /// exempt from the scoped-token Business gate — an embed of your OWN graph is
+    /// part of viewing it, not a colleague seat.
+    #[serde(default)]
+    embed: bool,
 }
 
 /// Resolve a token's clearance to (rank, level_name, level_id) — preferring an
@@ -126,9 +132,11 @@ async fn list_keys(
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
     let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool)>(
+        // Hide auto-minted embed throwaways — this list is for the tokens the
+        // admin deliberately created for colleagues, not iframe embed keys.
         "SELECT id, name, key_prefix, max_clearance_rank, max_clearance_level, max_clearance_level_id,
                 last_used_at, expires_at, created_at, kb_scoped, read_only
-         FROM api_keys WHERE user_id = $1
+         FROM api_keys WHERE user_id = $1 AND embed = false
          ORDER BY created_at DESC"
     )
     .bind(claims.sub)
@@ -189,8 +197,18 @@ async fn create_key(
     // paid tiers are allowed but count-limited like business — an unrecognized
     // tier name must not end up MORE privileged than a paying business customer.
     //
+    // Auto-minted embed tokens (EmbedShareDialog / Anvil) are read-only,
+    // scoped to the caller's OWN graph, and thrown away — treat them as embed
+    // even if the sender hasn't been redeployed to pass the flag yet, so they're
+    // hidden + pruned consistently.
+    let embed = req.embed
+        || req.name.starts_with("Anvil embed")
+        || req.name.starts_with("Embed: ");
+
     // This is a packaging guardrail, not DRM — GCTRL is self-hosted by design.
-    if kb_scoped {
+    // Embed tokens are exempt: embedding your own graph is not a colleague seat,
+    // so it must work on Free and never counts against the Business seat limit.
+    if kb_scoped && !embed {
         let tier: Option<String> = sqlx::query_scalar(
             "SELECT tier FROM licenses
              WHERE user_id = $1 AND status = 'active'
@@ -206,8 +224,9 @@ async fn create_key(
         };
 
         if !tier.eq_ignore_ascii_case("enterprise") {
+            // Count real colleague tokens only — embed throwaways don't consume seats.
             let scoped_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND kb_scoped = true"
+                "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND kb_scoped = true AND embed = false"
             ).bind(claims.sub).fetch_one(&state.db).await?;
 
             // starter/pro are transitional business aliases until the central
@@ -232,8 +251,8 @@ async fn create_key(
 
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys
-           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only, embed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id"
     )
     .bind(claims.sub)
@@ -246,6 +265,7 @@ async fn create_key(
     .bind(req.expires_at)
     .bind(kb_scoped)
     .bind(req.read_only)
+    .bind(embed)
     .fetch_one(&state.db).await?;
 
     // Per-graph grants — only for compilations the caller actually owns.

@@ -45,6 +45,28 @@ pub fn spawn_all(state: Arc<AppState>) {
         }
     });
 
+    // Embed-token pruning: auto-minted iframe-embed keys (Anvil's 15-min ones,
+    // EmbedShareDialog's) are hidden from the token list, but nothing ever deleted
+    // the EXPIRED ones — the table grew unbounded. Delete expired embed keys daily
+    // (grants cascade). Only embed=true AND a set, past expires_at, so ExpireLESS
+    // "Embed:" tokens stay (they're still hidden). Auth already rejects expired keys.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(1800)).await; // 30m after startup
+        loop {
+            match sqlx::query(
+                "DELETE FROM api_keys \
+                 WHERE embed = true AND expires_at IS NOT NULL AND expires_at < NOW()"
+            ).execute(&s.db).await {
+                Ok(r) if r.rows_affected() > 0 =>
+                    tracing::info!("embed-token cleanup: pruned {} expired embed key(s)", r.rows_affected()),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("embed-token cleanup failed: {e}"),
+            }
+            sleep(Duration::from_secs(86400)).await; // 24h
+        }
+    });
+
     // Free monthly token grant: every user gets 1,000,000 tokens/month at no cost.
     // A daily tick tops each user back up to the 1M floor once their rolling
     // one-month window elapses. GREATEST never reduces a larger balance, so a
