@@ -9,7 +9,22 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: c9ded03 -->
+<!-- baseline-sha: 51c0d8a -->
+
+## v0.7.0 - Plans that scale, unlimited tokens & a big reliability sweep
+
+*22 July 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **New plan model - Free, Business, Enterprise.** Free now includes 1,000,000 tokens every month at no cost. Business and Enterprise run on unlimited tokens. Plans gate features and seats, never your day-to-day usage.
+- **Scoped colleague tokens by seat:** Business includes 10 scoped tokens per license (stack licenses for more seats); Enterprise is unlimited. Embedding your own graph never counts against that.
+- **Your balance and plan now read correctly in the client:** the free monthly grant is visible instead of a stale figure, and unlimited plans show as "Unlimited" rather than a meaningless number. The License tab was cleaned up into a single, clear view.
+- **Imports reliably land in the graph you chose:** connector and vault ingests (Obsidian, folder sync, uploads) that completed but left their nodes invisible now appear in the target graph as expected.
+- **Retry failed extractions without re-uploading:** re-run a single failed job or all failed jobs at once; connector jobs re-fetch straight from the source.
+- **Cloud cloaking hardened further:** hosted "-cloud" models served through a local Ollama are now cloaked too, and the reasoning traces of reasoning models are de-cloaked - so a pseudonym never surfaces to you, and plaintext never leaves for the cloud.
+- **Model picker follows your active runtime:** switch to a native GPU Ollama and the installed/selected state reflects that instance; missing recommended models re-appear for one-click download.
+- **Cleaner, tidier housekeeping:** deleting an extraction now works and removes its chunks and vectors; auto-generated iframe embed keys no longer clutter your Access Tokens list (only the tokens you deliberately created show, and expired embed keys are pruned nightly); a background loop that could pile up maintenance jobs was fixed.
+- **Hardware panel detects Apple Silicon and NVIDIA GPUs** for host GPU reporting.
+- **Security hardening:** license activation is more robust, and access-token creation never trusts client-supplied plan or credit values.
 
 ## v0.6.0 - Observability, GPU extraction & hardened cloaking
 
