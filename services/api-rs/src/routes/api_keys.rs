@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     routing::{delete, get},
     Json, Router,
 };
@@ -127,25 +127,38 @@ async fn grants_for_keys(
     map
 }
 
+#[derive(Deserialize)]
+struct ListQuery {
+    /// Include auto-minted embed tokens (hidden by default). Lets an owner
+    /// discover + revoke them — so hiding is decluttering, not an invisible
+    /// non-revocable backdoor.
+    #[serde(rename = "includeEmbed", default)]
+    include_embed: bool,
+}
+
 async fn list_keys(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool)>(
-        // Hide auto-minted embed throwaways — this list is for the tokens the
-        // admin deliberately created for colleagues, not iframe embed keys.
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool, bool)>(
+        // Hide auto-minted embed throwaways by default — this list is for tokens
+        // the admin deliberately created for colleagues, not iframe embed keys.
+        // `?includeEmbed=true` returns them (with an `embed` flag) so they can be
+        // audited + revoked.
         "SELECT id, name, key_prefix, max_clearance_rank, max_clearance_level, max_clearance_level_id,
-                last_used_at, expires_at, created_at, kb_scoped, read_only
-         FROM api_keys WHERE user_id = $1 AND embed = false
+                last_used_at, expires_at, created_at, kb_scoped, read_only, embed
+         FROM api_keys WHERE user_id = $1 AND (embed = false OR $2)
          ORDER BY created_at DESC"
     )
     .bind(claims.sub)
+    .bind(q.include_embed)
     .fetch_all(&state.db).await?;
 
     let key_ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     let mut grants = grants_for_keys(&state.db, &key_ids).await;
 
-    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only)| {
+    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only, embed)| {
         json!({
             "id": id,
             "name": name,
@@ -158,6 +171,7 @@ async fn list_keys(
             "createdAt": created,
             "kbScoped": kb_scoped,
             "readOnly": read_only,
+            "embed": embed,
             "grants": grants.remove(&id).unwrap_or_default(),
         })
     }).collect();
@@ -197,18 +211,20 @@ async fn create_key(
     // paid tiers are allowed but count-limited like business — an unrecognized
     // tier name must not end up MORE privileged than a paying business customer.
     //
-    // Auto-minted embed tokens (EmbedShareDialog / Anvil) are read-only,
-    // scoped to the caller's OWN graph, and thrown away — treat them as embed
-    // even if the sender hasn't been redeployed to pass the flag yet, so they're
-    // hidden + pruned consistently.
-    let embed = req.embed
-        || req.name.starts_with("Anvil embed")
-        || req.name.starts_with("Embed: ");
+    // "embed" only controls list-hiding + pruning. It is taken ONLY from the
+    // explicit flag (never derived from the client-settable name, which a caller
+    // could forge) AND only honored for READ-ONLY tokens — a write-capable hidden
+    // token would be a stealth backdoor. Owners can still list these via
+    // ?includeEmbed=true and revoke them.
+    let embed = req.embed && req.read_only;
 
-    // This is a packaging guardrail, not DRM — GCTRL is self-hosted by design.
-    // Embed tokens are exempt: embedding your own graph is not a colleague seat,
-    // so it must work on Free and never counts against the Business seat limit.
-    if kb_scoped && !embed {
+    // Packaging guardrail (not DRM — GCTRL is self-hosted). Exempt genuine graph
+    // EMBEDS from the Business seat gate: a read-only token scoped to a SINGLE
+    // graph is a view, not a colleague seat. Decided by REAL capabilities, never
+    // the client-set `embed` flag — otherwise a Free user could mint free
+    // read-write or multi-graph scoped tokens just by setting embed:true.
+    let is_graph_embed = req.read_only && req.grants.len() == 1;
+    if kb_scoped && !is_graph_embed {
         let tier: Option<String> = sqlx::query_scalar(
             "SELECT tier FROM licenses
              WHERE user_id = $1 AND status = 'active'
