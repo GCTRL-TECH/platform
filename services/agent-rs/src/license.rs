@@ -28,6 +28,13 @@ pub struct LicenseCache {
     activated:     bool,
     claims:        Option<LicenseClaims>,
     local_balance: i64,
+    /// Machine-readable activation state for /status + /health + operators:
+    /// "active" | "unactivated" | "fingerprint_mismatch" | "revoked" | "seat_limit".
+    reason:        &'static str,
+    /// Grace flag: a validly-signed license is being honored but its fingerprint
+    /// binding is stale (e.g. first boot after the fingerprint fix). Enforcement
+    /// keeps working; the re-attestation loop rebinds it to this instance.
+    needs_reattest: bool,
 }
 
 impl LicenseCache {
@@ -36,6 +43,8 @@ impl LicenseCache {
             activated:     false,
             claims:        None,
             local_balance: 0,
+            reason:        "unactivated",
+            needs_reattest: false,
         }
     }
 
@@ -57,6 +66,8 @@ impl LicenseCache {
             activated:     true,
             claims:        Some(data.claims),
             local_balance: balance,
+            reason:        "active",
+            needs_reattest: false,
         })
     }
 
@@ -64,7 +75,31 @@ impl LicenseCache {
         self.local_balance = claims.credits_balance;
         self.activated     = true;
         self.claims        = Some(claims);
+        self.reason        = "active";
+        self.needs_reattest = false;
     }
+
+    /// Honor a validly-signed but fingerprint-mismatched license: keep enforcing
+    /// (activated stays true) but flag it for background re-attestation. A hard
+    /// fail here is what caused the recreate outage — grace + re-attest is the fix.
+    pub fn into_grace(mut self, reason: &'static str) -> Self {
+        if self.claims.is_some() {
+            self.needs_reattest = true;
+            self.reason = reason;
+        }
+        self
+    }
+
+    /// The license server ACTIVELY rejected this instance (revoked / seat limit).
+    /// Only this drops enforcement — a transient/unreachable server never does.
+    pub fn mark_unactivated(&mut self, reason: &'static str) {
+        self.activated = false;
+        self.needs_reattest = false;
+        self.reason = reason;
+    }
+
+    pub fn reason(&self)         -> &'static str { self.reason }
+    pub fn needs_reattest(&self) -> bool { self.needs_reattest }
 
     pub fn is_activated(&self)         -> bool { self.activated }
     pub fn is_valid(&self)             -> bool { self.activated }

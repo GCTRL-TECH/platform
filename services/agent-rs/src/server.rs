@@ -60,14 +60,18 @@ struct StatusResponse {
     latest_version:   String,
     #[serde(rename = "currentVersion")]
     current_version:  String,
+    /// Machine-readable activation state so operators/monitoring can react to the
+    /// SPECIFIC cause: "active" | "unactivated" | "fingerprint_mismatch" (grace,
+    /// re-attesting) | "revoked" | "seat_limit" | "server_rejected".
+    reason:           String,
 }
 
 async fn handle_activate(
     State(state): State<AppState>,
     Json(req): Json<ActivateRequest>,
 ) -> impl IntoResponse {
-    // 1. Compute hardware fingerprint
-    let fingerprint = crate::fingerprint::compute().await;
+    // 1. Compute the stable instance fingerprint (persisted UUID, recreate-safe)
+    let fingerprint = crate::fingerprint::compute(&state.cfg.instance_id_path).await;
 
     // 2. Call license API
     let api_url = format!("{}/v1/activate", state.cfg.api_url);
@@ -121,6 +125,12 @@ async fn handle_activate(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Failed to save license: {e}") })),
         );
+    }
+    // 4b. Persist the key (same trust boundary as the JWT — both live in the RW
+    // config volume) so the agent can self-re-attest after a fingerprint change
+    // without operator intervention. Best-effort: never block activation on it.
+    if let Err(e) = tokio::fs::write(&state.cfg.license_key_path, req.license_key.trim()).await {
+        tracing::warn!("Failed to persist license key for re-attestation: {e}");
     }
 
     // 5. Update in-memory cache
@@ -242,7 +252,23 @@ async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
         update_required:  c.is_update_required(),
         latest_version,
         current_version,
+        reason:           c.reason().into(),
     })
+}
+
+/// GET /health — liveness AND license-enforceability in one signal, for compose
+/// healthchecks + monitoring. Returns 200 only while the license is actually
+/// enforceable (activated, incl. grace which still enforces); 503 otherwise, with
+/// the machine-readable reason. Unlike /status (always 200 JSON), a non-200 here
+/// makes a silent activation failure visible instead of masking it.
+async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+    let c = state.cache.read().await;
+    let (code, status) = if c.is_activated() {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "license_unenforceable")
+    };
+    (code, Json(serde_json::json!({ "status": status, "reason": c.reason() })))
 }
 
 #[derive(Deserialize)]
@@ -417,6 +443,7 @@ pub async fn run(
         .route("/check",    post(handle_check))
         .route("/report",   post(handle_report))
         .route("/status",   get(handle_status))
+        .route("/health",   get(handle_health))
         .route("/version",  post(handle_set_version))
         .route("/tuning",   get(handle_tuning))
         .route("/recreate", post(handle_recreate))

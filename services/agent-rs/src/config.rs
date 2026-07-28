@@ -17,6 +17,14 @@ pub struct Config {
     /// api-rs already applies to kex/fuse's `/search`). Empty = grace mode (no
     /// check) — matches the existing INTERNAL_API_SECRET pattern everywhere else.
     pub internal_api_secret: String,
+    /// Persistent per-instance identity file (in the RW config volume). The
+    /// activation fingerprint is derived from this UUID, NOT from ephemeral
+    /// container properties (veth MAC / sysinfo disk), so it survives container
+    /// recreates and image updates instead of silently invalidating the license.
+    pub instance_id_path: String,
+    /// The activation license key, persisted here on `/activate` so the agent can
+    /// self-re-attest (rebind to this instance id) without operator intervention.
+    pub license_key_path: String,
 }
 
 impl Config {
@@ -45,6 +53,10 @@ impl Config {
             reported_version_path: std::env::var("GCTRL_REPORTED_VERSION_PATH")
                 .unwrap_or_else(|_| "/app/config/reported_version".into()),
             internal_api_secret: std::env::var("INTERNAL_API_SECRET").unwrap_or_default(),
+            instance_id_path: std::env::var("GCTRL_INSTANCE_ID_PATH")
+                .unwrap_or_else(|_| "/app/config/instance_id".into()),
+            license_key_path: std::env::var("GCTRL_LICENSE_KEY_PATH")
+                .unwrap_or_else(|_| "/app/config/license.key".into()),
         }
     }
 }

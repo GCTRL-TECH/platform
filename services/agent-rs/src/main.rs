@@ -6,6 +6,7 @@ mod license;
 mod credits;
 mod usage_queue;
 mod heartbeat;
+mod reattest;
 mod tuning;
 mod version;
 mod server;
@@ -22,10 +23,14 @@ async fn main() {
 
     let cache = match license::LicenseCache::load_from_disk(&cfg.license_jwt_path, &cfg.license_public_key).await {
         Ok(loaded) => {
-            let fp = fingerprint::compute().await;
+            let fp = fingerprint::compute(&cfg.instance_id_path).await;
             if loaded.hardware_fingerprint() != fp {
-                tracing::warn!("Hardware fingerprint mismatch — starting in unactivated mode");
-                license::LicenseCache::unactivated()
+                // GRACE, not hard-fail: the JWT is validly signed, so we keep
+                // enforcing and re-attest in the background to rebind it to the
+                // (now stable) instance id. A hard fail here is exactly what turned
+                // a harmless container recreate into a licensing outage.
+                tracing::warn!("Fingerprint mismatch (recreate/first boot after fix) — honoring the signed license in grace, re-attesting in background");
+                loaded.into_grace("fingerprint_mismatch")
             } else {
                 tracing::info!("License valid — tier={} balance={}", loaded.tier(), loaded.balance());
                 loaded
@@ -46,6 +51,14 @@ async fn main() {
     let queue_hb = queue.clone();
     tokio::spawn(async move {
         heartbeat::run_loop(cache_hb, queue_hb, cfg_hb).await;
+    });
+
+    // Auto re-attestation loop: rebinds a grace/mismatched license to this
+    // instance id using the persisted key, so a fingerprint change self-heals.
+    let cfg_re   = cfg.clone();
+    let cache_re = cache.clone();
+    tokio::spawn(async move {
+        reattest::run_loop(cache_re, cfg_re).await;
     });
 
     server::run(cache, queue, cfg).await;

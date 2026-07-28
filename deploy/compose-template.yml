@@ -28,7 +28,10 @@ services:
     networks:
       - gctrl
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7070/status"]
+      # /health returns non-200 when the license is unenforceable (/status always
+      # returns 200, which masked activation failures). -q makes wget exit non-zero
+      # on an HTTP error, so an unenforceable license flips the container unhealthy.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:7070/health"]
       interval: 30s
       timeout: 5s
       retries: 3
