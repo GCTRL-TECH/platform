@@ -1,7 +1,8 @@
 import { Link } from 'react-router-dom'
-import { Github } from 'lucide-react'
+import { Github, Users } from 'lucide-react'
 
 const GITHUB_URL = 'https://github.com/GCTRL-TECH/platform'
+const COMMUNITY_URL = 'https://www.reddit.com/r/GCTRL/'
 
 const COLUMNS: { title: string; links: [label: string, href: string][] }[] = [
   {
@@ -44,15 +45,26 @@ export function SiteFooter() {
             <p className="text-sm leading-relaxed text-slate-500">
               The knowledge infrastructure layer for enterprise AI. Ground your data. Command your AI.
             </p>
-            <a
-              href={GITHUB_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-4 inline-flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:border-slate-600 hover:text-slate-200"
-            >
-              <Github className="h-4 w-4" strokeWidth={1.75} />
-              GitHub
-            </a>
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <a
+                href={GITHUB_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:border-slate-600 hover:text-slate-200"
+              >
+                <Github className="h-4 w-4" strokeWidth={1.75} />
+                GitHub
+              </a>
+              <a
+                href={COMMUNITY_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:border-slate-600 hover:text-slate-200"
+              >
+                <Users className="h-4 w-4" strokeWidth={1.75} />
+                Developer Community
+              </a>
+            </div>
           </div>
 
           {COLUMNS.map((col) => (

@@ -9,7 +9,13 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 1dc8b2d -->
+<!-- baseline-sha: eeb92b3 -->
+
+## v0.7.2 - Developer community
+
+*29 July 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The GCTRL developer community is live:** join us at [reddit.com/r/GCTRL](https://www.reddit.com/r/GCTRL/) for questions, setups, benchmarks and roadmap discussion. Linked from the site footer next to GitHub.
 
 ## v0.7.1 - License activation survives container recreates
 
