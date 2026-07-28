@@ -174,5 +174,10 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         // previous 10MB limit rejected any file >~7.5MB with a 413 before the
         // tool's own size check ever ran (bug-hunt W7).
         .layer(RequestBodyLimitLayer::new(40 * 1024 * 1024))
+        // AND axum's own DefaultBodyLimit: the tower-http layer above does NOT
+        // replace it — the Multipart/Json EXTRACTORS still enforced axum's 2MB
+        // default, so any upload >2MB died as "Error parsing multipart/form-data
+        // request" (kex /upload) before the 40MB layer ever mattered.
+        .layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024))
         .with_state(state)
 }
