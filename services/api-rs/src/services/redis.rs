@@ -20,6 +20,15 @@ pub async fn llen(conn: &Arc<Mutex<MultiplexedConnection>>, key: &str) -> redis:
     redis::cmd("LLEN").arg(key).query_async(&mut *c).await
 }
 
+/// Atomically move one element from the tail of `src` to the head of `dst`
+/// (LMOVE RIGHT LEFT). Returns the moved element, or None when `src` is empty.
+/// Atomic per element — a crash mid-drain can never lose a payload the way a
+/// separate RPOP+LPUSH could.
+pub async fn lmove(conn: &Arc<Mutex<MultiplexedConnection>>, src: &str, dst: &str) -> redis::RedisResult<Option<String>> {
+    let mut c = conn.lock().await;
+    redis::cmd("LMOVE").arg(src).arg(dst).arg("RIGHT").arg("LEFT").query_async(&mut *c).await
+}
+
 pub async fn set(conn: &Arc<Mutex<MultiplexedConnection>>, key: &str, value: &str) -> redis::RedisResult<()> {
     let mut c = conn.lock().await;
     redis::cmd("SET").arg(key).arg(value).query_async(&mut *c).await

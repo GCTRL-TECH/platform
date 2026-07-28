@@ -37,6 +37,12 @@ struct CheckResponse {
     credits: i64,
     balance: i64,
     reason:  Option<String>,
+    /// Denial is TRANSIENT (license not activated / forced update pending): the
+    /// caller should HOLD the work and auto-resume once the license recovers,
+    /// instead of failing it terminally. False for business denials
+    /// ("Insufficient credits") which need a human decision. Additive — old
+    /// workers that don't know the field keep their previous behavior.
+    hold:    bool,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +188,7 @@ async fn handle_check(
                 credits: 0,
                 balance: 0,
                 reason:  Some("License not activated. Complete setup at http://localhost:3001".into()),
+                hold:    true, // transient license state — hold + auto-resume, don't fail jobs
             }),
         );
     }
@@ -194,6 +201,7 @@ async fn handle_check(
                 credits: 0,
                 balance: cache.balance(),
                 reason:  Some("Required update pending. Run: curl -fsSL https://gctrl.tech/update | bash".into()),
+                hold:    true, // transient — resolves once the update runs
             }),
         );
     }
@@ -212,6 +220,7 @@ async fn handle_check(
                 credits: cost,
                 balance: cache.balance(),
                 reason:  Some("Insufficient credits".into()),
+                hold:    false, // business denial — needs a top-up, not a wait
             }),
         );
     }
@@ -219,7 +228,7 @@ async fn handle_check(
     cache.deduct_local(cost);
     (
         StatusCode::OK,
-        Json(CheckResponse { allowed: true, credits: cost, balance: cache.balance(), reason: None }),
+        Json(CheckResponse { allowed: true, credits: cost, balance: cache.balance(), reason: None, hold: false }),
     )
 }
 

@@ -67,6 +67,49 @@ pub fn spawn_all(state: Arc<AppState>) {
         }
     });
 
+    // License-resume watcher: KEX parks jobs denied by a TRANSIENT license state
+    // (agent /check hold=true) on 'kex:jobs:license_held' instead of failing them.
+    // This loop polls the agent's /health (200 = license enforceable, incl. grace)
+    // and, once healthy, drains the held payloads back onto 'kex:jobs' and clears
+    // the license_hold marker — jobs resume automatically after (re-)activation,
+    // closing the "43 jobs terminally failed during a 4h license outage" incident.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(60)).await;
+        let agent_base = std::env::var("GCTRL_AGENT_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "http://gctrl-agent:7070".into());
+        let client = reqwest::Client::new();
+        loop {
+            let held = crate::services::redis::llen(&s.redis, "kex:jobs:license_held").await.unwrap_or(0);
+            if held > 0 {
+                let healthy = client
+                    .get(format!("{}/health", agent_base.trim_end_matches('/')))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                if healthy {
+                    let mut moved = 0usize;
+                    while let Ok(Some(_)) = crate::services::redis::lmove(&s.redis, "kex:jobs:license_held", "kex:jobs").await {
+                        moved += 1;
+                        if moved as i64 >= held { break; } // don't chase concurrent re-parks forever
+                    }
+                    if moved > 0 {
+                        let _ = sqlx::query(
+                            "UPDATE jobs SET error = NULL, updated_at = NOW()
+                             WHERE status = 'pending' AND error = 'license_hold'"
+                        ).execute(&s.db).await;
+                        tracing::info!("license resume: released {moved} held job(s) back to the queue");
+                    }
+                }
+            }
+            sleep(Duration::from_secs(60)).await;
+        }
+    });
+
     // Free monthly token grant: every user gets 1,000,000 tokens/month at no cost.
     // A daily tick tops each user back up to the 1M floor once their rolling
     // one-month window elapses. GREATEST never reduces a larger balance, so a
@@ -801,10 +844,17 @@ async fn recover_stale_jobs(state: &AppState) {
     .execute(&state.db).await;
 
     // Jobs in 'pending' for >10 min: queue not draining, mark failed so the user sees something.
+    // - keyed on updated_at (not created_at): a RESUMED/re-pushed job bumps
+    //   updated_at and gets a fresh 10-minute window — the old created_at key
+    //   made any retried/held job older than 10 minutes instantly "stalled".
+    // - license-held jobs (error='license_hold') are exempt: they wait, visibly,
+    //   for the resume watcher — a hold may legitimately outlive any timeout and
+    //   customer data must never be failed because of a license state.
     let ten_min_ago = now - chrono::Duration::minutes(10);
     let _ = sqlx::query(
         "UPDATE jobs SET status='failed', error='Queue stalled (>10min pending)', completed_at=NOW(), updated_at=NOW()
-         WHERE status='pending' AND created_at < $1"
+         WHERE status='pending' AND COALESCE(updated_at, created_at) < $1
+           AND (error IS NULL OR error <> 'license_hold')"
     )
     .bind(ten_min_ago)
     .execute(&state.db).await;

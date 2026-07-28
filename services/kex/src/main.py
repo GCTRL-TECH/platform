@@ -37,7 +37,14 @@ from .code_parser import parse_python_repo
 from .embedding import get_embedding_client, build_embedding_client
 from .entity_verify import verify_entities
 from .kg_builder import get_kg_builder, entity_uri
-from .middleware.license_check import check_credits, report_usage
+from .middleware.license_check import LicenseHoldError, check_credits, report_usage
+
+# Jobs denied by a TRANSIENT license state (agent /check hold=true) park here —
+# raw payload, unmodified — until api-rs's license-resume watcher sees the agent
+# healthy again and moves them back onto 'kex:jobs'. Their PG row stays 'pending'
+# with error='license_hold' (the marker recover_stale_jobs exempts).
+LICENSE_HOLD_LIST = "kex:jobs:license_held"
+LICENSE_HOLD_MARKER = "license_hold"
 from .ner import get_ner_pipeline
 from .pii_detector import detect_pii, redact_pii
 from .relex import get_extractor
@@ -381,6 +388,28 @@ def _run_pipeline_impl(
     except Exception as exc:
         logger.warning(f"[{job_id}] Vector store failed (non-fatal): {exc}")
 
+    # 7b. Session fact log (fail-soft, fully local): distill the document into
+    # atomic memory facts stored as their own small chunks under this job —
+    # buried one-liners (updated values, denials, dated events) become directly
+    # retrievable instead of losing the top-k race to bulk prose.
+    try:
+        from .fact_log import extract_facts, fact_chunks
+        facts = extract_facts(text)
+        if facts:
+            f_chunks = fact_chunks(text, facts)
+            f_embeddings = embedder.embed_batch([c.get("embed_text", c["content"]) for c in f_chunks])
+            with telemetry.span("kex.fact_log", "LLM", {"kex.facts": len(f_chunks)}):
+                stored = vs.store_chunks(
+                    f_chunks, f_embeddings, job_id, user_id,
+                    compilation_id=None,
+                    entity_mentions=[[] for _ in f_chunks],
+                    source_document_id=source_document_id,
+                    classification=classification,
+                )
+            logger.info(f"[{job_id}] Fact log: {stored} fact chunks stored")
+    except Exception as exc:
+        logger.warning(f"[{job_id}] Fact log failed (non-fatal): {exc}")
+
     # A concise human-readable note for the dashboard when the extraction
     # completed but a step degraded (e.g. relation extraction skipped because the
     # LLM was unavailable). The job is still 'completed'/'success', not 'failed'.
@@ -619,6 +648,20 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             _extend_ontology(ontology_id, result)
             _publish_result(r, job_id, result)
 
+        except LicenseHoldError as exc:
+            # Transient license state (not activated / forced update): park the
+            # ORIGINAL payload for the resume watcher and mark the row pending
+            # with the hold marker — never terminal-fail customer data on a
+            # license hiccup. No kex:results publish (api-rs would write failed).
+            logger.warning(f"Worker: job {job_id} held at license gate ({exc}) — parked for auto-resume")
+            try:
+                r.rpush(LICENSE_HOLD_LIST, raw_payload)
+                _update_job_status(job_id, "pending", error=LICENSE_HOLD_MARKER)
+            except Exception as park_exc:
+                # Parking failed (Redis/PG down) — fall back to the old terminal
+                # path so the job is at least visible as failed, not lost silently.
+                logger.error(f"Worker: failed to park held job {job_id}: {park_exc}")
+                _publish_error(r, job_id, str(exc))
         except Exception as exc:
             logger.error(f"Worker: job {job_id} failed: {exc}\n{traceback.format_exc()}")
             _publish_error(r, job_id, str(exc))
@@ -681,6 +724,15 @@ def _update_job_status(job_id: str, status: str, result: dict | None = None, err
                     cur.execute(
                         "UPDATE jobs SET status='processing', updated_at=NOW() WHERE id=%s",
                         (job_id,),
+                    )
+                elif status == "pending":
+                    # License hold: back to pending (it WILL run again) with the
+                    # hold marker in `error` so operators see why it waits and
+                    # recover_stale_jobs knows to leave it alone. completed_at is
+                    # cleared — the job is explicitly not finished.
+                    cur.execute(
+                        "UPDATE jobs SET status='pending', error=%s, completed_at=NULL, updated_at=NOW() WHERE id=%s",
+                        (error, job_id),
                     )
                 else:  # failed
                     cur.execute(
@@ -1559,6 +1611,27 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
                         results[rid] = _normalize(rid, content, mentions, job_id, comp_id)
                         results[rid]["score"] = float(rank or 0.0)
                         order.append(rid)
+            # OR-relaxation: websearch_to_tsquery AND-semantics drops statements
+            # that contain most-but-not-all query words (one absent stopword-like
+            # term, e.g. "worked", hides "I've never written any Flask routes …").
+            # When the strict pass leaves headroom, fill it with an OR-ranked pass:
+            # ts_rank_cd still puts the densest multi-term matches first, so this
+            # adds recall without displacing strict hits (appended AFTER them).
+            if len(order) < limit:
+                toks = list(dict.fromkeys(
+                    t for t in "".join(c if c.isalnum() else " " for c in q).split()
+                    if len(t) >= 2))
+                if len(toks) >= 2:
+                    with conn.cursor() as cur:
+                        sql, params = _scope_sql(include_comp)
+                        params = dict(params)
+                        params["q"] = " OR ".join(toks)
+                        cur.execute(sql, params)
+                        for rid, content, mentions, job_id, comp_id, rank in cur.fetchall():
+                            if rid not in results:
+                                results[rid] = _normalize(rid, content, mentions, job_id, comp_id)
+                                results[rid]["score"] = float(rank or 0.0) * 0.5
+                                order.append(rid)
             # ILIKE fallback for exact substrings (punctuated IDs/filenames). These
             # rank at the FRONT — an exact literal hit is the strongest lexical
             # signal and is precisely what BM25-over-tsvector can miss.
