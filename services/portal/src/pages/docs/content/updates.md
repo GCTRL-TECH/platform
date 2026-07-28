@@ -9,7 +9,15 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: eeb92b3 -->
+<!-- baseline-sha: 77e21f9 -->
+
+## v0.7.3 - pip install, bigger uploads, sharper recall
+
+*29 July 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **`pip install gctrl`:** a second, first-class way to self-host, alongside the curl script. `pip install gctrl` (or `pipx install gctrl`) then `gctrl install` brings up the same stack - now cross-platform including native Windows, with Docker as the only prerequisite (no curl/openssl/bash needed). The curl one-liner keeps working unchanged.
+- **Uploads over 2 MB now ingest:** a hidden framework default capped request bodies at 2 MB, so any document larger than that failed with a "multipart parse" error before the real 25 MB limit ever applied. Lifted - a 3.4 MB PDF ingests end to end.
+- **Session fact log:** each ingested document is now distilled into atomic memory facts stored as their own retrievable chunks, so buried one-liners (an updated deadline, a denial, a dated event) surface directly instead of losing the top-k race to bulk prose. A backfill script retrofits already-ingested corpora.
 
 ## v0.7.2 - Developer community
 

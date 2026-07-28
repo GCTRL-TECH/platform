@@ -37,3 +37,6 @@ docs/superpowers/
 # CI-generated update-channel manifest (services/portal build step writes this
 # before the docker build) — never a committed file in the repo tree.
 services/portal/public/version.json
+.claude/
+beam-repo/
+serve.pid
