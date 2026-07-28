@@ -9,7 +9,20 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 51c0d8a -->
+<!-- baseline-sha: 1dc8b2d -->
+
+## v0.7.1 - License activation survives container recreates
+
+*22 July 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+Self-hosted operators reported that recreating the app containers (docker compose up -d, same images) could invalidate the license activation and silently stop ingestion. This release removes that whole failure class:
+
+- **Stable instance identity:** activation now binds to a UUID persisted in your config volume, not to ephemeral container properties. Recreates, image updates and compose changes keep the activation - automatically.
+- **Self-healing activation:** if the binding ever mismatches, the agent honors your validly signed license in a grace mode and re-attests itself in the background with the stored key. Only an active rejection by the license server (revoked, seat limit) stops enforcement - a temporarily unreachable server never does.
+- **No more lost jobs on license hiccups:** ingestion jobs denied by a transient license state are now parked, visibly, and resume automatically the moment the license recovers - instead of failing terminally. Business denials (insufficient credits) still surface immediately.
+- **Honest health signals:** the agent's status now reports a machine-readable reason, and a new /health endpoint returns non-200 while the license is unenforceable - so monitoring and the built-in container healthcheck actually catch it.
+- **Pin your versions:** set GCTRL_IMAGE_TAG in your .env to pin the whole stack to a release (e.g. v0.1.230) or a commit sha. Every build is published under latest, a version tag and its git sha.
+- Also fixed: agent timeouts are treated like an unreachable agent (graceful degradation instead of hard job failures), and retried jobs no longer trip the "queue stalled" watchdog prematurely.
 
 ## v0.7.0 - Plans that scale, unlimited tokens & a big reliability sweep
 
