@@ -1,0 +1,45 @@
+name: pip-publish
+
+# Publishes the `gctrl` pip package to PyPI via OIDC "trusted publishing" —
+# no long-lived API token stored anywhere. Fires only on a dedicated tag so it
+# never collides with the Docker image release workflow (build-push.yml).
+#
+# One-time PyPI setup (pending publisher, done in the PyPI account UI):
+#   Project name : gctrl
+#   Owner        : GCTRL-TECH
+#   Repository   : platform
+#   Workflow     : pip-publish.yml
+#   Environment  : (leave blank)
+#
+# Release:  git tag pip-v0.1.0 && git push origin pip-v0.1.0
+# (Bump the version in pip/pyproject.toml + pip/src/gctrl/__init__.py first.)
+
+on:
+  push:
+    tags:
+      - "pip-v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for PyPI trusted publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build sdist + wheel
+        working-directory: pip
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pip/dist
