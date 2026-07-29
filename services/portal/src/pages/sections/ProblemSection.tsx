@@ -1,19 +1,30 @@
-import type { ComponentType } from 'react'
-import { SilosVignette, ConflictVignette, GovernanceVignette } from './vignettes/CardVignettes'
+import { Boxes, CopyX, ShieldAlert, type LucideIcon } from 'lucide-react'
 
-const PROBLEMS: { Vignette: ComponentType; title: string; body: string }[] = [
+// Per-card CI accent: drives the icon tile gradient, its border, the icon color,
+// and the soft glow blob behind it. Cyan / violet / indigo, matching the section's
+// gradient headline.
+const ACCENT: Record<string, { tile: string; icon: string; glow: string }> = {
+  cyan: { tile: 'border-cyan-500/25 from-cyan-500/15 to-cyan-500/5', icon: 'text-cyan-300', glow: 'bg-cyan-500/10' },
+  violet: { tile: 'border-violet-500/25 from-violet-500/15 to-violet-500/5', icon: 'text-violet-300', glow: 'bg-violet-500/10' },
+  indigo: { tile: 'border-indigo-500/25 from-indigo-500/15 to-indigo-500/5', icon: 'text-indigo-300', glow: 'bg-indigo-500/10' },
+}
+
+const PROBLEMS: { Icon: LucideIcon; accent: keyof typeof ACCENT; title: string; body: string }[] = [
   {
-    Vignette: SilosVignette,
+    Icon: Boxes,
+    accent: 'cyan',
     title: 'Locked in silos & legacy systems',
     body: 'The knowledge your AI needs is scattered across SharePoint, old mailservers, legacy SQL, and orphaned file shares. Before anything is useful, you have to reach it - and just reaching it is a project of its own.',
   },
   {
-    Vignette: ConflictVignette,
+    Icon: CopyX,
+    accent: 'violet',
     title: 'Messy, duplicated, contradictory',
     body: 'Garbage in, garbage out. Point an LLM at raw, unresolved data and it learns from noise: the same entity under ten names, stale records, conflicting versions. The answers look confident and are quietly wrong.',
   },
   {
-    Vignette: GovernanceVignette,
+    Icon: ShieldAlert,
+    accent: 'indigo',
     title: 'Governance is overwhelming',
     body: 'Even once you can reach the data - who is allowed to see what? Classification, clearance, and an audit trail across every source is a task most teams start, dread, and never finish.',
   },
@@ -39,13 +50,21 @@ export function ProblemSection() {
         </div>
 
         <div className="grid gap-6 md:grid-cols-3">
-          {PROBLEMS.map((p, i) => (
-            <div key={p.title} className={`feature-card-landing reveal reveal-delay-${i + 1} p-8`}>
-              <p.Vignette />
-              <h3 className="mb-2 text-lg font-semibold text-white">{p.title}</h3>
-              <p className="text-sm leading-relaxed text-slate-400">{p.body}</p>
-            </div>
-          ))}
+          {PROBLEMS.map((p, i) => {
+            const a = ACCENT[p.accent]
+            return (
+              <div key={p.title} className={`feature-card-landing reveal reveal-delay-${i + 1} relative overflow-hidden p-8`}>
+                {/* Soft accent glow in the corner - the "pimped" card backdrop, no animation */}
+                <div className={`pointer-events-none absolute -right-8 -top-10 h-40 w-40 rounded-full ${a.glow} blur-3xl`} />
+                {/* Large vector icon in a gradient tile */}
+                <div className={`relative mb-5 flex h-14 w-14 items-center justify-center rounded-2xl border bg-gradient-to-br ${a.tile}`}>
+                  <p.Icon className={`h-7 w-7 ${a.icon}`} strokeWidth={1.5} />
+                </div>
+                <h3 className="relative mb-2 text-lg font-semibold text-white">{p.title}</h3>
+                <p className="relative text-sm leading-relaxed text-slate-400">{p.body}</p>
+              </div>
+            )
+          })}
         </div>
 
         <p className="mx-auto mt-12 max-w-2xl text-center text-base text-slate-500 reveal">
