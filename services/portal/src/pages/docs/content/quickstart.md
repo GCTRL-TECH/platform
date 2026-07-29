@@ -6,15 +6,17 @@ Get from zero to a working, queryable knowledge graph - and an AI agent that can
 
 ## 1. Install GCTRL
 
-One command brings up the whole stack:
+One command installs the CLI and brings up the whole stack:
 
 ```bash
-curl -fsSL https://gctrl.tech/install | bash
+pip install gctrl && gctrl install
 ```
+
+Prefer a shell one-liner on macOS / Linux? `curl -fsSL https://gctrl.tech/install | bash` does the same. The pip path additionally works on **native Windows** (Docker is the only requirement either way).
 
 The installer detects what you already run (Neo4j / Qdrant / Ollama), deploys only what's missing, lets you pick a model, and starts everything. When it finishes, the dashboard is at **`http://localhost:3001`**.
 
-→ Detail: [Installation](installation.md) · on Windows use [Docker Desktop + WSL 2](windows.md).
+→ Detail: [Installation](installation.md) · manage it later with `gctrl up` / `down` / `update` / `logs`.
 
 ## 2. Set up your LLM (local, or native Ollama for GPU)
 

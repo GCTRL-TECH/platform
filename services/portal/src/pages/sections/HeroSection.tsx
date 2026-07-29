@@ -247,7 +247,7 @@ function useTypewriter(phrases: string[]) {
   return text
 }
 
-const INSTALL_CMD = 'curl -fsSL https://gctrl.tech/install | bash'
+const INSTALL_CMD = 'pip install gctrl && gctrl install'
 
 export function HeroSection() {
   const [scrollY, setScrollY] = useState(0)

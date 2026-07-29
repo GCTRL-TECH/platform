@@ -1,14 +1,22 @@
 # Installation
 
-GCTRL installs with a single command. The installer detects what you already run, deploys only what is missing, and brings up the full stack.
+GCTRL installs with a single command. The installer detects what you already run, deploys only what is missing, and brings up the full stack. There are two ways to run it - both deploy the identical stack, and **Docker is the only hard requirement**.
 
-## One-line install
+## Install with pip (recommended, cross-platform)
+
+```bash
+pip install gctrl && gctrl install
+```
+
+`pip install gctrl` gives you the `gctrl` command; `gctrl install` detects your environment, lets you pick a model, and brings the platform up. This path works on **macOS, Linux and native Windows** - no curl, openssl or bash needed, just **Python 3.8+** and **Docker**. Prefer an isolated CLI? Use `pipx install gctrl` instead of `pip install gctrl`.
+
+## Install with curl (macOS / Linux)
 
 ```bash
 curl -fsSL https://gctrl.tech/install | bash
 ```
 
-The script is interactive on first run: it detects your environment, lets you pick a model, and brings the platform up.
+The shell one-liner does the same thing on macOS and Linux. On first run it is interactive: it detects your environment, lets you pick a model, and brings the platform up.
 
 > **For full performance, run Ollama natively.** The bundled Ollama runs inside Docker, which is **CPU-only** - Docker cannot reach your GPU (Apple Metal, or NVIDIA on Windows/Linux). Install Ollama natively on the host and point GCTRL at it in **Settings → Infrastructure**. It is the single biggest performance lever - see [Infrastructure & Ollama](infrastructure.md).
 
@@ -16,16 +24,16 @@ The script is interactive on first run: it detects your environment, lets you pi
 
 | Requirement | Notes |
 |-------------|-------|
-| **Docker** + **docker compose** plugin | The stack runs as containers; the compose plugin (`docker compose`, not legacy `docker-compose`) is required |
-| **curl** | Fetches the installer |
-| **openssl** | Generates local secrets and keys |
+| **Docker** + **docker compose** plugin | The stack runs as containers; the compose plugin (`docker compose`, not legacy `docker-compose`) is required. This is the only hard requirement for either install path |
+| **Python 3.8+** | For the pip path only (`pip install gctrl`). Nothing else - the CLI is stdlib-only and generates secrets itself |
+| **curl** + **openssl** | For the curl path only (fetches the installer, generates local secrets). The pip path needs neither |
 | **16 GB+ RAM** | Minimum. Larger models need more - budget accordingly |
 
 ### Supported platforms
 
 - **macOS (Apple Silicon)** - images run **native arm64**.
 - **Linux (x86_64)** - an **NVIDIA GPU is auto-detected**; when present the installer selects **CUDA** images.
-- **Windows** - run it via **Docker Desktop + WSL 2**. Follow the dedicated [Windows Install](windows.md) guide.
+- **Windows** - `pip install gctrl` runs **natively in PowerShell**; you still need **Docker Desktop** for the container engine. See the [Windows Install](windows.md) guide.
 
 ## What the installer does
 
@@ -47,11 +55,29 @@ The script is interactive on first run: it detects your environment, lets you pi
 
 > **Keep the data-layer ports private.** The bundled Neo4j, Postgres, Qdrant and Ollama are for local/Docker access only - never expose them to the internet. Database passwords are generated uniquely per install into `~/gctrl/.env`. Before exposing anything beyond `localhost`, read [Securing Your Deployment](security.md).
 
+## Managing your install (the `gctrl` CLI)
+
+After `pip install gctrl`, the `gctrl` command manages the whole lifecycle:
+
+| Command | What it does |
+|---------|--------------|
+| `gctrl install` | Install and start: detect infra, pick a model, `docker compose up` |
+| `gctrl update` | Re-pull the compose file and images, then restart - **preserves** your `.env` and generated secrets |
+| `gctrl up` / `gctrl down` | Start / stop the installed stack |
+| `gctrl status` | Container status |
+| `gctrl logs` | Tail logs (`--no-follow` to print current logs and exit) |
+
+The curl path installs to the same place (`~/gctrl`), so you can still manage it with plain `docker compose` from that directory if you prefer.
+
 ## Non-interactive install
 
-To skip the model picker, set `GCTRL_MODEL` and the installer runs unattended:
+To skip the model picker, set `GCTRL_MODEL` and the installer runs unattended - both paths honor the same environment variables (`GCTRL_MODEL`, `GCTRL_RUNTIME`, `GCTRL_INSTALL_DIR`):
 
 ```bash
+# pip
+GCTRL_MODEL=qwen2.5:7b gctrl install
+
+# curl
 GCTRL_MODEL=qwen2.5:7b curl -fsSL https://gctrl.tech/install | bash
 ```
 

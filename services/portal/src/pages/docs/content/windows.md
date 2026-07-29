@@ -67,22 +67,26 @@ You connect GCTRL to this native Ollama in step 6.
 
 ## Step 4 - Run the GCTRL installer
 
-1. Open an **Ubuntu (WSL) terminal** (search "Ubuntu" in the Start menu, or run `wsl` in PowerShell).
-2. Run the installer:
+On Windows the simplest path is **pip, straight from PowerShell** - no WSL terminal needed. Docker Desktop still runs the containers via WSL 2 under the hood, but the installer itself is native Python.
 
-   ```bash
-   curl -fsSL https://gctrl.tech/install | bash
+1. In **PowerShell**, install and run:
+
+   ```powershell
+   pip install gctrl
+   gctrl install
    ```
 
-   Docker Desktop runs the containers via WSL 2, so no extra Docker setup is needed inside Ubuntu.
+   (If `pip` isn't found, install [Python 3.8+](https://www.python.org/downloads/) first and reopen PowerShell.)
 
-3. The installer is interactive on first run: it detects existing services, lets you pick a model, brings up the stack, and deploys the **FUSE** resolution engine automatically.
+2. The installer is interactive on first run: it detects existing services, lets you pick a model, brings up the stack, and deploys the **FUSE** resolution engine automatically. Manage it afterwards with `gctrl up`, `gctrl down`, `gctrl status`, `gctrl logs`, and `gctrl update`.
 
 To skip the model picker for a scripted install, set the model up front:
 
-```bash
-GCTRL_MODEL=qwen2.5:7b curl -fsSL https://gctrl.tech/install | bash
+```powershell
+$env:GCTRL_MODEL = "qwen2.5:7b"; gctrl install
 ```
+
+**Prefer the shell installer?** Open an **Ubuntu (WSL) terminal** and run `curl -fsSL https://gctrl.tech/install | bash` instead - it deploys the identical stack.
 
 ### Ports
 
