@@ -653,18 +653,13 @@ export function HeroSection() {
           </span>
         </h1>
 
-        {/* Crisp category line - the plain-language "what is this" statement.
-            Deliberately prominent: brand poetry lives in the headline above,
-            this line does the explaining (also read by search + LLM crawlers). */}
-        <p className="mb-6 text-xl font-semibold text-white md:text-2xl">
-          The sovereign memory layer for AI agents.
-        </p>
-
         {/* Glass-card backdrop gives the paragraph solid readability over the
-            mission-control imagery without darkening the hero. One idea only -
-            everything else has its own section below. */}
+            mission-control imagery without darkening the hero. Leads with the
+            plain-language "what is this" positioning statement (also read by
+            search + LLM crawlers), then the elaboration. */}
         <div className="mx-auto mb-10 max-w-2xl rounded-2xl border border-white/10 bg-slate-950/45 px-6 py-4 backdrop-blur-md">
           <p className="text-base leading-relaxed text-slate-200 md:text-lg">
+            <span className="font-semibold text-white">The sovereign memory layer for AI agents.</span>{' '}
             Every document, drive and agent session - fused into{' '}
             <span className="text-indigo-300">one governed knowledge graph</span> on your own
             infrastructure.{' '}
