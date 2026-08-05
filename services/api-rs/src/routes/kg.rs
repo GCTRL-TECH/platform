@@ -3302,8 +3302,15 @@ async fn export_compilation(
                     "name":  name,
                 })
             }).collect();
+            // EU AI Act Art. 50(2): exported graphs are AI-extracted content,
+            // so the export carries machine-readable provenance.
             let body = serde_json::to_string_pretty(&serde_json::json!({
                 "@context": { "@vocab": "https://schema.org/" },
+                "creator": {
+                    "@type": "SoftwareApplication",
+                    "name": "GCTRL",
+                    "description": "AI-assisted knowledge graph extraction (ai-generated content)",
+                },
                 "@graph": graph,
             })).unwrap_or_default();
             let disposition = format!("attachment; filename=\"{comp_name}.jsonld\"");

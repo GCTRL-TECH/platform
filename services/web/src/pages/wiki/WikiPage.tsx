@@ -459,6 +459,8 @@ function WikiExplorer({
                 : 'Not yet distilled'}
               <span className="text-slate-700">·</span>
               <span className="text-slate-500">{pages.length} pages visible to you</span>
+              <span className="text-slate-700">·</span>
+              <span className="text-slate-600">AI-generated from your sources</span>
             </p>
           </div>
         </div>

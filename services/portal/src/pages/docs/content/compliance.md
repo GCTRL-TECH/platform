@@ -1,6 +1,6 @@
 # Compliance & Data Sovereignty
 
-GCTRL is designed for regulated and enterprise environments where *where your data lives* and *who touched it* are first-class questions. Three pillars carry that posture: a complete **audit trail**, **GDPR-aware** session and personalization handling, and **on-prem / local inference** so nothing leaves your network.
+GCTRL is designed for regulated and enterprise environments where *where your data lives* and *who touched it* are first-class questions. Four pillars carry that posture: a complete **audit trail**, **GDPR-aware** session and personalization handling, **EU AI Act transparency** built into the product, and **on-prem / local inference** so nothing leaves your network.
 
 > **Posture note:** the design references below (ISO 27001-aware design, TISAX-readiness as a north star) describe GCTRL's engineering *posture and intent*. They are not a claim of formal certification or audit. Treat them as how the system is built to behave, not as a compliance attestation.
 
@@ -57,6 +57,35 @@ A user can **erase their personalization profile** at any time. Right-to-be-forg
 | Incognito | No - browser memory only | No |
 | Standard | Yes | Only if personalization is opted in |
 | Personalization profile | Yes, until erased | n/a - it *is* the profile |
+
+---
+
+## EU AI Act
+
+GCTRL is an AI system placed on the EU market by Cinque Monti Ltd. as its provider. This section states, in plain language, where GCTRL sits under Regulation (EU) 2024/1689 (as amended by the 2026 digital omnibus) and what that means for you as a deployer.
+
+> **Posture note, again:** this is our good-faith self-assessment, not legal advice and not a conformity attestation. If you embed GCTRL in a context that is itself high-risk under Annex III, the high-risk obligations for that use sit with you as the deployer.
+
+### Where GCTRL sits
+
+- **Not high-risk by intended purpose.** GCTRL's intended purpose is knowledge extraction, fusion, retrieval and question answering over your own documents. That purpose does not fall under Annex III, and GCTRL implements no practice prohibited by Article 5.
+- **Not a general-purpose AI model provider.** GCTRL integrates third-party open-weight models that you choose and run on your own hardware (or cloud models you opt into). We do not train or provide the models themselves; the model providers carry the GPAI obligations.
+
+### Transparency (Article 50, applicable since 2 August 2026)
+
+- **You always know you are talking to an AI.** Talk to Graph is presented as an AI system, and the chat carries an explicit notice.
+- **AI-generated content is marked.** Auto-generated wiki pages, summaries and public graph embeds carry a machine-readable `ai-generated` marking, so downstream systems can recognise synthetic content.
+- **Answers are verifiable, not just plausible.** Every answer is grounded in the graph and traces back to its sources - the practical antidote to treating AI output as fact.
+
+### What GCTRL gives you for your own AI Act duties
+
+| Your duty as a deployer | What GCTRL provides |
+|-------------------------|---------------------|
+| Record-keeping and traceability | The forensic audit trail above: every access, every denial, queryable |
+| Human oversight | Clearance ranks, scoped tokens, and source-traced answers a human can verify |
+| Data governance | On-prem deployment and local inference: the data lifecycle stays under your control |
+| Transparency toward your users | AI notices and machine-readable content markings, out of the box |
+| Accuracy monitoring | Published benchmarks and per-answer source receipts |
 
 ---
 

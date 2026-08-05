@@ -97,12 +97,21 @@ export default function EmbedGraphPage() {
 
   // GDPR/embedding hygiene: never leak the host page's URL to the API origin
   // via the Referer header on this cross-site-friendly surface.
+  // EU AI Act Art. 50(2): this public surface shows AI-assisted content, so it
+  // carries a machine-readable ai-generated marking for downstream systems.
   useEffect(() => {
-    const meta = document.createElement('meta')
-    meta.name = 'referrer'
-    meta.content = 'no-referrer'
-    document.head.appendChild(meta)
-    return () => { document.head.removeChild(meta) }
+    const metas = [
+      { name: 'referrer', content: 'no-referrer' },
+      { name: 'ai-generated', content: 'true' },
+      { name: 'generator', content: 'GCTRL (AI-assisted knowledge graph)' },
+    ].map(({ name, content }) => {
+      const meta = document.createElement('meta')
+      meta.name = name
+      meta.content = content
+      document.head.appendChild(meta)
+      return meta
+    })
+    return () => { metas.forEach((m) => document.head.removeChild(m)) }
   }, [])
 
   useEffect(() => {

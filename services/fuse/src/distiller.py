@@ -154,6 +154,11 @@ def _frontmatter(
     if core_hash:
         lines.append(f"core_hash: {core_hash}")
     lines.append(f"last_distilled: {last_distilled}")
+    # EU AI Act Art. 50(2): wiki bodies are LLM-synthesized, so the markdown
+    # carries a machine-readable ai-generated marking that travels with every
+    # export/sync surface (Obsidian, downloads).
+    lines.append("ai_generated: true")
+    lines.append("generator: GCTRL Wiki-LLM")
     lines.append("---")
     return "\n".join(lines) + "\n\n"
 

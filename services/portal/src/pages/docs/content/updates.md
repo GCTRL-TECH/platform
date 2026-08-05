@@ -11,6 +11,13 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: f1d1b02 -->
 
+## v0.7.6 - EU AI Act transparency + the GCTRL blog
+
+*5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **EU AI Act transparency, shipped in the product.** Since 2 August 2026 the Act's Article 50 obligations apply, and GCTRL now wears them visibly: Talk to Graph states plainly that you are interacting with an AI system, auto-generated wiki pages carry a machine-readable `ai_generated` marking in their frontmatter (it travels with every Obsidian sync and export), public graph embeds declare themselves via meta tags, and graph exports include AI provenance in their JSON-LD. Our full self-assessment - where GCTRL sits under the Act and what deployers get for their own duties - is published on the [Compliance page](/docs/compliance).
+- **The GCTRL blog is live at [gctrl.tech/blog](/blog):** engineering notes on self-hosted knowledge graphs, GraphRAG, sovereign AI memory and compliance, starting with four posts. Linked from the site footer.
+
 ## v0.7.5 - Faster extraction, embeddable node deep-links, cloak-safe tool calls
 
 *5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

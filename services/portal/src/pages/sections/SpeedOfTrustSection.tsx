@@ -1,6 +1,6 @@
 import { SlidersHorizontal, KeyRound, ScrollText, Network, type LucideIcon } from 'lucide-react'
 
-const STANDARDS = ['GDPR', 'ISO 27001', 'SOC 2', 'TISAX', 'NIS2']
+const STANDARDS = ['GDPR', 'EU AI Act', 'ISO 27001', 'SOC 2', 'TISAX', 'NIS2']
 
 const ICON_CLS: Record<string, string> = {
   indigo: 'border-indigo-500/20 bg-indigo-500/10 text-indigo-300',
@@ -57,7 +57,7 @@ export function SpeedOfTrustSection() {
         </div>
 
         {/* Compliance standards strip */}
-        <div className="mb-16 flex flex-wrap items-center justify-center gap-3 reveal">
+        <div className="mb-3 flex flex-wrap items-center justify-center gap-3 reveal">
           {STANDARDS.map((std) => (
             <span key={std} className="glass-pill">
               <svg className="h-3.5 w-3.5 text-emerald-400" fill="currentColor" viewBox="0 0 20 20">
@@ -67,6 +67,12 @@ export function SpeedOfTrustSection() {
             </span>
           ))}
         </div>
+        <p className="mb-16 text-center text-xs text-slate-500 reveal">
+          Built for environments governed by these frameworks - design posture, not a certification claim.{' '}
+          <a href="/docs/compliance" className="text-indigo-400 hover:text-indigo-300">
+            How we address each
+          </a>
+        </p>
 
         {/* The four pillars of the moat */}
         <div className="grid gap-6 md:grid-cols-2">

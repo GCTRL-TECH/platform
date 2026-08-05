@@ -1789,6 +1789,10 @@ export function TalkToGraphPage() {
                 <p className="mt-2 max-w-xs text-sm text-slate-500 leading-relaxed">
                   Natural language queries over your Neo4j graphs. Sources cited, reasoning shown.
                 </p>
+                <p className="mt-3 max-w-xs text-xs text-slate-600 leading-relaxed">
+                  You are interacting with an AI system. Answers are AI-generated — verify important
+                  facts via the cited sources.
+                </p>
               </div>
             </div>
           ) : (
@@ -2053,8 +2057,8 @@ export function TalkToGraphPage() {
 
             <p className="mt-1.5 text-center text-[10px] text-slate-600">
               {mode === 'incognito'
-                ? 'No conversations stored — GDPR compliant'
-                : 'Conversations saved to your account'}
+                ? 'AI-generated answers — verify via sources · No conversations stored — GDPR compliant'
+                : 'AI-generated answers — verify via sources · Conversations saved to your account'}
             </p>
           </div>
         </div>
