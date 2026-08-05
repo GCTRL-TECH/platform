@@ -204,6 +204,7 @@ def verify_entities(entities, text, model, base, kind, api_key=None, min_score=0
                 prompt, model, base, kind,
                 api_key=api_key,
                 options={"temperature": 0.0},
+                think=config.ENTITY_VERIFY_THINK,
                 timeout=180,
             )
             report["llm_calls"] += 1

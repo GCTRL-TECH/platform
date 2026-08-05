@@ -35,6 +35,7 @@ def complete(
     kind: str,
     api_key=None,
     options=None,
+    think=None,
     timeout=120,
 ) -> str:
     """Traced wrapper around ``_complete_impl`` — one OpenInference LLM span per
@@ -45,7 +46,7 @@ def complete(
         "LLM",
         {"llm.model_name": model, "llm.provider": kind, "input.value": telemetry.trunc(prompt)},
     ) as sp:
-        out = _complete_impl(prompt, model, base, kind, api_key=api_key, options=options, timeout=timeout)
+        out = _complete_impl(prompt, model, base, kind, api_key=api_key, options=options, think=think, timeout=timeout)
         try:
             sp.set_attribute("output.value", telemetry.trunc(out, 4000))
         except Exception:
@@ -60,6 +61,7 @@ def _complete_impl(
     kind: str,
     api_key=None,
     options=None,
+    think=None,
     timeout=120,
 ) -> str:
     """Synchronous LLM completion.  Uses `requests`.
@@ -95,6 +97,12 @@ def _complete_impl(
         # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
         # Env-tunable for RAM-tight boxes; "0" unloads immediately, "5m" = Ollama default.
         body["keep_alive"] = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+        # Reasoning models spend most of their tokens on a chain-of-thought the
+        # extraction parsers discard; `think: false` skips it (big speed-up, same
+        # structured output). Models without a thinking capability ignore the
+        # field, and older Ollama ignores the unknown key. None => omit entirely.
+        if think is not None:
+            body["think"] = bool(think)
         resp = requests.post(
             f"{base}/api/generate",
             json=body,
@@ -133,6 +141,7 @@ async def acomplete(
     kind: str,
     api_key=None,
     options=None,
+    think=None,
     timeout=120,
 ) -> str:
     """Async LLM completion.  Uses `httpx`.
@@ -158,6 +167,8 @@ async def acomplete(
         # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
         # Env-tunable for RAM-tight boxes; "0" unloads immediately, "5m" = Ollama default.
         body["keep_alive"] = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+        if think is not None:
+            body["think"] = bool(think)
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{base}/api/generate",

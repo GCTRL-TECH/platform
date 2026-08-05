@@ -9,7 +9,13 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: f1d1b02 -->
+<!-- baseline-sha: db5749f -->
+
+## v0.7.7 - Faster structured extraction on reasoning models
+
+*5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Extraction skips the reasoning trace on thinking models.** Relation extraction, auto-classification, entity verification and the fact-log distiller now tell Ollama `think: false`, so a reasoning model (gemma3 / gemma4, gpt-oss, qwen3, deepseek-r1) no longer spends most of its output on a chain-of-thought the extraction parsers then throw away. Measured about 3.7x faster on gemma4:31b (44.7s to 12.0s) at identical JSON, and a ~200-character document drops from ~56s to under 20s. Models without a thinking capability (like the default qwen2.5:7b relation model) ignore the field, so nothing changes for them, and chat keeps its reasoning. Set `KEX_THINK=true`, or a per-purpose `RELEX_THINK` / `AUTO_CLASSIFY_THINK` / `ENTITY_VERIFY_THINK` / `FACT_LOG_THINK`, to keep the reasoning.
 
 ## v0.7.6 - EU AI Act transparency + the GCTRL blog
 

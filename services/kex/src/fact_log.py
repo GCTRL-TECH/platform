@@ -59,7 +59,8 @@ def _generate(base: str, model: str, prompt: str, timeout: int = 90) -> str | No
         resp = requests.post(
             f"{base}/api/generate",
             json={"model": model, "prompt": prompt, "stream": False,
-                  "options": {"temperature": 0.1}},
+                  "options": {"temperature": 0.1},
+                  "think": config.FACT_LOG_THINK},
             timeout=timeout,
         )
         if resp.status_code == 404:

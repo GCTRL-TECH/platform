@@ -55,6 +55,36 @@ RELEX_NUM_PREDICT: int = int(os.environ.get("RELEX_NUM_PREDICT", "2048"))
 # path. Lower it (e.g. 120) on hosts where a stalled runner should give up sooner.
 RELEX_TIMEOUT: int = int(os.environ.get("RELEX_TIMEOUT", "180"))
 
+
+# ── Reasoning ("think") on structured-extraction LLM calls ────────────────────
+# Reasoning models (gemma3/gemma4, gpt-oss, qwen3, deepseek-r1, …) spend the bulk
+# of their generation on a chain-of-thought our extraction parsers then DISCARD —
+# measured ~3.7x slower for identical output (gemma4:31b: 44.7s → 12.0s, same JSON).
+# We therefore send Ollama `think: false` on the extraction calls by DEFAULT. It is
+# a plain per-request field: models WITHOUT a thinking capability (e.g. qwen2.5:7b,
+# the default relation model) ignore it, and older Ollama ignores the unknown key —
+# so it is safe everywhere and only speeds up reasoning models. Chat/agent runtimes
+# are a separate service and keep their reasoning. Flip KEX_THINK=true to keep
+# reasoning on every extraction call, or a per-purpose <PURPOSE>_THINK=true
+# (RELEX_THINK / AUTO_CLASSIFY_THINK / ENTITY_VERIFY_THINK / FACT_LOG_THINK).
+def _think_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+KEX_THINK: bool = _think_flag("KEX_THINK", False)
+RELEX_THINK: bool = _think_flag("RELEX_THINK", KEX_THINK)
+AUTO_CLASSIFY_THINK: bool = _think_flag("AUTO_CLASSIFY_THINK", KEX_THINK)
+ENTITY_VERIFY_THINK: bool = _think_flag("ENTITY_VERIFY_THINK", KEX_THINK)
+FACT_LOG_THINK: bool = _think_flag("FACT_LOG_THINK", KEX_THINK)
+
 # Entity Verify/Retype tier (precision, opt-in): an LLM verify/retype pass
 # over GLiNER's candidate entities — drops junk noun-phrases and fixes obvious
 # type errors WITHOUT ever inventing a span (GLiNER stays the only span

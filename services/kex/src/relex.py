@@ -850,6 +850,7 @@ class RelationExtractor:
                 kind,
                 api_key=api_key,
                 options={"temperature": 0.0, "num_predict": num_predict},
+                think=getattr(config, "RELEX_THINK", False),
                 timeout=getattr(config, "RELEX_TIMEOUT", 180),
             )
             return ("ok", text)

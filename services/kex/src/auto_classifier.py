@@ -1,6 +1,6 @@
 import os
 
-from . import llm_client
+from . import config, llm_client
 
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434")
 DEFAULT_MODEL = os.getenv("AUTO_CLASSIFY_MODEL", "llama3.2")
@@ -41,6 +41,7 @@ async def auto_classify(
             resolved_base,
             kind,
             api_key=api_key,
+            think=config.AUTO_CLASSIFY_THINK,
             timeout=30.0,
         )
         result = result.strip().upper()
