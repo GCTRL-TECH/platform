@@ -527,6 +527,11 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
 
             # Authoritative state: write to Postgres BEFORE the fire-and-forget pubsub.
             _update_job_status(job_id, "processing")
+            # Wall-clock of the ACTUAL processing (dequeue -> result), stamped into the
+            # result below. The DB's created_at->completed_at also spans the time the job
+            # waited in the queue behind others, which over-reports the duration for
+            # batched ingests (see the frontend's getJobDuration).
+            _job_start = time.monotonic()
             hb_stop = _start_job_heartbeat(job_id)
             # Publish 'processing' status immediately so the UI shows it
             try:
@@ -620,6 +625,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                     "warning": "Crawl found no extractable content (no readable pages on this domain).",
                     "crawled_urls": crawled_urls or [],
                 }
+                empty_result["duration_ms"] = int((time.monotonic() - _job_start) * 1000)
                 _publish_result(r, job_id, empty_result)
                 continue
 
@@ -646,6 +652,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 result["crawled_urls"] = crawled_urls
             report_usage("kex_extract", len(text), check_result["credits_spent"])
             _extend_ontology(ontology_id, result)
+            result["duration_ms"] = int((time.monotonic() - _job_start) * 1000)
             _publish_result(r, job_id, result)
 
         except LicenseHoldError as exc:

@@ -14,6 +14,9 @@ export interface KexJob {
   result?: {
     entities?: unknown[]
     graph_stats?: { entities_created?: number }
+    /** Actual worker processing time in ms (dequeue -> result), excludes queue wait.
+     *  Absent on jobs recorded before this was tracked -> fall back to wall time. */
+    duration_ms?: number
   }
   error?: string
   batchId?: string | null
@@ -41,6 +44,17 @@ function getJobEntities(job: KexJob): number | null {
 }
 
 function getJobDuration(job: KexJob): string | null {
+  // Prefer the worker-stamped processing time (dequeue -> result). The DB's
+  // created_at -> completed_at also counts the time the job sat queued behind other
+  // jobs, which massively over-reported the duration for batched ingests (e.g. 481s
+  // shown for a 4.8s extraction).
+  const proc = job.result?.duration_ms
+  if (typeof proc === 'number' && proc >= 0) {
+    if (proc < 1000) return `${Math.round(proc)}ms`
+    return `${(proc / 1000).toFixed(1)}s`
+  }
+  // Fallback for older jobs without a stamped processing time: enqueue -> done wall
+  // clock (includes queue wait, so it can over-report).
   if (!job.createdAt || !job.completedAt) return null
   const ms = new Date(job.completedAt).getTime() - new Date(job.createdAt).getTime()
   if (ms < 1000) return `${ms}ms`

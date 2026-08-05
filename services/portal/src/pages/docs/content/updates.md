@@ -9,7 +9,13 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 13abd3d -->
+<!-- baseline-sha: 53cdd60 -->
+
+## v0.7.9 - Extraction duration shows real processing time, not queue wait
+
+*5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **"Your Extractions" now reports the actual processing time.** The per-job duration was measured enqueue-to-completion, which also counted the time a job spent waiting in the queue behind other jobs - so a 4.8-second extraction inside a batch could read as ~481 seconds. The worker now stamps the true processing time (dequeue to result) onto each job and the list shows that. Jobs recorded before this update fall back to the old wall-clock reading.
 
 ## v0.7.8 - Reasoning-skip speedup extended to distillation and conflict resolution
 
