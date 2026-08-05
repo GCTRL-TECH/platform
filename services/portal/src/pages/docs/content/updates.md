@@ -9,7 +9,15 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 77e21f9 -->
+<!-- baseline-sha: f1d1b02 -->
+
+## v0.7.5 - Faster extraction, embeddable node deep-links, cloak-safe tool calls
+
+*5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Extraction stops stalling on the wrong model.** Default installs now run relation extraction on their configured relation model (qwen2.5:7b) right away, instead of falling through a 180-second timeout when a mismatched chat model slipped in - so a small document that could take minutes now finishes in seconds. Extra safety net: if you deliberately pick a relation model that is not loaded, the worker fast-fails to the fallback instead of re-paying that timeout on every window of the document.
+- **Embeddable graphs can open a specific node.** An embed can now deep-link straight to a node and its Source Text (the underlying chunks), offer free-text node search, and be driven by the hosting page over a strict, origin-checked message channel - all inside the embed's existing read-only, single-graph scope. Nothing new is exposed; it reuses the access the shared embed link already had.
+- **Cloud cloaking no longer garbles agent tool calls.** With entity cloaking on for a cloud model, tool results and tool-call arguments now stay byte-exact: machine data handed back to the model is left untouched, and any pseudonym that reaches a tool-call argument is reversed before it leaves the gateway, streaming included - so agentic file and write actions through the cloak gateway are safe again.
 
 ## v0.7.4 - Pricing rework: unlimited tokens everywhere, plans buy access & compliance
 

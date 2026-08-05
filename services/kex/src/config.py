@@ -48,6 +48,13 @@ RELEX_MIN_CONFIDENCE: float = float(os.environ.get("KEX_MIN_RELATION_CONFIDENCE"
 # overridable per-install for very constrained hosts.
 RELEX_NUM_PREDICT: int = int(os.environ.get("RELEX_NUM_PREDICT", "2048"))
 
+# Max seconds to wait for ONE relation-extraction generate call. Kept generous so
+# a heavy model on a cold/CPU host still finishes. A deliberately-picked model
+# that can't run is caught earlier by relex.py's tags precheck + dead-primary memo
+# (skips it after the first timeout), so this ceiling is a backstop, not the hot
+# path. Lower it (e.g. 120) on hosts where a stalled runner should give up sooner.
+RELEX_TIMEOUT: int = int(os.environ.get("RELEX_TIMEOUT", "180"))
+
 # Entity Verify/Retype tier (precision, opt-in): an LLM verify/retype pass
 # over GLiNER's candidate entities — drops junk noun-phrases and fixes obvious
 # type errors WITHOUT ever inventing a span (GLiNER stays the only span

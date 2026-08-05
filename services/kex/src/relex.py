@@ -770,6 +770,20 @@ class RelationExtractor:
                 candidates.append(fallback)
 
         for idx, m in enumerate(candidates):
+            # Backstop: a primary that already timed out / was found unavailable
+            # this process is skipped, so windows 2..N and the gap-fill pass go
+            # straight to the fallback instead of re-paying the full generate
+            # timeout each time.
+            if idx == 0 and kind == "ollama" and m in _relex_dead_primaries:
+                continue
+            # Cheap availability precheck for the primary: if it isn't installed on
+            # this Ollama, provision it once (self-heal) rather than issuing a blind
+            # generate that can block for the full timeout on a crashy runtime. On a
+            # failed pull, mark it dead and move to the fallback.
+            if idx == 0 and kind == "ollama" and not self._model_installed(base, m):
+                if not self._pull_model(base, m):
+                    _relex_dead_primaries.add(m)
+                    continue
             status, text = self._generate_once(base, m, prompt, kind=kind, api_key=api_key)
             if status == "ok":
                 if idx > 0:
@@ -786,9 +800,14 @@ class RelationExtractor:
                             if idx > 0:
                                 logger.warning(f"RelEx fell back to '{m}' and pulled it on demand")
                             return text2
+                    if idx == 0:
+                        _relex_dead_primaries.add(m)
                 continue  # pull failed or still unusable → try the next candidate
             if status == "server_error":
                 # OOM / crashed runner / timeout on this model → try the lighter fallback.
+                if idx == 0 and kind == "ollama":
+                    # Don't re-pay the full timeout on this primary next window.
+                    _relex_dead_primaries.add(m)
                 logger.warning(f"RelEx model '{m}' could not run; trying fallback model")
                 continue
             if status == "unreachable":
@@ -831,7 +850,7 @@ class RelationExtractor:
                 kind,
                 api_key=api_key,
                 options={"temperature": 0.0, "num_predict": num_predict},
-                timeout=180,
+                timeout=getattr(config, "RELEX_TIMEOUT", 180),
             )
             return ("ok", text)
         except requests.exceptions.HTTPError as exc:
@@ -883,6 +902,28 @@ class RelationExtractor:
         except Exception as exc:
             logger.warning(f"RelEx: could not pull relation model '{model}': {exc}")
             return False
+
+    def _model_installed(self, base: str, model: str) -> bool:
+        """Best-effort availability precheck via Ollama's `/api/tags`.
+
+        Returns False ONLY when the tags list was fetched successfully and the
+        model is positively absent. On any error (tags unreachable / bad response)
+        returns True so the normal generate + self-heal path runs unchanged.
+        Tolerates Ollama's implicit ':latest' tag (e.g. 'llama3.2' matches
+        'llama3.2:latest'). Uses a short timeout so it never becomes a new stall.
+        """
+        try:
+            resp = requests.get(f"{base.rstrip('/')}/api/tags", timeout=5)
+            if not resp.ok:
+                return True
+            names = {mm.get("name", "") for mm in (resp.json().get("models") or [])}
+        except Exception:
+            return True
+        if model in names:
+            return True
+        if ":" not in model and f"{model}:latest" in names:
+            return True
+        return False
 
     def _parse_json_array(self, response_text: str) -> list[dict]:
         """Parse a JSON array of relation objects from the model response.
@@ -1241,6 +1282,13 @@ class RelationExtractor:
 _pull_lock = threading.Lock()
 _pull_attempted: set[str] = set()
 _pulled_ok: set[str] = set()
+
+# Primary relation models that already timed out / were found unavailable this
+# process. Once a primary lands here, later windows and the gap-fill pass skip it
+# and go straight to the fallback instead of re-paying the full generate timeout
+# each time. Unannotated on purpose: the Cython prod build enforces exact-dict/
+# list/set checks that reject subclasses, and an annotation buys nothing here.
+_relex_dead_primaries = set()
 
 # Module-level singleton
 _extractor = RelationExtractor()

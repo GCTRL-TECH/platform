@@ -276,6 +276,17 @@ async fn chat_completions_inner(
     let ns = [namespace];
     if let Some(messages) = out_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for msg in messages.iter_mut() {
+            // NEVER cloak tool RESULT messages: their content is verbatim tool
+            // output (file listings, paths, IDs) that the model copies straight
+            // into its NEXT assistant `tool_calls[].function.arguments`.
+            // Pseudonymizing it corrupts those literals — e.g. a write path
+            // shipped as `/Users/Org-46/asgard_Term-3170/...` = silent file
+            // corruption. (Likewise `tools[]` definitions and `tool_calls`
+            // arguments are NEVER cloaked here — they are only DE-cloaked on the
+            // response side; keep it that way in any future refactor.)
+            if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                continue;
+            }
             let Some(content) = msg.get("content").and_then(|c| c.as_str()) else { continue };
             if content.is_empty() {
                 continue;
@@ -375,6 +386,13 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
         // prompt — it needs its own rolling buffer, or interleaved content/
         // reasoning deltas would corrupt each other's partial-pseudonym state.
         let mut reasoning_buf = String::new();
+        // Tool-call arguments also stream as fragments, and a pseudonym can be
+        // split across them (`"Term-"` then `"3170"`). Each tool call therefore
+        // needs its OWN rolling buffer, keyed by the `index` carried on every
+        // `delta.tool_calls[]` entry, so fragments for different calls never
+        // corrupt each other's partial-pseudonym state. NOTE: only de-cloaked
+        // here — tool-call args are NEVER cloaked on the request side.
+        let mut toolarg_bufs: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
 
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
@@ -406,6 +424,17 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
                     if !tail.is_empty() {
                         let ev = json!({ "choices": [ { "index": 0, "delta": { "content": tail }, "finish_reason": Value::Null } ] });
                         yield Ok(Bytes::from(format!("data: {ev}\n\n")));
+                    }
+                    // Backstop for a stream that ended WITHOUT a finish_reason
+                    // chunk: flush each tool call's held-back argument tail, keyed
+                    // by its index. Normally already empty (the finish chunk
+                    // flushed them) — a half-reversed pseudonym is never emitted.
+                    for (idx, buf) in toolarg_bufs.iter_mut() {
+                        let t_tail = privacy::decloak_stream_finish(&session, buf);
+                        if !t_tail.is_empty() {
+                            let ev = json!({ "choices": [ { "index": 0, "delta": { "tool_calls": [ { "index": idx, "function": { "arguments": t_tail } } ] }, "finish_reason": Value::Null } ] });
+                            yield Ok(Bytes::from(format!("data: {ev}\n\n")));
+                        }
                     }
                     yield Ok(Bytes::from("data: [DONE]\n\n"));
                     continue;
@@ -449,6 +478,47 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
                         if had_content || !emit.is_empty() {
                             if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
                                 delta.insert("content".into(), json!(emit));
+                            }
+                        }
+
+                        // De-cloak streamed tool-call arguments. The model echoes
+                        // literals from a (now un-cloaked) tool RESULT back into
+                        // its arguments, so a write path would otherwise ship as
+                        // `/Users/Org-46/asgard_Term-3170/...`. A pseudonym can be
+                        // split across argument fragments, so each call's args ride
+                        // their OWN rolling buffer keyed by the delta's `index` —
+                        // the same cross-chunk hold/flush the content buffer uses.
+                        // Only ever DE-cloak here; args are NEVER cloaked on the
+                        // request side.
+                        if let Some(tcs) = choice.get_mut("delta").and_then(|d| d.get_mut("tool_calls")).and_then(|t| t.as_array_mut()) {
+                            for tc in tcs.iter_mut() {
+                                let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+                                let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) else { continue };
+                                let buf = toolarg_bufs.entry(idx).or_default();
+                                let safe = privacy::decloak_stream_chunk(&session, buf, args);
+                                if let Some(func) = tc.get_mut("function").and_then(|f| f.as_object_mut()) {
+                                    func.insert("arguments".into(), json!(safe));
+                                }
+                            }
+                        }
+                        // On the finishing chunk, flush each held-back argument
+                        // tail so the last fragment rides WITH finish_reason and is
+                        // never stranded after it (or left half-reversed).
+                        if has_finish && !toolarg_bufs.is_empty() {
+                            let mut tails: Vec<Value> = Vec::new();
+                            for (idx, buf) in toolarg_bufs.iter_mut() {
+                                let tail = privacy::decloak_stream_finish(&session, buf);
+                                if !tail.is_empty() {
+                                    tails.push(json!({ "index": idx, "function": { "arguments": tail } }));
+                                }
+                            }
+                            if !tails.is_empty() {
+                                if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                                    match delta.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                                        Some(arr) => arr.extend(tails),
+                                        None => { delta.insert("tool_calls".into(), Value::Array(tails)); }
+                                    }
+                                }
                             }
                         }
                     }
@@ -496,6 +566,21 @@ async fn proxy_once_decloaked(body: Bytes, session: privacy::CloakSession) -> Re
                     let plain = privacy::decloak(&session, text);
                     if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
                         msg.insert(field.into(), json!(plain));
+                    }
+                }
+            }
+            // Also reverse-map tool-call arguments: the model echoes literals
+            // from a (now un-cloaked) tool RESULT into `function.arguments`, so a
+            // write path would otherwise ship as `/Users/Org-46/asgard_Term-3170/...`
+            // (silent file corruption). `decloak` is exact pseudonym→original
+            // replacement — safe on the raw JSON args string. Args are NEVER
+            // cloaked on the request side; only DE-cloaked here — keep it so.
+            if let Some(calls) = choice.get_mut("message").and_then(|m| m.get_mut("tool_calls")).and_then(|c| c.as_array_mut()) {
+                for call in calls.iter_mut() {
+                    let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) else { continue };
+                    let plain = privacy::decloak(&session, args);
+                    if let Some(func) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
+                        func.insert("arguments".into(), json!(plain));
                     }
                 }
             }

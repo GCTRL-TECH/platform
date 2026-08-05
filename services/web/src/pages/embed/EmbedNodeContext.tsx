@@ -44,6 +44,10 @@ interface EmbedNodeContextProps {
   onClose: () => void
   /** Select another entity by display name (neighbor / mention click). */
   onNavigate: (name: string) => void
+  /** Which tab to open on mount. Deep-links land on 'chunks' (Source Text) so a
+   *  focused node shows its provenance immediately; defaults to 'overview' for
+   *  normal (click) selections — unchanged for existing callers. */
+  initialTab?: Tab
 }
 
 function authHeaders(token: string): Record<string, string> {
@@ -275,8 +279,9 @@ export function EmbedNodeContext({
   edges,
   onClose,
   onNavigate,
+  initialTab = 'overview',
 }: EmbedNodeContextProps) {
-  const [tab, setTab] = useState<Tab>('overview')
+  const [tab, setTab] = useState<Tab>(initialTab)
   const [copied, setCopied] = useState(false)
   const [detail, setDetail] = useState<EntityDetail | null>(null)
   const [detailError, setDetailError] = useState<string | null>(null)

@@ -581,6 +581,16 @@ pub async fn resolve_purpose(
                 if t.provider == "ollama" {
                     t.model = m;
                 }
+            } else if t.provider == "ollama" && purpose == "relation" {
+                // No explicit per-purpose relation model: inheriting the GLOBAL
+                // chat default (llama3.2) is wrong for relation extraction and
+                // shadows KEX's `RELEX_MODEL` env, so the relex call blocks on an
+                // unloaded chat model. Use the relation purpose's OWN default —
+                // the SAME value Settings → AI Models shows (qwen2.5:7b) — so
+                // extraction runs on the intended model. Scoped to "relation"
+                // only: agent/rag are chat purposes and must keep inheriting the
+                // user's chat model (which they may have deliberately changed).
+                t.model = crate::routes::llm::default_model_for(purpose).to_string();
             }
             t
         }
