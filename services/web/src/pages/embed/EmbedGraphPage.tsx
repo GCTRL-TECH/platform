@@ -271,18 +271,22 @@ export default function EmbedGraphPage() {
       />
 
       {/* Minimal free-text search — peeks/highlights the best-matching node.
-          Top-center so it clears the canvas's own corner controls. */}
-      <div className="absolute left-1/2 top-3 z-30 -translate-x-1/2">
-        <div className="relative">
-          <Search size={12} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
-          <input
-            value={searchQuery}
-            onChange={(e) => runSearch(e.target.value)}
-            placeholder="Search nodes…"
-            className="w-56 rounded-lg border border-slate-700 bg-slate-900/90 py-1.5 pl-7 pr-2 text-xs text-slate-200 placeholder-slate-500 shadow-lg focus:border-indigo-500 focus:outline-none"
-          />
+          Opt-in so embeds stay clean by default: shown only when the host passes
+          ?search=1 or a ?q= deep-link. The postMessage `gctrl:search` channel keeps
+          working regardless. Top-center so it clears the canvas's own corner controls. */}
+      {(qParam != null || searchParams.get('search') === '1') && (
+        <div className="absolute left-1/2 top-3 z-30 -translate-x-1/2">
+          <div className="relative">
+            <Search size={12} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
+            <input
+              value={searchQuery}
+              onChange={(e) => runSearch(e.target.value)}
+              placeholder="Search nodes…"
+              className="w-56 rounded-lg border border-slate-700 bg-slate-900/90 py-1.5 pl-7 pr-2 text-xs text-slate-200 placeholder-slate-500 shadow-lg focus:border-indigo-500 focus:outline-none"
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Node context drawer — overlays the right edge (closable, read-only),
           so the canvas keeps its full size underneath. */}
