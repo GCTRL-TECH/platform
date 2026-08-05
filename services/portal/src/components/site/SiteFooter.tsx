@@ -21,6 +21,7 @@ const COLUMNS: { title: string; links: [label: string, href: string][] }[] = [
       ['Use Cases', '/use-cases'],
       ['Benchmarks', '/docs/benchmarks'],
       ['Architecture', '/docs/architecture'],
+      ['Blog', '/blog'],
     ],
   },
   {

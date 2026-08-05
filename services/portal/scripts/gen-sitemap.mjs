@@ -18,6 +18,7 @@ const STATIC_ROUTES = [
   { path: '/', priority: '1.0', changefreq: 'weekly' },
   { path: '/docs', priority: '0.8', changefreq: 'weekly' },
   { path: '/pricing', priority: '0.8', changefreq: 'monthly' },
+  { path: '/blog', priority: '0.7', changefreq: 'weekly' },
   { path: '/use-cases', priority: '0.7', changefreq: 'monthly' },
   { path: '/integrations', priority: '0.7', changefreq: 'monthly' },
   { path: '/imprint', priority: '0.2', changefreq: 'yearly' },
@@ -33,11 +34,25 @@ const docSlugs = readdirSync(contentDir)
   .map((f) => f.replace(/\.md$/, ''))
   .sort()
 
+// Blog posts are directory-driven too: dropping one .md into the blog content
+// dir is the whole publishing contract (see src/pages/blog/registry.ts).
+const blogDir = path.join(root, 'src/pages/blog/content')
+let blogSlugs = []
+try {
+  blogSlugs = readdirSync(blogDir)
+    .filter((f) => f.endsWith('.md'))
+    .map((f) => f.replace(/\.md$/, ''))
+    .sort()
+} catch {
+  // no blog content yet - fine
+}
+
 const lastmod = process.env.SITEMAP_LASTMOD || new Date().toISOString().slice(0, 10)
 
 const urls = [
   ...STATIC_ROUTES.map((r) => ({ loc: `${SITE_URL}${r.path}`, priority: r.priority, changefreq: r.changefreq })),
   ...docSlugs.map((slug) => ({ loc: `${SITE_URL}/docs/${slug}`, priority: '0.6', changefreq: 'monthly' })),
+  ...blogSlugs.map((slug) => ({ loc: `${SITE_URL}/blog/${slug}`, priority: '0.6', changefreq: 'monthly' })),
 ]
 
 const body = urls

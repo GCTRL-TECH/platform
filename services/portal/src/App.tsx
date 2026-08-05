@@ -22,6 +22,16 @@ const IntegrationsPage = lazy(() => import('@/pages/IntegrationsPage').then((m) 
 const PricingPage = lazy(() => import('@/pages/PricingPage').then((m) => ({ default: m.PricingPage })))
 const ImprintPage = lazy(() => import('@/pages/legal/LegalPages').then((m) => ({ default: m.ImprintPage })))
 const PrivacyPolicyPage = lazy(() => import('@/pages/legal/LegalPages').then((m) => ({ default: m.PrivacyPolicyPage })))
+const BlogIndexPage = lazy(() => import('@/pages/blog/BlogPages').then((m) => ({ default: m.BlogIndexPage })))
+const BlogPostPage = lazy(() => import('@/pages/blog/BlogPages').then((m) => ({ default: m.BlogPostPage })))
+
+// Slug discovery for prerendering WITHOUT bundling post content into this
+// module: a non-eager glob exposes only the file keys synchronously (the
+// ?raw loader keeps Vite from treating the .md files as JS modules).
+const BLOG_FILES = import.meta.glob('./pages/blog/content/*.md', { query: '?raw', import: 'default' })
+const BLOG_SLUGS = Object.keys(BLOG_FILES).map((k) =>
+  k.replace('./pages/blog/content/', '').replace(/\.md$/, ''),
+)
 
 function Spinner() {
   return (
@@ -135,6 +145,12 @@ export const routes: RouteRecord[] = [
       { path: '/use-cases', element: <UseCasesPage /> },
       { path: '/integrations', element: <IntegrationsPage /> },
       { path: '/pricing', element: <PricingPage /> },
+      { path: '/blog', element: <BlogIndexPage /> },
+      {
+        path: '/blog/:slug',
+        element: <BlogPostPage />,
+        getStaticPaths: () => BLOG_SLUGS.map((s) => `/blog/${s}`),
+      },
       { path: '/imprint', element: <ImprintPage /> },
       { path: '/privacy', element: <PrivacyPolicyPage /> },
 

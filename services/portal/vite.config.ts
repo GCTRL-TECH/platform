@@ -6,7 +6,7 @@ import path from 'path'
 // prerendered HTML. Everything else (auth pages, dashboard, licenses,
 // settings, admin) is intentionally excluded — those are behind a login
 // and were never meant to be indexed or statically generated.
-const PRERENDERED_STATIC_ROUTES = ['/', '/docs', '/use-cases', '/integrations', '/pricing', '/imprint', '/privacy']
+const PRERENDERED_STATIC_ROUTES = ['/', '/docs', '/use-cases', '/integrations', '/pricing', '/blog', '/imprint', '/privacy']
 
 export default defineConfig({
   plugins: [react()],
@@ -44,7 +44,7 @@ export default defineConfig({
     // src/App.tsx). Auth-gated app routes are never included, even if a
     // future route is added there without a getStaticPaths guard.
     includedRoutes: (paths) => {
-      const docSlugPaths = paths.filter((p) => /^\/docs\/[^/]+$/.test(p))
+      const docSlugPaths = paths.filter((p) => /^\/(docs|blog)\/[^/]+$/.test(p))
       const allow = new Set([...PRERENDERED_STATIC_ROUTES, ...docSlugPaths])
       return paths.filter((p) => allow.has(p))
     },
