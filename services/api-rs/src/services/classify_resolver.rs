@@ -66,6 +66,13 @@ pub async fn suggest_resolution(element_name: &str, labels: &Value) -> Suggestio
 
     let ollama_base = std::env::var("OLLAMA_BASE").unwrap_or_else(|_| "http://localhost:11434".into());
     let model = std::env::var("AGENT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.2".into());
+    // Structured conflict resolution — skip the reasoning trace for speed. `think` is a
+    // per-request Ollama field; models without a thinking capability (llama3.2) ignore it,
+    // so this is safe by default. Set CONFLICT_RESOLVER_THINK=true to keep reasoning.
+    let think = matches!(
+        std::env::var("CONFLICT_RESOLVER_THINK").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    );
 
     let prompt = format!(
         "An entity in a knowledge graph carries CONFLICTING data-classification labels \
@@ -85,6 +92,7 @@ pub async fn suggest_resolution(element_name: &str, labels: &Value) -> Suggestio
         .json(&json!({
             "model": model,
             "stream": false,
+            "think": think,
             "messages": [{ "role": "user", "content": prompt }],
             "format": "json",
         }))

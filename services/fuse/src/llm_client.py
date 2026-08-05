@@ -28,6 +28,17 @@ import requests
 from . import telemetry
 
 
+def _think_flag() -> bool:
+    """Whether FUSE's structured generation (wiki distillation, dossier summaries,
+    user-profile distillation) should let the model reason. Default False -> we send
+    Ollama `think: false`, so a reasoning model (gemma3/gemma4, gpt-oss, qwen3, …)
+    skips a chain-of-thought the distiller/summariser discards anyway (big speed-up;
+    models without a thinking capability ignore the field, and older Ollama ignores
+    the unknown key). Set FUSE_THINK=true to keep reasoning on FUSE's LLM calls."""
+    v = os.environ.get("FUSE_THINK", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def complete(
     prompt: str,
     model: str,
@@ -95,6 +106,9 @@ def _complete_impl(
         # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
         # Env-tunable for RAM-tight boxes; "0" unloads immediately, "5m" = Ollama default.
         body["keep_alive"] = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+        # Structured/background generation (distill, dossier, user-profile): skip the
+        # reasoning trace for speed. Per-request Ollama field; non-thinking models ignore it.
+        body["think"] = _think_flag()
         resp = requests.post(
             f"{base}/api/generate",
             json=body,
@@ -157,6 +171,7 @@ async def acomplete(
         # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
         # Env-tunable for RAM-tight boxes; "0" unloads immediately, "5m" = Ollama default.
         body["keep_alive"] = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+        body["think"] = _think_flag()
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{base}/api/generate",

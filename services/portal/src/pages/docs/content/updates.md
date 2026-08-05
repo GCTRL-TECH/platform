@@ -9,7 +9,13 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: db5749f -->
+<!-- baseline-sha: 13abd3d -->
+
+## v0.7.8 - Reasoning-skip speedup extended to distillation and conflict resolution
+
+*5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The `think: false` speedup now covers the rest of the pipeline's background LLM work.** After extraction (v0.7.7), the same reasoning-skip now applies to the FUSE distillers - the auto-maintained knowledge wiki, on-demand dossiers and the user-profile summary - and to the classification-conflict resolver. On a reasoning model like gemma4:31b these skip the chain-of-thought they only discard anyway, for the same multi-x speedup at identical output. User-facing chat and RAG answers are deliberately left untouched, so they keep their reasoning. Per-service overrides to keep reasoning on: `FUSE_THINK=true` and `CONFLICT_RESOLVER_THINK=true`.
 
 ## v0.7.7 - Faster structured extraction on reasoning models
 
