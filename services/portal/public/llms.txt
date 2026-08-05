@@ -38,6 +38,6 @@ Agent skill: https://gctrl.tech/skill.md
 
 ## Site
 
-- [Pricing](https://gctrl.tech/pricing): Free forever for non-commercial private use; Business and Individual tiers for teams and sovereign deployments.
+- [Pricing](https://gctrl.tech/pricing): Unlimited inference tokens on every plan. Free forever for non-commercial private use; Business (€29 per license / month, 10 scoped colleague tokens, full compliance suite) and Enterprise (€25,000 / year, 100 seats, sovereign deployment, SLAs) for teams.
 - [Use Cases](https://gctrl.tech/use-cases): Agentic team memory, per-project isolation, legacy data activation.
 - [Integrations](https://gctrl.tech/integrations): Coding agents, IDEs, agent frameworks, copilots, automation, and knowledge-source connectors.

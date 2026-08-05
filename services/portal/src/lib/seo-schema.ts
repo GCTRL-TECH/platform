@@ -24,12 +24,32 @@ export const softwareApplicationJsonLd = {
   operatingSystem: 'Linux, macOS, Windows (Docker)',
   description:
     'Self-hosted knowledge graph and governed memory layer for AI agents. Ingests unstructured data (KEX), fuses it into one clean graph (FUSE), enforces classification-based access control, and serves it to every agent framework over MCP or HTTP - fully on-prem, with local inference and no per-token cost.',
-  offers: {
-    '@type': 'Offer',
-    price: '0',
-    priceCurrency: 'USD',
-    description: 'Free forever for non-commercial private use.',
-  },
+  offers: [
+    {
+      '@type': 'Offer',
+      name: 'Free',
+      price: '0',
+      priceCurrency: 'EUR',
+      description:
+        'Free forever for non-commercial private use. Unlimited inference tokens, 1 full-access token.',
+    },
+    {
+      '@type': 'Offer',
+      name: 'Business',
+      price: '29',
+      priceCurrency: 'EUR',
+      description:
+        'Per license per month. 10 scoped colleague tokens per license, clearance enforcement, instant revocation, audit trail, connectors. Unlimited inference tokens.',
+    },
+    {
+      '@type': 'Offer',
+      name: 'Enterprise',
+      price: '25000',
+      priceCurrency: 'EUR',
+      description:
+        'Per year, 100 seats included, additional seats individually priced. Premium support and SLAs, sovereign and air-gapped deployment. Unlimited inference tokens.',
+    },
+  ],
   url: SITE_URL,
 }
 
@@ -106,7 +126,7 @@ export const faqJsonLd = {
       acceptedAnswer: {
         '@type': 'Answer',
         text:
-          'Yes, GCTRL is free forever for non-commercial private use, including all four modules (KEX, FUSE, Knowledge Graphs, Talk-to-Graph) fully self-hosted with local inference. Commercial team and enterprise tiers are available for organizations that need licensed use, team access control, or sovereign/air-gapped deployment.',
+          'Yes, GCTRL is free forever for non-commercial private use, including all four modules (KEX, FUSE, Knowledge Graphs, Talk-to-Graph) fully self-hosted with local inference and unlimited inference tokens. The Business tier adds commercial licensing, scoped colleague tokens with clearance enforcement, connectors and an audit trail; the Enterprise tier adds 100 seats, sovereign/air-gapped deployment and SLAs. Inference tokens stay unlimited on every tier.',
       },
     },
   ],

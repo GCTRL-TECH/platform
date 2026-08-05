@@ -11,6 +11,16 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 77e21f9 -->
 
+## v0.7.4 - Pricing rework: unlimited tokens everywhere, plans buy access & compliance
+
+*5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Inference tokens are now unlimited on every plan - including Free.** The 1,000,000-token monthly grant on Free is retired; there is no grant because there is no meter. Extraction, fusion and chat run on your hardware, and plans never touch day-to-day usage.
+- **Free is the whole platform for one person:** all four modules, Wiki-LLM, MCP gateway, one full-access token and single-file manual ingest. Non-commercial use.
+- **Business (€29 per license / month) is the compliance suite:** 10 scoped colleague tokens per license - stack licenses as the team grows - with KB scoping, clearance enforcement (PUBLIC / INTERNAL / CONFIDENTIAL / RESTRICTED), instant revocation and an audit trail, plus drive connectors and scheduled refresh.
+- **Enterprise replaces the former "Individual" tier:** €25,000 / year with 100 seats included and additional seats individually priced - premium support and SLAs, deployment as managed cloud, your cloud, on-prem, air-gapped or sovereign, custom connectors, TISAX & ISO 27001-aware hardening, SSO / SCIM.
+- **The pricing page grew a full plan comparison and a definitions section,** so what an inference token, an access token, a license and a seat each mean is spelled out in one place.
+
 ## v0.7.3 - pip install, bigger uploads, sharper recall
 
 *29 July 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

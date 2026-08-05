@@ -7,11 +7,15 @@ export const CREDIT_COSTS = {
 
 export type CreditAction = keyof typeof CREDIT_COSTS;
 
-// Unlimited paid tiers use a large integer sentinel because credits_balance is
-// an INTEGER column and cannot hold Infinity. The authoritative "never deny"
-// behaviour comes from isUnlimitedTier() below, not from this number.
+// All tiers use the same large integer sentinel because credits_balance is
+// an INTEGER column and cannot hold Infinity. Since the v0.7.4 pricing rework
+// inference tokens are unmetered on EVERY tier including free (plans gate
+// access tokens and compliance features, never usage); the sentinel balance
+// means the agent-side affordability gate never denies in practice. For paid
+// tiers the authoritative "never deny" behaviour additionally comes from
+// isUnlimitedTier() below, not from this number.
 export const TIER_MONTHLY_CREDITS: Record<string, number> = {
-  free: 1_000_000,
+  free: 999_999_999,
   business: 999_999_999,
   enterprise: 999_999_999,
 };

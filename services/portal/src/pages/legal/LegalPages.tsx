@@ -7,7 +7,22 @@ import { Seo } from '@/components/Seo'
 // Single legal entity for the whole product / site.
 const COMPANY = 'Cinque Monti Ltd.'
 const EMAIL = 'fabio@5monti.com'
-const UPDATED = '17 June 2026'
+const UPDATED = '5 August 2026'
+
+/** Registered office address, shared by the imprint and the privacy policy. */
+function RegisteredAddress() {
+  return (
+    <>
+      Dept 9184
+      <br />
+      196 High Road, Wood Green
+      <br />
+      London, N22 8HH
+      <br />
+      United Kingdom
+    </>
+  )
+}
 
 /** A placeholder for a statutory detail the company will fill in. Rendered as a
  *  neutral, unobtrusive stub rather than an alarming highlight. */
@@ -70,7 +85,7 @@ export function ImprintPage() {
         <p>
           <span className="font-medium text-slate-200">{COMPANY}</span>
           <br />
-          <Fill>Registered office address</Fill>
+          <RegisteredAddress />
         </p>
         <p>
           Represented by: <Fill>Managing Director name</Fill>
@@ -153,7 +168,7 @@ export function PrivacyPolicyPage() {
         <p>
           <span className="font-medium text-slate-200">{COMPANY}</span>
           <br />
-          <Fill>Registered office address</Fill>
+          <RegisteredAddress />
           <br />
           Email:{' '}
           <a href={`mailto:${EMAIL}`} className="text-indigo-400 hover:text-indigo-300">
@@ -216,6 +231,17 @@ export function PrivacyPolicyPage() {
           The GCTRL product is designed to run on your own infrastructure with local inference. Knowledge you
           process in the product, and conversational sessions in the chat features, are handled under our
           GDPR-by-design model and are not stored by us for our own purposes.
+        </p>
+        <p>
+          <span className="font-medium text-slate-200">AI processing in the product:</span> GCTRL&apos;s AI
+          features (extraction, fusion, chat) run on your own infrastructure with the models you choose.{' '}
+          {COMPANY} does not receive, store, or process the content you feed into the product and is not the
+          controller of that processing. Content the product generates (answers, wiki pages) is AI-generated
+          and marked as such. For our position under the EU AI Act, see the{' '}
+          <a href="/docs/compliance" className="text-indigo-400 hover:text-indigo-300">
+            Compliance page
+          </a>{' '}
+          in our documentation.
         </p>
       </Section>
 

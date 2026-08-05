@@ -141,6 +141,13 @@ const STATEMENTS: string[] = [
   // Backfill existing free users up to the new floor without ever lowering a
   // balance (GREATEST keeps any manually-granted surplus).
   `UPDATE users SET credits_balance = GREATEST(credits_balance, 1000000) WHERE tier = 'free'`,
+
+  // ── v0.7.4 pricing rework: unmetered free tier ──────────────────────────
+  // Inference tokens are unlimited on every plan, free included. Free keeps
+  // the sentinel balance the paid tiers use so the affordability gate never
+  // denies. Same GREATEST pattern: idempotent, never lowers a balance.
+  `ALTER TABLE users ALTER COLUMN credits_balance SET DEFAULT 999999999`,
+  `UPDATE users SET credits_balance = GREATEST(credits_balance, 999999999) WHERE tier = 'free'`,
 ];
 
 async function main() {
