@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 53cdd60 -->
 
+## v0.8.0 - Cloaked cloud chat is as fast as uncloaked
+
+*7 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Pseudonymizing a chat request no longer costs you seconds.** Cloaking compares your prompt against the entity dictionary built from your own documents, and it used to test every character of the prompt against every entry of that dictionary. On a long conversation with a large knowledge base that got expensive fast: on our own box a 60,000-character prompt spent about 35 seconds in the cloak step alone, before the model had even seen it. Now only the entities that can actually occur in the text are considered, the matcher runs without re-allocating on every comparison, and the pseudonym registry is read once per request instead of once per message. The same measurement is now about 0.3 seconds, and time-to-first-token with cloaking on is indistinguishable from cloaking off. What the cloud model receives is byte-for-byte what it received before, so nothing about the protection changes, only its cost.
+
 ## v0.7.9 - Extraction duration shows real processing time, not queue wait
 
 *5 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

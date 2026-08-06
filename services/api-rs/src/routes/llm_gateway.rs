@@ -269,13 +269,15 @@ async fn chat_completions_inner(
     // cloak()). Cached per-user for 10 min.
     let candidates = privacy::user_entity_candidates(&state.db, claims.sub).await;
 
-    // Cloak every message's string content, accumulating ONE session so the same
-    // entity → the same pseudonym across the whole conversation.
-    let mut cloak_session = privacy::CloakSession::empty();
+    // Cloak every message's string content in ONE pass, so the same entity → the
+    // same pseudonym across the whole conversation AND the pseudonym registry is
+    // read once per request rather than once per message.
     let mut out_body = parsed.clone();
     let ns = [namespace];
-    if let Some(messages) = out_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for msg in messages.iter_mut() {
+    let mut slots: Vec<usize> = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    if let Some(messages) = out_body.get("messages").and_then(|m| m.as_array()) {
+        for (idx, msg) in messages.iter().enumerate() {
             // NEVER cloak tool RESULT messages: their content is verbatim tool
             // output (file listings, paths, IDs) that the model copies straight
             // into its NEXT assistant `tool_calls[].function.arguments`.
@@ -291,9 +293,16 @@ async fn chat_completions_inner(
             if content.is_empty() {
                 continue;
             }
-            let (cloaked, sess) = privacy::cloak(&state.db, &ns, &candidates, content).await;
-            cloak_session.merge(sess);
-            msg["content"] = json!(cloaked);
+            slots.push(idx);
+            plain.push(content.to_string());
+        }
+    }
+    let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
+    let (cloaked, cloak_session) = privacy::cloak_batch(&state.db, &ns, &candidates, &refs).await;
+    if let Some(messages) = out_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for (slot, idx) in slots.iter().enumerate() {
+            let (Some(msg), Some(text)) = (messages.get_mut(*idx), cloaked.get(slot)) else { continue };
+            msg["content"] = json!(text);
         }
     }
     tracing::debug!(

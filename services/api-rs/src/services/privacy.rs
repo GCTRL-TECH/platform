@@ -423,26 +423,108 @@ fn find_pii(text: &str) -> Vec<(String, &'static str)> {
     out
 }
 
-/// PURE: gather cloak candidates — entity mentions + the PII regex sweep of
-/// `text` — into a `lower_key -> (kind, canonical original text)` map. No DB.
-fn collect_candidates(
-    candidates: &[EntityCandidate],
-    text: &str,
-) -> HashMap<String, (Option<String>, String)> {
-    let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+/// A dictionary entry with its match key already folded: `(lower key, kind,
+/// canonical original text)`. Built ONCE per request — `lower_key` allocates,
+/// and a chat request cloaks many messages against the same dictionary.
+type PreparedCandidate = (String, Option<String>, String);
+
+/// PURE: fold a candidate dictionary into match keys once, dropping entries too
+/// short to be worth hiding (they would match noise).
+fn prepare_candidates(candidates: &[EntityCandidate]) -> Vec<PreparedCandidate> {
+    let mut out = Vec::with_capacity(candidates.len());
     for c in candidates {
         let trimmed = c.name.trim();
         let key = lower_key(trimmed);
         if key.chars().count() < 2 {
             continue;
         }
-        seen.entry(key).or_insert_with(|| (c.kind.clone(), trimmed.to_string()));
+        out.push((key, c.kind.clone(), trimmed.to_string()));
+    }
+    out
+}
+
+/// PURE: the set of alphanumeric word tokens in `text`, folded with the same
+/// per-char lowering [`lower_key`] uses so both sides of a comparison agree.
+fn text_tokens(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            cur.push(c.to_lowercase().next().unwrap_or(c));
+        } else if !cur.is_empty() {
+            out.insert(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.insert(cur);
+    }
+    out
+}
+
+/// PURE: could `key` match ANYWHERE in a text whose token set is `tokens`?
+///
+/// This is an EXACT pre-filter, not a heuristic — it can never drop a key that
+/// would have matched. [`apply_pseudonyms`] only substitutes on WORD BOUNDARIES,
+/// so at any real match every maximal alphanumeric run of the key lines up with
+/// a complete token of the text (the run's outer edge is the boundary guard, its
+/// inner edges are the key's own separators). One missing run therefore proves
+/// the key cannot match. A key with no alphanumeric run at all (pure
+/// punctuation) is unfilterable and always kept.
+///
+/// Why it matters: without it EVERY dictionary entry entered the pseudonym map,
+/// making each request O(text × whole dictionary) — 60k chars against a
+/// 2000-entity dictionary measured at tens of seconds — and minting a
+/// `cloak_maps` row for every entity the user never actually mentioned.
+fn key_can_occur(key: &str, tokens: &HashSet<String>) -> bool {
+    let mut run = String::new();
+    for c in key.chars() {
+        if c.is_alphanumeric() {
+            run.push(c);
+        } else if !run.is_empty() {
+            if !tokens.contains(&run) {
+                return false;
+            }
+            run.clear();
+        }
+    }
+    if !run.is_empty() && !tokens.contains(&run) {
+        return false;
+    }
+    true
+}
+
+/// PURE: gather the cloak candidates that can actually occur in `text` — the
+/// pre-filtered dictionary plus the PII regex sweep (whose hits come FROM the
+/// text, so they are present by construction) — as a
+/// `lower_key -> (kind, canonical original text)` map. No DB.
+fn collect_prepared(
+    prepared: &[PreparedCandidate],
+    text: &str,
+) -> HashMap<String, (Option<String>, String)> {
+    let tokens = text_tokens(text);
+    let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+    for (key, kind, canonical) in prepared {
+        if !key_can_occur(key, &tokens) {
+            continue;
+        }
+        seen.entry(key.clone()).or_insert_with(|| (kind.clone(), canonical.clone()));
     }
     for (val, kind) in find_pii(text) {
         let key = lower_key(&val);
         seen.entry(key).or_insert_with(|| (Some(kind.to_string()), val));
     }
     seen
+}
+
+/// PURE: [`collect_prepared`] straight from a raw dictionary. Test-only — every
+/// production path goes through [`cloak_batch`], which prepares the dictionary
+/// once and reuses it across all texts of the request.
+#[cfg(test)]
+fn collect_candidates(
+    candidates: &[EntityCandidate],
+    text: &str,
+) -> HashMap<String, (Option<String>, String)> {
+    collect_prepared(&prepare_candidates(candidates), text)
 }
 
 /// PURE: longest-match-first, case-insensitive substitution of `text` using an
@@ -452,8 +534,24 @@ pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) 
     if key_to_pseudonym.is_empty() {
         return text.to_string();
     }
-    let mut keys: Vec<&String> = key_to_pseudonym.keys().collect();
-    keys.sort_by_key(|k| std::cmp::Reverse(k.chars().count()));
+    // Fold each key into chars ONCE. The previous shape re-counted the key's
+    // chars and heap-allocated a window `String` for every (position × key)
+    // pair — the O(text × dictionary) cost behind the multi-second cloak
+    // overhead on long chat prompts.
+    let mut keys: Vec<(Vec<char>, &str)> = key_to_pseudonym
+        .iter()
+        .map(|(k, p)| (k.chars().collect::<Vec<char>>(), p.as_str()))
+        .filter(|(k, _)| !k.is_empty())
+        .collect();
+    // Longest first, so a longer entity always wins over one that prefixes it.
+    keys.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    // Bucket by first char (the sort order carries into each bucket, keeping
+    // longest-match-first intact): a position whose char starts no key costs one
+    // hash lookup instead of a full sweep over the dictionary.
+    let mut by_first: HashMap<char, Vec<usize>> = HashMap::new();
+    for (n, (k, _)) in keys.iter().enumerate() {
+        by_first.entry(k[0]).or_default().push(n);
+    }
 
     let chars: Vec<char> = text.chars().collect();
     let lower_chars: Vec<char> = text.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
@@ -461,13 +559,13 @@ pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) 
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     'outer: while i < chars.len() {
-        for key in &keys {
-            let klen = key.chars().count();
-            if klen == 0 || i + klen > lower_chars.len() {
-                continue;
-            }
-            let window: String = lower_chars[i..i + klen].iter().collect();
-            if &window == *key {
+        if let Some(bucket) = by_first.get(&lower_chars[i]) {
+            for &n in bucket {
+                let (key, pseudonym) = &keys[n];
+                let klen = key.len();
+                if i + klen > lower_chars.len() || lower_chars[i..i + klen] != key[..] {
+                    continue;
+                }
                 // WORD-BOUNDARY guard: a key must never match INSIDE a word. Without
                 // this, a short graph entity like "LAN" cloaked the middle of "plant"
                 // → "pTerm-781t", and an "…EUR"-suffixed amount entity ate "Eur" out
@@ -477,7 +575,7 @@ pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) 
                 let before_ok = i == 0 || !chars[i - 1].is_alphanumeric();
                 let after_ok = i + klen >= chars.len() || !chars[i + klen].is_alphanumeric();
                 if before_ok && after_ok {
-                    out.push_str(&key_to_pseudonym[key.as_str()]);
+                    out.push_str(pseudonym);
                     i += klen;
                     continue 'outer;
                 }
@@ -503,6 +601,11 @@ pub fn decloak(session: &CloakSession, text: &str) -> String {
     keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
     let mut out = text.to_string();
     for pseudonym in keys {
+        // `replace` allocates a fresh String even on a total miss, and the
+        // streaming path calls this for every emitted chunk — skip the misses.
+        if !out.contains(pseudonym.as_str()) {
+            continue;
+        }
         out = out.replace(pseudonym.as_str(), &session.map[pseudonym]);
     }
     out
@@ -659,13 +762,40 @@ pub async fn cloak(
     candidates: &[EntityCandidate],
     text: &str,
 ) -> (String, CloakSession) {
+    let (mut texts, session) = cloak_batch(db, compilation_ids, candidates, &[text]).await;
+    (texts.pop().unwrap_or_else(|| text.to_string()), session)
+}
+
+/// Cloak SEVERAL texts of one request (e.g. every message of a chat completion)
+/// against one shared pseudonym resolution: the candidate sets are unioned, the
+/// registry is read ONCE, and the resulting map is applied to each text. Same
+/// semantics as [`cloak`] per text — the only difference is that N messages cost
+/// one database round trip instead of N.
+///
+/// Returns one cloaked string per input (same order) and the merged
+/// [`CloakSession`] needed to de-cloak the answer.
+pub async fn cloak_batch(
+    db: &sqlx::PgPool,
+    compilation_ids: &[Uuid],
+    candidates: &[EntityCandidate],
+    texts: &[&str],
+) -> (Vec<String>, CloakSession) {
     let mut session = CloakSession::empty();
+    let verbatim = || texts.iter().map(|t| t.to_string()).collect::<Vec<String>>();
     let Some(primary) = compilation_ids.first().copied() else {
-        return (text.to_string(), session);
+        return (verbatim(), session);
     };
-    let seen = collect_candidates(candidates, text);
+    // Fold the dictionary once, then narrow it per text to what can actually
+    // occur there, and union the results.
+    let prepared = prepare_candidates(candidates);
+    let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+    for text in texts {
+        for (key, val) in collect_prepared(&prepared, text) {
+            seen.entry(key).or_insert(val);
+        }
+    }
     if seen.is_empty() {
-        return (text.to_string(), session);
+        return (verbatim(), session);
     }
 
     // ROUNDTRIP 1 (the hot-path win): batch-fetch every already-assigned
@@ -698,7 +828,10 @@ pub async fn cloak(
         session.map.insert(pseudonym.clone(), canonical.clone());
         key_to_pseudonym.insert(key.clone(), pseudonym);
     }
-    let cloaked = apply_pseudonyms(text, &key_to_pseudonym);
+    let cloaked = texts
+        .iter()
+        .map(|t| apply_pseudonyms(t, &key_to_pseudonym))
+        .collect();
     (cloaked, session)
 }
 
@@ -847,8 +980,101 @@ mod tests {
     #[test]
     fn same_entity_different_casing_collapses_to_one_key() {
         let candidates = vec![cand("Fabio", Some("person")), cand("FABIO", Some("person")), cand("fabio", Some("person"))];
-        let seen = collect_candidates(&candidates, "");
+        let seen = collect_candidates(&candidates, "FABIO und fabio sprachen mit Fabio.");
         assert_eq!(seen.len(), 1, "case variations of the same entity must be one key");
+    }
+
+    #[test]
+    fn a_text_that_names_nobody_cloaks_nothing() {
+        let candidates = vec![cand("Fabio", Some("person")), cand("Cyberiade", Some("organization"))];
+        assert!(
+            collect_candidates(&candidates, "Wie ist das Wetter morgen?").is_empty(),
+            "entities absent from the text must never enter the pseudonym map"
+        );
+        assert!(collect_candidates(&candidates, "").is_empty(), "empty text cloaks nothing");
+    }
+
+    #[test]
+    fn prefilter_keeps_multi_word_and_punctuated_keys_that_can_still_match() {
+        // Every alphanumeric run of a key must be present as a whole token —
+        // "12,5 Mio. EUR" survives on a text carrying all four runs, and a key
+        // whose LAST run is missing is dropped even though its first one matches.
+        let candidates = vec![
+            cand("12,5 Mio. EUR", Some("money")),
+            cand("Anna Schmidt", Some("person")),
+            cand("Anna Weber", Some("person")),
+        ];
+        let seen = collect_candidates(&candidates, "Budget: 12,5 Mio. EUR — freigegeben von Anna Schmidt.");
+        let names: Vec<&String> = seen.values().map(|(_, canonical)| canonical).collect();
+        assert!(names.iter().any(|n| n.as_str() == "12,5 Mio. EUR"));
+        assert!(names.iter().any(|n| n.as_str() == "Anna Schmidt"));
+        assert!(!names.iter().any(|n| n.as_str() == "Anna Weber"), "'Weber' never appears");
+    }
+
+    #[test]
+    fn narrowing_the_dictionary_does_not_change_the_cloaked_text() {
+        // The pre-filter must be a pure COST optimisation: what the cloud model
+        // receives has to be byte-identical to substituting with the entire
+        // dictionary. (It is: an entity absent from the text cannot match, so
+        // carrying it in the map only ever cost time.)
+        let names = [
+            "LAN", "Anna Schmidt", "Anna Schmidt-Weber", "12,5 Mio. EUR",
+            "Ground Control", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.",
+        ];
+        let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, Some("person"))).collect();
+        let full: HashMap<String, String> = names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| (lower_key(name), format!("Person-{n}")))
+            .collect();
+        for text in [
+            "Anna Schmidt-Weber plant 12,5 Mio. EUR fuer Projekt Nordwind im LAN.",
+            "Die Anlage plant mehr Euro, Björn Öztürk widerspricht.",
+            "GROUND CONTROL und ACME & Co. sprachen mit Anna Schmidt.",
+            "Nichts hiervon nennt eine Entitaet.",
+        ] {
+            let narrowed: HashMap<String, String> = collect_candidates(&candidates, text)
+                .keys()
+                .map(|k| (k.clone(), full[k].clone()))
+                .collect();
+            assert_eq!(
+                apply_pseudonyms(text, &narrowed),
+                apply_pseudonyms(text, &full),
+                "narrowing changed what the cloud model sees for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefilter_never_drops_a_key_the_substitution_would_have_matched() {
+        // The pre-filter must be EXACT, not a heuristic: for a corpus of tricky
+        // keys and texts, "survives the filter" must agree with "actually
+        // substitutes" on every pair — otherwise an entity leaks in plaintext.
+        let names = [
+            "LAN", "Anna Schmidt", "Anna Schmidt-Weber", "12,5 Mio. EUR", "Ground Control",
+            "GCTRL", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.", "x9",
+        ];
+        let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, None)).collect();
+        let texts = [
+            "Das LAN ist offline.", "Die Anlage plant mehr.", "Anna Schmidt-Weber rief an.",
+            "Anna Schmidt rief an.", "Budget 12,5 Mio. EUR heute.", "12,5 Mio. USD heute.",
+            "GROUND CONTROL steuert das.", "gctrl/anvil läuft.", "Björn Öztürk kam.",
+            "ACME & Co. liefert.", "ACME liefert.", "Wert x9 gesetzt.", "Wert x99 gesetzt.",
+            "Nichts davon hier.", "",
+        ];
+        for text in texts {
+            let survived = collect_candidates(&candidates, text);
+            for name in names {
+                let key = lower_key(name);
+                let mut only = HashMap::new();
+                only.insert(key.clone(), "PSEUDO".to_string());
+                let substitutes = apply_pseudonyms(text, &only) != text;
+                assert!(
+                    !substitutes || survived.contains_key(&key),
+                    "pre-filter dropped {name:?} although it substitutes in {text:?} — that entity would leak"
+                );
+            }
+        }
     }
 
     #[test]
@@ -967,6 +1193,70 @@ mod tests {
     }
 
     // ── privacy mode strictness ordering ─────────────────────────────────
+
+    // ── request-side cloak cost ───────────────────────────────────────────
+
+    /// Build a realistic free-chat cloak workload: a full-size user dictionary
+    /// and a long chat prompt that mentions only a handful of its entities.
+    fn long_prompt_workload() -> (Vec<EntityCandidate>, String) {
+        let dict: Vec<EntityCandidate> = (0..CANDIDATE_CAP)
+            .map(|i| cand(&format!("Projekt Nordwind {i}"), Some("organization")))
+            .collect();
+        // ~60k chars ≈ the 8–19k-token prompts a real chat turn carries.
+        let para = "Der Bericht fasst die Lage zusammen und nennt die offenen Punkte, \
+                    ohne dabei neue Zusagen zu machen oder Zahlen zu wiederholen. ";
+        let mut text = String::new();
+        while text.chars().count() < 60_000 {
+            text.push_str(para);
+        }
+        // Two dictionary entities genuinely appear, the other 1998 do not.
+        text.push_str(" Projekt Nordwind 7 arbeitet mit Projekt Nordwind 42 zusammen.");
+        (dict, text)
+    }
+
+    #[test]
+    fn cloak_dictionary_is_narrowed_to_entities_present_in_the_text() {
+        // THE hot-path invariant: substitution cost is O(text × entities that
+        // can actually match), never O(text × whole dictionary). Before this
+        // guard every one of the 2000 dictionary entries entered the pseudonym
+        // map — for a 60k-char prompt that is ~120M windowed comparisons per
+        // message (measured live on Asgard as +14 s per cloaked turn) and it
+        // also minted a cloak_maps row for every entity the user never named.
+        let (dict, text) = long_prompt_workload();
+        let seen = collect_candidates(&dict, &text);
+        let names: Vec<&String> = seen.values().map(|(_, canonical)| canonical).collect();
+        assert_eq!(
+            seen.len(),
+            2,
+            "only entities the text actually mentions may be cloaked, got {names:?}"
+        );
+        assert!(names.iter().any(|n| n.as_str() == "Projekt Nordwind 7"));
+        assert!(names.iter().any(|n| n.as_str() == "Projekt Nordwind 42"));
+    }
+
+    #[test]
+    fn cloaking_a_long_prompt_stays_fast() {
+        // Coarse catastrophic-regression net (runs in an UNOPTIMIZED test build,
+        // hence the generous bound — the pre-fix implementation took tens of
+        // seconds here, so the signal is unambiguous either way).
+        let (dict, text) = long_prompt_workload();
+        let started = Instant::now();
+        let seen = collect_candidates(&dict, &text);
+        let map: HashMap<String, String> = seen
+            .keys()
+            .enumerate()
+            .map(|(n, k)| (k.clone(), format!("Org-{n}")))
+            .collect();
+        let cloaked = apply_pseudonyms(&text, &map);
+        let elapsed = started.elapsed();
+        eprintln!("cloak of {} chars took {elapsed:?}", text.chars().count());
+        assert!(cloaked.contains("Org-"), "the present entities were substituted");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "cloaking a 60k-char prompt took {elapsed:?} — the per-request cost is \
+             back to O(text × dictionary)"
+        );
+    }
 
     #[test]
     fn privacy_mode_ordering_strictest_wins() {
