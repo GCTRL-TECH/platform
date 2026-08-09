@@ -41,8 +41,10 @@ jobs:
             echo "count=0" >> "$GITHUB_OUTPUT"; exit 0
           fi
           # Fail loudly on a bad response rather than committing an error page.
+          # GROWTH_API is the n8n webhook base; the bridge paths are named
+          # growth-pending / growth-confirm.
           code=$(curl -sS -o /tmp/staged.json -w '%{http_code}' --max-time 60 \
-            -H "X-Growth-Key: ${GROWTH_KEY}" "${GROWTH_API}/pending?site=gctrl")
+            -H "X-Growth-Key: ${GROWTH_KEY}" "${GROWTH_API}/growth-pending?site=gctrl")
           if [ "$code" != "200" ]; then
             echo "growth API returned $code"; cat /tmp/staged.json || true; exit 1
           fi
@@ -118,5 +120,5 @@ jobs:
               -H "X-Growth-Key: ${GROWTH_KEY}" \
               -H 'Content-Type: application/json' \
               -d "{\"slug\":\"${slug}\",\"site\":\"gctrl\"}" \
-              "${GROWTH_API}/confirm" || echo "confirm failed for ${slug}"
+              "${GROWTH_API}/growth-confirm" || echo "confirm failed for ${slug}"
           done
