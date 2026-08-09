@@ -42,3 +42,10 @@ Agent skill: https://gctrl.tech/skill.md
 - [Use Cases](https://gctrl.tech/use-cases): Agentic team memory, per-project isolation, legacy data activation.
 - [Blog](https://gctrl.tech/blog): Engineering notes on self-hosted knowledge graphs, GraphRAG, sovereign AI memory and compliance.
 - [Integrations](https://gctrl.tech/integrations): Coding agents, IDEs, agent frameworks, copilots, automation, and knowledge-source connectors.
+
+## Articles
+
+- [EU AI Act for RAG Deployments: What Actually Applies Since August 2026](https://gctrl.tech/blog/eu-ai-act-rag-deployments-2026): Article 50 transparency is enforceable since 2 August 2026, while high-risk duties moved to 2027. A practical checklist for teams running RAG and AI memory in the EU.
+- [The Real Cost of Metered AI Memory (and Why We Refuse to Count Tokens)](https://gctrl.tech/blog/unlimited-tokens-metered-ai-memory): Cloud memory platforms charge around $2.50 per million tokens after a small free grant. The arithmetic looks harmless - until you run a real team's workload through it.
+- [Self-Hosted RAG in 2026: Why Serious Teams Are Moving On-Prem](https://gctrl.tech/blog/self-hosted-rag-on-prem-guide): Data sovereignty, predictable cost, and EU compliance are pushing RAG workloads back on-prem. What self-hosting actually takes, and what you get for it.
+- [GraphRAG vs. Vector RAG: When a Knowledge Graph Beats Top-k](https://gctrl.tech/blog/graphrag-vs-vector-rag): Vector search answers "what sounds similar" - a knowledge graph answers "what is actually connected". Where plain RAG breaks, and when GraphRAG is worth it.

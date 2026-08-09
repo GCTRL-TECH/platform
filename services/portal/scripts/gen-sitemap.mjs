@@ -3,7 +3,7 @@
 // in the docs registry, so it can never drift out of sync with the app.
 // Run via `npm run gen:sitemap`, or automatically as part of `prebuild`.
 
-import { writeFileSync, readdirSync } from 'node:fs'
+import { writeFileSync, readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
@@ -34,32 +34,48 @@ const docSlugs = readdirSync(contentDir)
   .map((f) => f.replace(/\.md$/, ''))
   .sort()
 
+// A post's own frontmatter `date:` is its real publication date. Stamping the
+// build date on every blog URL instead would tell crawlers that all posts
+// changed on every deploy, which devalues the lastmod signal entirely.
+function frontmatterDate(file) {
+  const raw = readFileSync(file, 'utf8')
+  const block = raw.match(/^---\n([\s\S]*?)\n---/)?.[1]
+  const date = block?.match(/^date:\s*(\S+)/m)?.[1]
+  return date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null
+}
+
 // Blog posts are directory-driven too: dropping one .md into the blog content
 // dir is the whole publishing contract (see src/pages/blog/registry.ts).
 const blogDir = path.join(root, 'src/pages/blog/content')
-let blogSlugs = []
+let blogPosts = []
 try {
-  blogSlugs = readdirSync(blogDir)
+  blogPosts = readdirSync(blogDir)
     .filter((f) => f.endsWith('.md'))
-    .map((f) => f.replace(/\.md$/, ''))
-    .sort()
+    .map((f) => ({ slug: f.replace(/\.md$/, ''), date: frontmatterDate(path.join(blogDir, f)) }))
+    .sort((a, b) => a.slug.localeCompare(b.slug))
 } catch {
   // no blog content yet - fine
 }
 
+// Fallback for routes with no content date of their own (static + docs pages).
 const lastmod = process.env.SITEMAP_LASTMOD || new Date().toISOString().slice(0, 10)
 
 const urls = [
-  ...STATIC_ROUTES.map((r) => ({ loc: `${SITE_URL}${r.path}`, priority: r.priority, changefreq: r.changefreq })),
-  ...docSlugs.map((slug) => ({ loc: `${SITE_URL}/docs/${slug}`, priority: '0.6', changefreq: 'monthly' })),
-  ...blogSlugs.map((slug) => ({ loc: `${SITE_URL}/blog/${slug}`, priority: '0.6', changefreq: 'monthly' })),
+  ...STATIC_ROUTES.map((r) => ({ loc: `${SITE_URL}${r.path}`, lastmod, priority: r.priority, changefreq: r.changefreq })),
+  ...docSlugs.map((slug) => ({ loc: `${SITE_URL}/docs/${slug}`, lastmod, priority: '0.6', changefreq: 'monthly' })),
+  ...blogPosts.map((p) => ({
+    loc: `${SITE_URL}/blog/${p.slug}`,
+    lastmod: p.date || lastmod,
+    priority: '0.6',
+    changefreq: 'monthly',
+  })),
 ]
 
 const body = urls
   .map(
     (u) => `  <url>
     <loc>${u.loc}</loc>
-    <lastmod>${lastmod}</lastmod>
+    <lastmod>${u.lastmod}</lastmod>
     <changefreq>${u.changefreq}</changefreq>
     <priority>${u.priority}</priority>
   </url>`,

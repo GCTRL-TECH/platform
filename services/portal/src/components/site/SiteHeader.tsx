@@ -10,6 +10,7 @@ const NAV: [label: string, href: string][] = [
   ['Integrations', '/integrations'],
   ['Pricing', '/pricing'],
   ['Documentation', '/docs'],
+  ['Blog', '/blog'],
 ]
 
 const USE_CASES: [label: string, href: string, desc: string][] = [

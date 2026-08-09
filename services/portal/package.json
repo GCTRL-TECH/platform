@@ -6,10 +6,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node scripts/gen-og.mjs && node scripts/gen-sitemap.mjs",
+    "prebuild": "node scripts/gen-og.mjs && node scripts/gen-sitemap.mjs && node scripts/gen-rss.mjs && node scripts/gen-llms.mjs",
     "build": "tsc && vite-react-ssg build",
     "gen:og": "node scripts/gen-og.mjs",
     "gen:sitemap": "node scripts/gen-sitemap.mjs",
+    "gen:rss": "node scripts/gen-rss.mjs",
+    "gen:llms": "node scripts/gen-llms.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

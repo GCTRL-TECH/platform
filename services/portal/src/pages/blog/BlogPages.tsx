@@ -23,6 +23,10 @@ function TagPills({ tags }: { tags: string[] }) {
   )
 }
 
+function countWords(body: string): number {
+  return body.trim().split(/\s+/).filter(Boolean).length
+}
+
 function PostCard({ post }: { post: BlogPost }) {
   return (
     <Link
@@ -58,15 +62,25 @@ export function BlogIndexPage() {
         title="Blog - GCTRL"
         description="Engineering notes on self-hosted knowledge graphs, GraphRAG, sovereign AI memory and compliance - from the team building GCTRL (Ground Control)."
         path="/blog"
-        jsonLd={{
-          '@context': 'https://schema.org',
-          '@type': 'Blog',
-          name: 'GCTRL Blog',
-          url: `${SITE_URL}/blog`,
-          description:
-            'Engineering notes on self-hosted knowledge graphs, GraphRAG, sovereign AI memory and compliance.',
-          publisher: { '@type': 'Organization', name: 'Cinque Monti Ltd.' },
-        }}
+        jsonLd={[
+          {
+            '@context': 'https://schema.org',
+            '@type': 'Blog',
+            name: 'GCTRL Blog',
+            url: `${SITE_URL}/blog`,
+            description:
+              'Engineering notes on self-hosted knowledge graphs, GraphRAG, sovereign AI memory and compliance.',
+            publisher: { '@type': 'Organization', name: 'Cinque Monti Ltd.' },
+          },
+          {
+            '@context': 'https://schema.org',
+            '@type': 'BreadcrumbList',
+            itemListElement: [
+              { '@type': 'ListItem', position: 1, name: 'Home', item: SITE_URL },
+              { '@type': 'ListItem', position: 2, name: 'Blog', item: `${SITE_URL}/blog` },
+            ],
+          },
+        ]}
       />
       <SiteHeader />
 
@@ -131,17 +145,36 @@ export function BlogPostPage() {
         description={post.description}
         path={`/blog/${post.slug}`}
         type="article"
-        jsonLd={{
-          '@context': 'https://schema.org',
-          '@type': 'BlogPosting',
-          headline: post.title,
-          description: post.description,
-          datePublished: post.date,
-          author: { '@type': 'Organization', name: 'GCTRL', url: SITE_URL },
-          publisher: { '@type': 'Organization', name: 'Cinque Monti Ltd.' },
-          keywords: post.tags.join(', '),
-          mainEntityOfPage: `${SITE_URL}/blog/${post.slug}`,
-        }}
+        jsonLd={[
+          {
+            '@context': 'https://schema.org',
+            '@type': 'BlogPosting',
+            headline: post.title,
+            description: post.description,
+            datePublished: post.date,
+            dateModified: post.date,
+            wordCount: countWords(post.body),
+            inLanguage: 'en',
+            author: { '@type': 'Organization', name: 'GCTRL', url: SITE_URL },
+            publisher: { '@type': 'Organization', name: 'Cinque Monti Ltd.' },
+            keywords: post.tags.join(', '),
+            mainEntityOfPage: `${SITE_URL}/blog/${post.slug}`,
+          },
+          {
+            '@context': 'https://schema.org',
+            '@type': 'BreadcrumbList',
+            itemListElement: [
+              { '@type': 'ListItem', position: 1, name: 'Home', item: SITE_URL },
+              { '@type': 'ListItem', position: 2, name: 'Blog', item: `${SITE_URL}/blog` },
+              {
+                '@type': 'ListItem',
+                position: 3,
+                name: post.title,
+                item: `${SITE_URL}/blog/${post.slug}`,
+              },
+            ],
+          },
+        ]}
       />
       <SiteHeader />
 

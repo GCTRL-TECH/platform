@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>GCTRL Blog</title>
+    <link>https://gctrl.tech/blog</link>
+    <description>Engineering notes on self-hosted knowledge graphs, GraphRAG, sovereign AI memory and compliance.</description>
+    <language>en</language>
+    <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
+    <item>
+      <title>EU AI Act for RAG Deployments: What Actually Applies Since August 2026</title>
+      <link>https://gctrl.tech/blog/eu-ai-act-rag-deployments-2026</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/eu-ai-act-rag-deployments-2026</guid>
+      <description>Article 50 transparency is enforceable since 2 August 2026, while high-risk duties moved to 2027. A practical checklist for teams running RAG and AI memory in the EU.</description>
+      <pubDate>Wed, 05 Aug 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>The Real Cost of Metered AI Memory (and Why We Refuse to Count Tokens)</title>
+      <link>https://gctrl.tech/blog/unlimited-tokens-metered-ai-memory</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/unlimited-tokens-metered-ai-memory</guid>
+      <description>Cloud memory platforms charge around $2.50 per million tokens after a small free grant. The arithmetic looks harmless - until you run a real team's workload through it.</description>
+      <pubDate>Mon, 03 Aug 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Self-Hosted RAG in 2026: Why Serious Teams Are Moving On-Prem</title>
+      <link>https://gctrl.tech/blog/self-hosted-rag-on-prem-guide</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/self-hosted-rag-on-prem-guide</guid>
+      <description>Data sovereignty, predictable cost, and EU compliance are pushing RAG workloads back on-prem. What self-hosting actually takes, and what you get for it.</description>
+      <pubDate>Sat, 01 Aug 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>GraphRAG vs. Vector RAG: When a Knowledge Graph Beats Top-k</title>
+      <link>https://gctrl.tech/blog/graphrag-vs-vector-rag</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/graphrag-vs-vector-rag</guid>
+      <description>Vector search answers &quot;what sounds similar&quot; - a knowledge graph answers &quot;what is actually connected&quot;. Where plain RAG breaks, and when GraphRAG is worth it.</description>
+      <pubDate>Thu, 30 Jul 2026 00:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>
