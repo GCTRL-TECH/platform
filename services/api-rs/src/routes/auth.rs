@@ -240,22 +240,20 @@ async fn seed_default_ontology(db: &sqlx::PgPool, user_id: Uuid) {
     seed_default_workspace(db, user_id).await;
 }
 
-/// Seeds a default workspace for a freshly-registered user:
-///   - 1 KG folder ("My Workspace")
-///   - 1 empty compilation ("My First Knowledge Base") inside that folder
+/// Seeds a freshly-registered user's landing spot: one compilation
+/// ("My First Knowledge Base") filed under `Users/<email-localpart>/`.
 ///
-/// This ensures KEX uploads and FUSE merges have a target out of the box —
-/// the user can ingest their first document immediately without any setup.
+/// KEX uploads and FUSE merges need a target out of the box — `resolve_default_compilation`
+/// picks the oldest non-system compilation, so dropping this seed would silently orphan
+/// every ingest that names no target.
+///
+/// The former "My Workspace" folder is gone. It opened a second top-level tree competing
+/// with `Users/`, and since nothing else ever filed anything into it, every account simply
+/// grew an empty one.
 async fn seed_default_workspace(db: &sqlx::PgPool, user_id: Uuid) {
-    let folder_id = Uuid::new_v4();
-    if let Err(e) = sqlx::query(
-        "INSERT INTO kg_folders (id, user_id, name, position) VALUES ($1, $2, 'My Workspace', 0)"
-    )
-    .bind(folder_id)
-    .bind(user_id)
-    .execute(db).await {
-        tracing::warn!(?e, %user_id, "failed to seed default folder");
-        return;
+    let folder_id = seed_user_folder(db, user_id).await;
+    if folder_id.is_none() {
+        tracing::warn!(%user_id, "could not resolve Users/<name> folder; seeding the default KB at root");
     }
 
     let compilation_id = Uuid::new_v4();
@@ -273,6 +271,23 @@ async fn seed_default_workspace(db: &sqlx::PgPool, user_id: Uuid) {
     }
 
     seed_default_wiki(db, user_id).await;
+}
+
+/// `Users/<email-localpart>` for this user, created if absent. Falls back to the
+/// user id when the address is unusable, so the folder is never named "".
+async fn seed_user_folder(db: &sqlx::PgPool, user_id: Uuid) -> Option<Uuid> {
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(user_id).fetch_optional(db).await.ok().flatten();
+    let local = email.as_deref()
+        .and_then(|e| e.split('@').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| user_id.to_string());
+    match crate::routes::kg::ensure_folder_path(db, user_id, &["Users", &local]).await {
+        Ok(id) => Some(id),
+        Err(e) => { tracing::warn!(?e, %user_id, "ensure_folder_path(Users/<name>) failed"); None }
+    }
 }
 
 /// Seeds the default, non-deletable "Knowledge Wiki" for a freshly-registered

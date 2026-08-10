@@ -56,6 +56,8 @@ interface Compilation {
 
 interface CompilationsResponse {
   compilations: Compilation[]
+  /** Server-side total. The list itself is the 20 newest unless a limit is passed. */
+  total?: number
 }
 
 interface CreateCompilationResponse {
@@ -70,6 +72,10 @@ interface KgFolder {
   position: number
   createdAt: string
   updatedAt: string
+  /** Graphs directly in this folder — served by GET /kg/folders. */
+  compilationCount?: number
+  /** …plus everything in its subfolders. This is what a folder card shows. */
+  totalCompilationCount?: number
 }
 
 interface FoldersResponse {
@@ -137,6 +143,7 @@ function CreateModal({ onClose, onCreated, rawCompilations }: CreateModalProps) 
     {
       onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: ['kg', 'compilations'] })
+        queryClient.invalidateQueries({ queryKey: ['kg', 'folders'] })
         // data shape from POST is { id, name, type } — normalise to an id.
         const id =
           (data as unknown as { id?: string }).id ??
@@ -483,6 +490,7 @@ export function KGListPage() {
       const { apiDelete } = await import('@/lib/api')
       await apiDelete(`/kg/compilations/${deleteTarget.id}`)
       queryClient.invalidateQueries({ queryKey: ['kg', 'compilations'] })
+      queryClient.invalidateQueries({ queryKey: ['kg', 'folders'] })
       setDeleteTarget(null)
     } catch {} finally {
       setIsDeleting(false)
@@ -532,6 +540,9 @@ export function KGListPage() {
       const { apiPut } = await import('@/lib/api')
       await apiPut(`/kg/folders/move/${compilationId}`, { folderId })
       queryClient.invalidateQueries({ queryKey: ['kg', 'compilations'] })
+      // Folder counts live on the folders response now, so they go stale on
+      // every move unless this key is refetched too.
+      queryClient.invalidateQueries({ queryKey: ['kg', 'folders'] })
     } catch {}
   }
 
@@ -742,8 +753,12 @@ export function KGListPage() {
               </div>
               <div className="min-w-0 flex-1">
                 <h4 className="text-sm font-semibold text-slate-200 truncate">{folder.name}</h4>
+                {/* Served by GET /kg/folders and counted over the whole subtree.
+                    Counting client-side over `compilations` was wrong twice: that
+                    list is only the 20 newest, and it shrinks as you type in the
+                    search box — a folder's size must not depend on a text filter. */}
                 <p className="text-xs text-slate-600">
-                  {filtered.filter((c) => c.folderId === folder.id).length} graphs
+                  {folder.totalCompilationCount ?? 0} graphs
                 </p>
               </div>
               <ChevronRight size={14} className="text-slate-700 opacity-0 group-hover:opacity-100 transition-opacity" />

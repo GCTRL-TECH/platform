@@ -11,6 +11,17 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 53cdd60 -->
 
+## v0.8.1 - Folders tell the truth, and new knowledge bases file themselves
+
+*10 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Every folder showed "0 graphs", however full it was.** The count was worked out in the browser from the knowledge-base list, and that list is the 20 newest unless you ask for more - so any folder whose graphs were older simply counted nothing. It also shrank while you typed in the search box, because it counted the filtered result. The number now comes from the server, covers everything in a folder including its subfolders, and no longer moves when you search.
+- **New knowledge bases now land in a folder by themselves.** Placement used to be a separate step after creation, and several paths skipped it: knowledge bases created from a chat, the result of a fusion, and graphs made through the API all ended up loose at the top level. Creating a knowledge base and filing it are now one operation, so personal graphs go to `Users/<name>/` and a project's graph to `Projects/<customer>/` without anyone having to remember.
+- **Deleting a folder moves its contents up, as the button always promised.** Until now the graphs and subfolders inside it dropped to the top level instead of moving into the parent folder.
+- **Obsidian imports get their own graph under `Global/Obsidian`.** An import that named no target used to be added to your oldest knowledge base, which is how a single graph quietly absorbed years of unrelated material. Choosing a target explicitly still overrides this.
+- **Access tokens scoped to specific knowledge bases can no longer reshape your folders.** Such a token could rename, move and delete any folder in the account and relocate graphs it had no access to. Folder changes are now an owner action, and moving a graph into a folder that is not yours is refused instead of silently hiding it.
+- **A new account starts in `Users/<name>`.** The old "My Workspace" folder is gone; it was created for everyone and used by nothing.
+
 ## v0.8.0 - Cloaked cloud chat is as fast as uncloaked
 
 *7 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

@@ -119,7 +119,7 @@ fail_test() {
 }
 
 # ── total test count (update when adding tests) ───────────────────────────────
-N_TESTS=15
+N_TESTS=16
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -375,6 +375,32 @@ if [ -n "$COMPILATION_ID" ]; then
   fi
 else
   fail_test "no compilation to delete (skipped — prior test failed)"
+fi
+
+# ── [16] Folder placement invariant ───────────────────────────────────────────
+# Every non-system knowledge base belongs in a folder, and that folder must exist for
+# its owner. Both halves have been violated in production: creation paths that skipped
+# filing left graphs in the root, and a move endpoint without an ownership check left
+# graphs pointing at folders they could never be shown in. One assertion covers both.
+begin_test "Every knowledge base is filed in an existing folder"
+FOLDER_IDS=$(curl -s --max-time 10 -H "Authorization: Bearer ${JWT}"   "${API_BASE}/kg/folders" 2>/dev/null | grep -o '"id":"[^"]*"' | cut -d'"' -f4 | sort -u)
+UNFILED=$(curl -s --max-time 20 -H "Authorization: Bearer ${JWT}"   "${API_BASE}/kg/compilations?limit=100" 2>/dev/null   | tr '}' '
+'   | grep -v '"isSystem":true'   | grep -o '"folderId":\(null\|"[^"]*"\)'   | cut -d':' -f2 | tr -d '"' | grep -v '^$' || true)
+
+BAD=0
+while IFS= read -r fid; do
+  [ -z "$fid" ] && continue
+  if [ "$fid" = "null" ]; then
+    BAD=$(( BAD + 1 ))
+  elif ! echo "$FOLDER_IDS" | grep -qx "$fid"; then
+    BAD=$(( BAD + 1 ))
+  fi
+done <<< "$UNFILED"
+
+if [ "$BAD" -eq 0 ]; then
+  pass_test
+else
+  fail_test "$BAD knowledge base(s) unfiled or pointing at a folder that does not exist"
 fi
 
 # ── summary ───────────────────────────────────────────────────────────────────

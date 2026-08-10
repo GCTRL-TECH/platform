@@ -40,6 +40,43 @@ pub struct VaultRow {
     pub api_token: Option<String>,
 }
 
+/// Where an Obsidian import lands when the caller picked no target graph.
+///
+/// Without this it fell through to `resolve_default_compilation` — the user's OLDEST
+/// non-system compilation. That is how one knowledge base ended up absorbing every
+/// untargeted ingest on the instance (1083 jobs) while nobody could tell what was in it.
+/// Vault material now gets its own graph per vault, under `Global/Obsidian/`.
+///
+/// An explicit compilation choice always wins; this is only the fallback.
+pub async fn resolve_obsidian_compilation(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    vault_label: &str,
+) -> Option<Uuid> {
+    let label = vault_label.trim();
+    let name = if label.is_empty() { "Obsidian".to_string() } else { format!("Obsidian: {label}") };
+
+    if let Ok(Some(id)) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM compilations WHERE user_id = $1 AND name = $2 ORDER BY created_at ASC LIMIT 1"
+    ).bind(user_id).bind(&name).fetch_optional(db).await {
+        return Some(id);
+    }
+
+    let folder_id = crate::routes::kg::ensure_folder_path(db, user_id, &["Global", "Obsidian"])
+        .await
+        .map_err(|e| tracing::warn!(?e, %user_id, "ensure_folder_path(Global/Obsidian) failed"))
+        .ok()?;
+
+    let id = Uuid::new_v4();
+    match sqlx::query(
+        "INSERT INTO compilations (id, user_id, name, description, classification, folder_id) \
+         VALUES ($1, $2, $3, 'Obsidian-Import — automatisch angelegt', 'INTERNAL', $4)"
+    ).bind(id).bind(user_id).bind(&name).bind(folder_id).execute(db).await {
+        Ok(_) => Some(id),
+        Err(e) => { tracing::warn!(?e, %user_id, "failed to create Obsidian compilation"); None }
+    }
+}
+
 /// Resolved KEX options for a re-ingest (ontology entity types + classification).
 /// Built once per vault sync, reused for every note.
 #[derive(Clone, Default)]
@@ -225,7 +262,11 @@ async fn reingest_folder_vault(
         // entities appear in the graph — membership is via compilation.source_job_ids,
         // not a per-node compilationId. Without this the job completes but its nodes
         // never show up in the chosen graph.
-        crate::routes::kex::link_owned_job(db, vault.user_id, opts.compilation_id, job_id).await;
+        let target = match opts.compilation_id {
+            Some(id) => Some(id),
+            None => resolve_obsidian_compilation(db, vault.user_id, &vault.label).await,
+        };
+        crate::routes::kex::link_owned_job(db, vault.user_id, target, job_id).await;
 
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
             .await;
@@ -332,7 +373,11 @@ async fn reingest_rest_vault(
         // entities appear in the graph — membership is via compilation.source_job_ids,
         // not a per-node compilationId. Without this the job completes but its nodes
         // never show up in the chosen graph.
-        crate::routes::kex::link_owned_job(db, vault.user_id, opts.compilation_id, job_id).await;
+        let target = match opts.compilation_id {
+            Some(id) => Some(id),
+            None => resolve_obsidian_compilation(db, vault.user_id, &vault.label).await,
+        };
+        crate::routes::kex::link_owned_job(db, vault.user_id, target, job_id).await;
 
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
             .await;

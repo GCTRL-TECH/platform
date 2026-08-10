@@ -159,6 +159,12 @@ struct CreateComp {
     #[serde(rename = "type")] comp_type: Option<String>,
     /// Required when `type == "WIKI"`: the RAW compilation this wiki distils from.
     #[serde(rename = "wikiSourceCompilationId")] wiki_source_compilation_id: Option<Uuid>,
+    /// File the new KB straight away. `folderPath` (e.g. ["Users","fabio"]) is
+    /// find-or-create and wins over `folderId`. Without one of these a caller has
+    /// to create and then move, which is two round-trips and — far worse — a step
+    /// every caller has so far been free to forget, leaving graphs in the root.
+    #[serde(rename = "folderId")] folder_id: Option<Uuid>,
+    #[serde(rename = "folderPath")] folder_path: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -262,6 +268,78 @@ struct MoveToFolder {
     #[serde(rename = "folderId")] folder_id: Option<Uuid>,
 }
 
+/// Reshaping the folder tree is an OWNER action. All Anvil colleagues share one GCTRL
+/// account, so a kb-scoped key — handed out per project and per person — could otherwise
+/// rename, re-parent or delete every folder in the account, and move any of the owner's
+/// compilations, including ones it holds no grant on. None of that is needed by a scoped
+/// integration: Anvil provisions and files with the system token.
+async fn deny_scoped_folder_write(db: &sqlx::PgPool, claims: &JwtClaims) -> Result<()> {
+    if api_key_scope(db, claims).await.is_some() {
+        return Err(AppError::Forbidden(
+            "This access token is scoped to specific knowledge bases and cannot change folders".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Folders are per-user, so EVERY folder id that arrives from a client must pass
+/// through here first. A bare `WHERE id=$1 AND user_id=$2` UPDATE affects 0 rows
+/// for a foreign id and still answers 200 — and a compilation left pointing at a
+/// foreign folder renders in neither the root nor any folder: it disappears from
+/// the UI entirely. The TypeScript API this service replaced did check.
+async fn folder_owned(db: &sqlx::PgPool, user_id: Uuid, folder_id: Uuid) -> Result<()> {
+    sqlx::query_scalar::<_, i32>("SELECT 1 FROM kg_folders WHERE id = $1 AND user_id = $2")
+        .bind(folder_id).bind(user_id)
+        .fetch_optional(db).await?
+        .ok_or(AppError::NotFound)?;
+    Ok(())
+}
+
+/// Does `candidate` sit inside the subtree rooted at `folder`? Walks parents
+/// upward from `candidate`. Depth-capped rather than recursive-CTE because
+/// production data predates the cycle check below and may already contain one —
+/// hitting the cap is treated as "yes", so a cyclic tree refuses further moves
+/// instead of hanging.
+async fn is_descendant(db: &sqlx::PgPool, user_id: Uuid, candidate: Uuid, folder: Uuid) -> Result<bool> {
+    let mut cur = Some(candidate);
+    for _ in 0..32 {
+        let Some(id) = cur else { return Ok(false) };
+        if id == folder { return Ok(true); }
+        cur = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT parent_folder_id FROM kg_folders WHERE id = $1 AND user_id = $2"
+        ).bind(id).bind(user_id).fetch_optional(db).await?.flatten();
+    }
+    Ok(true)
+}
+
+/// Find-or-create every segment of a folder path and return the leaf id — the
+/// one place server-side code (registration seed, connectors) creates folders.
+/// `ORDER BY created_at` makes a pre-existing duplicate resolve to the same
+/// folder every time instead of growing a third one.
+pub(crate) async fn ensure_folder_path(db: &sqlx::PgPool, user_id: Uuid, segments: &[&str]) -> Result<Uuid> {
+    let mut parent: Option<Uuid> = None;
+    for raw in segments {
+        let name = raw.trim();
+        if name.is_empty() { continue; }
+        let existing = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM kg_folders \
+             WHERE user_id = $1 AND name = $2 AND parent_folder_id IS NOT DISTINCT FROM $3 \
+             ORDER BY created_at ASC LIMIT 1"
+        ).bind(user_id).bind(name).bind(parent).fetch_optional(db).await?;
+        parent = Some(match existing {
+            Some(id) => id,
+            None => {
+                let id = Uuid::new_v4();
+                sqlx::query("INSERT INTO kg_folders (id, user_id, name, parent_folder_id) VALUES ($1, $2, $3, $4)")
+                    .bind(id).bind(user_id).bind(name).bind(parent)
+                    .execute(db).await?;
+                id
+            }
+        });
+    }
+    parent.ok_or_else(|| AppError::BadRequest("Folder path must not be empty".into()))
+}
+
 async fn list_folders(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -269,10 +347,48 @@ async fn list_folders(
     let rows = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, i32, chrono::DateTime<chrono::Utc>)>(
         "SELECT id, name, parent_folder_id, position, created_at FROM kg_folders WHERE user_id=$1 ORDER BY position, name"
     ).bind(claims.sub).fetch_all(&state.db).await?;
-    let folders: Vec<Value> = rows.into_iter().map(|(id, name, parent, pos, created)| {
+
+    // How many graphs a folder holds is answered HERE, in one GROUP BY, rather
+    // than in the browser. The UI used to count client-side over
+    // `GET /kg/compilations`, which serves the 20 newest by default — so every
+    // folder whose graphs were older than that window reported "0 graphs", and
+    // the number also moved while you typed in the search box.
+    let direct: std::collections::HashMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT folder_id, COUNT(*) FROM compilations \
+         WHERE user_id = $1 AND folder_id IS NOT NULL AND COALESCE(is_system, false) = false \
+         GROUP BY folder_id"
+    ).bind(claims.sub).fetch_all(&state.db).await?.into_iter().collect();
+
+    let mut children: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+    for (id, _, parent, _, _) in &rows {
+        if let Some(p) = parent { children.entry(*p).or_default().push(*id); }
+    }
+
+    /// Graphs in this folder plus everything below it. Iterative with a visited
+    /// set: a folder tree that already contains a cycle (possible — the cycle
+    /// check on re-parenting is newer than the data) must not hang the request.
+    fn subtree_total(
+        root: Uuid,
+        children: &std::collections::HashMap<Uuid, Vec<Uuid>>,
+        direct: &std::collections::HashMap<Uuid, i64>,
+    ) -> i64 {
+        let mut total = 0i64;
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) { continue; }
+            total += direct.get(&id).copied().unwrap_or(0);
+            if let Some(kids) = children.get(&id) { stack.extend(kids.iter().copied()); }
+        }
+        total
+    }
+
+    let folders: Vec<Value> = rows.iter().map(|(id, name, parent, pos, created)| {
         json!({
             "id": id, "name": name, "parentFolderId": parent,
             "position": pos, "createdAt": created,
+            "compilationCount": direct.get(id).copied().unwrap_or(0),
+            "totalCompilationCount": subtree_total(*id, &children, &direct),
         })
     }).collect();
     Ok(Json(json!({ "folders": folders })))
@@ -283,8 +399,12 @@ async fn create_folder(
     State(state): State<Arc<crate::models::AppState>>,
     Json(req): Json<CreateFolder>,
 ) -> Result<Json<Value>> {
+    deny_scoped_folder_write(&state.db, &claims).await?;
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("Folder name required".into()));
+    }
+    if let Some(parent) = req.parent_folder_id {
+        folder_owned(&state.db, claims.sub, parent).await?;
     }
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO kg_folders (id, user_id, name, parent_folder_id) VALUES ($1, $2, $3, $4)")
@@ -299,6 +419,19 @@ async fn update_folder(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateFolder>,
 ) -> Result<Json<Value>> {
+    deny_scoped_folder_write(&state.db, &claims).await?;
+    folder_owned(&state.db, claims.sub, id).await?;
+    // Re-parenting: the new parent must be ours, and must not be the folder
+    // itself or anything below it — otherwise the subtree detaches from the
+    // root and vanishes from the tree view while still holding graphs.
+    if let Some(Some(parent)) = req.parent_folder_id {
+        folder_owned(&state.db, claims.sub, parent).await?;
+        if parent == id || is_descendant(&state.db, claims.sub, parent, id).await? {
+            return Err(AppError::BadRequest(
+                "A folder cannot be moved into itself or its own subtree".into(),
+            ));
+        }
+    }
     sqlx::query(
         "UPDATE kg_folders \
          SET name = COALESCE($1, name), \
@@ -320,9 +453,24 @@ async fn delete_folder(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
+    deny_scoped_folder_write(&state.db, &claims).await?;
+    folder_owned(&state.db, claims.sub, id).await?;
+    // Contents move UP to the parent — what the UI has always promised
+    // ("Delete folder (contents move up)"). Leaning on the FK's ON DELETE SET
+    // NULL instead would dump every graph AND every subfolder into the root.
+    let parent = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT parent_folder_id FROM kg_folders WHERE id=$1 AND user_id=$2"
+    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?.flatten();
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE compilations SET folder_id=$1, updated_at=NOW() WHERE folder_id=$2 AND user_id=$3")
+        .bind(parent).bind(id).bind(claims.sub).execute(&mut *tx).await?;
+    sqlx::query("UPDATE kg_folders SET parent_folder_id=$1, updated_at=NOW() WHERE parent_folder_id=$2 AND user_id=$3")
+        .bind(parent).bind(id).bind(claims.sub).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM kg_folders WHERE id=$1 AND user_id=$2")
-        .bind(id).bind(claims.sub).execute(&state.db).await?;
-    Ok(Json(json!({ "ok": true })))
+        .bind(id).bind(claims.sub).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true, "movedTo": parent })))
 }
 
 async fn move_compilation_to_folder(
@@ -331,10 +479,20 @@ async fn move_compilation_to_folder(
     Path(compilation_id): Path<Uuid>,
     Json(req): Json<MoveToFolder>,
 ) -> Result<Json<Value>> {
-    sqlx::query("UPDATE compilations SET folder_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
+    deny_scoped_folder_write(&state.db, &claims).await?;
+    if let Some(folder_id) = req.folder_id {
+        folder_owned(&state.db, claims.sub, folder_id).await?;
+    }
+    let res = sqlx::query("UPDATE compilations SET folder_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
         .bind(req.folder_id).bind(compilation_id).bind(claims.sub)
         .execute(&state.db).await?;
-    Ok(Json(json!({ "ok": true })))
+    // 0 rows means the compilation is not ours. Answering 200 here is what let
+    // callers (Anvil files every new KB this way) believe a move succeeded when
+    // nothing happened.
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "ok": true, "compilationId": compilation_id, "folderId": req.folder_id })))
 }
 
 // ── neo4rs helpers ────────────────────────────────────────────────────────────
@@ -712,20 +870,34 @@ async fn create(
             "wikiSourceCompilationId is only valid for WIKI compilations".into()));
     }
 
+    // Resolve the destination folder BEFORE the insert, so a bad path fails the
+    // whole call instead of leaving an unfiled graph behind.
+    let folder_id = match req.folder_path.as_ref() {
+        Some(path) if !path.is_empty() => {
+            let segs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+            Some(ensure_folder_path(&state.db, claims.sub, &segs).await?)
+        }
+        _ => match req.folder_id {
+            Some(fid) => { folder_owned(&state.db, claims.sub, fid).await?; Some(fid) }
+            None => None,
+        },
+    };
+
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO compilations
             (id, user_id, name, description, classification, source_job_ids, version,
-             type, wiki_source_compilation_id)
-         VALUES ($1,$2,$3,$4,$5,$6,1,$7::compilation_type,$8)"
+             type, wiki_source_compilation_id, folder_id)
+         VALUES ($1,$2,$3,$4,$5,$6,1,$7::compilation_type,$8,$9)"
     )
         .bind(id).bind(claims.sub).bind(&req.name).bind(&req.description)
         .bind(req.classification.unwrap_or_else(|| "INTERNAL".into()))
         .bind(req.source_job_ids.unwrap_or_default())
         .bind(comp_type)
         .bind(req.wiki_source_compilation_id)
+        .bind(folder_id)
         .execute(&state.db).await?;
-    Ok(Json(json!({ "id": id, "name": req.name, "type": comp_type })))
+    Ok(Json(json!({ "id": id, "name": req.name, "type": comp_type, "folderId": folder_id })))
 }
 
 // Frontend KGDetailPage expects `{ compilation: ... }` wrapper with full row fields.

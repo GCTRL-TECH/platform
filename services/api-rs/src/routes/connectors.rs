@@ -2514,7 +2514,11 @@ async fn sync_obsidian(
         // Link into the target compilation (or default KB) so the note's extracted
         // entities appear in the graph — membership is via compilation.source_job_ids,
         // not a per-node compilationId.
-        crate::routes::kex::link_owned_job(&state.db, claims.sub, resolved.compilation_id, job_id).await;
+        let target = match resolved.compilation_id {
+            Some(id) => Some(id),
+            None => crate::services::obsidian::resolve_obsidian_compilation(&state.db, claims.sub, &vault.label).await,
+        };
+        crate::routes::kex::link_owned_job(&state.db, claims.sub, target, job_id).await;
 
         crate::services::usage::record_usage(
             &state.db,
@@ -2821,7 +2825,11 @@ async fn sync_obsidian_folder(
 
         // Link into the target compilation (or default KB) so the file's extracted
         // entities appear in the graph (via compilation.source_job_ids).
-        crate::routes::kex::link_owned_job(&state.db, claims.sub, resolved.compilation_id, job_id).await;
+        let target = match resolved.compilation_id {
+            Some(id) => Some(id),
+            None => crate::services::obsidian::resolve_obsidian_compilation(&state.db, claims.sub, &vault.label).await,
+        };
+        crate::routes::kex::link_owned_job(&state.db, claims.sub, target, job_id).await;
 
         crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
 
