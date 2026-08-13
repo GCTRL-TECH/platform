@@ -6,13 +6,13 @@ Get from zero to a working, queryable knowledge graph - and an AI agent that can
 
 ## 1. Install GCTRL
 
-One command installs the CLI and brings up the whole stack:
+One command brings up the whole stack:
 
 ```bash
-pip install gctrl && gctrl install
+curl -fsSL https://gctrl.tech/install | bash
 ```
 
-Prefer a shell one-liner on macOS / Linux? `curl -fsSL https://gctrl.tech/install | bash` does the same. The pip path additionally works on **native Windows** (Docker is the only requirement either way).
+Prefer Python, or on **Windows**? `pip install gctrl && gctrl install` does the same and runs natively in PowerShell. On macOS and Linux use `pipx install gctrl` instead of plain pip - most distributions and Homebrew refuse a `pip install` into their system Python ([details](installation.md#externally-managed-environments-pep-668)). Docker is the only requirement either way.
 
 The installer detects what you already run (Neo4j / Qdrant / Ollama), deploys only what's missing, lets you pick a model, and starts everything. When it finishes, the dashboard is at **`http://localhost:3001`**.
 

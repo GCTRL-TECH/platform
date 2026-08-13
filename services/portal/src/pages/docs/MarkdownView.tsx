@@ -53,7 +53,9 @@ export function MarkdownView({ content }: { content: string }) {
               )
             }
             // Bare slug ("installation") → /docs/installation; "#anchor" stays; "/path" routes.
-            const to = h.startsWith('#') ? h : h.startsWith('/') ? h : `/docs/${h.replace(/\.md$/, '')}`
+            // The .md strip has to survive a trailing anchor too ("installation.md#pep-668"),
+            // otherwise a cross-page anchor link routes to a slug that does not exist.
+            const to = h.startsWith('#') ? h : h.startsWith('/') ? h : `/docs/${h.replace(/\.md(?=#|$)/, '')}`
             if (to.startsWith('#')) {
               return <a href={to} className="text-indigo-400 hover:text-indigo-300 hover:underline">{children}</a>
             }

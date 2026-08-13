@@ -9,7 +9,14 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 53cdd60 -->
+<!-- baseline-sha: 618670b -->
+
+## v0.8.3 - The install command on the homepage works on every machine again
+
+*13 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The one-line install on the homepage was a dead end on most Linux machines.** It read `pip install gctrl && gctrl install`, and on Arch, Debian 12+, Ubuntu 23.04+, Fedora 38+ and any Mac running Homebrew's Python, pip flatly refuses to write into the system Python: it answers `error: externally-managed-environment` and stops before it has even looked up the package. Nothing was wrong with the package, but the very first command on the site failed for a large share of self-hosters. The homepage shows the shell installer again, `curl -fsSL https://gctrl.tech/install | bash`, which has no such gate.
+- **The install docs now say what to run on your system instead of what usually works.** curl is the recommended path on macOS and Linux, pip is the native Windows path, and a new section on externally managed environments gives the four real answers - pipx, uv, an explicit `--break-system-packages`, or a virtualenv - along with the follow-on trap where the freshly installed `gctrl` command is not yet on your `PATH`. The pip package itself is unchanged and still installs the identical stack.
 
 ## v0.8.2 - A new knowledge base can be born private
 

@@ -76,7 +76,9 @@ On Windows the simplest path is **pip, straight from PowerShell** - no WSL termi
    gctrl install
    ```
 
-   (If `pip` isn't found, install [Python 3.8+](https://www.python.org/downloads/) first and reopen PowerShell.)
+   (If `pip` isn't found, install [Python 3.8+](https://www.python.org/downloads/) first and reopen PowerShell, then use `py -m pip install gctrl`.)
+
+   Windows Python is not "externally managed", so plain `pip` works here - unlike on Arch, Debian, Ubuntu, Fedora or Homebrew, where you need `pipx`. If `gctrl` is not recognised right after installing, pip put it in a Scripts directory that is not on your `PATH`: reopen PowerShell, or run it as `py -m gctrl install`.
 
 2. The installer is interactive on first run: it detects existing services, lets you pick a model, brings up the stack, and deploys the **FUSE** resolution engine automatically. Manage it afterwards with `gctrl up`, `gctrl down`, `gctrl status`, `gctrl logs`, and `gctrl update`.
 

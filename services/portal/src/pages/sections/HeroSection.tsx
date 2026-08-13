@@ -247,7 +247,12 @@ function useTypewriter(phrases: string[]) {
   return text
 }
 
-const INSTALL_CMD = 'pip install gctrl && gctrl install'
+// The headline command has to work on a machine we've never seen. `pip install`
+// does not: on Arch, Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python,
+// pip refuses to touch a distro-managed interpreter (PEP 668) before it even
+// resolves the package name. The shell one-liner has no such gate, so it stays
+// the hero command; pip/pipx is documented per-platform in the install docs.
+const INSTALL_CMD = 'curl -fsSL https://gctrl.tech/install | bash'
 
 export function HeroSection() {
   const [scrollY, setScrollY] = useState(0)
