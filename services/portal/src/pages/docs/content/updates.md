@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 53cdd60 -->
 
+## v0.8.2 - A new knowledge base can be born private
+
+*13 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **An integration creating knowledge bases for you can now set their privacy mode.** Private Memory (`open` / `cloaked` / `local_only`) could only ever be changed from a signed-in session, so anything created on your behalf through an access token - a workspace tool provisioning a graph per project, for instance - was stuck at the open default, and a tool that tried to tighten it got a refusal it could only swallow. The setting is now accepted when the knowledge base is created, and the response says which mode it got. Changing the mode of an existing knowledge base stays a signed-in-session action: at creation there is no earlier choice to overrule, but later there is, and a delegated key must not be able to loosen what you decided.
+
 ## v0.8.1 - Folders tell the truth, and new knowledge bases file themselves
 
 *10 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

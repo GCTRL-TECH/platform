@@ -165,6 +165,16 @@ struct CreateComp {
     /// every caller has so far been free to forget, leaving graphs in the root.
     #[serde(rename = "folderId")] folder_id: Option<Uuid>,
     #[serde(rename = "folderPath")] folder_path: Option<Vec<String>>,
+    /// Privacy posture of the NEW graph ("open" | "cloaked" | "local_only").
+    ///
+    /// Deliberately asymmetric to the update handler, which rejects `privacyMode` from an
+    /// access token: there, a delegated key could loosen a posture its owner had chosen, so
+    /// only a signed-in session may flip it. At CREATION there is no prior posture and no
+    /// other party's choice to override — the caller creating the graph is the one deciding
+    /// how it should live, and the column default ("open") is the loosest value anyway, so
+    /// nothing here can weaken anything. Without this, an integration creating graphs on a
+    /// user's behalf (Anvil's project rooms) could never file them as `cloaked`.
+    #[serde(rename = "privacyMode")] privacy_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -883,12 +893,20 @@ async fn create(
         },
     };
 
+    // Enum-validated here rather than left to the DB CHECK, so a typo 400s with a readable
+    // message instead of surfacing as a constraint violation.
+    let privacy_mode = req.privacy_mode.as_deref().unwrap_or("open").to_string();
+    if !matches!(privacy_mode.as_str(), "open" | "cloaked" | "local_only") {
+        return Err(AppError::BadRequest(
+            "privacyMode must be one of 'open', 'cloaked', 'local_only'".into()));
+    }
+
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO compilations
             (id, user_id, name, description, classification, source_job_ids, version,
-             type, wiki_source_compilation_id, folder_id)
-         VALUES ($1,$2,$3,$4,$5,$6,1,$7::compilation_type,$8,$9)"
+             type, wiki_source_compilation_id, folder_id, privacy_mode)
+         VALUES ($1,$2,$3,$4,$5,$6,1,$7::compilation_type,$8,$9,$10)"
     )
         .bind(id).bind(claims.sub).bind(&req.name).bind(&req.description)
         .bind(req.classification.unwrap_or_else(|| "INTERNAL".into()))
@@ -896,8 +914,14 @@ async fn create(
         .bind(comp_type)
         .bind(req.wiki_source_compilation_id)
         .bind(folder_id)
+        .bind(&privacy_mode)
         .execute(&state.db).await?;
-    Ok(Json(json!({ "id": id, "name": req.name, "type": comp_type, "folderId": folder_id })))
+    // `privacyMode` is echoed so a caller can tell whether this server honoured the field
+    // (older builds silently ignore unknown keys and leave the graph "open").
+    Ok(Json(json!({
+        "id": id, "name": req.name, "type": comp_type,
+        "folderId": folder_id, "privacyMode": privacy_mode,
+    })))
 }
 
 // Frontend KGDetailPage expects `{ compilation: ... }` wrapper with full row fields.
