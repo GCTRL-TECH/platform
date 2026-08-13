@@ -18,6 +18,12 @@ keep improving - so here it is, release by release.
 - **The one-line install on the homepage was a dead end on most Linux machines.** It read `pip install gctrl && gctrl install`, and on Arch, Debian 12+, Ubuntu 23.04+, Fedora 38+ and any Mac running Homebrew's Python, pip flatly refuses to write into the system Python: it answers `error: externally-managed-environment` and stops before it has even looked up the package. Nothing was wrong with the package, but the very first command on the site failed for a large share of self-hosters. The homepage shows the shell installer again, `curl -fsSL https://gctrl.tech/install | bash`, which has no such gate.
 - **The install docs now say what to run on your system instead of what usually works.** curl is the recommended path on macOS and Linux, pip is the native Windows path, and a new section on externally managed environments gives the four real answers - pipx, uv, an explicit `--break-system-packages`, or a virtualenv - along with the follow-on trap where the freshly installed `gctrl` command is not yet on your `PATH`. The pip package itself is unchanged and still installs the identical stack.
 
+## v0.8.5 - Word documents laid out in text boxes are readable again
+
+*14 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A .docx whose text sits in text boxes or tables was rejected as empty.** The extractor read only the document's plain paragraphs, which is exactly what a layouted Word file does not use: a booklet, a one-pager or a form puts every line in a text box, and tables were skipped as well. Such a file came back as "DOCX contained no extractable text" although it was full of it - on the document that surfaced this, 3806 characters in 16 text boxes and nothing outside them. Text boxes, tables, headers and footers are now read along with the body, in document order. Word stores a text box twice (a modern and a legacy copy of the same text), and a repeated header is inherited rather than re-written, so both are recognised and counted once instead of turning up as duplicates in your knowledge base.
+
 ## v0.8.2 - A new knowledge base can be born private
 
 *13 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

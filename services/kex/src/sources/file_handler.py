@@ -377,20 +377,100 @@ def _extract_pptx(data: bytes) -> str:
     return "\n\n".join(texts)
 
 
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _docx_textbox_paragraphs(root) -> list[str]:
+    """Text living inside DOCX text boxes, one entry per paragraph.
+
+    `python-docx` walks only the body's direct `w:p` children, so a text box — which nests
+    its paragraphs in `w:txbxContent` inside a drawing — is invisible to it.
+
+    A text box is usually stored TWICE: the modern DrawingML shape under `mc:Choice` and a
+    legacy VML copy under `mc:Fallback`, carrying identical text (verified on the booklet
+    that surfaced this: 4 boxes outside the fallback, 4 inside, same content in all four
+    pairs). Skipping the fallback BRANCH would be the obvious fix, but it loses documents
+    whose boxes exist ONLY as the legacy copy. So the duplicate is dropped by CONTENT
+    instead: whichever branch comes first wins, and the identical twin is ignored.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for box in root.iter(f"{_W_NS}txbxContent"):
+        paragraphs = []
+        for para in box.iter(f"{_W_NS}p"):
+            text = "".join(t.text or "" for t in para.iter(f"{_W_NS}t")).strip()
+            if text:
+                paragraphs.append(text)
+        if not paragraphs:
+            continue
+        key = "\n".join(paragraphs)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.extend(paragraphs)
+    return out
+
+
 def _extract_docx(data: bytes) -> str:
-    """Extract text from all paragraphs of a DOCX file."""
+    """Extract text from a DOCX: body paragraphs, tables, text boxes, headers and footers.
+
+    Reading only `doc.paragraphs` was not enough, and the gap was invisible rather than
+    loud: python-docx does not descend into tables, text boxes or headers, so a LAYOUTED
+    document — a booklet, a one-pager, a form — yielded literally nothing and was rejected
+    with "contained no extractable text" although it was full of it. Measured on the file
+    that surfaced this (2026-08-13): 3806 characters in 16 text boxes, 0 outside them.
+
+    Order follows the document: body first (paragraphs and tables in the order they appear),
+    then the floating text boxes, then headers and footers. Empty strings are dropped
+    throughout so a decorative table of blank cells adds nothing.
+    """
     try:
         from docx import Document  # type: ignore
+        from docx.table import Table  # type: ignore
+        from docx.text.paragraph import Paragraph  # type: ignore
     except ImportError:
         raise ValueError("python-docx is not installed")
 
     doc = Document(io.BytesIO(data))
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    parts: list[str] = []
 
-    if not paragraphs:
+    # Body in document order: iterating the XML children keeps a table between two
+    # paragraphs where it belongs, instead of appending all tables at the end.
+    for child in doc.element.body.iterchildren():
+        if child.tag == f"{_W_NS}p":
+            text = Paragraph(child, doc).text.strip()
+            if text:
+                parts.append(text)
+        elif child.tag == f"{_W_NS}tbl":
+            for row in Table(child, doc).rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    # Pipe-separated like the PPTX handler above — a row stays one line.
+                    parts.append(" | ".join(cells))
+
+    parts.extend(_docx_textbox_paragraphs(doc.element.body))
+
+    # Kopf- und Fusszeilen: NUR die eigenen. Ein Abschnitt, der seine Kopfzeile vom
+    # vorherigen erbt (`is_linked_to_previous`), liefert dieselbe Zeile noch einmal — bei
+    # einem Lebenslauf mit neun Abschnitten stand die Kontaktzeile sonst neunmal im Text
+    # und wäre neunmal als Fakt gelandet.
+    seen_running: set[str] = set()
+    for section in doc.sections:
+        for container in (section.header, section.footer):
+            if container is None or getattr(container, "is_linked_to_previous", False):
+                continue
+            lines = [p.text.strip() for p in container.paragraphs if p.text.strip()]
+            lines.extend(_docx_textbox_paragraphs(container._element))
+            key = "\n".join(lines)
+            if not lines or key in seen_running:
+                continue
+            seen_running.add(key)
+            parts.extend(lines)
+
+    if not parts:
         raise ValueError("DOCX contained no extractable text")
 
-    return "\n\n".join(paragraphs)
+    return "\n\n".join(parts)
 
 
 def _extract_csv(data: bytes) -> str:
