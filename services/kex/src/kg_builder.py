@@ -109,7 +109,10 @@ class KGBuilder:
           - _min_rank       : most-permissive rank — the value reads filter on
           - _class_conflict : true once ≥2 distinct ranks are present
           - _owner          : user_id
-          - _source_job     : job_id
+          - _source_job     : job_id of the LATEST contributor (display / lineage)
+          - _source_jobs    : every job that contributed to this node (authoritative
+                              for scoping and deletion — a node is only garbage once
+                              this list is empty)
           - _origin         : file name or short text-preview the entity came from
                               (provenance signal the A2 dossier layer cites)
 
@@ -313,9 +316,23 @@ class KGBuilder:
                     n._class_conflict = false,
                     n._owner          = $owner,
                     n._source_job     = $job_id,
+                    n._source_jobs    = [$job_id],
                     n._origin         = $origin,
                     n.created_at      = timestamp()
                 ON MATCH SET
+                    // `_source_jobs` MUST be updated before `_source_job`: Cypher applies
+                    // SET items in order, so reading `n._source_job` after overwriting it
+                    // would fold the new job in twice and lose the previous contributor.
+                    // The inner CASE is the legacy fallback for nodes written before
+                    // `_source_jobs` existed (migration 075 backfills them, this covers
+                    // the window before it has run).
+                    n._source_jobs = CASE
+                        WHEN $job_id IN coalesce(n._source_jobs,
+                                 CASE WHEN n._source_job IS NULL THEN [] ELSE [n._source_job] END)
+                        THEN coalesce(n._source_jobs, [n._source_job])
+                        ELSE coalesce(n._source_jobs,
+                                 CASE WHEN n._source_job IS NULL THEN [] ELSE [n._source_job] END)
+                             + [$job_id] END,
                     n._source_job  = $job_id,
                     n._origin      = coalesce($origin, n._origin),
                     n.coarse_type  = coalesce(n.coarse_type, $coarse_type),
@@ -456,6 +473,7 @@ class KGBuilder:
                 MERGE (h)-[r:{rel_type}]->(t)
                 ON CREATE SET
                     r._source_job      = $job_id,
+                    r._source_jobs     = [$job_id],
                     r._source_chunk    = $source_chunk,
                     r.confidence       = $confidence,
                     r.extraction_method = 'EXTRACTED',
@@ -469,6 +487,15 @@ class KGBuilder:
                     r._source_doc      = $source_doc,
                     r._source_doc_modified_at = $source_doc_modified_at
                 ON MATCH SET
+                    // Membership list before the latest-contributor pointer — see the
+                    // node MERGE above for why the order matters.
+                    r._source_jobs = CASE
+                        WHEN $job_id IN coalesce(r._source_jobs,
+                                 CASE WHEN r._source_job IS NULL THEN [] ELSE [r._source_job] END)
+                        THEN coalesce(r._source_jobs, [r._source_job])
+                        ELSE coalesce(r._source_jobs,
+                                 CASE WHEN r._source_job IS NULL THEN [] ELSE [r._source_job] END)
+                             + [$job_id] END,
                     r._source_job   = $job_id,
                     r._source_chunk = coalesce($source_chunk, r._source_chunk),
                     // Recency/lineage: bump on every re-extraction so retrieval can

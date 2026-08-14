@@ -22,6 +22,7 @@ from typing import Optional
 from neo4j import GraphDatabase
 
 from . import config
+from .scope import job_scope
 
 logger = logging.getLogger(__name__)
 
@@ -42,18 +43,18 @@ _MAX_ITERS = 50
 def _read_subgraph(driver, source_job_ids: list[str], user_id: str) -> tuple[list[str], list[tuple[str, str]]]:
     """Return (node_names, edges) for the compilation's scope.
 
-    Scoped to `_source_job IN job_ids` when the compilation has source jobs,
-    else to the user's whole owned graph (`_owner = user_id`). Skips SIMILAR_TO
-    (a fusion artifact) so communities reflect real relationships.
+    Scoped to the compilation's source jobs when it has any, else to the user's
+    whole owned graph (`_owner = user_id`). Skips SIMILAR_TO (a fusion artifact)
+    so communities reflect real relationships.
     """
     if source_job_ids:
         node_q = (
-            "MATCH (e:Entity) WHERE e._source_job IN $jobs "
+            f"MATCH (e:Entity) WHERE {job_scope('e', 'jobs')} "
             "RETURN e.name AS name LIMIT $cap"
         )
         edge_q = (
             "MATCH (a:Entity)-[r]->(b:Entity) "
-            "WHERE a._source_job IN $jobs AND b._source_job IN $jobs "
+            f"WHERE {job_scope('a', 'jobs')} AND {job_scope('b', 'jobs')} "
             "  AND NOT type(r) IN $skip "
             "RETURN a.name AS a, b.name AS b"
         )
@@ -206,7 +207,7 @@ def detect_communities(
         write_q = (
             "UNWIND $rows AS row "
             "MATCH (e:Entity {name: row.name}) "
-            + ("WHERE e._source_job IN $jobs " if source_job_ids else "WHERE e._owner = $uid ")
+            + (f"WHERE {job_scope('e', 'jobs')} " if source_job_ids else "WHERE e._owner = $uid ")
             + "SET e._community = row.community, e._centrality = row.degree, "
             "    e._god_node = row.god"
         )

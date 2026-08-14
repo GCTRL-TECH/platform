@@ -132,6 +132,14 @@ pub fn spawn_all(state: Arc<AppState>) {
         }
     });
 
+    // One-time graph backfill: give every pre-existing node/relationship the
+    // `_source_jobs` membership list the scoping and deletion paths now read.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(45)).await; // after migrations
+        backfill_source_jobs(&s).await;
+    });
+
     // A4/A5/A7 — Memory-governance cycle: ONE ordered pass (decay → dedup →
     // promote → evict → dossier-refresh) on a slow cadence (default 600s, env
     // GCTRL_MEMORY_TICK_SECS), independent of the 60s cron. Each run records a
@@ -1041,11 +1049,10 @@ async fn run_retention_cleanup(state: &AppState) {
     for (comp_id, comp_name) in &expired {
         tracing::info!("retention: deleting expired compilation {comp_name} ({comp_id})");
 
-        // Delete from Neo4j
-        let cypher = "MATCH (n {compilation_id: $cid}) DETACH DELETE n";
-        let _ = state.neo.run(
-            neo4rs::query(cypher).param("cid", comp_id.to_string().as_str())
-        ).await;
+        // Delete from Neo4j. This used to be `MATCH (n {compilation_id: $cid})`,
+        // which matched ONLY the `(:Compilation)` container node — that property
+        // exists on nothing else, so every entity survived its own compilation.
+        let _ = crate::routes::kg::purge_compilation_graph(&state.db, &state.neo, *comp_id).await;
 
         // Audit log — insert before the DELETE so the FK to compilations still resolves
         let _ = sqlx::query(
@@ -1061,13 +1068,180 @@ async fn run_retention_cleanup(state: &AppState) {
             .bind(comp_id).execute(&state.db).await;
     }
 
-    // 2. Find expired jobs and their chunks
+    // 2. Expired jobs. Their graph elements go first, for the same reason: once
+    //    the row is gone nothing can map an entity back to the job that made it.
+    let expired_jobs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM jobs WHERE expires_at IS NOT NULL AND expires_at < NOW()"
+    ).fetch_all(&state.db).await.unwrap_or_default();
+    if !expired_jobs.is_empty() {
+        let purged = crate::services::neo4j::purge_jobs(&state.neo, &expired_jobs).await;
+        tracing::info!(
+            "retention: {} expired jobs took {} nodes and {} relationships with them",
+            expired_jobs.len(), purged.nodes_deleted, purged.rels_deleted
+        );
+    }
     let _ = sqlx::query(
         "DELETE FROM jobs WHERE expires_at IS NOT NULL AND expires_at < NOW()"
     ).execute(&state.db).await;
 
     if !expired.is_empty() {
         tracing::info!("retention: cleaned up {} expired compilations", expired.len());
+    }
+
+    // 3. Sweep whatever earlier versions left behind.
+    sweep_orphaned_graph(state).await;
+}
+
+const BACKFILL_SOURCE_JOBS: &str = "2026_08_14_source_jobs_list";
+
+/// Give every element written before the membership list existed a
+/// `_source_jobs` of `[_source_job]`.
+///
+/// Queries carry a `coalesce(x._source_jobs, [x._source_job])` fallback, so the
+/// graph is correct with or without this — the backfill is what lets deletion be
+/// precise (a list can lose one contributor and keep the rest; a single value
+/// cannot) and what lets the fallback eventually be dropped.
+///
+/// Batched by LIMIT rather than `CALL … IN TRANSACTIONS` so it stays interruptible
+/// and driver-agnostic: a restart mid-backfill simply resumes, because the marker
+/// is only written once nothing is left to convert.
+async fn backfill_source_jobs(state: &AppState) {
+    let done: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM neo4j_migrations WHERE name = $1"
+    ).bind(BACKFILL_SOURCE_JOBS).fetch_optional(&state.db).await.ok().flatten();
+    if done.is_some() {
+        return;
+    }
+
+    let mut nodes = 0i64;
+    let mut rels = 0i64;
+
+    for (label, cypher, counter) in [
+        ("nodes",
+         "MATCH (n) WHERE n._source_job IS NOT NULL AND n._source_jobs IS NULL \
+          WITH n LIMIT 5000 SET n._source_jobs = [n._source_job] RETURN count(*) AS c",
+         &mut nodes),
+        ("relationships",
+         "MATCH ()-[r]->() WHERE r._source_job IS NOT NULL AND r._source_jobs IS NULL \
+          WITH r LIMIT 5000 SET r._source_jobs = [r._source_job] RETURN count(*) AS c",
+         &mut rels),
+    ] {
+        loop {
+            let converted = match state.neo.execute(neo4rs::query(cypher)).await {
+                Ok(mut s) => match s.next().await {
+                    Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+                    _ => 0,
+                },
+                Err(e) => {
+                    // Leave the marker unwritten so the next boot retries.
+                    tracing::warn!("backfill {label}: {e} — will retry on next start");
+                    return;
+                }
+            };
+            *counter += converted;
+            if converted == 0 {
+                break;
+            }
+        }
+    }
+
+    let _ = sqlx::query(
+        "INSERT INTO neo4j_migrations (name, details) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+    )
+    .bind(BACKFILL_SOURCE_JOBS)
+    .bind(serde_json::json!({ "nodes": nodes, "relationships": rels }))
+    .execute(&state.db)
+    .await;
+
+    if nodes + rels > 0 {
+        tracing::info!("backfill: gave {nodes} nodes and {rels} relationships a _source_jobs list");
+    }
+}
+
+/// Delete graph elements whose owner in Postgres is gone.
+///
+/// Every delete path now cleans up after itself, but for most of this codebase's
+/// life none of them did: the only `DETACH DELETE` matched a property no entity
+/// ever carried, so deleted knowledge bases and expired jobs left their nodes in
+/// Neo4j permanently. Those leftovers are not merely wasted disk — they still
+/// answer an owner's unscoped queries, so they pollute search results too.
+///
+/// The test is conservative and cross-store: an element goes only when NO job in
+/// its membership list still exists as a row in `jobs`. A brand-new extraction
+/// whose compilation has not been created yet therefore stays (its job row is
+/// there); only elements whose every source has been deleted qualify.
+async fn sweep_orphaned_graph(state: &AppState) {
+    // Job ids the graph still references (bounded by the number of extractions,
+    // not by node count).
+    let graph_jobs: Vec<String> = match state.neo.execute(neo4rs::query(
+        "MATCH (n) WHERE n._source_jobs IS NOT NULL OR n._source_job IS NOT NULL \
+         UNWIND coalesce(n._source_jobs, [n._source_job]) AS j \
+         RETURN DISTINCT j AS j"
+    )).await {
+        Ok(mut s) => {
+            let mut out = vec![];
+            while let Ok(Some(row)) = s.next().await {
+                if let Ok(j) = row.get::<String>("j") { out.push(j); }
+            }
+            out
+        }
+        Err(e) => {
+            tracing::warn!("sweep: could not list graph jobs: {e}");
+            return;
+        }
+    };
+    if graph_jobs.is_empty() {
+        return;
+    }
+
+    let parsed: Vec<Uuid> = graph_jobs.iter().filter_map(|j| j.parse::<Uuid>().ok()).collect();
+    let live: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM jobs WHERE id = ANY($1)")
+        .bind(&parsed)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let live: std::collections::HashSet<Uuid> = live.into_iter().collect();
+    let dead: Vec<Uuid> = parsed.into_iter().filter(|j| !live.contains(j)).collect();
+
+    if !dead.is_empty() {
+        let purged = crate::services::neo4j::purge_jobs(&state.neo, &dead).await;
+        tracing::info!(
+            "sweep: {} jobs no longer exist in Postgres — removed {} nodes, {} relationships",
+            dead.len(), purged.nodes_deleted, purged.rels_deleted
+        );
+    }
+
+    // FUSE-merged entities + their container node, for compilations that are gone.
+    let graph_comps: Vec<String> = match state.neo.execute(neo4rs::query(
+        "MATCH (n) WHERE n._compilation IS NOT NULL OR n.compilation_id IS NOT NULL \
+         RETURN DISTINCT coalesce(n._compilation, n.compilation_id) AS c"
+    )).await {
+        Ok(mut s) => {
+            let mut out = vec![];
+            while let Ok(Some(row)) = s.next().await {
+                if let Ok(c) = row.get::<String>("c") { out.push(c); }
+            }
+            out
+        }
+        Err(_) => vec![],
+    };
+    let parsed_comps: Vec<Uuid> = graph_comps.iter().filter_map(|c| c.parse::<Uuid>().ok()).collect();
+    if parsed_comps.is_empty() {
+        return;
+    }
+    let live_comps: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM compilations WHERE id = ANY($1)")
+        .bind(&parsed_comps)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let live_comps: std::collections::HashSet<Uuid> = live_comps.into_iter().collect();
+
+    let mut merged_removed = 0i64;
+    for cid in parsed_comps.into_iter().filter(|c| !live_comps.contains(c)) {
+        merged_removed += crate::services::neo4j::purge_compilation(&state.neo, cid).await.nodes_deleted;
+    }
+    if merged_removed > 0 {
+        tracing::info!("sweep: removed {merged_removed} merged nodes of deleted compilations");
     }
 }
 

@@ -11,18 +11,36 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 09d5892 -->
 
-## v0.8.3 - The install command on the homepage works on every machine again
+## v0.8.6 - Deleting a knowledge base now deletes its knowledge
 
-*13 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+*14 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
 
-- **The one-line install on the homepage was a dead end on most Linux machines.** It read `pip install gctrl && gctrl install`, and on Arch, Debian 12+, Ubuntu 23.04+, Fedora 38+ and any Mac running Homebrew's Python, pip flatly refuses to write into the system Python: it answers `error: externally-managed-environment` and stops before it has even looked up the package. Nothing was wrong with the package, but the very first command on the site failed for a large share of self-hosters. The homepage shows the shell installer again, `curl -fsSL https://gctrl.tech/install | bash`, which has no such gate.
-- **The install docs now say what to run on your system instead of what usually works.** curl is the recommended path on macOS and Linux, pip is the native Windows path, and a new section on externally managed environments gives the four real answers - pipx, uv, an explicit `--break-system-packages`, or a virtualenv - along with the follow-on trap where the freshly installed `gctrl` command is not yet on your `PATH`. The pip package itself is unchanged and still installs the identical stack.
+- **Deleting a knowledge base left every entity behind in the graph database.** The knowledge base disappeared from your account, but its nodes and relationships stayed in Neo4j forever, and with the knowledge base gone there was nothing left that could ever find them again. Deleting an extraction had the same result by a different route: it skipped the graph on purpose and deferred to knowledge-base deletion, which did not do it either. Nothing in GCTRL ever removed an entity, so every install has been accumulating the remains of everything its owner deleted. Both paths now clean up after themselves, and a nightly sweep clears what earlier versions left behind.
+- **Shared entities survive a deletion that is not theirs.** The same entity often comes from several documents, so removing one of them must not take the entity with it. Every node and relationship now records all the extractions it came from, not just the most recent one, and deletion removes an entity only once the last of them is gone. Existing graphs are upgraded to this record automatically on the first start after the update.
+- **A knowledge base shared with a colleague showed them less than it should.** Access for a scoped colleague was decided by which extraction touched an entity *last*, so an entity that also appeared in a knowledge base someone else updated more recently silently vanished from their view - it was in the graph, it was granted to them, and it did not show up. Access is now decided by everything an entity belongs to.
+- **Exporting a knowledge base produced an empty file.** Every export - JSON-LD, RDF Turtle and GraphML alike - looked up the graph by a marker that only an internal bookkeeping node carries, so it never found a single entity. Exports now contain what the knowledge base actually holds.
 
 ## v0.8.5 - Word documents laid out in text boxes are readable again
 
 *14 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
 
 - **A .docx whose text sits in text boxes or tables was rejected as empty.** The extractor read only the document's plain paragraphs, which is exactly what a layouted Word file does not use: a booklet, a one-pager or a form puts every line in a text box, and tables were skipped as well. Such a file came back as "DOCX contained no extractable text" although it was full of it - on the document that surfaced this, 3806 characters in 16 text boxes and nothing outside them. Text boxes, tables, headers and footers are now read along with the body, in document order. Word stores a text box twice (a modern and a legacy copy of the same text), and a repeated header is inherited rather than re-written, so both are recognised and counted once instead of turning up as duplicates in your knowledge base.
+
+## v0.8.4 - Updates clean up after themselves
+
+*13 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Every update used to leave its predecessor on your disk, forever.** GCTRL's images ship under a moving `latest` tag, so each update pulled the new image and quietly abandoned the old one: still on the machine, still several gigabytes, referenced by nothing. Nothing ever collected them, so a machine that had been updated a dozen times was carrying a dozen dead copies of GCTRL. Updates now reclaim them, both before pulling and right after the swap, so an installation stays at the size of the version it is running. The clean-up runs in the in-app updater, the `gctrl.tech/update` script and the pip installer alike, and it reports what it freed instead of doing it behind your back.
+- **The clean-up only ever touches GCTRL's own images.** It identifies them by the registry they came from, and skips anything a container still uses, running or stopped. Other software on the same machine is never considered, not even its unused images. If you need the old copies kept anyway, for instance on a machine with no route to the registry, set `GCTRL_KEEP_OLD_IMAGES=1` in your `.env`.
+- **Freeing the disk before the download also fixes the update that ran out of space.** The reclaim happens first, so the room the incoming images need is made available before they start arriving rather than after.
+- **Rollback works now.** It was recording internal image IDs and then trying to fetch them as if they were addresses, which cannot work, and the failure was swallowed, so rolling back appeared to succeed and changed nothing. It now records proper image addresses, fetches the previous version from the registry and repoints your stack at it. `https://gctrl.tech/rollback` also served the website instead of the script until now, so the command printed at the end of every update was never able to run.
+
+## v0.8.3 - The install command on the homepage works on every machine again
+
+*13 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The one-line install on the homepage was a dead end on most Linux machines.** It read `pip install gctrl && gctrl install`, and on Arch, Debian 12+, Ubuntu 23.04+, Fedora 38+ and any Mac running Homebrew's Python, pip flatly refuses to write into the system Python: it answers `error: externally-managed-environment` and stops before it has even looked up the package. Nothing was wrong with the package, but the very first command on the site failed for a large share of self-hosters. The homepage shows the shell installer again, `curl -fsSL https://gctrl.tech/install | bash`, which has no such gate.
+- **The install docs now say what to run on your system instead of what usually works.** curl is the recommended path on macOS and Linux, pip is the native Windows path, and a new section on externally managed environments gives the four real answers - pipx, uv, an explicit `--break-system-packages`, or a virtualenv - along with the follow-on trap where the freshly installed `gctrl` command is not yet on your `PATH`. The pip package itself is unchanged and still installs the identical stack.
 
 ## v0.8.2 - A new knowledge base can be born private
 

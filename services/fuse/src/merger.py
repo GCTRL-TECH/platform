@@ -22,6 +22,7 @@ from typing import Optional
 from neo4j import GraphDatabase, Driver
 
 from . import config
+from .scope import job_scope
 from .limes_client import get_limes_client
 from . import config_builder
 from . import canonical_link
@@ -837,10 +838,14 @@ class ThreeStageEntityMerger:
         Fast pre-filter: find entities with identical/near-identical names
         across different source jobs using Neo4j Cypher.
         """
-        query = """
+        # Membership is tested on the full `_source_jobs` list; the `<>` on the
+        # latest contributor stays as the "came from different extractions"
+        # heuristic this pre-filter always used (candidate selection only —
+        # stages 2 and 3 re-check every pair).
+        query = f"""
         MATCH (a:Entity), (b:Entity)
-        WHERE a._source_job IN $job_ids
-          AND b._source_job IN $job_ids
+        WHERE {job_scope('a')}
+          AND {job_scope('b')}
           AND a._source_job <> b._source_job
           AND coalesce(a.coarse_type, a.type) = coalesce(b.coarse_type, b.type)
           AND toLower(a.name) = toLower(b.name)
@@ -1887,7 +1892,7 @@ class ThreeStageEntityMerger:
         extra = ", ".join(f"e.{p} AS {p}" for p in ATTR_EXTRA_PROPS)
         query = f"""
         MATCH (e:Entity)
-        WHERE e._source_job IN $job_ids
+        WHERE {job_scope('e')}
         RETURN e.name AS name, e.type AS type, e.coarse_type AS coarse_type,
                e.label AS label,
                {extra},
@@ -1901,10 +1906,10 @@ class ThreeStageEntityMerger:
 
     def _collect_triples(self, source_job_ids: list[str]) -> list[tuple[str, str, str]]:
         """Collect (head_uri, relation_type, tail_uri) triples."""
-        query = """
+        query = f"""
         MATCH (a:Entity)-[r]->(b:Entity)
-        WHERE a._source_job IN $job_ids
-          AND b._source_job IN $job_ids
+        WHERE {job_scope('a')}
+          AND {job_scope('b')}
           AND NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
         RETURN a.uri AS head, type(r) AS rel, b.uri AS tail
         """
@@ -2120,10 +2125,10 @@ class ThreeStageEntityMerger:
         classification: str,
     ) -> int:
         """Copy relations from source jobs to merged entities."""
-        query = """
+        query = f"""
         MATCH (a:Entity)-[r]->(b:Entity)
-        WHERE a._source_job IN $job_ids
-          AND b._source_job IN $job_ids
+        WHERE {job_scope('a')}
+          AND {job_scope('b')}
           AND NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
         RETURN a.name AS head_name, a.type AS head_type,
                type(r) AS rel_type,

@@ -777,10 +777,12 @@ async fn cancel_job(
 /// rows survive via ON DELETE SET NULL (migration 070) — they are billing/audit
 /// history, not job data.
 ///
-/// Deliberately NOT deleted: Neo4j entities. Nodes are URI-merged across jobs
-/// (`_source_job` holds only the LATEST contributor), so deleting by source job
-/// would destroy nodes other jobs also produced. Entity lifecycle belongs to
-/// compilation deletion / memory governance, not per-job deletion.
+/// Neo4j entities included: every element drops this job from its `_source_jobs`
+/// membership, and whatever ends up with an empty list is deleted. Nodes are
+/// URI-merged across jobs, so this is precise — what other jobs also produced
+/// survives, minus one contributor. (Until the membership list existed there was
+/// only `_source_job`, the LATEST contributor, which could not tell the two apart;
+/// deletion was skipped here and never happened anywhere else either.)
 async fn delete_job(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -806,6 +808,10 @@ async fn delete_job(
          WHERE user_id = $2 AND $1 = ANY(source_job_ids)"
     ).bind(id).bind(claims.sub).execute(&state.db).await?;
 
+    // Graph footprint before the row: after the DELETE nothing maps a node back
+    // to this job.
+    let purged = crate::services::neo4j::purge_jobs(&state.neo, &[id]).await;
+
     sqlx::query("DELETE FROM jobs WHERE id=$1 AND user_id=$2")
         .bind(id).bind(claims.sub).execute(&state.db).await?;
 
@@ -825,7 +831,13 @@ async fn delete_job(
         }
     }
 
-    Ok(Json(json!({ "ok": true, "chunksDeleted": point_ids.len(), "vectorsDeleted": vectors_deleted })))
+    Ok(Json(json!({
+        "ok": true,
+        "chunksDeleted": point_ids.len(),
+        "vectorsDeleted": vectors_deleted,
+        "nodesDeleted": purged.nodes_deleted,
+        "relationshipsDeleted": purged.rels_deleted,
+    })))
 }
 
 /// Redis key the KEX worker's config-watcher polls to scale its thread pool.

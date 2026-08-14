@@ -40,6 +40,7 @@ from . import telemetry
 
 from . import config
 from . import distiller
+from .scope import job_scope
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,7 @@ def _fetch_entity_facts_scoped(
 ) -> Optional[dict]:
     """KB-SCOPED variant of `_fetch_entity_facts`: authorizes on the GRANTED
     source-jobs instead of ownership, and confines the canonical node AND every
-    neighbour to `_source_job IN $job_ids`. This is what lets a colleague token get
+    neighbour to the granted jobs. This is what lets a colleague token get
     a HOT dossier for an entity in its granted knowledge base — leak-safe BY
     CONSTRUCTION: no node, edge, or neighbour name from outside the grant can enter
     the compiled facts. Returns None when the entity has no node inside the grant."""
@@ -133,13 +134,16 @@ def _fetch_entity_facts_scoped(
         return None
     # Mirror of the owner query, but every MATCH endpoint is gated on the granted
     # jobs (the grant IS the authorization boundary — no `_owner`/`user_id` clause).
-    query = """
-    MATCH (n {name: $name})
-      WHERE n._source_job IN $job_ids
+    # Only the gating predicates are interpolated; the body below stays a plain
+    # string so its Cypher map literals need no brace escaping.
+    query = f"""
+    MATCH (n {{name: $name}})
+      WHERE {job_scope('n')}
     OPTIONAL MATCH (n)-[ro]->(o)
-      WHERE NOT type(ro) IN $structural AND o._source_job IN $job_ids
+      WHERE NOT type(ro) IN $structural AND {job_scope('o')}
     OPTIONAL MATCH (i)-[ri]->(n)
-      WHERE NOT type(ri) IN $structural AND i._source_job IN $job_ids
+      WHERE NOT type(ri) IN $structural AND {job_scope('i')}
+    """ + """
     WITH n,
          count(DISTINCT o) + count(DISTINCT i) AS degree,
          count(DISTINCT CASE WHEN ro.confidence IS NOT NULL THEN o END)
@@ -237,11 +241,11 @@ def _fetch_top_entity_names(driver, source_job_ids: list[str], top_n: int) -> li
     """The highest-degree entity names in the compilation's source graph."""
     if not source_job_ids:
         return []
-    query = """
+    query = f"""
     MATCH (e:Entity)
-      WHERE e._source_job IN $job_ids
+      WHERE {job_scope('e')}
     OPTIONAL MATCH (e)-[r]-(m:Entity)
-      WHERE NOT type(r) IN $structural AND m._source_job IN $job_ids
+      WHERE NOT type(r) IN $structural AND {job_scope('m')}
     WITH e, count(DISTINCT m) AS degree
     WHERE e.name IS NOT NULL
     RETURN e.name AS name

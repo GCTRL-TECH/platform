@@ -79,8 +79,8 @@ pub(crate) async fn api_key_scope(
 /// The set of source-job ids a KB-scoped token may traverse in the graph: the union
 /// of `source_job_ids` across its granted compilations. `None` = JWT/unscoped token
 /// (no restriction). `Some(empty)` = scoped but granted nothing → the caller returns
-/// no results. Graph nodes/edges carry `_source_job` (a UUID string), so adding
-/// `n._source_job IN $jobs` confines a scoped token to its knowledge base(s) — this
+/// no results. Graph nodes/edges carry `_source_jobs` (every contributing job), so
+/// `neo4j::job_scope` confines a scoped token to its knowledge base(s) — this
 /// closes the hole where the global graph tools (search_entities / get_entity /
 /// get_neighbors / shortest_path / graph_search) enforced only owner + rank and let a
 /// KB-scoped token enumerate the owner's ENTIRE graph across KB boundaries.
@@ -705,17 +705,18 @@ async fn live_counts(
         (nodes, edges)
     } else {
         let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
-        let node_cypher = "MATCH (n) WHERE n._source_job IN $jobIds RETURN count(n) AS c";
-        let edge_cypher = "MATCH (n)-[r]->() WHERE n._source_job IN $jobIds RETURN count(r) AS c";
+        let scope = crate::services::neo4j::job_scope("n", "jobIds");
+        let node_cypher = format!("MATCH (n) WHERE {scope} RETURN count(n) AS c");
+        let edge_cypher = format!("MATCH (n)-[r]->() WHERE {scope} RETURN count(r) AS c");
 
-        let nodes = match neo.execute(neo_query(node_cypher).param("jobIds", job_strs.clone())).await {
+        let nodes = match neo.execute(neo_query(&node_cypher).param("jobIds", job_strs.clone())).await {
             Ok(mut s) => match s.next().await {
                 Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
                 _ => 0,
             },
             Err(_) => 0,
         };
-        let edges = match neo.execute(neo_query(edge_cypher).param("jobIds", job_strs)).await {
+        let edges = match neo.execute(neo_query(&edge_cypher).param("jobIds", job_strs)).await {
             Ok(mut s) => match s.next().await {
                 Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
                 _ => 0,
@@ -1077,6 +1078,53 @@ async fn update(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// The jobs a compilation would take to the grave: its own `source_job_ids`
+/// minus every job that ANY other compilation still references.
+///
+/// Nodes are URI-merged across jobs, so a job can feed several knowledge bases.
+/// Subtracting the still-referenced ones is what makes deleting one knowledge
+/// base safe for the others. Deliberately not filtered by user: if a row still
+/// points at the job, the job stays, whoever owns it.
+pub(crate) async fn orphaned_jobs(db: &sqlx::PgPool, compilation_id: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT j FROM compilations c, unnest(c.source_job_ids) AS j WHERE c.id = $1
+         EXCEPT
+         SELECT DISTINCT j FROM compilations c, unnest(c.source_job_ids) AS j WHERE c.id <> $1"
+    )
+    .bind(compilation_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
+
+/// Remove a compilation's graph footprint. Call BEFORE the Postgres row goes —
+/// `source_job_ids` lives on that row and is the only path from a compilation to
+/// its nodes.
+///
+/// Two halves, because the graph holds two kinds of node: the FUSE-merged
+/// entities and the container node belong to this compilation alone and go
+/// unconditionally; the raw entities are shared through jobs and only lose the
+/// jobs nobody else claims.
+pub(crate) async fn purge_compilation_graph(
+    db: &sqlx::PgPool,
+    neo: &neo4rs::Graph,
+    compilation_id: Uuid,
+) -> crate::services::neo4j::PurgeStats {
+    let orphans = orphaned_jobs(db, compilation_id).await;
+    let mut stats = crate::services::neo4j::purge_compilation(neo, compilation_id).await;
+    let job_stats = crate::services::neo4j::purge_jobs(neo, &orphans).await;
+    stats.nodes_deleted += job_stats.nodes_deleted;
+    stats.rels_deleted += job_stats.rels_deleted;
+    if stats.total() > 0 {
+        tracing::info!(
+            "purged compilation {compilation_id} from the graph: {} nodes, {} relationships \
+             ({} orphaned jobs)",
+            stats.nodes_deleted, stats.rels_deleted, orphans.len()
+        );
+    }
+    stats
+}
+
 async fn delete_one(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -1095,8 +1143,15 @@ async fn delete_one(
             "This is a system compilation and cannot be deleted".into())),
         Some((false,)) => {}
     }
+    // Graph first: `source_job_ids` is on the row we are about to delete, and
+    // without it nothing can ever find these nodes again.
+    let purged = purge_compilation_graph(&state.db, &state.neo, id).await;
     sqlx::query("DELETE FROM compilations WHERE id=$1 AND user_id=$2").bind(id).bind(claims.sub).execute(&state.db).await?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({
+        "ok": true,
+        "nodesDeleted": purged.nodes_deleted,
+        "relationshipsDeleted": purged.rels_deleted,
+    })))
 }
 
 async fn refresh(
@@ -1740,9 +1795,9 @@ async fn get_graph(
     // top the degree ranking). It is not a knowledge entity and must never show
     // in the explorer — including it made the "core" an empty unlabeled hub.
     let scope = if source_job_ids.is_empty() {
-        "n._owner = $uid AND NOT n:Compilation"
+        "n._owner = $uid AND NOT n:Compilation".to_string()
     } else {
-        "n._source_job IN $jobIds AND NOT n:Compilation"
+        format!("{} AND NOT n:Compilation", crate::services::neo4j::job_scope("n", "jobIds"))
     };
     let label_pat = match &q.node_type {
         Some(label) => format!("(n:{label})"),
@@ -1912,9 +1967,9 @@ async fn public_get_graph(
     let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
     let scope = if source_job_ids.is_empty() {
-        "n._owner = $uid AND NOT n:Compilation"
+        "n._owner = $uid AND NOT n:Compilation".to_string()
     } else {
-        "n._source_job IN $jobIds AND NOT n:Compilation"
+        format!("{} AND NOT n:Compilation", crate::services::neo4j::job_scope("n", "jobIds"))
     };
     let label_pat = match &q.node_type {
         Some(label) => format!("(n:{label})"),
@@ -2046,7 +2101,11 @@ async fn graph_search(
     // KB-scope: a scoped token may only search within its granted knowledge base(s).
     let scoped = api_key_scoped_jobs(&state.db, &claims).await;
     if matches!(&scoped, Some(j) if j.is_empty()) { return Ok(Json(json!({ "nodes": [] }))); }
-    let job_clause = if scoped.is_some() { "AND n._source_job IN $jobs" } else { "" };
+    let job_clause = if scoped.is_some() {
+        format!("AND {}", crate::services::neo4j::job_scope("n", "jobs"))
+    } else {
+        String::new()
+    };
 
     let cypher = format!("MATCH (n) \
                   WHERE (n.name CONTAINS $q OR n.label CONTAINS $q) \
@@ -2222,9 +2281,9 @@ async fn entity_detail(
 
     // 2. Build scope clause — mirrors get_graph.
     let where_clause = if source_job_ids.is_empty() {
-        "n._owner = $uid"
+        "n._owner = $uid".to_string()
     } else {
-        "n._source_job IN $jobIds"
+        crate::services::neo4j::job_scope("n", "jobIds")
     };
 
     // 3. Run the Cypher. `name` is bound as a parameter — never interpolated, so
@@ -2483,7 +2542,7 @@ pub(crate) async fn build_dossier_via_fuse(
 /// fusion) and store it under `user_id` (the scoped caller — so the colleague's
 /// confined dossier never mixes with, nor pollutes, the KB owner's cross-KB aggregate).
 /// Leak-safe by construction: FUSE authorizes every node/edge/neighbour on
-/// `_source_job IN source_jobs`, so no fact from outside the grant can enter the
+/// membership in `source_jobs`, so no fact from outside the grant can enter the
 /// compiled dossier. Returns Ok(Some) when built, Ok(None) when the grant has no such
 /// entity. Passing `entity_name` + `source_job_ids` selects FUSE's scoped build mode.
 pub(crate) async fn build_dossier_via_fuse_scoped(
@@ -2520,7 +2579,7 @@ pub(crate) async fn build_dossier_via_fuse_scoped(
 
 /// Clearance ceiling for a KB-SCOPED dossier read: the max `_min_rank` across the
 /// entity's node and its relations, computed ONLY over the caller's granted jobs
-/// (`_source_job IN $jobs`) rather than by ownership. Mirrors `dossier_required_rank`
+/// (membership in `$jobs`) rather than by ownership. Mirrors `dossier_required_rank`
 /// but for a colleague token; fails CLOSED (i32::MAX) on a Neo4j error so a hiccup
 /// never leaks a confined dossier to a low-clearance caller.
 pub(crate) async fn dossier_required_rank_scoped(
@@ -2531,13 +2590,17 @@ pub(crate) async fn dossier_required_rank_scoped(
     if jobs.is_empty() {
         return i32::MAX; // no grant → nothing readable
     }
-    let cypher = "MATCH (n) WHERE toLower(n.name) = toLower($name) \
-                    AND n._source_job IN $jobs \
-                  OPTIONAL MATCH (n)-[r]-(m) WHERE m._source_job IN $jobs \
+    let cypher = format!(
+        "MATCH (n) WHERE toLower(n.name) = toLower($name) \
+                    AND {n_scope} \
+                  OPTIONAL MATCH (n)-[r]-(m) WHERE {m_scope} \
                   RETURN coalesce(max(coalesce(r._min_rank,0)),0) AS relmax, \
-                         coalesce(max(coalesce(n._min_rank,0)),0) AS nodemax";
+                         coalesce(max(coalesce(n._min_rank,0)),0) AS nodemax",
+        n_scope = crate::services::neo4j::job_scope("n", "jobs"),
+        m_scope = crate::services::neo4j::job_scope("m", "jobs"),
+    );
     match state.neo.execute(
-        neo4rs::query(cypher).param("name", name).param("jobs", jobs.to_vec()),
+        neo4rs::query(&cypher).param("name", name).param("jobs", jobs.to_vec()),
     ).await {
         Ok(mut res) => {
             if let Ok(Some(row)) = res.next().await {
@@ -2873,7 +2936,11 @@ pub(crate) async fn delete_relationship_core(
     let (jobs, owner) = resolve_mutation_scope(&state.db, claims, compilation_id).await?;
     let owner_str = owner.to_string();
     let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-    let scope = if jobs.is_empty() { "a._owner = $uid" } else { "a._source_job IN $jobIds" };
+    let scope = if jobs.is_empty() {
+        "a._owner = $uid".to_string()
+    } else {
+        crate::services::neo4j::job_scope("a", "jobIds")
+    };
 
     // Match the edge, collect, FOREACH-delete, return the count (clean even after delete).
     let cypher = format!(
@@ -2949,9 +3016,13 @@ pub(crate) async fn add_relationship_core(
     let owner_str = owner.to_string();
     let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
     let scope = if jobs.is_empty() {
-        "a._owner = $uid AND b._owner = $uid"
+        "a._owner = $uid AND b._owner = $uid".to_string()
     } else {
-        "a._source_job IN $jobIds AND b._source_job IN $jobIds"
+        format!(
+            "{} AND {}",
+            crate::services::neo4j::job_scope("a", "jobIds"),
+            crate::services::neo4j::job_scope("b", "jobIds"),
+        )
     };
 
     let cypher = format!(
@@ -3017,7 +3088,11 @@ pub(crate) async fn delete_node_core(
     let (jobs, owner) = resolve_mutation_scope(&state.db, claims, compilation_id).await?;
     let owner_str = owner.to_string();
     let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-    let scope = if jobs.is_empty() { "n._owner = $uid" } else { "n._source_job IN $jobIds" };
+    let scope = if jobs.is_empty() {
+        "n._owner = $uid".to_string()
+    } else {
+        crate::services::neo4j::job_scope("n", "jobIds")
+    };
 
     let cypher = format!(
         "MATCH (n {{name: $name}}) WHERE {scope} \
@@ -3455,13 +3530,27 @@ async fn export_compilation(
     let (comp_name,) = row.ok_or(AppError::NotFound)?;
 
     // Fetch graph data from Neo4j — per-element clearance gates the export too.
+    //
+    // This used to match `{compilation_id: $cid}`, a property that only the
+    // `(:Compilation)` container node carries — so every export returned an empty
+    // graph. Membership is the same job scoping the graph view uses.
+    let job_strs: Vec<String> = sqlx::query_scalar::<_, Uuid>(
+        "SELECT unnest(COALESCE(source_job_ids, '{}'::uuid[])) FROM compilations WHERE id = $1"
+    ).bind(id).fetch_all(&state.db).await.unwrap_or_default()
+     .into_iter().map(|j| j.to_string()).collect();
+
+    let cypher = format!(
+        "MATCH (n) WHERE {n_scope} AND coalesce(n._min_rank,0) <= $rank \
+         OPTIONAL MATCH (n)-[r]->(m) \
+           WHERE {m_scope} AND coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
+         RETURN n, r, m LIMIT 5000",
+        n_scope = crate::services::neo4j::job_scope("n", "jobIds"),
+        m_scope = crate::services::neo4j::job_scope("m", "jobIds"),
+    );
     let mut rows = state.neo.execute(
-        neo4rs::query(
-            "MATCH (n {compilation_id: $cid}) WHERE coalesce(n._min_rank,0) <= $rank \
-             OPTIONAL MATCH (n)-[r]->(m {compilation_id: $cid}) \
-               WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
-             RETURN n, r, m LIMIT 5000"
-        ).param("cid", id.to_string().as_str()).param("rank", clearance_rank as i64)
+        neo4rs::query(&cypher)
+            .param("jobIds", job_strs)
+            .param("rank", clearance_rank as i64)
     ).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
     let mut nodes: Vec<(String, String, String)> = vec![]; // (id, name, type)

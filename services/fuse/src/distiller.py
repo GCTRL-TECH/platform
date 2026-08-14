@@ -51,6 +51,7 @@ from neo4j import GraphDatabase
 from . import telemetry
 from . import config
 from . import llm_client
+from .scope import job_scope
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +222,7 @@ def _fetch_entities_with_neighbors(
     neighbours. Each item: {name, type, coarse_type, conflict, min_rank,
     class_labels, neighbors:[...]}.
 
-    Scoped to the RAW comp's source jobs via `_source_job`. Skips the structural
+    Scoped to the RAW comp's source jobs via `_source_jobs`. Skips the structural
     CONTAINS/SIMILAR_TO edges so neighbours are real domain relationships.
 
     `min_rank` is the page's compliance gate: the MOST-RESTRICTIVE rank over the
@@ -229,16 +230,16 @@ def _fetch_entities_with_neighbors(
     neighbour must itself be confidential). `class_labels` is the union of the
     contributing provenance labels.
     """
-    query = """
+    query = f"""
     MATCH (e:Entity)
-    WHERE e._source_job IN $job_ids
+    WHERE {job_scope('e')}
     OPTIONAL MATCH (e)-[r]-(n:Entity)
       WHERE NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
-            AND n._source_job IN $job_ids
+            AND {job_scope('n')}
     WITH e, count(DISTINCT n) AS degree,
-         collect(DISTINCT {name: n.name, type: n.type, rel: type(r),
+         collect(DISTINCT {{name: n.name, type: n.type, rel: type(r),
                            label_ranks: n._label_ranks, min_rank: n._min_rank,
-                           class_labels: n._class_labels})[..12] AS neighbors
+                           class_labels: n._class_labels}})[..12] AS neighbors
     RETURN e.name AS name, e.type AS type,
            e.coarse_type AS coarse_type, e._class_conflict AS conflict,
            e._label_ranks AS label_ranks, e._min_rank AS min_rank,
@@ -281,7 +282,7 @@ def _fetch_entities_with_neighbors(
 def _count_source_entities(driver, source_job_ids: list[str]) -> int:
     """Total distinct entities in the source graph (for the lint 'no page yet' count)."""
     query = (
-        "MATCH (e:Entity) WHERE e._source_job IN $job_ids "
+        f"MATCH (e:Entity) WHERE {job_scope('e')} "
         "RETURN count(DISTINCT e.name) AS c"
     )
     with driver.session() as session:

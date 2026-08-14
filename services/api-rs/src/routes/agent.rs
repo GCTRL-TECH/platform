@@ -416,7 +416,7 @@ const READ_TOOLS: &[&str] = &[
 /// of truth for the node-level authorization boundary, so the graph read tools
 /// (search_entities / get_entity / get_neighbors / shortest_path / schema) cannot drift.
 ///
-///   scoped (`Some(jobs)`)   → `alias._source_job IN $jobs`
+///   scoped (`Some(jobs)`)   → `any(j IN alias._source_jobs WHERE j IN $jobs)`
 ///       The granted source-jobs ARE the authorization boundary. NO `_owner`/`user_id`
 ///       requirement — that is exactly what lets a KB-scoped COLLEAGUE token read the
 ///       granted knowledge base (whose nodes are owned by someone else) and nothing
@@ -461,7 +461,10 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 fn node_auth_clause(alias: &str, scoped: &Option<Vec<String>>) -> String {
     if scoped.is_some() {
-        format!("{alias}._source_job IN $jobs")
+        // Membership, not last-touched: a node URI-merged across several jobs
+        // carries only its LATEST contributor in `_source_job`, so testing that
+        // alone hid nodes a scoped token legitimately owns.
+        crate::services::neo4j::job_scope(alias, "jobs")
     } else {
         format!("({alias}._owner = $uid OR {alias}.user_id = $uid)")
     }
@@ -476,11 +479,15 @@ mod node_auth_clause_tests {
         // A KB-scoped (colleague) token authorizes on the granted jobs ONLY — no
         // `_owner`/`user_id` clause, so it can read granted data owned by someone else.
         let scoped = Some(vec!["job-a".to_string(), "job-b".to_string()]);
-        assert_eq!(node_auth_clause("n", &scoped), "n._source_job IN $jobs");
-        assert_eq!(node_auth_clause("m", &scoped), "m._source_job IN $jobs");
+        let clause = node_auth_clause("n", &scoped);
+        // Membership list, not the latest-contributor pointer: a node merged across
+        // jobs must stay readable for every job that contributed to it.
+        assert!(clause.contains("n._source_jobs"), "got: {clause}");
+        assert!(clause.contains("$jobs"), "got: {clause}");
+        assert!(node_auth_clause("m", &scoped).contains("m._source_jobs"));
         // Must never fall back to ownership when scoped (the leak/robustness invariant).
-        assert!(!node_auth_clause("n", &scoped).contains("_owner"));
-        assert!(!node_auth_clause("n", &scoped).contains("user_id"));
+        assert!(!clause.contains("_owner"));
+        assert!(!clause.contains("user_id"));
     }
 
     #[test]
@@ -498,7 +505,9 @@ mod node_auth_clause_tests {
         // Empty grant is `Some(vec![])` — callers return early BEFORE building the
         // query, but the clause itself must stay on the scoped (job) branch.
         let empty = Some(Vec::<String>::new());
-        assert_eq!(node_auth_clause("n", &empty), "n._source_job IN $jobs");
+        let clause = node_auth_clause("n", &empty);
+        assert!(clause.contains("n._source_jobs") && clause.contains("$jobs"), "got: {clause}");
+        assert!(!clause.contains("_owner"));
     }
 }
 
@@ -668,7 +677,11 @@ async fn execute_tool_inner(
                 return json!({ "error": "not found or insufficient clearance" });
             }
             let nauth = node_auth_clause("n", &scoped);
-            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() {
+                format!("AND {}", node_auth_clause("m", &scoped))
+            } else {
+                String::new()
+            };
             let cypher = format!("MATCH (n {{name: $name}}) \
                 WHERE {nauth} AND coalesce(n._min_rank,0) <= $rank \
                 OPTIONAL MATCH (n)-[r]->(m) WHERE coalesce(m._min_rank,0) <= $rank {mjob} \
@@ -1053,7 +1066,11 @@ async fn execute_tool_inner(
             let Some((jobs,)) = row else { return json!({ "error": "graph not found" }); };
             let uid = claims.sub.to_string();
             let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-            let scope = if jobs.is_empty() { "n._owner = $uid" } else { "n._source_job IN $jobIds" };
+            let scope = if jobs.is_empty() {
+                "n._owner = $uid".to_string()
+            } else {
+                crate::services::neo4j::job_scope("n", "jobIds")
+            };
 
             crate::services::audit::log_access(&state.db, claims, "agent.get_graph", "compilation", &cid.to_string(), rank, None, true, None).await;
 
@@ -1279,7 +1296,11 @@ async fn execute_tool_inner(
             let nauth = node_auth_clause("n", &scoped);
             // The relation query's far endpoint `m` keeps a bare `mjob`: unscoped it stays
             // unconstrained (byte-identical to before); scoped it is confined to $jobs.
-            let mjob = if scoped.is_some() { "AND m._source_job IN $jobs" } else { "" };
+            let mjob = if scoped.is_some() {
+                format!("AND {}", node_auth_clause("m", &scoped))
+            } else {
+                String::new()
+            };
             let cypher_e = format!(
                 "MATCH (n) WHERE {nauth} AND coalesce(n._min_rank,0)<=$rank \
                  WITH coalesce(n.coarse_type, n.type, n.label) AS t WHERE t IS NOT NULL AND t <> '' \
@@ -1341,12 +1362,24 @@ async fn execute_tool_inner(
             if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
                 return json!({ "error": e.to_string() });
             }
+            // Same order as the HTTP handler: the graph footprint goes first,
+            // while `source_job_ids` still exists to find it by.
+            let owns: bool = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM compilations WHERE id=$1 AND user_id=$2"
+            ).bind(cid).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(0) > 0;
+            let purged = if owns {
+                crate::routes::kg::purge_compilation_graph(&state.db, &state.neo, cid).await
+            } else {
+                Default::default()
+            };
             let res = sqlx::query("DELETE FROM compilations WHERE id=$1 AND user_id=$2")
                 .bind(cid).bind(claims.sub).execute(&state.db).await;
             match res {
                 Ok(r) if r.rows_affected() > 0 => {
                     crate::services::audit::log_access(&state.db, claims, "agent.delete_compilation", "compilation", &cid.to_string(), 0, None, true, None).await;
-                    json!({ "ok": true, "deleted": cid })
+                    json!({ "ok": true, "deleted": cid,
+                            "nodesDeleted": purged.nodes_deleted,
+                            "relationshipsDeleted": purged.rels_deleted })
                 }
                 _ => json!({ "error": "compilation not found or not yours" }),
             }
@@ -1521,7 +1554,11 @@ async fn execute_tool_inner(
             // shortestPath up to 8 hops; reject any path crossing a node above the
             // caller's clearance OR outside its granted knowledge base(s) — no leaking a
             // connection THROUGH classified or out-of-scope nodes.
-            let pathjob = if scoped.is_some() { "AND all(x IN nodes(p) WHERE x._source_job IN $jobs)" } else { "" };
+            let pathjob = if scoped.is_some() {
+                format!("AND all(x IN nodes(p) WHERE {})", node_auth_clause("x", &scoped))
+            } else {
+                String::new()
+            };
             let (aauth, bauth) = (node_auth_clause("a", &scoped), node_auth_clause("b", &scoped));
             // `length(p)` below is VALID: `p` is a real PATH from shortestPath(...), not
             // a relationship list — leave it (only `[r*..N]` lists need `size`).
