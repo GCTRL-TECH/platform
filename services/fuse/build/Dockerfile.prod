@@ -33,9 +33,19 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # PyPI (the pytorch CPU/cu121 indexes are x86_64-only). amd64 → the matrix index
 # (cpu or cu121). The CUDA variant is amd64-only, so it never hits the arm branch.
 ARG TARGETARCH
+# The CUDA index stopped serving nvidia-cudnn-cu12 9.1.0.70 (its oldest 9.x is now
+# 9.1.1.17), and torch 2.4.0 pins that version exactly — so the CUDA build broke
+# without any change on our side. The wheel is still on PyPI, so satisfy that one
+# dependency from there FIRST and let torch itself keep coming strictly from the
+# CUDA index. Deliberately not `--extra-index-url` on the torch install: with two
+# indexes offering a "2.4.0", pip may pick either, and silently getting the PyPI
+# build into the CUDA image is worse than a red build.
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
       pip install --no-cache-dir torch==2.4.0; \
     else \
+      case "${TORCH_INDEX_URL}" in \
+        *cu1*) pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 ;; \
+      esac; \
       pip install --no-cache-dir torch==2.4.0 --index-url ${TORCH_INDEX_URL}; \
     fi
 RUN pip install --no-cache-dir -r requirements.txt
