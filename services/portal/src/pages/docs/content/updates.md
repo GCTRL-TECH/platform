@@ -9,7 +9,15 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: d131014 -->
+<!-- baseline-sha: 12511d1 -->
+
+## v0.8.8 - A new knowledge base starts empty, as it should
+
+*16 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A knowledge base you had just created showed everything else in the account.** Create a knowledge base, open it before extracting anything into it, and it listed the entities of your other knowledge bases as if they were its own. The cause was a single rule: a knowledge base holds whatever its extractions put there, and when there were none yet, the graph was read for the account instead of for the knowledge base. That was meant as a convenience for the very first knowledge base of a new account, but it applied to every knowledge base that had not been extracted into - and since a knowledge base only gains extractions once you run one, "empty" is what every new knowledge base is. It affected the entity counts, the graph view, the entity detail and the graph tool your agents use. A knowledge base is now exactly its own extractions, and an empty one is empty.
+- **The same rule reached further than the eye.** A knowledge base published as a public embed showed the account's whole graph to anyone with the link while it was still empty, and an edit or a deletion aimed at an empty knowledge base was applied across all the others. Both are scoped to the knowledge base itself now.
+- **Nothing became invisible in the process.** Older installations can hold extractions that were never filed into any knowledge base, and until now those were only reachable through the very rule that has been removed. They are now filed into their owner's default knowledge base on update, so what you could see before, you can still see - in the one place it belongs to, and only for the account it belongs to.
 
 ## v0.8.7 - A fresh install works out of the box, and says so when it does not
 
