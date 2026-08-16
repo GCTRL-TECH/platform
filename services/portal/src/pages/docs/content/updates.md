@@ -9,7 +9,16 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 09d5892 -->
+<!-- baseline-sha: d131014 -->
+
+## v0.8.7 - A fresh install works out of the box, and says so when it does not
+
+*16 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A new installation reached under its own hostname flickered instead of showing the activation dialog.** The screen reloaded several times a second and nothing could be clicked. The activation check runs before anyone signs in, because a machine installed minutes ago has no accounts yet, but it was answered as if a session were required. The rejection sent the browser to the sign-in page, loading that page ran the check again, and the loop never ended. Installing on localhost never showed it, because the activation step is skipped there. The check now answers without a session, and it answers with less: reachability and activation state only, never the licence tier or credit balance of an installation that has not signed anyone in yet.
+- **On Linux, extractions produced entities and no relations at all.** If Neo4j, Qdrant or Ollama were already running on the machine, GCTRL was told to reach them under a name that Docker on Linux does not resolve unless the container is explicitly taught it - and of the services that need it, only one had been. So the extraction engine could not reach the model that reads relations, could not reach the one that builds embeddings, and quietly finished with a handful of unconnected entities, most of which were then tidied away as isolated. Every service that can be pointed at a program on your own machine now resolves it, in the published stack and the deployment template alike, and a build check keeps the installer from ever again handing out an address the stack cannot resolve.
+- **An extraction that lost half its pipeline no longer reports plain success.** Relations skipped because the language model was unreachable, or embeddings that never came back, left the job marked "completed" with the reason buried in a log file - which is precisely why a broken installation looked healthy. Such a job is now marked as completed but incomplete, carries the reason with it, and shows up that way in the extraction list, the job page, the command line, the n8n trigger and for connected agents. A knowledge graph that is missing half of itself says so.
+
 
 ## v0.8.6 - Deleting a knowledge base now deletes its knowledge
 
