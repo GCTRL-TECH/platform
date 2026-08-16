@@ -149,6 +149,12 @@ fn build_router(state: Arc<models::AppState>) -> Router {
 
     let optional = Router::new()
         .nest("/api/rag", routes::rag::router())
+        // GET /api/update/agent-status — probed by ActivationGate BEFORE any login
+        // (a fresh install has no users yet), so it must not 401. Optional auth,
+        // not none: with a session it returns the full agent payload, without one
+        // only `reachable`/`activated`. Carries its own full path — a second
+        // `.nest("/api/update", …)` beside the protected one below would collide.
+        .merge(routes::update::public_router())
         .layer(middleware::from_fn_with_state(state.clone(), optional_auth));
 
     Router::new()
@@ -180,4 +186,40 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         // request" (kex /upload) before the 40MB layer ever mattered.
         .layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod router_shape_tests {
+    use axum::{body::Body, http::{Request, StatusCode}, routing::get, Router};
+    use tower::util::ServiceExt;
+
+    async fn ok() -> &'static str { "ok" }
+
+    /// `GET /api/update/agent-status` must answer without a session (ActivationGate
+    /// probes it before any login), while the rest of `/api/update` stays behind
+    /// `require_auth`. axum cannot carry two `.nest("/api/update", …)` — the second
+    /// insertion panics at startup — so the public half is registered with its FULL
+    /// path and merged instead (see `routes::update::public_router`).
+    ///
+    /// This pins that shape: a future refactor back to a second nest fails here
+    /// rather than in a container that then restart-loops.
+    #[tokio::test]
+    async fn public_agent_status_coexists_with_the_protected_update_nest() {
+        let protected = Router::new().nest(
+            "/api/update",
+            Router::new().route("/", get(ok)).route("/check", get(ok)),
+        );
+        let public = Router::new().route("/api/update/agent-status", get(ok));
+        let app: Router = Router::new().merge(public).merge(protected);
+
+        // `nest("/api/update", route("/"))` yields `/api/update`, not `/api/update/`.
+        for path in ["/api/update/agent-status", "/api/update", "/api/update/check"] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "route missing: {path}");
+        }
+    }
 }

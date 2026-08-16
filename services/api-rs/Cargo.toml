@@ -47,6 +47,12 @@ rand            = "0.8"
 regex           = "1"
 once_cell       = "1"
 
+[dev-dependencies]
+# `ServiceExt::oneshot` — lets the router-shape test in main.rs actually route a
+# request through the router instead of only constructing it. Test-only: the
+# release binary keeps the featureless `tower` above.
+tower           = { version = "0.4", features = ["util"] }
+
 [profile.release]
 opt-level = 3
 lto       = true

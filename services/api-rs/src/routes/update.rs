@@ -1,9 +1,10 @@
 use axum::{
-    extract::Query,
+    extract::{Extension, Query},
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
     Json, Router,
 };
+use crate::middleware::auth::JwtClaims;
 use serde_json::{json, Value};
 use std::{
     convert::Infallible,
@@ -58,10 +59,27 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/", get(trigger_update))
         // GET — lightweight version/update-available check (bell polling)
         .route("/check", get(check_update))
+}
+
+/// The one `/api/update/*` route that must answer WITHOUT a session.
+///
+/// `ActivationGate` (web/src/App.tsx) probes it on mount — deliberately before
+/// any login, because a freshly installed box has no users yet. Behind
+/// `require_auth` that probe answered 401, the axios interceptor turned the 401
+/// into `window.location.href = '/login'`, the full page load re-mounted the
+/// gate, and the gate probed again: a reload loop that looked like the login
+/// page flickering (only under a real hostname — `isLocalDev()` skips the gate
+/// on localhost). Commit 69048a5 fixed the interceptor half; this is the cause.
+///
+/// Registered with FULL paths and merged into the public router in `main.rs`
+/// rather than nested: a second `.nest("/api/update", …)` beside the protected
+/// nest would collide. `/` and `/check` stay behind `require_auth`.
+pub fn public_router() -> Router<Arc<crate::models::AppState>> {
+    Router::new()
         // GET — server-side proxy to the gctrl-agent's :7070/status, so browsers
         // that can't reach the agent's internal-network port directly still get a
         // truthful reachable/unreachable signal via the API's own origin.
-        .route("/agent-status", get(agent_status))
+        .route("/api/update/agent-status", get(agent_status))
 }
 
 // ─── Version / update-available check ─────────────────────────────────────────
@@ -365,7 +383,12 @@ fn first_repo_digest(inspect: &Value) -> Option<String> {
 /// host can reach the API but not that agent port directly (it's published
 /// loopback-only). Absence of the agent is a normal dev/grace state, not an error:
 /// on any failure this returns HTTP 200 `{"reachable": false}`, never a 5xx.
-async fn agent_status() -> Json<Value> {
+///
+/// Anonymous callers (the pre-login `ActivationGate`, see [`public_router`]) get
+/// only the two booleans that gate actually reads. The full agent payload —
+/// licence tier, credit balance, versions — stays behind a session; its only
+/// consumers (`LicenseBanner`, Settings) render inside the authenticated shell.
+async fn agent_status(Extension(claims): Extension<Option<JwtClaims>>) -> Json<Value> {
     let base = std::env::var("GCTRL_AGENT_URL").unwrap_or_else(|_| "http://gctrl-agent:7070".to_string());
     let base = base.trim_end_matches('/').to_string();
 
@@ -384,6 +407,10 @@ async fn agent_status() -> Json<Value> {
 
     match fetched {
         Some(mut v) => {
+            if claims.is_none() {
+                let activated = v.get("activated").cloned().unwrap_or(json!(false));
+                return Json(json!({ "reachable": true, "activated": activated }));
+            }
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("reachable".to_string(), json!(true));
             }
