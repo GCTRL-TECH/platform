@@ -50,6 +50,16 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:4010:4010"
+    # On Linux, host.docker.internal does NOT exist inside a container unless it
+    # is mapped here (Docker Desktop provides it, plain Docker does not). The
+    # installer points NEO4J_URI / QDRANT_URL / OLLAMA_BASE / EMBEDDING_BASE_URL
+    # at that name for every service it detects running on the host - so without
+    # this line embeddings AND relation extraction fail to resolve it, the job
+    # still reports "completed", and the graph comes out with entities but zero
+    # edges. Every service that can receive one of those URLs needs the mapping;
+    # scripts/check-compose-hosts.py keeps installer and template in lockstep.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
       - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
@@ -114,6 +124,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:4020:4020"
+    # Same host-service mapping as gctrl-kex above - FUSE gets NEO4J_URI,
+    # QDRANT_URL and OLLAMA_BASE too, so distill breaks the same way without it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - NEO4J_URI=${NEO4J_URI:-bolt://gctrl-neo4j:7687}
       - NEO4J_USER=${NEO4J_USER:-neo4j}

@@ -354,6 +354,20 @@ def _run_pipeline_impl(
         successful_embeddings = sum(1 for v in embeddings if v is not None)
         _sp.set_attribute("kex.embedded", successful_embeddings)
     logger.info(f"[{job_id}] Embedded: {successful_embeddings}/{len(embeddings)} vectors")
+    # An embedding backend that can't be reached returns None for every chunk. That
+    # was previously visible ONLY as "0/N vectors" in the log while the job still
+    # reported a plain success — same silent failure class as a skipped RelEx, so it
+    # degrades the job the same way.
+    if embeddings and successful_embeddings == 0:
+        warnings.append(
+            "No embeddings were produced — semantic search over this document is "
+            "unavailable. Check the embedding runtime in Settings → Infrastructure."
+        )
+    elif successful_embeddings < len(embeddings):
+        warnings.append(
+            f"Only {successful_embeddings} of {len(embeddings)} chunks were embedded — "
+            "semantic search over this document is incomplete."
+        )
 
     # 6. Map entity mentions to chunks by character offset
     chunk_entities: list[list[dict]] = []
@@ -387,6 +401,10 @@ def _run_pipeline_impl(
         logger.info(f"[{job_id}] Vector store: {chunks_stored} chunks stored")
     except Exception as exc:
         logger.warning(f"[{job_id}] Vector store failed (non-fatal): {exc}")
+        warnings.append(
+            "Chunks could not be stored — this document is not retrievable via "
+            "search or chat."
+        )
 
     # 7b. Session fact log (fail-soft, fully local): distill the document into
     # atomic memory facts stored as their own small chunks under this job —

@@ -237,9 +237,10 @@ while [ "$POLL_COUNT" -lt "$MAX_POLL" ]; do
   RESP=$(auth_curl "${API_BASE}/kex/jobs/${JOB_ID}" 2>/dev/null) || RESP=""
   if [ -n "$RESP" ]; then
     JOB_STATUS=$(json_get "$RESP" "status")
-    if [ "$JOB_STATUS" = "completed" ] || [ "$JOB_STATUS" = "failed" ]; then
-      break
-    fi
+    # completed_degraded is terminal too: the job finished with a phase skipped.
+    case "$JOB_STATUS" in
+      completed*|failed) break ;;
+    esac
   fi
   sleep 3
   POLL_COUNT=$(( POLL_COUNT + 1 ))
@@ -247,6 +248,10 @@ done
 
 if [ "$JOB_STATUS" = "completed" ]; then
   pass_test
+elif [ "$JOB_STATUS" = "completed_degraded" ]; then
+  # A graph without relations/embeddings is not a passing smoke test, even though
+  # the job itself did not fail — that silent pass is the bug this state exists for.
+  fail_test "job completed DEGRADED: $(json_get "$RESP" "degradedReason")"
 elif [ "$JOB_STATUS" = "failed" ]; then
   JOB_ERR=$(json_get "$RESP" "error")
   fail_test "job failed: ${JOB_ERR}"

@@ -5,11 +5,12 @@ import { useAuth } from '@/hooks/useAuth'
 import { useApiQuery } from '@/hooks/useApi'
 import { useUiMode } from '@/hooks/useUiMode'
 import { cn } from '@/lib/utils'
+import { isCompleted, type JobStatus } from '@/lib/jobStatus'
 
 interface KexJob {
   id: string
   type: string
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  status: JobStatus
   createdAt: string
   input?: string
 }
@@ -56,6 +57,7 @@ const STATUS_BADGE: Record<string, { className: string; label: string }> = {
   pending: { className: 'badge-yellow', label: 'Pending' },
   processing: { className: 'badge-blue', label: 'Processing' },
   completed: { className: 'badge-green', label: 'Completed' },
+  completed_degraded: { className: 'badge-yellow', label: 'Incomplete' },
   failed: { className: 'badge-red', label: 'Failed' },
 }
 
@@ -85,7 +87,7 @@ export function DashboardPage() {
   // only while talking to an older API without the total fields.
   const totalJobs = jobsData?.total ?? jobs.length
   const completedJobs =
-    jobsData?.completed ?? jobs.filter((j) => j.status === 'completed').length
+    jobsData?.completed ?? jobs.filter((j) => isCompleted(j.status)).length
   const graphCount = compsData?.total ?? compsData?.compilations?.length ?? 0
 
   return (

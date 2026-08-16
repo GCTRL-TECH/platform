@@ -46,6 +46,20 @@ jobs:
       - run: cd services/license-api && npm ci
       - run: cd services/license-api && npx tsc --noEmit
 
+  check-compose-hosts:
+    name: Compose host mapping
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      # Fails if the installer can point a service at host.docker.internal that the
+      # shipped compose files cannot resolve (Linux needs an explicit host-gateway
+      # mapping) — the cause of edgeless graphs on native-Ollama Linux installs.
+      - run: python3 scripts/check-compose-hosts.py
+
   test-agent:
     name: Test Agent
     runs-on: ubuntu-latest

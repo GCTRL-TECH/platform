@@ -3,11 +3,14 @@ import { XCircle, Trash2, RotateCw } from 'lucide-react'
 import type { MouseEvent } from 'react'
 import { formatDistanceToNow } from 'date-fns'
 import { cn } from '@/lib/utils'
+import { isDegraded, type JobStatus } from '@/lib/jobStatus'
 
 export interface KexJob {
   id: string
   type: string
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  status: JobStatus
+  /** Why the graph is incomplete — set only for `completed_degraded`. */
+  degradedReason?: string | null
   createdAt: string
   completedAt?: string | null
   input?: Record<string, unknown>
@@ -26,6 +29,9 @@ const STATUS_BADGE: Record<string, { className: string; label: string; dot: stri
   pending: { className: 'badge-yellow', label: 'Pending', dot: 'bg-amber-400' },
   processing: { className: 'badge-blue', label: 'Processing', dot: 'bg-blue-400' },
   completed: { className: 'badge-green', label: 'Completed', dot: 'bg-emerald-400' },
+  // Finished, but a phase was skipped — amber, and the row carries the reason as
+  // its tooltip so the incomplete graph is visible in the list itself.
+  completed_degraded: { className: 'badge-yellow', label: 'Incomplete', dot: 'bg-amber-400' },
   failed: { className: 'badge-red', label: 'Failed', dot: 'bg-red-400' },
 }
 
@@ -92,7 +98,12 @@ export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProp
       </div>
 
       {/* Status badge — fixed width */}
-      <span className={cn(badge.className, 'shrink-0 text-[9px] w-16 text-center')}>{badge.label}</span>
+      <span
+        className={cn(badge.className, 'shrink-0 text-[9px] w-16 text-center')}
+        title={isDegraded(job.status) ? (job.degradedReason ?? undefined) : undefined}
+      >
+        {badge.label}
+      </span>
 
       {/* Entities — always rendered, fixed width */}
       <span className="shrink-0 text-[10px] text-slate-500 w-12 text-right">{entities !== null ? `${entities} ent` : '—'}</span>

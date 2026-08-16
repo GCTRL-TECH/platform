@@ -60,10 +60,17 @@ export function registerKex(program: Command): void {
           for (let i = 0; i < 120; i++) {
             await new Promise(r => setTimeout(r, 3000))
             const { data } = await client.get(`/kex/jobs/${jobId}/result`)
-            const result = data as { status: string; result?: KexResult }
-            if (result.status === 'done' || result.status === 'completed') {
+            const result = data as { status: string; degradedReason?: string | null; result?: KexResult }
+            // `completed_degraded` = finished, but a phase (relations/embeddings)
+            // was skipped. Terminal like any completion — but say so, don't cheer.
+            if (result.status === 'done' || result.status.startsWith('completed')) {
               const r = result.result ?? {}
-              waitSpinner.succeed(`Done — ${r.entities ?? r.nodes ?? '?'} entities, ${r.relations ?? r.edges ?? '?'} relations`)
+              const summary = `${r.entities ?? r.nodes ?? '?'} entities, ${r.relations ?? r.edges ?? '?'} relations`
+              if (result.status === 'completed_degraded') {
+                waitSpinner.warn(`Done, but incomplete — ${summary}. ${result.degradedReason ?? ''}`.trim())
+              } else {
+                waitSpinner.succeed(`Done — ${summary}`)
+              }
               return
             }
             if (result.status === 'failed') {

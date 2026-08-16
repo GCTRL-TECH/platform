@@ -44,6 +44,7 @@ import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useUiMode } from '@/hooks/useUiMode'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { isCompleted, isDegraded } from '@/lib/jobStatus'
 import { getToken } from '@/lib/auth'
 import { pickDefaultChatModel, isValidChatSelection } from '@/lib/models'
 import { formatDistanceToNow } from 'date-fns'
@@ -1626,12 +1627,18 @@ export function TalkToGraphPage() {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         })
         if (!res.ok) return // transient (e.g. job not visible yet) — keep polling
-        const data = (await res.json()) as { job?: { status?: string; error?: string } }
+        const data = (await res.json()) as {
+          job?: { status?: string; error?: string; degradedReason?: string | null }
+        }
         const status = data.job?.status
         if (cancelled) return
-        if (status === 'completed') {
+        if (isCompleted(status)) {
           setExtractionPhase('done')
-          setExtractionResult('Import complete — knowledge graph updated.')
+          setExtractionResult(
+            isDegraded(status)
+              ? `Import finished, but incomplete — ${data.job?.degradedReason ?? 'a processing phase was skipped'}`
+              : 'Import complete — knowledge graph updated.',
+          )
           setTrackedJobId(null)
         } else if (status === 'failed') {
           setExtractionPhase('failed')

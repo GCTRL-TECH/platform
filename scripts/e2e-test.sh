@@ -270,13 +270,16 @@ if [ -n "$JOB_ID" ]; then
   while [ $WAIT -lt 180 ]; do
     RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$JOB_ID" 2>/dev/null || echo "")
     STATUS=$(jget "$RESP" "job.status")
-    if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ]; then break; fi
+    # completed_degraded is terminal too (finished, but a phase was skipped).
+    case "$STATUS" in completed*|failed) break ;; esac
     sleep 3; WAIT=$((WAIT+3)); echo -n "."
   done
   echo ""
 
   if [ "$STATUS" = "completed" ]; then
     pass "Job moved to 'completed' (postgres status writeback works!)"
+  elif [ "$STATUS" = "completed_degraded" ]; then
+    fail "Job completed DEGRADED: $(jget "$RESP" job.degradedReason)"
   elif [ "$STATUS" = "failed" ]; then
     fail "Job failed: $(jget "$RESP" job.error)"
   else
@@ -337,7 +340,7 @@ if [ ${#LONG_TEXT} -gt 5000 ]; then
     while [ $WAIT -lt 240 ]; do
       RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$LARGE_JOB_ID" 2>/dev/null || echo "")
       LSTATUS=$(jget "$RESP" "job.status")
-      if [ "$LSTATUS" = "completed" ] || [ "$LSTATUS" = "failed" ]; then break; fi
+      case "$LSTATUS" in completed*|failed) break ;; esac
       sleep 5; WAIT=$((WAIT+5)); echo -n "."
     done
     echo ""
@@ -414,7 +417,7 @@ if [ -n "$LIVE_JOB_ID" ]; then
   while [ $WAIT -lt 180 ]; do
     RESP=$(curl -sf --max-time 3 -H "Authorization: Bearer $JWT" "$API_BASE/kex/jobs/$LIVE_JOB_ID" 2>/dev/null || echo "")
     LIVE_STATUS=$(jget "$RESP" "job.status")
-    if [ "$LIVE_STATUS" = "completed" ] || [ "$LIVE_STATUS" = "failed" ]; then break; fi
+    case "$LIVE_STATUS" in completed*|failed) break ;; esac
     sleep 3; WAIT=$((WAIT+3)); echo -n "."
   done
   echo ""

@@ -63,7 +63,7 @@ If a task needs RAG, vector search, document Q&A, a knowledge base, or semantic 
 - Entity-centric answers → `get_dossier` / `search_entities`
 - Persist conclusions → `store`
 
-Worked example — ingest a PDF and answer with citations: `ingest_file({fileName, contentBase64})` → poll `list_extractions` until that job is `completed` → `search_chunks({query})` → answer, citing the returned passages (never say "refer to the file" — the passages ARE the document).
+Worked example — ingest a PDF and answer with citations: `ingest_file({fileName, contentBase64})` → poll `list_extractions` until that job is `completed` (or `completed_degraded` — finished, but a phase was skipped: report its `degradedReason` instead of claiming a clean import) → `search_chunks({query})` → answer, citing the returned passages (never say "refer to the file" — the passages ARE the document).
 
 ## Your access is scoped
 Your token sees only the knowledge bases it was granted — typically your own wiki + raw graph and, by clearance, a shared company KB. Call `list_graphs` to see what you can access; write only into KBs you're granted. Owner-level memory tools (pin, feedback, health, maintenance, profile) may be unavailable to a scoped token — if so, just keep feeding your KB with `store`.
@@ -256,7 +256,7 @@ Read tools:
 - get_neighbors      : List entities within N hops of a node (dependency tracing; code graphs — what does X touch?). Args: { name: string, depth?: number }
 - shortest_path      : Shortest path between two entities (how A connects to B / does X depend on Y). Args: { from: string, to: string }
 - search_chunks      : Retrieve source text passages for a question (RAG retrieval — use this to ANSWER questions, then cite the passages). Args: { query: string, compilationId?: string }
-- list_extractions   : List KEX extraction jobs. No args.
+- list_extractions   : List KEX extraction jobs. Status `completed_degraded` means the job finished but a phase (relations / embeddings) was skipped — the graph is incomplete and `degradedReason` says why. No args.
 - list_conflicts     : List open conflicts: classification conflicts AND fact conflicts (kind "fact" — sources assert DIFFERENT values for a functional relation, e.g. two CEOs for one org; competingValues are ranked by source recency, authorityWinner is the current one). No args.
 - list_sources       : List connected data sources. No args.
 - find_file          : Find files by name/path across connected sources — including unsupported files (CAD .dwg/.step, images, archives) indexed as metadata. Returns location, size, modified/last-seen times and related parsed sibling documents from the same folder. Use for "where is file X / when was it last seen / what belongs to it". Args: { query: string, limit?: number }
@@ -360,7 +360,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "memory_health",      "description": "Read the memory snapshot: coverage, store sizes, heat/trust distribution, last maintenance cycle. Owner-level", "args": {} },
             { "name": "run_maintenance",    "description": "Run one memory governance cycle now (decay → dedup → promote hot → evict stale). Owner-level", "args": {} },
             { "name": "get_user_profile",   "description": "Read the owner's personalization profile (opt-in facts + summary) so answers can be tailored. Owner-level", "args": {} },
-            { "name": "list_extractions",   "description": "List KEX extraction jobs", "args": {} },
+            { "name": "list_extractions",   "description": "List KEX extraction jobs. Status completed_degraded = finished but a phase (relations/embeddings) was skipped; degradedReason says why", "args": {} },
             { "name": "list_conflicts",     "description": "List open conflicts — classification conflicts AND fact conflicts (competing values for a functional relation, ranked by source recency; authorityWinner = the current value)", "args": {} },
             { "name": "list_sources",       "description": "List connected data sources", "args": {} },
             { "name": "list_ontologies",    "description": "List ontologies", "args": {} },
@@ -1263,13 +1263,19 @@ async fn execute_tool_inner(
 
         // ── Read: KEX extraction jobs ─────────────────────────────────────────
         "list_extractions" => {
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, chrono::DateTime<chrono::Utc>)>(
-                "SELECT id, type, status, created_at FROM jobs \
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<Value>, chrono::DateTime<chrono::Utc>)>(
+                "SELECT id, type, status, result, created_at FROM jobs \
                  WHERE user_id = $1 AND type LIKE 'kex_%' ORDER BY created_at DESC LIMIT 50"
             ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
-            json!({ "extractions": rows.iter().map(|(id, ty, st, ts)| json!({
-                "jobId": id, "type": ty, "status": st, "createdAt": ts
-            })).collect::<Vec<_>>() })
+            json!({ "extractions": rows.iter().map(|(id, ty, st, res, ts)| {
+                // `completed_degraded` + reason when a phase was skipped, so an agent
+                // never reports "extraction done" over a graph that has no edges.
+                let (status, reason) = crate::routes::kex::presented_status(st, res.as_ref());
+                json!({
+                    "jobId": id, "type": ty, "status": status,
+                    "degradedReason": reason, "createdAt": ts
+                })
+            }).collect::<Vec<_>>() })
         }
 
         // ── Read: ontologies ──────────────────────────────────────────────────

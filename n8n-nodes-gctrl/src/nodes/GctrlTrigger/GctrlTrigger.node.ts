@@ -75,11 +75,14 @@ export class GctrlTrigger implements INodeType {
 			jobs.push(...fuseJobs);
 		}
 
-		// Filter to completed jobs since last check
+		// Filter to completed jobs since last check. `completed_degraded` counts:
+		// the job finished, but a phase was skipped — the item still flows through
+		// the workflow, carrying its `degradedReason` so downstream nodes can react.
 		const newJobs = jobs.filter((job) => {
 			const completedAt = job.completedAt as string;
+			const status = job.status as string;
 			return (
-				job.status === 'completed' &&
+				(status === 'completed' || status === 'completed_degraded') &&
 				completedAt &&
 				new Date(completedAt) > new Date(lastChecked)
 			);

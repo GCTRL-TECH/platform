@@ -25,6 +25,7 @@ import { formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { isCompleted, type JobStatus } from '@/lib/jobStatus'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
 import { useAuth } from '@/hooks/useAuth'
 import { resolveSourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
@@ -36,7 +37,7 @@ import { ConflictsPanel } from '@/components/conflicts/ConflictsPanel'
 interface KexJob {
   id: string
   type: string
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  status: JobStatus
   createdAt: string
   completedAt?: string | null
   input?: Record<string, unknown>
@@ -147,7 +148,9 @@ function SourcePicker({
     '/kex/jobs'
   )
 
-  const completedJobs = (kexData?.jobs ?? []).filter((j) => j.status === 'completed')
+  // isCompleted, not === 'completed': a degraded extraction produced a real (if
+  // incomplete) graph and must stay fusable instead of vanishing from the picker.
+  const completedJobs = (kexData?.jobs ?? []).filter((j) => isCompleted(j.status))
 
   const filtered = search.trim()
     ? completedJobs.filter((j) => {

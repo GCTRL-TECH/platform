@@ -246,7 +246,9 @@ registerToolWithAlias<{
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 3000));
       job = (await apiCall('GET', `/kex/jobs/${result.jobId}`)) as typeof job;
-      if (job.job.status === 'completed' || job.job.status === 'failed') {
+      // `completed_degraded` is terminal too (finished, but a phase was skipped) —
+      // treating only 'completed' as done left the poll spinning its full budget.
+      if (job.job.status.startsWith('completed') || job.job.status === 'failed') {
         break;
       }
     }
@@ -270,6 +272,9 @@ registerToolWithAlias<{
         text: JSON.stringify({
           jobId: result.jobId,
           status: finalJob['status'] || 'completed',
+          // Set when status is completed_degraded: the extraction finished but a
+          // phase was skipped, so the graph is incomplete. Report it, don't hide it.
+          degradedReason: finalJob['degradedReason'] ?? null,
           compilationId: compilationId || null,
           linkedToCompilation,
           entities: (finalJob['result'] as Record<string, unknown>)?.['entities'] || [],
@@ -907,7 +912,7 @@ registerToolWithAlias<{
       for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 3000));
         const job = (await apiCall('GET', `/kex/jobs/${result.jobId}`)) as { job: { status: string } };
-        if (job.job.status === 'completed' || job.job.status === 'failed') {
+        if (job.job.status.startsWith('completed') || job.job.status === 'failed') {
           break;
         }
       }

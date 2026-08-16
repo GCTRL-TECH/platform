@@ -10,6 +10,7 @@ import {
   GitBranch,
   Hash,
   AlertCircle,
+  AlertTriangle,
   ThumbsUp,
   ThumbsDown,
   Shield,
@@ -18,6 +19,7 @@ import { format } from 'date-fns'
 import { useApiQuery } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { cn } from '@/lib/utils'
+import { isCompleted, isDegraded, type JobStatus } from '@/lib/jobStatus'
 
 interface Entity {
   text: string
@@ -35,7 +37,9 @@ interface Relation {
 interface JobData {
   id: string
   type: string
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  status: JobStatus
+  /** Why the graph is incomplete — set only for `completed_degraded`. */
+  degradedReason?: string | null
   createdAt: string
   updatedAt?: string
   completedAt?: string
@@ -92,7 +96,7 @@ function getStepStatus(stepKey: string, jobStatus: string): StepStatus {
     return 'done'
   }
   if (stepKey === 'completed') {
-    if (jobStatus === 'completed') return 'done'
+    if (isCompleted(jobStatus)) return 'done'
     return 'pending'
   }
   return 'pending'
@@ -109,6 +113,7 @@ const STATUS_BADGE: Record<string, { className: string; label: string }> = {
   pending: { className: 'badge-yellow', label: 'Pending' },
   processing: { className: 'badge-blue', label: 'Processing' },
   completed: { className: 'badge-green', label: 'Completed' },
+  completed_degraded: { className: 'badge-yellow', label: 'Completed (incomplete)' },
   failed: { className: 'badge-red', label: 'Failed' },
 }
 
@@ -138,7 +143,7 @@ export function KexJobDetail() {
     ['kex', 'jobs', id, 'result'],
     `/kex/jobs/${id}/result`,
     {
-      enabled: !!id && job?.status === 'completed',
+      enabled: !!id && isCompleted(job?.status),
     }
   )
 
@@ -238,10 +243,22 @@ export function KexJobDetail() {
             <span>{job.error}</span>
           </div>
         )}
+
+        {/* Finished, but a phase was skipped — say so here instead of leaving it
+            in the KEX log, where nobody looks until the graph is visibly empty. */}
+        {isDegraded(job.status) && (
+          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-300">
+            <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+            <span>
+              {job.degradedReason ??
+                'A processing phase was skipped, so this graph is incomplete.'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Stats */}
-      {job.status === 'completed' && graphStats && (
+      {isCompleted(job.status) && graphStats && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="card flex items-center gap-4">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">
@@ -265,7 +282,7 @@ export function KexJobDetail() {
       )}
 
       {/* PII Shield */}
-      {job.status === 'completed' && resultData?.result?.pii_findings && (
+      {isCompleted(job.status) && resultData?.result?.pii_findings && (
         <div className={cn(
           "card flex items-start gap-4 border",
           resultData.result.pii_findings.has_pii

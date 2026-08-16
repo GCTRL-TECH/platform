@@ -32,6 +32,37 @@ struct ExtractReq {
     #[serde(rename = "compilationId")]       compilation_id:         Option<Uuid>,
 }
 
+/// The status a caller is shown for a finished job.
+///
+/// A job whose relation extraction or embedding phase fell over still finished —
+/// KEX keeps whatever it got instead of failing the customer's document — but the
+/// graph it produced is INCOMPLETE (typically entities without a single edge, and
+/// the isolated ones get pruned afterwards). Reporting that as a plain `completed`
+/// is what made a broken install look healthy: the only trace was a line in the
+/// KEX log.
+///
+/// KEX flags it in the result payload (`degraded` + `warning`, see
+/// `services/kex/src/main.py`). The `jobs.status` COLUMN deliberately stays
+/// `completed` — every filter, count and retry path keeps its meaning — while every
+/// read surface (job list, job detail, result, agent `list_extractions`) reports the
+/// distinguishable `completed_degraded` plus the reason. Terminal-success checks in
+/// clients therefore test `status.startsWith("completed")`.
+pub(crate) fn presented_status(status: &str, result: Option<&Value>) -> (String, Option<String>) {
+    let degraded = status == "completed"
+        && result
+            .and_then(|r| r.get("degraded"))
+            .and_then(|d| d.as_bool())
+            .unwrap_or(false);
+    if !degraded {
+        return (status.to_string(), None);
+    }
+    let reason = result
+        .and_then(|r| r.get("warning"))
+        .and_then(|w| w.as_str())
+        .map(|s| s.to_string());
+    ("completed_degraded".to_string(), reason)
+}
+
 /// Link a freshly-created extraction job into a compilation's `source_job_ids`,
 /// if the caller owns that compilation. Idempotent (`array_append` only when the
 /// id isn't already present) and owner-scoped (the `user_id` guard means a caller
@@ -699,8 +730,10 @@ async fn list_jobs(
     .fetch_all(&state.db).await?;
 
     let jobs: Vec<Value> = rows.into_iter().map(|(id, t, status, input, result, error, created, completed)| {
+        let (status, degraded_reason) = presented_status(&status, result.as_ref());
         json!({
             "id": id, "type": t, "status": status,
+            "degradedReason": degraded_reason,
             "input": input, "result": result, "error": error,
             "createdAt": created, "completedAt": completed,
         })
@@ -732,8 +765,10 @@ async fn get_job(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
     let (id, t, status, input, result, error, created, completed) = row;
+    let (status, degraded_reason) = presented_status(&status, result.as_ref());
     Ok(Json(json!({ "job": {
         "id": id, "type": t, "status": status,
+        "degradedReason": degraded_reason,
         "input": input, "result": result, "error": error,
         "createdAt": created, "completedAt": completed,
     } })))
@@ -752,9 +787,11 @@ async fn get_result(
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
     let (status, result, completed_at) = row;
+    let (status, degraded_reason) = presented_status(&status, result.as_ref());
     Ok(Json(json!({
         "jobId": id,
         "status": status,
+        "degradedReason": degraded_reason,
         "completedAt": completed_at,
         "result": result,
     })))
@@ -1046,4 +1083,37 @@ pub(crate) async fn delete_chunk_core(
     crate::services::audit::log_access(&state.db, claims, "chunk.delete",
         "chunk", &id.to_string(), eff, None, true, None).await;
     Ok(vector_deleted)
+}
+
+#[cfg(test)]
+mod degraded_status_tests {
+    use super::presented_status;
+    use serde_json::json;
+
+    #[test]
+    fn plain_completion_is_unchanged() {
+        let r = json!({ "entities": [], "relations": [] });
+        assert_eq!(presented_status("completed", Some(&r)), ("completed".into(), None));
+        assert_eq!(presented_status("completed", None), ("completed".into(), None));
+    }
+
+    #[test]
+    fn a_skipped_phase_is_reported_as_degraded_with_its_reason() {
+        let r = json!({
+            "degraded": true,
+            "warning": "Extracted 4 entities; Relation extraction skipped — LLM unavailable."
+        });
+        let (status, reason) = presented_status("completed", Some(&r));
+        assert_eq!(status, "completed_degraded");
+        assert!(reason.unwrap().contains("Relation extraction skipped"));
+    }
+
+    #[test]
+    fn only_a_completed_job_can_be_degraded() {
+        // A failed/pending job keeps its own status — `degraded` in a stale result
+        // payload must never rewrite it.
+        let r = json!({ "degraded": true, "warning": "…" });
+        assert_eq!(presented_status("failed", Some(&r)).0, "failed");
+        assert_eq!(presented_status("processing", Some(&r)).0, "processing");
+    }
 }
