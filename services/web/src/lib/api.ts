@@ -70,8 +70,19 @@ api.interceptors.response.use(
 
       const refreshToken = getRefreshToken()
       if (!refreshToken) {
+        // Only bounce someone who ACTUALLY had a session. A visitor who was never
+        // logged in still triggers 401s from the probes that run before any login —
+        // ActivationGate calls `/update/agent-status`, which sits behind require_auth.
+        // Hard-redirecting there reloads the whole app, which mounts ActivationGate,
+        // which probes again: an endless reload loop that looks like the login page
+        // flickering. It never showed up in development because ActivationGate skips
+        // itself on localhost/.local/192.168.*/10.* (isLocalDev in App.tsx), so the
+        // loop only ever appeared under a real hostname.
+        const hadSession = !!getToken()
         clearAuthStorage()
-        window.location.href = '/login'
+        if (hadSession && window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
         return Promise.reject(error)
       }
 
@@ -91,7 +102,12 @@ api.interceptors.response.use(
       } catch (refreshError) {
         processQueue(refreshError, null)
         clearAuthStorage()
-        window.location.href = '/login'
+        // Here a session really did exist and its refresh failed, so bouncing to the
+        // login form is right — but not when we are already standing on it, which
+        // would reload in place forever.
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
         return Promise.reject(refreshError)
       } finally {
         isRefreshing = false
