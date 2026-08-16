@@ -1066,11 +1066,10 @@ async fn execute_tool_inner(
             let Some((jobs,)) = row else { return json!({ "error": "graph not found" }); };
             let uid = claims.sub.to_string();
             let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-            let scope = if jobs.is_empty() {
-                "n._owner = $uid".to_string()
-            } else {
-                crate::services::neo4j::job_scope("n", "jobIds")
-            };
+            // Jobs only — an empty knowledge base is empty (neo4j::job_scope). The old
+            // owner-wide fallback made this the agent-side twin of the REST leak: an
+            // agent asking "what is in MY knowledge base" got the whole account back.
+            let scope = crate::services::neo4j::job_scope("n", "jobIds");
 
             crate::services::audit::log_access(&state.db, claims, "agent.get_graph", "compilation", &cid.to_string(), rank, None, true, None).await;
 

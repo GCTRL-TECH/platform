@@ -48,6 +48,20 @@ pub fn source_jobs_expr(alias: &str) -> String {
 /// Replaces the old `alias._source_job IN $jobs`, which only ever tested the
 /// latest contributor and therefore hid nodes that a scoped token legitimately
 /// owns (and, worse, made deletion unable to tell shared nodes from private ones).
+///
+/// THE definition of "what is in a knowledge base", and it holds for the EMPTY
+/// list too: an empty `$<param>` matches nothing, so a knowledge base without
+/// source jobs is empty. Every compilation-scoped read must go through this and
+/// must never substitute an owner-wide clause (`alias._owner = $uid`) when the
+/// job list happens to be empty.
+///
+/// That substitution was the bug fixed on 2026-08-16: a compilation with no
+/// source jobs was rendered as "the owner's entire graph" in the counts, the
+/// graph view, the public embed and the entity read. Any freshly created — and
+/// therefore still empty — knowledge base showed the whole account: on the shared
+/// VPS install a colleague's brand-new personal KB listed all 14 nodes of the
+/// account owner's test data. An owner-wide clause answers "what does this ACCOUNT
+/// hold", which is never the question a single knowledge base asks.
 pub fn job_scope(alias: &str, param: &str) -> String {
     format!("any(__sj IN {} WHERE __sj IN ${param})", source_jobs_expr(alias))
 }
@@ -231,5 +245,35 @@ mod tests {
     fn purge_stats_add_up() {
         let s = PurgeStats { nodes_deleted: 3, rels_deleted: 4 };
         assert_eq!(s.total(), 7);
+    }
+
+    /// A knowledge base without source jobs is EMPTY — it is never the owner's
+    /// whole graph.
+    ///
+    /// The regression: every compilation-scoped path in routes::kg used to carry an
+    /// `if source_job_ids.is_empty() { "n._owner = $uid" }` branch. A knowledge base
+    /// that had not been extracted into yet therefore rendered the entire account —
+    /// including the anonymous `/public` embed and the mutation paths, where a delete
+    /// aimed at an empty knowledge base reached into every other one. On the shared
+    /// install this put the account owner's test data (person, company, city nodes)
+    /// into a colleague's brand-new personal knowledge base.
+    ///
+    /// The guard is a source-level one on purpose: the leak was never in the Cypher
+    /// this module builds, it was in callers substituting a DIFFERENT clause when the
+    /// job list was empty. So the test reads the call sites.
+    #[test]
+    fn no_compilation_read_falls_back_to_the_whole_account() {
+        let kg = include_str!("../routes/kg.rs");
+        for needle in [
+            "\"n._owner = $uid AND NOT n:Compilation\"",
+            "\"n._owner = $uid\".to_string()",
+            "\"a._owner = $uid\".to_string()",
+            "\"a._owner = $uid AND b._owner = $uid\".to_string()",
+        ] {
+            assert!(
+                !kg.contains(needle),
+                "routes/kg.rs re-introduced an owner-wide fallback for a compilation scope: {needle}"
+            );
+        }
     }
 }

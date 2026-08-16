@@ -680,51 +680,31 @@ pub(crate) async fn resolve_graph_uri(
 /// native UUID type — `kg_builder.py` writes them as strings.
 async fn live_counts(
     neo: &neo4rs::Graph,
-    user_id: &str,
     source_job_ids: &[Uuid],
 ) -> (i64, i64) {
-    if source_job_ids.is_empty() {
-        // Default compilation → user's full graph.
-        let node_cypher = "MATCH (n) WHERE n._owner = $uid RETURN count(n) AS c";
-        let edge_cypher = "MATCH (n)-[r]->() WHERE n._owner = $uid RETURN count(r) AS c";
+    // A knowledge base IS its source jobs — including when it has none. The empty
+    // case used to fall back to `n._owner = $uid`, i.e. the owner's ENTIRE graph
+    // (see neo4j::job_scope for what that leaked).
+    let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
+    let scope = crate::services::neo4j::job_scope("n", "jobIds");
+    let node_cypher = format!("MATCH (n) WHERE {scope} RETURN count(n) AS c");
+    let edge_cypher = format!("MATCH (n)-[r]->() WHERE {scope} RETURN count(r) AS c");
 
-        let nodes = match neo.execute(neo_query(node_cypher).param("uid", user_id.to_string())).await {
-            Ok(mut s) => match s.next().await {
-                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
-                _ => 0,
-            },
-            Err(_) => 0,
-        };
-        let edges = match neo.execute(neo_query(edge_cypher).param("uid", user_id.to_string())).await {
-            Ok(mut s) => match s.next().await {
-                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
-                _ => 0,
-            },
-            Err(_) => 0,
-        };
-        (nodes, edges)
-    } else {
-        let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
-        let scope = crate::services::neo4j::job_scope("n", "jobIds");
-        let node_cypher = format!("MATCH (n) WHERE {scope} RETURN count(n) AS c");
-        let edge_cypher = format!("MATCH (n)-[r]->() WHERE {scope} RETURN count(r) AS c");
-
-        let nodes = match neo.execute(neo_query(&node_cypher).param("jobIds", job_strs.clone())).await {
-            Ok(mut s) => match s.next().await {
-                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
-                _ => 0,
-            },
-            Err(_) => 0,
-        };
-        let edges = match neo.execute(neo_query(&edge_cypher).param("jobIds", job_strs)).await {
-            Ok(mut s) => match s.next().await {
-                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
-                _ => 0,
-            },
-            Err(_) => 0,
-        };
-        (nodes, edges)
-    }
+    let nodes = match neo.execute(neo_query(&node_cypher).param("jobIds", job_strs.clone())).await {
+        Ok(mut s) => match s.next().await {
+            Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+            _ => 0,
+        },
+        Err(_) => 0,
+    };
+    let edges = match neo.execute(neo_query(&edge_cypher).param("jobIds", job_strs)).await {
+        Ok(mut s) => match s.next().await {
+            Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+            _ => 0,
+        },
+        Err(_) => 0,
+    };
+    (nodes, edges)
 }
 
 async fn list(
@@ -782,7 +762,6 @@ async fn list(
     };
     let privacy_map: std::collections::HashMap<Uuid, String> = privacy_rows.into_iter().collect();
 
-    let user_id_str = claims.sub.to_string();
     let mut comps: Vec<Value> = Vec::with_capacity(rows.len());
     for (id, n, d, cls, sji, nc, ec, fid, c, clid, ctype, wiki_src, last_distill, page_count, is_system, embed_public) in rows {
         if let Some(set) = &scope { if !set.contains(&id) { continue; } }
@@ -791,7 +770,7 @@ async fn list(
         let stored_ec = ec.unwrap_or(0);
         // N+1 query — acceptable while typical users have <20 compilations.
         // Batch later if it becomes a hotspot.
-        let (live_nodes, live_edges) = live_counts(&state.neo, &user_id_str, &sji).await;
+        let (live_nodes, live_edges) = live_counts(&state.neo, &sji).await;
         let final_nodes = if live_nodes > 0 { live_nodes as i32 } else { stored_nc };
         let final_edges = if live_edges > 0 { live_edges as i32 } else { stored_ec };
         comps.push(json!({
@@ -979,10 +958,9 @@ async fn get_one(
         }
     }
 
-    let user_id_str = claims.sub.to_string();
     let stored_nc = nc.unwrap_or(0);
     let stored_ec = ec.unwrap_or(0);
-    let (live_nodes, live_edges) = live_counts(&state.neo, &user_id_str, &sji).await;
+    let (live_nodes, live_edges) = live_counts(&state.neo, &sji).await;
     let final_nodes = if live_nodes > 0 { live_nodes as i32 } else { stored_nc };
     let final_edges = if live_edges > 0 { live_edges as i32 } else { stored_ec };
 
@@ -1786,19 +1764,19 @@ async fn get_graph(
     let user_id_str = claims.sub.to_string();
     let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
-    // Build the WHERE clause based on whether this compilation has explicit
-    // source jobs (merge result) or not (default = full user graph). The
-    // optional `node_type` label is validated above and safe to interpolate.
+    // The WHERE clause is the compilation's source jobs, and ONLY those — an empty
+    // job list matches nothing (neo4j::job_scope). It used to fall back to
+    // `n._owner = $uid` for a compilation without source jobs, which showed the
+    // owner's ENTIRE graph in every still-empty knowledge base.
     //
     // `NOT n:Compilation` excludes the structural FUSE metadata node (one per
     // compilation, no `name`, links to every member entity so it would otherwise
     // top the degree ranking). It is not a knowledge entity and must never show
     // in the explorer — including it made the "core" an empty unlabeled hub.
-    let scope = if source_job_ids.is_empty() {
-        "n._owner = $uid AND NOT n:Compilation".to_string()
-    } else {
-        format!("{} AND NOT n:Compilation", crate::services::neo4j::job_scope("n", "jobIds"))
-    };
+    let scope = format!(
+        "{} AND NOT n:Compilation",
+        crate::services::neo4j::job_scope("n", "jobIds"),
+    );
     let label_pat = match &q.node_type {
         Some(label) => format!("(n:{label})"),
         None => "(n)".to_string(),
@@ -1966,11 +1944,13 @@ async fn public_get_graph(
     let user_id_str = owner_id.to_string();
     let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
-    let scope = if source_job_ids.is_empty() {
-        "n._owner = $uid AND NOT n:Compilation".to_string()
-    } else {
-        format!("{} AND NOT n:Compilation", crate::services::neo4j::job_scope("n", "jobIds"))
-    };
+    // Jobs only — see get_graph. An owner-wide fallback here would have been the
+    // worst of the four: this endpoint is ANONYMOUS, so an embed-published empty
+    // knowledge base would have put the owner's whole graph on the open internet.
+    let scope = format!(
+        "{} AND NOT n:Compilation",
+        crate::services::neo4j::job_scope("n", "jobIds"),
+    );
     let label_pat = match &q.node_type {
         Some(label) => format!("(n:{label})"),
         None => "(n)".to_string(),
@@ -2279,12 +2259,8 @@ async fn entity_detail(
     let user_id_str = claims.sub.to_string();
     let job_strs: Vec<String> = source_job_ids.iter().map(|u| u.to_string()).collect();
 
-    // 2. Build scope clause — mirrors get_graph.
-    let where_clause = if source_job_ids.is_empty() {
-        "n._owner = $uid".to_string()
-    } else {
-        crate::services::neo4j::job_scope("n", "jobIds")
-    };
+    // 2. Build scope clause — mirrors get_graph: jobs only, empty means empty.
+    let where_clause = crate::services::neo4j::job_scope("n", "jobIds");
 
     // 3. Run the Cypher. `name` is bound as a parameter — never interpolated, so
     //    spaces / slashes / newlines / unicode in the name are all safe.
@@ -2936,11 +2912,9 @@ pub(crate) async fn delete_relationship_core(
     let (jobs, owner) = resolve_mutation_scope(&state.db, claims, compilation_id).await?;
     let owner_str = owner.to_string();
     let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-    let scope = if jobs.is_empty() {
-        "a._owner = $uid".to_string()
-    } else {
-        crate::services::neo4j::job_scope("a", "jobIds")
-    };
+    // Jobs only — see neo4j::job_scope. The owner-wide fallback let a mutation on an
+    // EMPTY knowledge base reach into every other knowledge base of the account.
+    let scope = crate::services::neo4j::job_scope("a", "jobIds");
 
     // Match the edge, collect, FOREACH-delete, return the count (clean even after delete).
     let cypher = format!(
@@ -3015,15 +2989,12 @@ pub(crate) async fn add_relationship_core(
     let (jobs, owner) = resolve_mutation_scope(&state.db, claims, compilation_id).await?;
     let owner_str = owner.to_string();
     let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-    let scope = if jobs.is_empty() {
-        "a._owner = $uid AND b._owner = $uid".to_string()
-    } else {
-        format!(
-            "{} AND {}",
-            crate::services::neo4j::job_scope("a", "jobIds"),
-            crate::services::neo4j::job_scope("b", "jobIds"),
-        )
-    };
+    // Jobs only, both endpoints — see neo4j::job_scope.
+    let scope = format!(
+        "{} AND {}",
+        crate::services::neo4j::job_scope("a", "jobIds"),
+        crate::services::neo4j::job_scope("b", "jobIds"),
+    );
 
     let cypher = format!(
         "MATCH (a {{name: $head}}), (b {{name: $tail}}) WHERE {scope} \
@@ -3088,11 +3059,8 @@ pub(crate) async fn delete_node_core(
     let (jobs, owner) = resolve_mutation_scope(&state.db, claims, compilation_id).await?;
     let owner_str = owner.to_string();
     let job_strs: Vec<String> = jobs.iter().map(|u| u.to_string()).collect();
-    let scope = if jobs.is_empty() {
-        "n._owner = $uid".to_string()
-    } else {
-        crate::services::neo4j::job_scope("n", "jobIds")
-    };
+    // Jobs only — see neo4j::job_scope.
+    let scope = crate::services::neo4j::job_scope("n", "jobIds");
 
     let cypher = format!(
         "MATCH (n {{name: $name}}) WHERE {scope} \
