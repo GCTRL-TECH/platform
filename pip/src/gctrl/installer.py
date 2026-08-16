@@ -94,6 +94,104 @@ def _read_prev_env(key: str) -> str:
     return ""
 
 
+# -- Superseded-image cleanup (mirrors the bash reference) ---------------------
+# Every GCTRL image ships under a floating :latest tag, so each pull moves the
+# tag to the new image and strands the previous one on disk - untagged, unused
+# and, until now, forever. This matters just as much here as in the shell path:
+# `gctrl update` re-runs the whole installer.
+#
+# Only images belonging to a repo GCTRL publishes are ever considered, and only
+# when no container - running OR stopped - still references them. A blanket
+# `docker image prune` is deliberately NOT used: this host may run unrelated
+# stacks whose dangling images it would collect too.
+OWNED_REPOS = (
+    "ghcr.io/gctrl-tech/agent",
+    "ghcr.io/gctrl-tech/api",
+    "ghcr.io/gctrl-tech/web",
+    "ghcr.io/gctrl-tech/kex",
+    "ghcr.io/gctrl-tech/fuse",
+    "ghcr.io/gctrl-tech/fusion-engine",
+)
+
+# Windows caps a command line at ~32k characters and every image ID is 71 of
+# them, so the inspect calls go out in batches rather than one giant argv.
+_INSPECT_BATCH = 200
+
+
+def _capture(args: list[str]) -> str:
+    """stdout of `args`, or '' if it cannot run. Output is kept even on a
+    non-zero exit: `docker image inspect` fails as a whole when a single ID has
+    vanished mid-run (a normal race) while still printing every other entry."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True)
+    except OSError:
+        return ""
+    return p.stdout or ""
+
+
+def _batched(items: list[str], size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _is_owned(ref: str) -> bool:
+    """Whether `ref` names a repo GCTRL publishes. Matching stops at the
+    `repo:tag` / `repo@digest` boundary, so a future `.../api-experimental` is
+    never mistaken for `.../api`."""
+    return any(ref.startswith(r + ":") or ref.startswith(r + "@") for r in OWNED_REPOS)
+
+
+def cleanup_superseded_images() -> None:
+    """Removes GCTRL images no container references any more.
+
+    Attribution survives the tag moving away because a superseded image keeps
+    its `ghcr.io/gctrl-tech/<svc>@sha256:...` digest reference - the only thing
+    that still identifies an untagged image as ours.
+
+    Best-effort throughout: a cleanup that cannot run is never a reason to fail
+    an install. Set GCTRL_KEEP_OLD_IMAGES=1 to disable it entirely (an
+    air-gapped host can only roll back to images it still has locally).
+    """
+    if os.environ.get("GCTRL_KEEP_OLD_IMAGES", "0").strip().lower() in ("1", "true", "yes"):
+        return
+
+    ids = sorted(set(_capture(["docker", "images", "-q"]).split()))
+    if not ids:
+        return
+
+    # Images pinned by a container. Stopped ones count: a `docker start` would
+    # boot straight back onto that image.
+    in_use: set[str] = set()
+    cids = _capture(["docker", "ps", "-aq"]).split()
+    for batch in _batched(cids, _INSPECT_BATCH):
+        in_use.update(_capture(["docker", "inspect", "-f", "{{.Image}}", *batch]).split())
+
+    removed = 0
+    for batch in _batched(ids, _INSPECT_BATCH):
+        out = _capture([
+            "docker", "image", "inspect", *batch,
+            "--format", '{{.Id}} {{join .RepoTags ","}} {{join .RepoDigests ","}}',
+        ])
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            image_id, refs = parts[0], ",".join(parts[1:]).split(",")
+            if image_id in in_use:
+                continue
+            if not any(_is_owned(r) for r in refs if r):
+                continue
+            # No -f on purpose: dockerd then refuses to remove an image that is
+            # still referenced, or one carrying several repository references
+            # (so a locally pinned :v0.1.x tag survives rather than being
+            # silently untagged).
+            if run_quiet(["docker", "rmi", image_id]) == 0:
+                removed += 1
+
+    if removed:
+        info(f"Removed {removed} superseded image(s).")
+
+
 class Installer:
     """Holds the state the bash script keeps in globals, and the install steps."""
 
@@ -401,8 +499,15 @@ class Installer:
 
     def start_stack(self) -> None:
         info("Starting GCTRL...")
+        # Free what an earlier run superseded before pulling several GB - on a
+        # fresh install there is nothing to find, on `gctrl update` this is the
+        # disk being reclaimed exactly when it is about to be needed.
+        cleanup_superseded_images()
         run(self._compose("pull"))
         run(self._compose("up", "-d"))
+        # Containers are on their new images now, so the generation just
+        # replaced is unreferenced and can go immediately.
+        cleanup_superseded_images()
         # Persist profiles so `gctrl up/down/logs` reuse them without re-detecting.
         PROFILES_FILE.write_text("\n".join(self.profiles), encoding="utf-8")
 

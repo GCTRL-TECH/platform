@@ -551,6 +551,24 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
         return;
     }
 
+    // Step 0: Reclaim the images the PREVIOUS update superseded, before pulling
+    // several GB of new ones.
+    //
+    // Doing this first rather than last is what makes it safe: at this moment
+    // every container still runs the current generation, so anything owned by
+    // GCTRL and unreferenced is provably the leftover of an earlier run. It also
+    // frees the disk exactly when it is about to be needed — the failure mode
+    // this replaces was an update dying halfway through on a full disk.
+    match tokio::task::spawn_blocking(prune_superseded_images).await {
+        Ok(report) => {
+            if let Some(message) = report.message() {
+                send("progress", json!({ "step": "cleanup", "message": message }));
+            }
+        }
+        // A cleanup that cannot run is never a reason to block an update.
+        Err(e) => tracing::warn!("Pre-update image cleanup failed: {}", e),
+    }
+
     // Step 1: Pull all images
     for (_container, image) in SERVICES {
         send("progress", json!({ "step": "pull", "image": image, "message": format!("Pulling {}…", image) }));
@@ -599,6 +617,21 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
             }
             Err(_) => {}
         }
+    }
+
+    // Step 2a: Every service except the api is now on its new image, so the
+    // generation they just left is unreferenced and can go immediately rather
+    // than lingering until the next update. The api's own outgoing image is
+    // deliberately NOT reachable here — its container is still running on it, so
+    // the in-use filter protects it; the agent reclaims it after the swap in
+    // Step 3 (see agent-rs `reclaim_previous_image`).
+    match tokio::task::spawn_blocking(prune_superseded_images).await {
+        Ok(report) => {
+            if let Some(message) = report.message() {
+                send("progress", json!({ "step": "cleanup", "message": message }));
+            }
+        }
+        Err(e) => tracing::warn!("Post-update image cleanup failed: {}", e),
     }
 
     // Step 2b: Close the loop — tell the agent what version we just installed so it
@@ -987,6 +1020,218 @@ fn docker_restart(name: &str) {
     let _ = docker_http("POST", &format!("/containers/{name}/restart?t=5"), None, 30);
 }
 
+// ─── Superseded-image cleanup ─────────────────────────────────────────────────
+//
+// Every GCTRL image ships under a floating `:latest` tag, so each pull moves the
+// tag to the new image and leaves the previous one behind, untagged and forever.
+// Nothing ever collected it, so long-lived installs grew without bound. This
+// reclaims it.
+
+/// The container repositories GCTRL publishes and therefore owns. The cleanup
+/// only ever removes images attributable to one of these.
+///
+/// This is deliberately NOT `docker image prune` / `docker system prune`: a GCTRL
+/// install regularly shares its host with unrelated stacks (n8n, Traefik, other
+/// compose projects), whose dangling images a blanket prune would also collect.
+/// Deleting a foreign image would be an unrecoverable surprise for the operator,
+/// so attribution is required before anything is touched.
+///
+/// Tag variants live under the same repo (`kex:latest` and `kex:latest-cuda`),
+/// so they need no separate entries.
+const OWNED_REPOS: &[&str] = &[
+    "ghcr.io/gctrl-tech/agent",
+    "ghcr.io/gctrl-tech/api",
+    "ghcr.io/gctrl-tech/web",
+    "ghcr.io/gctrl-tech/kex",
+    "ghcr.io/gctrl-tech/fuse",
+    "ghcr.io/gctrl-tech/fusion-engine",
+];
+
+/// Escape hatch: `GCTRL_KEEP_OLD_IMAGES=1` in the install's `.env` disables the
+/// cleanup entirely — for an air-gapped host that must be able to roll back
+/// without registry access, since a removed image can only come back by pulling.
+fn cleanup_disabled() -> bool {
+    matches!(
+        std::env::var("GCTRL_KEEP_OLD_IMAGES").ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// One entry from `GET /images/json`, reduced to what the cleanup needs.
+#[derive(Debug, Clone, PartialEq)]
+struct ImageEntry {
+    id: String,
+    /// Every reference this image answers to — `RepoTags` plus `RepoDigests`.
+    ///
+    /// `RepoDigests` is what makes this work: a superseded image has no tags left
+    /// (the tag moved to the newly pulled image) but KEEPS its
+    /// `ghcr.io/gctrl-tech/api@sha256:…` digest reference. That is the only
+    /// reliable way to attribute an untagged image to GCTRL — compose labels
+    /// can't be used, because [`recreate_container`] does not preserve them.
+    refs: Vec<String>,
+    size: u64,
+}
+
+/// True when any reference names a repo GCTRL owns. Matches on the `repo:tag` /
+/// `repo@digest` boundary, so a future `…/api-experimental` is never mistaken
+/// for `…/api`.
+fn is_owned(refs: &[String]) -> bool {
+    refs.iter().any(|r| {
+        OWNED_REPOS.iter().any(|repo| {
+            r.strip_prefix(repo)
+                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('@'))
+        })
+    })
+}
+
+/// The images that may be removed: owned by GCTRL, and referenced by no
+/// container — running OR stopped. A stopped container still pins its image (a
+/// `docker start` would boot straight back onto it), so both count as in use.
+fn select_removable(images: &[ImageEntry], in_use: &std::collections::HashSet<String>) -> Vec<ImageEntry> {
+    images
+        .iter()
+        .filter(|img| is_owned(&img.refs))
+        .filter(|img| !in_use.contains(&img.id) && !img.refs.iter().any(|r| in_use.contains(r)))
+        .cloned()
+        .collect()
+}
+
+/// Parses `GET /images/json`. Docker reports a fully untagged image as the
+/// literal `<none>:<none>` / `<none>@<none>` rather than an empty list; those
+/// placeholders are not references and are dropped.
+fn parse_images(v: &Value) -> Vec<ImageEntry> {
+    let Some(arr) = v.as_array() else { return Vec::new() };
+    arr.iter()
+        .map(|e| {
+            let mut refs = Vec::new();
+            for key in ["RepoTags", "RepoDigests"] {
+                if let Some(list) = e.get(key).and_then(|x| x.as_array()) {
+                    refs.extend(
+                        list.iter()
+                            .filter_map(|s| s.as_str())
+                            .filter(|s| !s.starts_with("<none>"))
+                            .map(|s| s.to_string()),
+                    );
+                }
+            }
+            ImageEntry {
+                id: e.get("Id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                refs,
+                size: e.get("Size").and_then(|v| v.as_u64()).unwrap_or(0),
+            }
+        })
+        .filter(|i| !i.id.is_empty())
+        .collect()
+}
+
+/// Parses `GET /containers/json?all=true` into the set of image references that
+/// are spoken for. Collects BOTH `ImageID` (the resolved `sha256:…`) and `Image`
+/// (which for a container built by [`recreate_container`] is the image *name*),
+/// because either form may be how a container pins its image.
+fn parse_in_use(v: &Value) -> std::collections::HashSet<String> {
+    let Some(arr) = v.as_array() else { return std::collections::HashSet::new() };
+    arr.iter()
+        .flat_map(|c| {
+            ["ImageID", "Image"]
+                .into_iter()
+                .filter_map(move |k| c.get(k).and_then(|v| v.as_str()))
+        })
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Human-readable size for the one log line this feature emits.
+fn format_bytes(bytes: u64) -> String {
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else {
+        format!("{} MB", bytes / MB)
+    }
+}
+
+/// Outcome of one cleanup pass.
+pub(crate) struct PruneReport {
+    pub removed: usize,
+    /// Sum of the removed images' reported sizes. Docker counts layers shared
+    /// with a surviving image in that figure, so this is an upper bound on the
+    /// disk actually returned — phrased as "up to" wherever it is shown.
+    pub bytes: u64,
+}
+
+impl PruneReport {
+    /// `None` when there was nothing to do — the caller stays silent rather than
+    /// reporting a no-op as work.
+    pub fn message(&self) -> Option<String> {
+        (self.removed > 0).then(|| {
+            format!(
+                "Removed {} superseded image{}, freeing up to {}.",
+                self.removed,
+                if self.removed == 1 { "" } else { "s" },
+                format_bytes(self.bytes)
+            )
+        })
+    }
+}
+
+/// Removes GCTRL images that no container references any more.
+///
+/// Blocking (uses the [`docker_http`] socket helper) — call from
+/// `spawn_blocking`. Never fails the caller: every step degrades to "removed
+/// nothing", because a cleanup that cannot run is not a reason to block an
+/// update.
+///
+/// Deletion deliberately omits `force`: Docker then refuses (409) to remove an
+/// image that is still referenced, which is a second, daemon-enforced safety net
+/// under the in-use filter. It also refuses an image carrying several
+/// repository references, so a locally pinned `:v0.1.230` tag survives instead of
+/// being silently untagged.
+pub(crate) fn prune_superseded_images() -> PruneReport {
+    let empty = PruneReport { removed: 0, bytes: 0 };
+    if cleanup_disabled() {
+        return empty;
+    }
+
+    let Ok((200, images_body)) = docker_http("GET", "/images/json", None, 30) else {
+        return empty;
+    };
+    let Ok((200, containers_body)) = docker_http("GET", "/containers/json?all=true", None, 30) else {
+        // Without the container list we cannot prove an image is unused. Removing
+        // anything on that basis would be a guess, so do nothing.
+        return empty;
+    };
+
+    let images = parse_images(&json_from_body(&images_body));
+    let in_use = parse_in_use(&json_from_body(&containers_body));
+
+    let mut report = PruneReport { removed: 0, bytes: 0 };
+    for img in select_removable(&images, &in_use) {
+        match docker_http("DELETE", &format!("/images/{}", img.id), None, 60) {
+            Ok((200, _)) => {
+                report.removed += 1;
+                report.bytes += img.size;
+            }
+            Ok((status, _)) => {
+                tracing::debug!("Cleanup kept image {} (HTTP {})", img.id, status);
+            }
+            Err(e) => {
+                tracing::debug!("Cleanup kept image {} ({})", img.id, e);
+            }
+        }
+    }
+
+    if report.removed > 0 {
+        tracing::info!(
+            "Image cleanup removed {} superseded image(s), up to {}",
+            report.removed,
+            format_bytes(report.bytes)
+        );
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,5 +1364,108 @@ mod tests {
         assert_eq!(first_repo_digest(&json!({})), None);
         assert_eq!(first_repo_digest(&json!({ "RepoDigests": [] })), None);
         assert_eq!(first_repo_digest(&json!({ "RepoDigests": [""] })), None);
+    }
+
+    // ── Superseded-image cleanup ──────────────────────────────────────────────
+    // The selection half is pure, so the safety properties that matter (never
+    // touch a foreign image, never touch an in-use one) are provable here rather
+    // than only on a live host.
+
+    fn img(id: &str, refs: &[&str], size: u64) -> ImageEntry {
+        ImageEntry {
+            id: id.to_string(),
+            refs: refs.iter().map(|s| s.to_string()).collect(),
+            size,
+        }
+    }
+
+    fn in_use(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn owns_gctrl_images_by_tag_and_by_digest() {
+        assert!(is_owned(&["ghcr.io/gctrl-tech/api:latest".into()]));
+        assert!(is_owned(&["ghcr.io/gctrl-tech/kex:latest-cuda".into()]));
+        // The superseded case: tag already moved away, only the digest is left.
+        assert!(is_owned(&["ghcr.io/gctrl-tech/api@sha256:old".into()]));
+    }
+
+    #[test]
+    fn does_not_own_foreign_or_lookalike_repos() {
+        // Foreign stacks sharing the host must never be attributed to GCTRL.
+        assert!(!is_owned(&["postgres:16-alpine".into()]));
+        assert!(!is_owned(&["ollama/ollama:latest".into()]));
+        assert!(!is_owned(&["vllm/vllm-openai:latest".into()]));
+        assert!(!is_owned(&["ghcr.io/ggml-org/llama.cpp:server".into()]));
+        // Prefix matching must respect the repo boundary.
+        assert!(!is_owned(&["ghcr.io/gctrl-tech/api-experimental:latest".into()]));
+        // An image with no references left is unattributable, so off-limits.
+        assert!(!is_owned(&[]));
+    }
+
+    #[test]
+    fn selects_superseded_gctrl_image_only() {
+        let images = vec![
+            img("sha256:new", &["ghcr.io/gctrl-tech/api:latest", "ghcr.io/gctrl-tech/api@sha256:n"], 900),
+            img("sha256:old", &["ghcr.io/gctrl-tech/api@sha256:o"], 800),
+            img("sha256:pg", &["postgres:16-alpine"], 400),
+        ];
+        let selected = select_removable(&images, &in_use(&["sha256:new", "sha256:pg"]));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "sha256:old");
+    }
+
+    #[test]
+    fn never_selects_an_image_a_container_still_pins() {
+        let images = vec![img("sha256:a", &["ghcr.io/gctrl-tech/web:latest"], 100)];
+        // Pinned by resolved ID (the running case)…
+        assert!(select_removable(&images, &in_use(&["sha256:a"])).is_empty());
+        // …and pinned by name, which is how `recreate_container` records it.
+        assert!(select_removable(&images, &in_use(&["ghcr.io/gctrl-tech/web:latest"])).is_empty());
+    }
+
+    #[test]
+    fn never_selects_a_foreign_dangling_image() {
+        // The exact case a blanket `docker image prune` would get wrong: an
+        // untagged image belonging to some other stack on the same host.
+        let images = vec![img("sha256:x", &["registry.example.com/other/app@sha256:z"], 5_000)];
+        assert!(select_removable(&images, &in_use(&[])).is_empty());
+    }
+
+    #[test]
+    fn parses_images_and_drops_none_placeholders() {
+        let parsed = parse_images(&json!([
+            {
+                "Id": "sha256:old",
+                "RepoTags": ["<none>:<none>"],
+                "RepoDigests": ["ghcr.io/gctrl-tech/api@sha256:o"],
+                "Size": 800
+            },
+            { "Id": "", "RepoTags": [], "RepoDigests": [], "Size": 1 }
+        ]));
+        assert_eq!(parsed.len(), 1, "entries without an Id are unusable");
+        assert_eq!(parsed[0].refs, vec!["ghcr.io/gctrl-tech/api@sha256:o".to_string()]);
+        assert_eq!(parsed[0].size, 800);
+    }
+
+    #[test]
+    fn parses_in_use_from_both_id_and_name_fields() {
+        let set = parse_in_use(&json!([
+            { "ImageID": "sha256:a", "Image": "ghcr.io/gctrl-tech/api:latest" },
+            { "ImageID": "sha256:b", "Image": "" }
+        ]));
+        assert!(set.contains("sha256:a"));
+        assert!(set.contains("ghcr.io/gctrl-tech/api:latest"));
+        assert!(set.contains("sha256:b"));
+        assert!(!set.contains(""));
+    }
+
+    #[test]
+    fn report_stays_silent_when_nothing_was_removed() {
+        assert!(PruneReport { removed: 0, bytes: 0 }.message().is_none());
+        let msg = PruneReport { removed: 1, bytes: 2_400_000_000 }.message().unwrap();
+        assert!(msg.contains("1 superseded image,"), "singular, got: {msg}");
+        assert!(msg.contains("2.4 GB"), "got: {msg}");
     }
 }

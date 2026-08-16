@@ -184,6 +184,65 @@ pub fn recreate_container(name: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The image ID (`sha256:…`) `name` currently runs, or `None` when the container
+/// isn't present. Captured BEFORE a recreate so the image the container is about
+/// to move off can be reclaimed afterwards.
+///
+/// Note this is the *resolved* ID rather than the `:latest` tag: the tag has
+/// already moved to the newly pulled image by this point, so only the ID still
+/// identifies the outgoing one.
+pub fn container_image_id(name: &str) -> Option<String> {
+    let (status, body) = docker_http("GET", &format!("/containers/{name}/json"), None, 10).ok()?;
+    if status != 200 {
+        return None;
+    }
+    json_from_body(&body)
+        .get("Image")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Whether `name` exists and is running right now.
+pub fn container_running(name: &str) -> bool {
+    match docker_http("GET", &format!("/containers/{name}/json"), None, 10) {
+        Ok((200, body)) => json_from_body(&body)["State"]["Running"]
+            .as_bool()
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Reclaims a superseded image once nothing runs on it any more.
+///
+/// This is the last step of an update: every GCTRL image ships under a floating
+/// `:latest` tag, so each pull strands the previous one on disk untagged and
+/// forever. The api container is the one case the api itself cannot clean up —
+/// it is still running on that very image while it drives the update — so the
+/// agent, which performs the swap on its behalf, reclaims it here.
+///
+/// Scope is intentionally narrow and needs no repo allowlist: the only image
+/// ever passed in is the one a `gctrl-*` container was just running, which is
+/// GCTRL's by construction. Nothing else on the host can be reached from here.
+///
+/// Deletion deliberately omits `force`, so dockerd itself refuses (409) if any
+/// container still references the image — a daemon-enforced backstop under the
+/// caller's own checks. Returns whether the image was actually removed.
+pub fn remove_image_if_unused(image_id: &str) -> bool {
+    // Escape hatch, mirroring api-rs: `GCTRL_KEEP_OLD_IMAGES=1` keeps every old
+    // image on disk (an air-gapped host can only roll back to what it still has).
+    if matches!(
+        std::env::var("GCTRL_KEEP_OLD_IMAGES").ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    ) {
+        return false;
+    }
+    matches!(
+        docker_http("DELETE", &format!("/images/{image_id}"), None, 60),
+        Ok((200, _))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

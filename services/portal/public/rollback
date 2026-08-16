@@ -2,14 +2,14 @@
 # Ground Control Rollback
 # Usage: curl -fsSL https://gctrl.tech/rollback | bash
 #
-# Restores the image generation recorded by the last update run. The record
-# (.previous-images) holds PULLABLE digest references, so a rollback works even
-# after the automatic cleanup has reclaimed the old images locally - it simply
-# pulls them back from the registry.
+# Restores the image generation recorded by the last `gctrl.tech/update` run.
+# The record (.previous-images) holds PULLABLE digest references, so a rollback
+# works even after the automatic cleanup has reclaimed the old images locally -
+# it simply pulls them back from the registry.
 set -euo pipefail
 
-INSTALL_DIR="${HOME}/gctrl"
-PREV="${INSTALL_DIR}/.previous-images"
+GCTRL_DIR="${GCTRL_DIR:-$HOME/gctrl}"
+PREV="${GCTRL_DIR}/.previous-images"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[GCTRL]${NC} $1"; }
@@ -17,11 +17,15 @@ success() { echo -e "${GREEN}[GCTRL]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[GCTRL]${NC} $1"; }
 error()   { echo -e "${RED}[GCTRL]${NC} $1"; exit 1; }
 
-[ -s "$PREV" ] || error "No previous images recorded in ${PREV}. Cannot rollback."
+[ -f "${GCTRL_DIR}/docker-compose.yml" ] \
+  || error "No docker-compose.yml in ${GCTRL_DIR}. Set GCTRL_DIR to your installation directory and retry."
+
+[ -s "$PREV" ] \
+  || error "No previous images recorded in ${PREV}. Nothing to roll back to."
 
 # The tag the compose file resolves to, so the pulled digests are pinned under
 # the name the stack actually runs (defaults to :latest, like compose.yml).
-TAG=$(grep -E '^GCTRL_IMAGE_TAG=' "${INSTALL_DIR}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"' " || true)
+TAG=$(grep -E '^GCTRL_IMAGE_TAG=' "${GCTRL_DIR}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"' " || true)
 TAG="${TAG:-latest}"
 
 info "Rolling back to the previously recorded images (tag: ${TAG})..."
@@ -30,8 +34,8 @@ restored=0
 while IFS= read -r ref; do
   [ -n "$ref" ] || continue
 
-  # Only digest references are usable. Older installs recorded bare image IDs,
-  # which cannot be pulled - skip them loudly rather than failing silently.
+  # Only digest references are usable here. Older installs recorded bare image
+  # IDs, which cannot be pulled - skip them loudly rather than failing silently.
   case "$ref" in
     *@sha256:*) ;;
     *) warn "Skipping unusable rollback entry: ${ref}"; continue ;;
@@ -65,10 +69,10 @@ info "Restarting ${restored} service image(s) on the previous version..."
 # newer image. Written by the pip installer; absent for a plain bash install, in
 # which case compose just handles the always-on services.
 profile_flags=()
-if [ -s "${INSTALL_DIR}/.profiles" ]; then
+if [ -s "${GCTRL_DIR}/.profiles" ]; then
   while IFS= read -r p; do
     [ -n "$p" ] && profile_flags+=("--profile" "$p")
-  done < "${INSTALL_DIR}/.profiles"
+  done < "${GCTRL_DIR}/.profiles"
 fi
 
 # No --remove-orphans here: with profiles that this install may not have
@@ -78,13 +82,17 @@ fi
 # The branch avoids expanding an empty array under `set -u`, which is an error on
 # the bash 3.2 that stock macOS still ships.
 if [ ${#profile_flags[@]} -gt 0 ]; then
-  docker compose -f "${INSTALL_DIR}/docker-compose.yml" --env-file "${INSTALL_DIR}/.env" \
+  docker compose -f "${GCTRL_DIR}/docker-compose.yml" --env-file "${GCTRL_DIR}/.env" \
     "${profile_flags[@]}" up -d --force-recreate
 else
-  docker compose -f "${INSTALL_DIR}/docker-compose.yml" --env-file "${INSTALL_DIR}/.env" \
+  docker compose -f "${GCTRL_DIR}/docker-compose.yml" --env-file "${GCTRL_DIR}/.env" \
     up -d --force-recreate
 fi
 
 echo ""
-success "✅ Rollback complete"
+success "Rollback complete."
+echo ""
+docker ps --filter "name=gctrl-" --format "  {{.Names}}\t{{.Status}}"
+echo ""
 echo "  Back to the current version: curl -fsSL https://gctrl.tech/update | bash"
+echo ""

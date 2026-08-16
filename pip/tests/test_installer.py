@@ -61,3 +61,40 @@ def test_env_generation_has_all_keys(tmp_path, monkeypatch):
     assert len(jwt1) >= 32
     inst.generate_config()
     assert installer._read_prev_env("JWT_SECRET") == jwt1  # not rotated
+
+
+# -- Superseded-image cleanup --------------------------------------------------
+# The attribution half is pure, so the safety property that matters - never
+# touch an image that isn't GCTRL's - is provable without Docker.
+
+def test_owns_gctrl_images_by_tag_and_by_digest():
+    assert installer._is_owned("ghcr.io/gctrl-tech/api:latest")
+    assert installer._is_owned("ghcr.io/gctrl-tech/kex:latest-cuda")
+    # The superseded case: the tag already moved, only the digest is left.
+    assert installer._is_owned("ghcr.io/gctrl-tech/api@sha256:old")
+
+
+def test_does_not_own_foreign_or_lookalike_repos():
+    for ref in (
+        "postgres:16-alpine",
+        "ollama/ollama:latest",
+        "vllm/vllm-openai:latest",
+        "ghcr.io/ggml-org/llama.cpp:server",
+        "ghcr.io/gctrl-tech/api-experimental:latest",  # must respect the repo boundary
+        "",
+    ):
+        assert not installer._is_owned(ref), ref
+
+
+def test_cleanup_is_a_no_op_when_disabled(monkeypatch):
+    monkeypatch.setenv("GCTRL_KEEP_OLD_IMAGES", "1")
+    # Any docker call would blow up here, proving the opt-out short-circuits.
+    monkeypatch.setattr(installer, "_capture", lambda args: 1 / 0)
+    installer.cleanup_superseded_images()
+
+
+def test_batched_covers_every_item_exactly_once():
+    items = [str(i) for i in range(450)]
+    batches = list(installer._batched(items, installer._INSPECT_BATCH))
+    assert [x for b in batches for x in b] == items
+    assert all(len(b) <= installer._INSPECT_BATCH for b in batches)

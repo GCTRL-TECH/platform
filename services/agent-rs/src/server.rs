@@ -421,10 +421,23 @@ async fn handle_recreate(
     let container = req.container.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Capture the outgoing image BEFORE the swap: afterwards the container is
+        // on the new one and the `:latest` tag has moved, so nothing else still
+        // identifies the image being superseded.
+        let name = container.clone();
+        let previous_image = tokio::task::spawn_blocking(move || crate::docker::container_image_id(&name))
+            .await
+            .ok()
+            .flatten();
+
         let name = container.clone();
         let result = tokio::task::spawn_blocking(move || crate::docker::recreate_container(&name)).await;
         match result {
-            Ok(Ok(true)) => tracing::info!("recreate: {container} recreated"),
+            Ok(Ok(true)) => {
+                tracing::info!("recreate: {container} recreated");
+                reclaim_previous_image(&container, previous_image).await;
+            }
             Ok(Ok(false)) => tracing::warn!("recreate: {container} not found — nothing to recreate"),
             Ok(Err(e)) => tracing::error!("recreate: {container} failed: {e}"),
             Err(e) => tracing::error!("recreate: {container} task panicked: {e}"),
@@ -432,6 +445,55 @@ async fn handle_recreate(
     });
 
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+/// Reclaims the image `container` ran on before it was swapped onto the newly
+/// pulled one — the final step of an update, and the one the api cannot perform
+/// for itself (it is still running on that image while it drives the update).
+///
+/// Guarded, in order:
+/// 1. Nothing captured before the swap ⇒ nothing provably superseded.
+/// 2. The new container must actually be RUNNING. If it failed to start, the old
+///    image stays on disk, because that is what makes an immediate manual
+///    rollback possible — exactly the moment it matters most.
+/// 3. The image must have genuinely changed. A recreate onto an unchanged image
+///    (e.g. a config-only swap) supersedes nothing, and deleting there would take
+///    out the image the container is running on.
+///
+/// [`crate::docker::remove_image_if_unused`] then omits `force`, so dockerd
+/// refuses anyway if anything still references the image.
+async fn reclaim_previous_image(container: &str, previous: Option<String>) {
+    let Some(previous) = previous else { return };
+
+    // Let the new container settle before judging whether it came up.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let name = container.to_string();
+    let running = tokio::task::spawn_blocking(move || crate::docker::container_running(&name))
+        .await
+        .unwrap_or(false);
+    if !running {
+        tracing::warn!(
+            "recreate: {container} is not running after the swap — keeping its previous image for rollback"
+        );
+        return;
+    }
+
+    let name = container.to_string();
+    let current = tokio::task::spawn_blocking(move || crate::docker::container_image_id(&name))
+        .await
+        .ok()
+        .flatten();
+    if current.as_deref() == Some(previous.as_str()) {
+        return; // recreated onto the same image — nothing was superseded
+    }
+
+    let image = previous.clone();
+    match tokio::task::spawn_blocking(move || crate::docker::remove_image_if_unused(&image)).await {
+        Ok(true) => tracing::info!("recreate: reclaimed superseded image {previous} for {container}"),
+        Ok(false) => tracing::debug!("recreate: kept image {previous} (still referenced or cleanup disabled)"),
+        Err(e) => tracing::warn!("recreate: image cleanup task failed: {e}"),
+    }
 }
 
 pub async fn run(

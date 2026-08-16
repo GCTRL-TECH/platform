@@ -392,6 +392,61 @@ OVERRIDE
   fi
 }
 
+# ── Superseded-image cleanup ──────────────────────────────────────────────────
+# Matters here because this script is also the update path: `gctrl update` (pip)
+# re-runs the installer, and operators re-run it by hand. Every GCTRL image ships
+# under a floating :latest tag, so each pull moves the tag and strands the
+# previous image on disk - untagged, unused and, until now, forever.
+#
+# Only images belonging to a repo GCTRL publishes are ever considered, and only
+# when no container - running OR stopped - still references them. A blanket
+# `docker image prune` is deliberately NOT used: this host may run unrelated
+# stacks (n8n, Traefik, other compose projects) whose dangling images it would
+# collect too, which would be an unrecoverable surprise.
+#
+# Attribution still works after the tag has moved because the superseded image
+# keeps its ghcr.io/gctrl-tech/<svc>@sha256:... digest reference.
+#
+# Set GCTRL_KEEP_OLD_IMAGES=1 to disable (an air-gapped host can only roll back
+# to images it still has locally).
+GCTRL_OWNED_REPOS='ghcr\.io/gctrl-tech/(agent|api|web|kex|fuse|fusion-engine)[:@]'
+
+cleanup_superseded_images() {
+  if [ "${GCTRL_KEEP_OLD_IMAGES:-0}" = "1" ]; then
+    return 0
+  fi
+
+  local ids in_use candidates removed=0
+  ids=$(docker images -q | sort -u) || return 0
+  [ -n "$ids" ] || return 0
+
+  # Images pinned by a container. Stopped ones count: a `docker start` would
+  # boot straight back onto that image.
+  in_use=$(docker ps -aq | xargs -r docker inspect -f '{{.Image}}' 2>/dev/null | sort -u) || true
+
+  # shellcheck disable=SC2086  # deliberate word splitting: one inspect for all ids
+  candidates=$(docker image inspect $ids \
+      --format '{{.Id}} {{join .RepoTags ","}} {{join .RepoDigests ","}}' 2>/dev/null \
+    | grep -E "$GCTRL_OWNED_REPOS" | awk '{print $1}') || true
+
+  for id in $candidates; do
+    if echo "$in_use" | grep -qx "$id"; then
+      continue
+    fi
+    # No -f on purpose: dockerd then refuses to remove an image that is still
+    # referenced, or one carrying several repository references (so a locally
+    # pinned :v0.1.x tag survives instead of being silently untagged).
+    if docker rmi "$id" >/dev/null 2>&1; then
+      removed=$((removed + 1))
+    fi
+  done
+
+  if [ "$removed" -gt 0 ]; then
+    info "Removed $removed superseded image(s)."
+  fi
+  return 0
+}
+
 # ── Start Stack ───────────────────────────────────────────────────────────────
 start_stack() {
   info "Starting GCTRL..."
@@ -400,6 +455,11 @@ start_stack() {
   for p in "${PROFILES[@]}"; do
     profile_flags+=("--profile" "$p")
   done
+
+  # Free what an earlier run superseded before pulling several GB - on a fresh
+  # install there is nothing to find, on a re-run this is the disk being
+  # reclaimed exactly when it is about to be needed.
+  cleanup_superseded_images
 
   docker compose \
     -f "${INSTALL_DIR}/docker-compose.yml" \
@@ -412,6 +472,10 @@ start_stack() {
     --env-file "${INSTALL_DIR}/.env" \
     "${profile_flags[@]}" \
     up -d
+
+  # Containers are on their new images now, so the generation just replaced is
+  # unreferenced and can go immediately.
+  cleanup_superseded_images
 
   info "Waiting for the web UI to come up (up to 120s)..."
   local max_wait=120 waited=0

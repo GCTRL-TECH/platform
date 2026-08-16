@@ -29,6 +29,10 @@ services:
       # during a self-update - see api-rs update.rs). Same trust boundary as the
       # api/kex/fuse INTERNAL_API_SECRET pattern; empty = grace (no check).
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
+      # Set to 1 to keep superseded images on disk instead of reclaiming them
+      # after an update. Only for hosts that must be able to roll back without
+      # registry access - a reclaimed image can only come back by pulling.
+      - GCTRL_KEEP_OLD_IMAGES=${GCTRL_KEEP_OLD_IMAGES:-0}
     networks:
       - gctrl
     healthcheck:
@@ -167,6 +171,9 @@ services:
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
       - PHOENIX_SERVICE_NAME=gctrl-api
+      # Set to 1 to keep superseded images on disk instead of reclaiming them
+      # before/after an update (see api-rs update.rs `prune_superseded_images`).
+      - GCTRL_KEEP_OLD_IMAGES=${GCTRL_KEEP_OLD_IMAGES:-0}
     depends_on:
       gctrl-postgres:
         condition: service_healthy
