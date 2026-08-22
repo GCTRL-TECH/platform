@@ -213,6 +213,9 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
         .route("/extract",         post(extract))
         .route("/repo",            post(ingest_repo))
+        .route("/code",            post(ingest_code))
+        .route("/code/manifest",   get(code_manifest))
+        .route("/code/files",      axum::routing::delete(delete_code_files))
         .route("/upload",          post(upload))
         .route("/jobs",            get(list_jobs))
         .route("/jobs/:id",        get(get_job).delete(delete_job))
@@ -393,6 +396,170 @@ async fn ingest_repo(
         m.insert("jobId".into(), json!(job_id));
     }
     Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct CodeIngestReq {
+    #[serde(rename = "compilationId")]         compilation_id:          Uuid,
+    repo:                                      Value,
+    #[serde(default)]                          files:                   Vec<Value>,
+    #[serde(default)]                          removed:                 Vec<String>,
+    #[serde(rename = "classificationLevelId")] classification_level_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct CodeDeleteReq {
+    #[serde(rename = "compilationId")] compilation_id: Uuid,
+    #[serde(rename = "repoName")]      repo_name:      String,
+    paths:                             Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ManifestQuery {
+    #[serde(rename = "compilationId")] compilation_id: Uuid,
+}
+
+/// Pure builder for the kex:jobs payload of a code job (unit-tested).
+fn code_job_payload(
+    job_id: Uuid, user_id: Uuid, compilation_id: Uuid,
+    repo: &Value, files: &Value, removed: &Value,
+    classification_name: Option<String>, classification_level_id: Option<Uuid>,
+) -> Value {
+    json!({
+        "job_id": job_id, "user_id": user_id, "type": "code",
+        "compilation_id": compilation_id,
+        "repo": repo, "files": files, "removed": removed,
+        "classification": classification_name,
+        "classification_level_id": classification_level_id,
+    })
+}
+
+/// Pure Cypher for GET /kex/code/manifest: file hashes + the repo node, job-scoped.
+fn code_manifest_cypher() -> String {
+    format!(
+        "MATCH (n:Entity {{type: 'file', coarse_type: 'code'}}) WHERE {scope} \
+         RETURN n.name AS path, n.sha256 AS sha256, n._repo AS repo",
+        scope = crate::services::neo4j::job_scope("n", "jobs"),
+    )
+}
+
+fn code_repo_cypher() -> String {
+    format!(
+        "MATCH (n:Entity {{type: 'repo', coarse_type: 'code'}}) WHERE {scope} \
+         RETURN n.name AS repo, n.commit AS commit ORDER BY n.indexed_at DESC LIMIT 1",
+        scope = crate::services::neo4j::job_scope("n", "jobs"),
+    )
+}
+
+/// Shared by POST /code and DELETE /code/files: validates the target CODE
+/// compilation, inserts a pending `kex_code` job linked to it, enqueues it.
+async fn enqueue_code_job(
+    claims: &JwtClaims,
+    state: &Arc<crate::models::AppState>,
+    compilation_id: Uuid,
+    repo: Value,
+    files: Vec<Value>,
+    removed: Vec<String>,
+    classification_level_id: Option<Uuid>,
+) -> Result<Json<Value>> {
+    if files.is_empty() && removed.is_empty() {
+        return Err(AppError::BadRequest("files or removed is required".into()));
+    }
+    enforce_classification_ceiling(&state.db, claims, classification_level_id).await?;
+    crate::routes::kg::enforce_kb_write_scope(&state.db, claims, compilation_id).await?;
+    let ctype: Option<String> = sqlx::query_scalar("SELECT type::text FROM compilations WHERE id = $1")
+        .bind(compilation_id).fetch_optional(&state.db).await?;
+    match ctype.as_deref() {
+        Some("CODE") => {}
+        Some(other) => return Err(AppError::BadRequest(format!(
+            "compilation {compilation_id} is {other}, not CODE - create a CODE compilation for code graphs"))),
+        None => return Err(AppError::NotFound),
+    }
+    let repo_name = repo["name"].as_str().unwrap_or("repo").to_string();
+
+    let job_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
+         VALUES ($1, $2, 'kex_code', 'pending', $3, $4)"
+    )
+    .bind(job_id).bind(claims.sub)
+    .bind(json!({ "source": "code", "repoName": repo_name, "fileCount": files.len(),
+                  "removedCount": removed.len(), "commit": repo["commit"] }))
+    .bind(classification_level_id)
+    .execute(&state.db).await?;
+    record_usage(&state.db, claims.sub, "kex_code", 5, Some(job_id)).await;
+    link_job_to_compilation(&state.db, claims.sub, compilation_id, job_id).await;
+
+    let classification_name: Option<String> = if let Some(clf_id) = classification_level_id {
+        sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1")
+            .bind(clf_id).fetch_optional(&state.db).await.ok().flatten()
+    } else { None };
+
+    let mut payload = code_job_payload(
+        job_id, claims.sub, compilation_id, &repo, &Value::Array(files), &json!(removed),
+        classification_name, classification_level_id,
+    );
+    crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
+    lpush(&state.redis, "kex:jobs", &payload.to_string()).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+}
+
+/// POST /api/kex/code - async ingest of an IndexBatch (see spec §10).
+async fn ingest_code(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<CodeIngestReq>,
+) -> Result<Json<Value>> {
+    enqueue_code_job(&claims, &state, req.compilation_id, req.repo, req.files, req.removed,
+                     req.classification_level_id).await
+}
+
+/// DELETE /api/kex/code/files - drop symbols + chunks of the given paths.
+///
+/// Deviation from the original brief: the request carries a required `repoName`
+/// (instead of a null placeholder). `enqueue_code_job` falls back to repo name
+/// "repo" when `repo["name"]` is absent, which would purge whatever the WORKER
+/// happens to default to instead of the caller's actual repo — a required field
+/// keeps the delete scoped to the repo the caller means.
+async fn delete_code_files(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<CodeDeleteReq>,
+) -> Result<Json<Value>> {
+    enqueue_code_job(&claims, &state, req.compilation_id, json!({"name": req.repo_name}), vec![], req.paths, None).await
+}
+
+/// GET /api/kex/code/manifest?compilationId= - {repo, commit, files:{path:sha256}}
+async fn code_manifest(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<ManifestQuery>,
+) -> Result<Json<Value>> {
+    let eff = crate::routes::kg::effective_rank_for_compilation(&state.db, &claims, q.compilation_id).await;
+    if eff == i32::MIN { return Err(AppError::Forbidden("compilation not granted to this token".into())); }
+    let jobs: Option<(Vec<Uuid>,)> = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id = $1"
+    ).bind(q.compilation_id).fetch_optional(&state.db).await?;
+    let Some((job_ids,)) = jobs else { return Err(AppError::NotFound); };
+    let job_strs: Vec<String> = job_ids.iter().map(|u| u.to_string()).collect();
+
+    let mut files = serde_json::Map::new();
+    if let Ok(mut stream) = state.neo.execute(neo4rs::query(&code_manifest_cypher()).param("jobs", job_strs.clone())).await {
+        while let Ok(Some(row)) = stream.next().await {
+            let path = row.get::<String>("path").unwrap_or_default();
+            let sha = row.get::<String>("sha256").unwrap_or_default();
+            if !path.is_empty() { files.insert(path, json!(sha)); }
+        }
+    }
+    let (mut repo, mut commit) = (Value::Null, Value::Null);
+    if let Ok(mut stream) = state.neo.execute(neo4rs::query(&code_repo_cypher()).param("jobs", job_strs)).await {
+        if let Ok(Some(row)) = stream.next().await {
+            repo = row.get::<String>("repo").map(Value::String).unwrap_or(Value::Null);
+            commit = row.get::<String>("commit").map(Value::String).unwrap_or(Value::Null);
+        }
+    }
+    Ok(Json(json!({ "repo": repo, "commit": commit, "files": Value::Object(files) })))
 }
 
 /// Resolves the ontology to use for an extraction job, returning
@@ -1117,5 +1284,35 @@ mod degraded_status_tests {
         let r = json!({ "degraded": true, "warning": "…" });
         assert_eq!(presented_status("failed", Some(&r)).0, "failed");
         assert_eq!(presented_status("processing", Some(&r)).0, "processing");
+    }
+}
+
+#[cfg(test)]
+mod code_ingest_tests {
+    use super::*;
+
+    #[test]
+    fn code_job_payload_has_type_code_and_required_keys() {
+        let p = code_job_payload(
+            Uuid::nil(), Uuid::nil(), Uuid::nil(),
+            &json!({"name":"r","root":"/r","commit":null}),
+            &json!([{"path":"a.py","sha256":"x","lang":"python","symbols":[],"edges":[],"chunks":[]}]),
+            &json!(["gone.py"]),
+            Some("INTERNAL".into()), None,
+        );
+        assert_eq!(p["type"], "code");
+        assert_eq!(p["files"].as_array().unwrap().len(), 1);
+        assert_eq!(p["removed"][0], "gone.py");
+        assert_eq!(p["classification"], "INTERNAL");
+        assert!(p["compilation_id"].is_string());
+    }
+
+    #[test]
+    fn manifest_cypher_is_job_scoped_and_reads_file_hashes() {
+        let c = code_manifest_cypher();
+        assert!(c.contains("type: 'file'"));
+        assert!(c.contains("coarse_type: 'code'"));
+        assert!(c.contains(&crate::services::neo4j::job_scope("n", "jobs")));
+        assert!(c.contains("n.sha256"));
     }
 }
