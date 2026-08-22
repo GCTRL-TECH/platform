@@ -95,8 +95,10 @@ pub(crate) async fn link_job_to_compilation(
 
 /// Resolve the user's default knowledge base — the oldest compilation that is
 /// neither a system compilation (e.g. the seeded "Knowledge Wiki") nor a WIKI
-/// (distilled view, holds no graph data of its own). Every fresh registration
-/// seeds exactly one such compilation ("My First Knowledge Base" —
+/// (distilled view, holds no graph data of its own) nor a CODE compilation
+/// (code graphs are explicit targets, never a landing spot for documents).
+/// Every fresh registration seeds exactly one such compilation ("My First
+/// Knowledge Base" —
 /// `auth::seed_default_workspace`), so this gives every submission path
 /// without an explicit `compilationId` a landing spot instead of orphaning the
 /// job. Returns `None` only for the edge case of a user with no eligible
@@ -107,7 +109,7 @@ pub(crate) async fn resolve_default_compilation(db: &sqlx::PgPool, user_id: Uuid
         "SELECT id FROM compilations
           WHERE user_id = $1
             AND COALESCE(is_system, false) = false
-            AND type::text NOT IN ('WIKI')
+            AND type::text NOT IN ('WIKI', 'CODE')
           ORDER BY created_at ASC LIMIT 1"
     )
     .bind(user_id)

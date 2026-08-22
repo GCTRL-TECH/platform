@@ -829,11 +829,12 @@ async fn create(
     // "WIKI" (case-insensitive) is treated as the default RAW.
     let comp_type = match req.comp_type.as_deref().map(|s| s.trim().to_uppercase()) {
         Some(ref t) if t == "WIKI" => "WIKI",
+        Some(ref t) if t == "CODE" => "CODE",
         Some(ref t) if t == "RAW"  => "RAW",
         None                       => "RAW",
         Some(other) => {
             return Err(AppError::BadRequest(format!(
-                "Invalid compilation type '{other}' (expected 'RAW' or 'WIKI')"
+                "Invalid compilation type '{other}' (expected 'RAW', 'WIKI' or 'CODE')"
             )));
         }
     };
