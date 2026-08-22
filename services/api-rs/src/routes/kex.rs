@@ -453,6 +453,11 @@ fn code_repo_cypher() -> String {
 
 /// Shared by POST /code and DELETE /code/files: validates the target CODE
 /// compilation, inserts a pending `kex_code` job linked to it, enqueues it.
+///
+/// Owner or kb-scoped grant required; foreign ids return 404. A caller who is
+/// neither the compilation's owner nor holds an explicit grant for it (via a
+/// KB-scoped access token) gets `NotFound` — never `Forbidden` — so a foreign
+/// UUID cannot be distinguished from one that simply doesn't exist.
 async fn enqueue_code_job(
     claims: &JwtClaims,
     state: &Arc<crate::models::AppState>,
@@ -467,13 +472,20 @@ async fn enqueue_code_job(
     }
     enforce_classification_ceiling(&state.db, claims, classification_level_id).await?;
     crate::routes::kg::enforce_kb_write_scope(&state.db, claims, compilation_id).await?;
-    let ctype: Option<String> = sqlx::query_scalar("SELECT type::text FROM compilations WHERE id = $1")
-        .bind(compilation_id).fetch_optional(&state.db).await?;
-    match ctype.as_deref() {
-        Some("CODE") => {}
-        Some(other) => return Err(AppError::BadRequest(format!(
+    let comp: Option<(String, Uuid)> = sqlx::query_as(
+        "SELECT type::text, user_id FROM compilations WHERE id = $1"
+    ).bind(compilation_id).fetch_optional(&state.db).await?;
+    let Some((ctype, owner_id)) = comp else { return Err(AppError::NotFound); };
+    if owner_id != claims.sub {
+        match crate::routes::kg::api_key_scope(&state.db, claims).await {
+            Some(ref s) if s.contains(&compilation_id) => {}
+            _ => return Err(AppError::NotFound),
+        }
+    }
+    match ctype.as_str() {
+        "CODE" => {}
+        other => return Err(AppError::BadRequest(format!(
             "compilation {compilation_id} is {other}, not CODE - create a CODE compilation for code graphs"))),
-        None => return Err(AppError::NotFound),
     }
     let repo_name = repo["name"].as_str().unwrap_or("repo").to_string();
 
@@ -538,10 +550,18 @@ async fn code_manifest(
 ) -> Result<Json<Value>> {
     let eff = crate::routes::kg::effective_rank_for_compilation(&state.db, &claims, q.compilation_id).await;
     if eff == i32::MIN { return Err(AppError::Forbidden("compilation not granted to this token".into())); }
-    let jobs: Option<(Vec<Uuid>,)> = sqlx::query_as(
-        "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id = $1"
+    let jobs: Option<(Vec<Uuid>, Uuid)> = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids,'{}'::uuid[]), user_id FROM compilations WHERE id = $1"
     ).bind(q.compilation_id).fetch_optional(&state.db).await?;
-    let Some((job_ids,)) = jobs else { return Err(AppError::NotFound); };
+    let Some((job_ids, owner_id)) = jobs else { return Err(AppError::NotFound); };
+    // Owner or kb-scoped grant required; foreign ids return 404 (never Forbidden)
+    // so a foreign compilation UUID can't be distinguished from a nonexistent one.
+    if owner_id != claims.sub {
+        match crate::routes::kg::api_key_scope(&state.db, &claims).await {
+            Some(ref s) if s.contains(&q.compilation_id) => {}
+            _ => return Err(AppError::NotFound),
+        }
+    }
     let job_strs: Vec<String> = job_ids.iter().map(|u| u.to_string()).collect();
 
     let mut files = serde_json::Map::new();
