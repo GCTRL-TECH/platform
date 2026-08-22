@@ -40,3 +40,6 @@ services/portal/public/version.json
 .claude/
 beam-repo/
 serve.pid
+
+# Local git worktrees (superpowers)
+.worktrees/
