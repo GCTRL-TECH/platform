@@ -200,7 +200,7 @@ class KGBuilder:
             )
             relations_created = session.execute_write(
                 self._write_relations, job_id, relations,
-                label_json, rank, level_name, corrected, name_to_uri,
+                label_json, rank, level_name, user_id, corrected, name_to_uri,
                 source_document_id, source_modified_at_ms,
             )
             nodes_total = session.execute_read(self._count_nodes)
@@ -232,6 +232,55 @@ class KGBuilder:
             # computed uri against this set to decide uri-vs-pruned per mention.
             "graph_uris": sorted(set(name_to_uri.values())),
         }
+
+    # ── Codebase KB: per-file purge ───────────────────────────────────────────
+    def purge_code_file_edges(self, owner, repo, paths):
+        """Delete every relationship OWNED by one of `paths` (r._file) in `repo`.
+        Called BEFORE re-writing changed files so stale CALLS/IMPORTS/CONTAINS
+        vanish; incoming edges from OTHER files are untouched. Returns count."""
+        if not paths:
+            return 0
+        if not self._driver:
+            self.connect()
+        with self._driver.session() as session:
+            return session.execute_write(self._purge_file_edges_tx, owner, repo, list(paths))
+
+    @staticmethod
+    def _purge_file_edges_tx(tx, owner, repo, paths):
+        rec = tx.run(
+            """
+            MATCH ()-[r]->()
+            WHERE r._owner = $owner AND r._repo = $repo AND r._file IN $paths
+            DELETE r
+            RETURN count(*) AS deleted
+            """,
+            owner=owner, repo=repo, paths=paths,
+        ).single()
+        return int(rec["deleted"]) if rec else 0
+
+    def purge_code_symbols(self, owner, repo, path, keep_uris):
+        """Delete the code symbols of `path` whose uri is NOT in `keep_uris`
+        (set-difference after a re-parse). Empty keep_uris = the file was removed.
+        DETACH: a symbol that no longer exists takes its dangling edges with it."""
+        if not self._driver:
+            self.connect()
+        with self._driver.session() as session:
+            return session.execute_write(self._purge_symbols_tx, owner, repo, path, list(keep_uris))
+
+    @staticmethod
+    def _purge_symbols_tx(tx, owner, repo, path, keep):
+        rec = tx.run(
+            """
+            MATCH (n:Entity)
+            WHERE n._owner = $owner AND n._repo = $repo AND n._file = $path
+              AND NOT n.uri IN $keep
+            WITH n LIMIT 5000
+            DETACH DELETE n
+            RETURN count(*) AS deleted
+            """,
+            owner=owner, repo=repo, path=path, keep=keep,
+        ).single()
+        return int(rec["deleted"]) if rec else 0
 
     @staticmethod
     def _load_corrected_triples(user_id: str) -> set:
@@ -318,7 +367,8 @@ class KGBuilder:
                     n._source_job     = $job_id,
                     n._source_jobs    = [$job_id],
                     n._origin         = $origin,
-                    n.created_at      = timestamp()
+                    n.created_at      = timestamp(),
+                    n += $props
                 ON MATCH SET
                     // `_source_jobs` MUST be updated before `_source_job`: Cypher applies
                     // SET items in order, so reading `n._source_job` after overwriting it
@@ -341,7 +391,8 @@ class KGBuilder:
                                            ELSE coalesce(n._class_labels, []) + [$label_json] END,
                     n._label_ranks  = CASE WHEN $rank IN coalesce(n._label_ranks, [])
                                            THEN coalesce(n._label_ranks, [$rank])
-                                           ELSE coalesce(n._label_ranks, []) + [$rank] END
+                                           ELSE coalesce(n._label_ranks, []) + [$rank] END,
+                    n += $props
                 SET n._min_rank       = CASE WHEN $rank < coalesce(n._min_rank, 2147483647)
                                              THEN $rank ELSE coalesce(n._min_rank, $rank) END,
                     n._class_conflict = (size(coalesce(n._label_ranks, [$rank])) > 1)
@@ -359,6 +410,7 @@ class KGBuilder:
                 owner=user_id,
                 job_id=job_id,
                 origin=origin,
+                props=ent.get("props") or {},
             )
             summary = result.consume()
             created += summary.counters.nodes_created
@@ -373,6 +425,7 @@ class KGBuilder:
         label_json: str,
         rank: int,
         level_name: str,
+        user_id: Optional[str] = None,
         corrected: Optional[set] = None,
         name_to_uri: Optional[dict] = None,
         source_document_id: Optional[str] = None,
@@ -485,7 +538,9 @@ class KGBuilder:
                     r.created_at       = timestamp(),
                     r.asserted_at      = timestamp(),
                     r._source_doc      = $source_doc,
-                    r._source_doc_modified_at = $source_doc_modified_at
+                    r._source_doc_modified_at = $source_doc_modified_at,
+                    r._owner           = $owner,
+                    r += $props
                 ON MATCH SET
                     // Membership list before the latest-contributor pointer — see the
                     // node MERGE above for why the order matters.
@@ -517,7 +572,8 @@ class KGBuilder:
                                            ELSE coalesce(r._class_labels, []) + [$label_json] END,
                     r._label_ranks  = CASE WHEN $rank IN coalesce(r._label_ranks, [])
                                            THEN coalesce(r._label_ranks, [$rank])
-                                           ELSE coalesce(r._label_ranks, []) + [$rank] END
+                                           ELSE coalesce(r._label_ranks, []) + [$rank] END,
+                    r += $props
                 SET r._min_rank       = CASE WHEN $rank < coalesce(r._min_rank, 2147483647)
                                              THEN $rank ELSE coalesce(r._min_rank, $rank) END,
                     r._class_conflict = (size(coalesce(r._label_ranks, [$rank])) > 1)
@@ -537,6 +593,8 @@ class KGBuilder:
                 rank=rank,
                 source_doc=source_document_id,
                 source_doc_modified_at=source_modified_at_ms,
+                owner=user_id,
+                props=rel.get("props") or {},
             )
             summary = result.consume()
             created += summary.counters.relationships_created

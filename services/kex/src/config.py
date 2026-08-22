@@ -104,7 +104,7 @@ ENTITY_VERIFY_MODEL: str = os.environ.get("ENTITY_VERIFY_MODEL", "")
 # kept even if isolated. This is a GRAPH-only filter — entities remain in chunks/vectors
 # for retrieval, so nothing is lost to search. Set false to write every entity as a node.
 GRAPH_PRUNE_ISOLATED: bool = os.environ.get("GRAPH_PRUNE_ISOLATED", "true").lower() in ("1", "true", "yes")
-GRAPH_KEEP_TYPES: set = {"person", "organization", "location", "work"}
+GRAPH_KEEP_TYPES = {"person", "organization", "location", "work", "code"}
 
 # Neo4j graph database
 NEO4J_URI: str = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
