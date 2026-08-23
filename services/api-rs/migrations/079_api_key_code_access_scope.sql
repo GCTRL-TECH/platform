@@ -1,0 +1,27 @@
+-- 079: restate the "Codebase access" capability (078) now that it also covers
+-- UNSCOPED (full-owner) access tokens.
+--
+-- 078 is left byte-identical on purpose: sqlx verifies the checksum of every
+-- applied migration, so a corrected description has to arrive as a new file.
+--
+-- code_access = false turns OFF, for that token:
+--   * the agent code tools (code_symbol / code_trace / code_impact /
+--     code_architecture) - refused, and hidden from GET /api/agent/tools and the
+--     MCP gateway's tools/list so a connecting model never even sees them;
+--   * CODE knowledge-base visibility - dropped from the token's kb grant set,
+--     from /kg/compilations and the agent's list_graphs, from an explicit
+--     GET /kg/compilations/{id} (404, not 403), and from graph and chunk reads;
+--   * code writes and CODE-KB mutations - POST /api/kex/code and
+--     DELETE /api/kex/code/files, plus create / update / delete / refresh /
+--     distill / schedule of a CODE compilation.
+--
+-- A full-owner (unscoped) token with the flag off is additionally NARROWED to
+-- job-scoped reads of its non-code knowledge bases: the graph tools authorize on
+-- the source jobs of the owner's non-CODE compilations instead of on ownership,
+-- so code nodes are unreachable rather than merely un-listed.
+--
+-- Default true: existing tokens and every token created without the flag keep
+-- today's behaviour. This is a capability switch, not a security downgrade -
+-- turning it OFF only ever removes access.
+COMMENT ON COLUMN api_keys.code_access IS
+  'Capability switch. False = this token gets no code tools, no CODE knowledge-base visibility (lists, grants, explicit ids, graph/chunk reads), and no code writes or CODE-KB mutations; a full-owner token with the flag off is narrowed to job-scoped reads of its non-code knowledge bases. Default true (unchanged behaviour).';

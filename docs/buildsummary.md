@@ -344,15 +344,36 @@ allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-onl
 ### Token capability `codeAccess`
 
 Codebase access is a per-access-token capability (`api_keys.code_access`, migration 078,
-default `true` so nothing changes for existing tokens). Switching it off in
-**Settings -> Access Control** takes everything code-related away from that one token: the four
-code tools are refused by `agent::execute_tool` and omitted from the MCP gateway's `tools/list`,
-CODE compilations drop out of the token's grant set / `/kg/compilations` / the agent's
-`list_graphs` and resolve to denied (`i32::MIN`) on an explicit `compilationId` read, and code
-writes (`POST /api/kex/code`, `DELETE /api/kex/code/files`) return 403. The flag rides on
-`JwtClaims.code_access` (always `true` for JWT sessions), is set at creation via
-`{"codeAccess": false}` and toggled afterwards with `PUT /users/api-keys/:id`. Covered end to end
-by the `code_kb` release check.
+restated in 079, default `true` so nothing changes for existing tokens). Switching it off in
+**Settings -> Access Control** takes everything code-related away from that one token: code
+tools, CODE knowledge-base visibility (lists, grants, explicit ids, graph/chunk reads), code
+writes and CODE-KB mutations. Concretely:
+
+- **Code tools** - the four `code_*` tools are refused by `agent::execute_tool`, and hidden from
+  both discovery surfaces by the shared `agent::visible_tool_schema` (`GET /api/agent/tools` and
+  the MCP gateway's `tools/list`).
+- **Visibility** - CODE compilations drop out of the token's grant set, out of
+  `/kg/compilations` and the agent's `list_graphs` (excluded in SQL, so a page is never
+  shortened), and an explicit `GET /kg/compilations/{id}` of a code graph returns **404** - the
+  access rank is now computed unconditionally, so a denied graph is indistinguishable from one
+  that does not exist.
+- **Reads** - `search_chunks` and the agent `query` tool drop retrieved chunks/sources whose
+  compilation or origin job belongs to a CODE graph, so RAG cannot smuggle code back as text.
+- **Writes** - `POST /api/kex/code` and `DELETE /api/kex/code/files` return 403, and so do
+  create / update / delete / refresh / distill / schedule on a CODE compilation
+  (`kg::enforce_code_capability`, also wired into the `delete_compilation` /
+  `refresh_compilation` agent tools).
+
+**Full-owner (unscoped) tokens** with the flag off are additionally narrowed to *job-scoped*
+reads of their non-code knowledge bases: `kg::api_key_scoped_jobs` returns the source jobs of
+the owner's non-CODE compilations, which switches `node_auth_clause` off ownership and onto job
+scope, so code nodes vanish from `search_entities` / `get_entity` / `get_neighbors` /
+`shortest_path` / `schema`. Because job scope is a positive allow-list, an orphan node (in no
+compilation at all) is invisible to such a token too - the conservative direction.
+
+The flag rides on `JwtClaims.code_access` (always `true` for JWT sessions), is set at creation
+via `{"codeAccess": false}` and toggled afterwards with `PUT /users/api-keys/:id`. Covered end to
+end by the `code_kb` release check, for both KB-scoped and unscoped tokens.
 
 ### Measured numbers (dogfood: borghive indexing itself, 2026-08-23)
 - 464 files (Python/TypeScript/Rust) → 7134 symbols, 9080 edges, 3726 chunks.
