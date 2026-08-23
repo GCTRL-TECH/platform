@@ -25,6 +25,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as fs from 'node:fs';
 import * as nodePath from 'node:path';
+import { indexRepo } from '@gctrl/code-indexer';
 
 const API_BASE = process.env['GCTRL_API_URL'] || 'http://localhost:4000/api';
 const GCTRL_EMAIL = process.env['GCTRL_EMAIL'] || 'admin@gctrl.tech';
@@ -50,6 +51,13 @@ const SCOPED_TOKEN = process.env['GCTRL_API_TOKEN'] || '';
 // Code) reach a networked GCTRL harness without changing how it's configured.
 // When unset, the existing local/direct behavior below is used unchanged.
 const GATEWAY_URL = process.env['GCTRL_GATEWAY_URL'] || '';
+
+// Optional tool-set filter. `GCTRL_MCP_TOOLS=code` registers only the local code
+// indexer + code read tools - used when this server runs NEXT TO an HTTP gctrl
+// entry (Anvil's `gctrl-code`) so the knowledge tools are not duplicated.
+const TOOL_FILTER = process.env['GCTRL_MCP_TOOLS'];
+const CODE_ONLY_TOOLS = new Set(['gctrl_code_index', 'gctrl_code_symbol', 'gctrl_code_trace', 'gctrl_code_impact', 'gctrl_code_architecture']);
+function toolAllowed(name: string): boolean { return TOOL_FILTER !== 'code' || CODE_ONLY_TOOLS.has(name); }
 
 /** JSON-RPC call to the remote gateway, authed with the scoped Access Token. */
 async function gatewayRpc(method: string, params?: unknown): Promise<unknown> {
@@ -192,6 +200,9 @@ function registerToolWithAlias<TArgs>(
   // In remote mode the local tools are replaced by gateway passthroughs
   // (registered in main()), so skip the built-in direct-API tools entirely.
   if (GATEWAY_URL) {
+    return;
+  }
+  if (!toolAllowed(newName)) {
     return;
   }
 
@@ -973,6 +984,9 @@ function registerTool<TArgs>(
   if (GATEWAY_URL) {
     return;
   }
+  if (!toolAllowed(name)) {
+    return;
+  }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (server.tool as any)(name, description, schema, handler);
 }
@@ -1114,6 +1128,34 @@ registerToolWithAlias<{ compilationId: string; mode: 'cloaked' | 'local_only' }>
 
 const codeRead = (name: string, args: Record<string, unknown>) =>
   apiCall('POST', `/agent/tools/${name}`, args) as Promise<Record<string, unknown>>;
+
+registerTool<{ repoPath: string; compilationId?: string; full?: boolean; classificationLevelId?: string }>(
+  'gctrl_code_index',
+  'Index a local code repository into a GCTRL Codebase KB (compilation of type CODE): walks the repo (.gitignore-aware), parses Python/TypeScript/JavaScript/Rust with tree-sitter, uploads symbols + CONTAINS/IMPORTS/CALLS/INHERITS edges + one chunk per symbol. Incremental: only files whose content hash changed since the last run are uploaded. Omit compilationId to create a new CODE compilation named after the repo. Afterwards use gctrl_code_symbol / gctrl_code_trace / gctrl_code_impact / gctrl_code_architecture.',
+  {
+    repoPath: z.string().describe('Absolute path of the repository root on this machine'),
+    compilationId: z.string().optional().describe('Target CODE compilation. Omit to create one.'),
+    full: z.boolean().optional().describe('Force re-upload of every file (default: incremental)'),
+    classificationLevelId: z.string().optional(),
+  },
+  async ({ repoPath, compilationId, full, classificationLevelId }) => {
+    const progress: string[] = [];
+    try {
+      const s = await indexRepo({
+        repoPath, compilationId, full, classificationLevelId,
+        request: (method, p, body) => apiCall(method, p, body),
+        onProgress: (m) => { progress.push(m); console.error(`[gctrl_code_index] ${m}`); },
+      });
+      return { content: [{ type: 'text' as const, text:
+        `Indexed ${s.repo}${s.commit ? ` @ ${s.commit.slice(0, 7)}` : ''} into CODE compilation ${s.compilationId}: ` +
+        `${s.filesChanged}/${s.filesTotal} files uploaded (${s.filesRemoved} removed), ${s.symbols} symbols, ${s.edges} edges, ${s.chunks} chunks in ${s.batches} job(s).` +
+        (s.warnings.length ? ` Warnings: ${s.warnings.join('; ')}` : '') +
+        ` Next: gctrl_code_architecture({compilationId: "${s.compilationId}"}).` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error indexing ${repoPath}: ${(err as Error).message}\n${progress.slice(-5).join('\n')}` }] };
+    }
+  },
+);
 
 registerTool<{ query: string; compilationId?: string; types?: string[]; limit?: number; offset?: number }>(
   'gctrl_code_symbol',
