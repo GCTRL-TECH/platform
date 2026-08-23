@@ -1345,6 +1345,9 @@ pub(crate) async fn communities_core(
     id: Uuid,
 ) -> Result<Value> {
     enforce_kb_write_scope(&state.db, claims, id).await?;
+    // Community detection WRITES `_community`/`_centrality`/`_god_node` onto the
+    // graph's nodes - a mutation of a CODE knowledge base when the target is one.
+    enforce_code_capability(&state.db, claims, id).await?;
     let row: Option<(Vec<Uuid>,)> = sqlx::query_as(
         "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
     ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
@@ -1642,6 +1645,10 @@ async fn set_wiki_sources(
     Json(req): Json<SetWikiSources>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    // Repointing a wiki's source set rewrites what that knowledge base distils
+    // from - gated like every other CODE-KB mutation (078). The sources
+    // themselves must be RAW, so a CODE graph can never be pulled in as one.
+    enforce_code_capability(&state.db, &claims, id).await?;
     ensure_owned_wiki(&state, &claims, id).await?;
 
     // Validate every source: must exist, be owned by this user, and be RAW.
@@ -1778,6 +1785,10 @@ async fn set_acl(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    // Migration 078 - Codebase access off: who may read a CODE knowledge base is
+    // itself a code-KB mutation. Without this a no-code token could grant itself
+    // (or anyone) access to the very graph its capability denies.
+    enforce_code_capability(&state.db, &claims, id).await?;
     sqlx::query("DELETE FROM compilation_acl WHERE compilation_id=$1").bind(id).execute(&state.db).await?;
     if let Some(entries) = req.get("entries").and_then(|v| v.as_array()) {
         for e in entries {
@@ -2974,6 +2985,11 @@ async fn resolve_mutation_scope(
     // since add/delete-relationship and delete-node both route through here): a
     // KB-scoped access token may only mutate compilations in its grant set.
     enforce_kb_write_scope(db, claims, compilation_id).await?;
+    // Codebase-access gate (078), same place and for the same reason: every
+    // node/relationship mutation - REST handler AND agent tool arm (delete_node,
+    // delete_relationship/correct_relationship, add_relationship) - resolves its
+    // scope here, so one gate closes all of them before any side effect.
+    enforce_code_capability(db, claims, compilation_id).await?;
     let owned: Option<(Vec<Uuid>,)> = sqlx::query_as(
         "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
     ).bind(compilation_id).bind(claims.sub).fetch_optional(db).await?;
@@ -3994,5 +4010,97 @@ mod fact_conflict_tests {
         assert!(CONFLICTS_SQL.contains("CHECK (status IN ('open', 'resolved', 'dismissed'))"));
         assert!(CONFLICTS_SQL.contains("CHECK (key_side IN ('head', 'tail'))"));
         assert!(CONFLICTS_SQL.contains("resolved_correction_id UUID REFERENCES knowledge_corrections(id)"));
+    }
+}
+
+/// Source-level invariants for the per-token "Codebase access" capability
+/// (migration 078/079). These handlers touch a compilation the caller NAMES, so
+/// each one must run `enforce_code_capability` before any side effect — and the
+/// read paths that return chunk text must drop CODE-origin rows. A DB-backed
+/// test would need a live Postgres; reading the call sites is the cheap guard
+/// that keeps a future edit from quietly dropping one (same trick as
+/// `services/neo4j.rs::no_compilation_read_falls_back_to_the_whole_account`).
+#[cfg(test)]
+mod code_capability_source_invariants {
+    /// The body of `fn <name>` — from its signature to the next top-level `fn`.
+    fn body<'a>(src: &'a str, name: &str) -> &'a str {
+        let sig = format!("fn {name}(");
+        let start = src.find(&sig)
+            .unwrap_or_else(|| panic!("function {name} not found — was it renamed?"));
+        let rest = &src[start + sig.len()..];
+        let end = ["\nasync fn ", "\npub async fn ", "\npub(crate) async fn ",
+                   "\nfn ", "\npub fn ", "\npub(crate) fn "]
+            .iter()
+            .filter_map(|pat| rest.find(pat))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn code_kb_mutations_call_enforce_code_capability() {
+        let kg = include_str!("kg.rs");
+        for f in [
+            "update", "delete_one", "refresh", "distill",   // compilation lifecycle
+            "set_schedule", "set_acl", "set_wiki_sources",  // configuration
+            "communities_core",                             // writes onto the nodes
+            "resolve_mutation_scope",                       // node/relationship edits
+        ] {
+            assert!(
+                body(kg, f).contains("enforce_code_capability("),
+                "routes/kg.rs::{f} mutates a named compilation but no longer gates on \
+                 the Codebase-access capability"
+            );
+        }
+    }
+
+    /// Node/relationship edits (REST handlers AND agent tool arms) all resolve
+    /// their scope through `resolve_mutation_scope`, so the gate there is what
+    /// covers `delete_node`, `delete_relationship`/`correct_relationship` and
+    /// `add_relationship`. If a core stops going through it, the gate is gone.
+    #[test]
+    fn graph_mutation_cores_route_through_the_gated_scope_resolver() {
+        let kg = include_str!("kg.rs");
+        for f in ["delete_node_core", "delete_relationship_core", "add_relationship_core"] {
+            assert!(
+                body(kg, f).contains("resolve_mutation_scope("),
+                "routes/kg.rs::{f} no longer resolves scope via resolve_mutation_scope — \
+                 the Codebase-access gate for graph mutations was bypassed"
+            );
+        }
+    }
+
+    /// The ingest/write surfaces outside kg.rs.
+    #[test]
+    fn kex_write_paths_gate_code_knowledge_bases() {
+        let kex = include_str!("kex.rs");
+        for f in ["extract", "delete_chunk_core", "link_job_to_target_or_default"] {
+            let b = body(kex, f);
+            assert!(
+                b.contains("enforce_code_capability(")
+                    || b.contains("compilation_is_code(")
+                    || b.contains("claims.code_access"),
+                "routes/kex.rs::{f} writes/deletes knowledge for a named compilation but \
+                 no longer checks the Codebase-access capability"
+            );
+        }
+    }
+
+    /// The reads that hand back raw chunk TEXT: RAG answers and the chunks list.
+    /// Both must drop CODE-origin material for a token without the capability —
+    /// the code tools being refused is worthless if retrieval re-serves the code.
+    #[test]
+    fn chunk_reads_drop_code_origin_material() {
+        let rag = include_str!("rag.rs");
+        assert!(
+            body(rag, "query").contains("code_chunk_scope("),
+            "routes/rag.rs::query no longer drops CODE-origin chunks — a token without \
+             Codebase access would get code back as RAG evidence"
+        );
+        let kex = include_str!("kex.rs");
+        assert!(
+            body(kex, "list_chunks").contains("c.type::text = 'CODE'"),
+            "routes/kex.rs::list_chunks no longer excludes CODE-origin chunks in SQL"
+        );
     }
 }

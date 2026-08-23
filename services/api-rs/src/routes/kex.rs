@@ -161,6 +161,18 @@ pub(crate) async fn link_job_to_target_or_default(
         },
     };
     if let Some(cid) = target {
+        // Migration 078 — belt-and-braces for every ingest path that funnels
+        // through here (upload, connector, agent store/create_extraction): a
+        // token without Codebase access never links a job into a CODE knowledge
+        // base, not even the resolved default one. The callers that CAN return
+        // an error (POST /kex/extract) refuse earlier with 403.
+        if !claims.code_access
+            && crate::routes::kg::compilation_is_code(db, cid).await
+        {
+            tracing::warn!(%job_id, %cid,
+                "token without Codebase access targeted a CODE knowledge base — job left unlinked");
+            return;
+        }
         link_job_to_compilation(db, claims.sub, cid, job_id).await;
     }
 }
@@ -239,6 +251,12 @@ async fn extract(
         return Err(AppError::BadRequest("Text too short (min 10 chars)".into()));
     }
     enforce_classification_ceiling(&state.db, &claims, req.classification_level_id).await?;
+    // Migration 078 — ingesting INTO a CODE knowledge base is a code-KB mutation.
+    // Refused before the token spend, so a no-code token can't pay for a write it
+    // isn't allowed to make (the linker below would drop it anyway).
+    if let Some(cid) = req.compilation_id {
+        crate::routes::kg::enforce_code_capability(&state.db, &claims, cid).await?;
+    }
     // GREATEST(0, ...) prevents negative balances if a prior bug or race left them stuck.
     sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
         .bind(claims.sub).execute(&state.db).await?;
@@ -1174,13 +1192,24 @@ async fn list_chunks(
         // compilation_id (it's set later, if ever), so a chunk mentioning the
         // entity but not yet linked must still surface for its owner. Match the
         // requested compilation OR any of the user's unlinked chunks.
+        //
+        // Migration 078 — Codebase access off ($7 false): CODE-origin chunks are
+        // excluded IN SQL, not post-filtered, so the window-function `total` and
+        // the page stay consistent. A chunk is code when its own compilation is a
+        // CODE graph, or — for the NULL-compilation majority — when the job that
+        // produced it feeds one (same origin rule as agent::drop_code_chunks).
         "SELECT id, job_id, compilation_id, content, start_char, end_char,
                 chunk_sequence, entity_mentions, created_at,
                 COUNT(*) OVER () AS total
-           FROM text_chunks
+           FROM text_chunks tc
           WHERE user_id = $1
             AND ($2::uuid IS NULL OR compilation_id = $2 OR compilation_id IS NULL)
             AND COALESCE(min_rank, 0) <= $6
+            AND ($7::bool OR NOT EXISTS (
+                  SELECT 1 FROM compilations c
+                   WHERE c.type::text = 'CODE' AND c.user_id = tc.user_id
+                     AND (c.id = tc.compilation_id
+                          OR tc.job_id = ANY(COALESCE(c.source_job_ids, '{}'::uuid[])))))
             AND (
                  entity_mentions @> jsonb_build_array(jsonb_build_object('name', $3))
               OR content ILIKE '%' || $3 || '%'
@@ -1194,6 +1223,7 @@ async fn list_chunks(
     .bind(limit)
     .bind(offset)
     .bind(eff_rank)
+    .bind(claims.code_access)
     .fetch_all(&state.db).await?;
 
     let total: i64 = rows.first().map(|r| r.9).unwrap_or(0);
@@ -1246,6 +1276,25 @@ pub(crate) async fn delete_chunk_core(
     claims: &JwtClaims,
     id: Uuid,
 ) -> Result<bool> {
+    // Migration 078 — deleting a chunk that belongs to a CODE knowledge base is a
+    // code-KB mutation. The chunk carries no compilationId of its own in the
+    // request, so the origin is resolved here (own compilation, or the job that
+    // produced it) — one query, only when the capability is off.
+    if !claims.code_access {
+        let is_code: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM text_chunks tc JOIN compilations c
+                 ON c.type::text = 'CODE' AND c.user_id = tc.user_id
+                AND (c.id = tc.compilation_id
+                     OR tc.job_id = ANY(COALESCE(c.source_job_ids, '{}'::uuid[])))
+                WHERE tc.id = $1 AND tc.user_id = $2)"
+        ).bind(id).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(false);
+        if is_code {
+            return Err(AppError::Forbidden(
+                "This access token has Codebase access disabled - code knowledge bases cannot be modified".into(),
+            ));
+        }
+    }
     // Fetch the chunk (owner-scoped) and its Qdrant point id before deleting.
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT qdrant_point_id FROM text_chunks WHERE id = $1 AND user_id = $2"

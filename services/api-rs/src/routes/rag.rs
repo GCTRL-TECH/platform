@@ -671,6 +671,25 @@ async fn query(
         }
     };
 
+    // Migration 078 - Codebase access off: KEX scopes retrieval by owner +
+    // clearance only, so a CODE-origin chunk would otherwise ground (and be
+    // cited by) the answer. Dropped BEFORE the rerank/prompt, not just off the
+    // `sources` list, so the model never sees the code text either. Same origin
+    // rule as `agent::drop_code_chunks`: the chunk's own compilation, or - for
+    // the many chunks whose `compilation_id` is NULL - the job that produced it.
+    if let Some(ref c) = claims {
+        if !c.code_access {
+            let (code_comps, code_jobs) =
+                crate::routes::agent::code_chunk_scope(&state.db, c.sub).await;
+            if !(code_comps.is_empty() && code_jobs.is_empty()) {
+                chunks.retain(|ch| {
+                    !ch.compilation_id.as_deref().is_some_and(|v| code_comps.contains(v))
+                        && !ch.job_id.as_deref().is_some_and(|v| code_jobs.contains(v))
+                });
+            }
+        }
+    }
+
     // Query-aware rerank over the hybrid-fused candidates. KEX already fuses
     // dense+lexical (RRF); this nudges chunks whose text / entity mentions overlap
     // the (contextualized) query terms to the top, then keeps the best 6 so the

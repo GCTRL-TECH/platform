@@ -1317,6 +1317,10 @@ async fn execute_tool_inner(
                 if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
                     return json!({ "error": e.to_string() });
                 }
+                // 078: writing knowledge INTO a CODE graph is a code-KB mutation.
+                if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
+                    return json!({ "error": e.to_string() });
+                }
                 crate::routes::kex::link_job_to_compilation(&state.db, claims.sub, cid, job_id).await;
                 linked = true;
             }
@@ -1351,6 +1355,10 @@ async fn execute_tool_inner(
             // KB-scope: a colleague token may only ingest into a KB it's granted.
             if let Some(cid) = compilation_id {
                 if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                    return json!({ "error": e.to_string() });
+                }
+                // 078: same gate as `store` - no ingesting into a CODE graph.
+                if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
                     return json!({ "error": e.to_string() });
                 }
             }
@@ -1538,6 +1546,12 @@ async fn execute_tool_inner(
                 return json!({ "error": "mode must be 'cloaked' or 'local_only' (use the Settings UI to set 'open')" });
             }
             if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                return json!({ "error": e.to_string() });
+            }
+            // 078: privacy mode is a property of the knowledge base - a no-code
+            // token must not reconfigure a CODE one (and the refusal also stops it
+            // probing which of its graph ids are code).
+            if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
                 return json!({ "error": e.to_string() });
             }
             let current: Option<(String,)> = sqlx::query_as(
