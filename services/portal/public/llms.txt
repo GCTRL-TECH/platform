@@ -45,6 +45,8 @@ Agent skill: https://gctrl.tech/skill.md
 
 ## Articles
 
+- [Best Tools for LLM Product Analytics: Evals and Monitoring](https://gctrl.tech/blog/llm-product-analytics-the-stack-for-evals-and-monitoring): Discover the best tools for llm product analytics. Learn how to use Confident AI, DeepEval, and Langfuse for pre-production evals and production monitoring.
+- [Entity Resolution Duplicate Names: Improving RAG Accuracy](https://gctrl.tech/blog/entity-resolution-for-rag-merging-duplicate-identities-in-knowle): Learn how entity resolution duplicate names prevents retrieval fragmentation and hallucinations in RAG systems by merging records into a golden record.
 - [How to Build Knowledge Graph from Documents for Your Company](https://gctrl.tech/blog/how-to-build-a-company-knowledge-graph-from-unstructured-documents): Learn how to build knowledge graph from documents using a four-stage pipeline to improve multi-hop reasoning and entity relationship extraction.
 - [EU AI Act for RAG Deployments: What Actually Applies Since August 2026](https://gctrl.tech/blog/eu-ai-act-rag-deployments-2026): Article 50 transparency is enforceable since 2 August 2026, while high-risk duties moved to 2027. A practical checklist for teams running RAG and AI memory in the EU.
 - [The Real Cost of Metered AI Memory (and Why We Refuse to Count Tokens)](https://gctrl.tech/blog/unlimited-tokens-metered-ai-memory): Cloud memory platforms charge around $2.50 per million tokens after a small free grant. The arithmetic looks harmless - until you run a real team's workload through it.
