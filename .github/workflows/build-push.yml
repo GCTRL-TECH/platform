@@ -385,7 +385,15 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
-  deploy-vps:
+  # The legacy "deploy-vps" job used to `docker run` a standalone `gctrl-app`
+  # API container outside of Compose (no labels, no ports, DATABASE_URL pointing
+  # at a host that does not exist on the gctrl network). It could never serve
+  # traffic - the real API is the Compose service `gctrl-api` - and it sat in a
+  # permanent restart loop (9k+ restarts, "Failed to connect to PostgreSQL").
+  # The product install on the VPS is updated via Compose (pull + up -d), not by
+  # this workflow. This job now only removes that orphan if an old run left it
+  # behind, so the loop can never come back.
+  cleanup-legacy-vps:
     needs: [deploy-portal, build-api-rs]
     if: |
       always() &&
@@ -393,46 +401,23 @@ jobs:
       needs.build-api-rs.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy Rust API to VPS
+      - name: Remove legacy standalone gctrl-app container (if present)
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: GHCR_TOKEN,DATABASE_URL,JWT_SECRET,JWT_REFRESH_SECRET
           script: |
-            set -e
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin || echo "ghcr login skipped (images are public)"
-
-            docker pull ghcr.io/gctrl-tech/api:latest
-            GCTRL_NET=$(docker inspect gctrl-db --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
-            GCTRL_NET=${GCTRL_NET:-gctrl}
-            docker rm -f gctrl-app 2>/dev/null || true
-            docker run -d \
-              --name gctrl-app \
-              --network "$GCTRL_NET" \
-              --restart unless-stopped \
-              -e PORT=4000 \
-              -e DATABASE_URL="$DATABASE_URL" \
-              -e REDIS_URL="redis://gctrl-redis:6379" \
-              -e NEO4J_URI="bolt://localhost:7687" \
-              -e NEO4J_USER=neo4j \
-              -e NEO4J_PASSWORD=none \
-              -e JWT_SECRET="$JWT_SECRET" \
-              -e JWT_REFRESH_SECRET="$JWT_REFRESH_SECRET" \
-              -e FRONTEND_URL="https://gctrl.tech" \
-              ghcr.io/gctrl-tech/api:latest
-
-            echo "=== Running containers ==="
-            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
-        env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
+            if docker ps -a --format '{{.Names}}' | grep -qx gctrl-app; then
+              docker rm -f gctrl-app && echo "removed legacy gctrl-app"
+            else
+              echo "no legacy gctrl-app container - nothing to do"
+            fi
+            echo "=== Restarting containers (should be none) ==="
+            docker ps -a --filter status=restarting --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
 
   update-deploy-repo:
-    needs: deploy-vps
+    needs: cleanup-legacy-vps
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
