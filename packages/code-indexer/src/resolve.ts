@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { Lang } from './parser.js';
 import type { EdgeOut, SymbolOut, WalkedFile } from './types.js';
 import type { Extracted, RawImport, RawSymbol } from './extract/types.js';
+import { findNearestTsconfig, mapSpecifierViaConfig } from './tsPaths.js';
 
 export const symName = (p: string, qualname: string) => `${p}::${qualname}`;
 const posix = (p: string) => p.split(path.sep).join('/');
@@ -27,10 +28,26 @@ export interface RepoIndex {
   symbolsByFile: Map<string, RawSymbol[]>;
   byBareName: Map<string, string[]>;
   allPaths: Set<string>;
+  /** absolute, native-separator repo root (best-effort; '' if it couldn't be inferred) */
+  root: string;
 }
 
-export function buildRepoIndex(files: Array<{ walked: WalkedFile; ex: Extracted }>): RepoIndex {
-  const idx: RepoIndex = { files: new Map(), symbolsByFile: new Map(), byBareName: new Map(), allPaths: new Set() };
+/** Recover the absolute repo root from the first walked file's `abs` minus its `path`
+ * (both are set consistently by walkRepo), used when the caller doesn't pass one
+ * explicitly. Only needed for tsconfig baseUrl/paths lookups. */
+function inferRoot(files: Array<{ walked: WalkedFile }>): string {
+  for (const f of files) {
+    const relNative = f.walked.path.split('/').join(path.sep);
+    if (relNative && f.walked.abs.endsWith(relNative)) {
+      const root = f.walked.abs.slice(0, f.walked.abs.length - relNative.length).replace(/[\\/]+$/, '');
+      if (root) return root;
+    }
+  }
+  return '';
+}
+
+export function buildRepoIndex(files: Array<{ walked: WalkedFile; ex: Extracted }>, root?: string): RepoIndex {
+  const idx: RepoIndex = { files: new Map(), symbolsByFile: new Map(), byBareName: new Map(), allPaths: new Set(), root: root ? path.resolve(root) : inferRoot(files) };
   for (const f of files) {
     idx.files.set(f.walked.path, f); idx.allPaths.add(f.walked.path);
     idx.symbolsByFile.set(f.walked.path, f.ex.symbols);
@@ -64,10 +81,23 @@ export function resolveImport(fromPath: string, imp: RawImport, lang: Lang, idx:
     return firstExisting(idx, cands);
   }
   if (lang === 'typescript' || lang === 'tsx' || lang === 'javascript') {
-    if (!imp.module.startsWith('.')) return null;
-    const base = path.posix.join(dir, imp.module).replace(/\.(js|mjs|cjs|jsx)$/, '');
     const exts = ['.ts', '.tsx', '.mts', '.js', '.mjs', '.jsx', '.cjs'];
-    return firstExisting(idx, [...exts.map(e => base + e), ...exts.map(e => `${base}/index${e}`)]);
+    if (imp.module.startsWith('.')) {
+      const base = path.posix.join(dir, imp.module).replace(/\.(js|mjs|cjs|jsx)$/, '');
+      return firstExisting(idx, [...exts.map(e => base + e), ...exts.map(e => `${base}/index${e}`)]);
+    }
+    // Non-relative specifier (e.g. "@/hooks/useApi"): try the nearest tsconfig's
+    // baseUrl/paths before giving up (external package otherwise).
+    if (!idx.root) return null;
+    const cfg = findNearestTsconfig(path.join(idx.root, dir), idx.root);
+    if (!cfg) return null;
+    const bases = mapSpecifierViaConfig(cfg, imp.module)
+      .map(abs => path.relative(idx.root, abs).split(path.sep).join('/'))
+      .filter(rel => rel && !rel.startsWith('..'));
+    if (!bases.length) return null;
+    const candidates: string[] = [];
+    for (const base of bases) { for (const e of exts) candidates.push(base + e); for (const e of exts) candidates.push(`${base}/index${e}`); }
+    return firstExisting(idx, candidates);
   }
   if (lang === 'rust') {
     if (imp.alias === 'mod') {                                   // `mod foo;`

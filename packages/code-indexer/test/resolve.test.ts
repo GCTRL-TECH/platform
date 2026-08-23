@@ -56,6 +56,13 @@ describe('resolver', () => {
     // (not guessed), the repo-wide bare-name path isn't even needed for this case.
     expect(edges).toContain('CALLS src/index.ts::main -> src/models/user.ts::User.greet');
   });
+  it('typescript: tsconfig baseUrl/paths resolves a non-relative "@/..." specifier', async () => {
+    const idx = await indexFixture('ts-paths');
+    expect(resolveImport('src/app.ts', { module: '@/lib/util', names: ['add'], line: 1 }, 'typescript', idx)).toBe('src/lib/util.ts');
+    const out = fileOutputs(idx, 'src/app.ts');
+    const edges = out.edges.map(e => `${e.type} ${e.head} -> ${e.tail} (${e.confidence})`);
+    expect(edges).toContain('CALLS src/app.ts::main -> src/lib/util.ts::add (0.6)');
+  });
   it('rust: mod and use resolve to files; scoped calls resolve', async () => {
     const idx = await indexFixture('rust');
     expect(resolveImport('src/lib.rs', { module: 'util', names: [], alias: 'mod', line: 1 }, 'rust', idx)).toBe('src/util/mod.rs');

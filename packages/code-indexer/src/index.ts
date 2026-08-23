@@ -4,5 +4,6 @@ export * from './walk.js';
 export * from './extract/types.js';
 export { extractFile } from './extract/engine.js';
 export * from './resolve.js';
+export * from './tsPaths.js';
 export * from './chunks.js';
 export * from './indexer.js';

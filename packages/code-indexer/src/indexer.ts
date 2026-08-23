@@ -64,7 +64,7 @@ export async function indexRepo(opts: IndexOptions): Promise<IndexSummary> {
     catch (e) { warnings.push(`parse failed ${w.path}: ${(e as Error).message}`); }
   }
   log(`parsed ${parsed.length}/${walked.length} files`);
-  const idx = buildRepoIndex(parsed);
+  const idx = buildRepoIndex(parsed, repoPath);
 
   const manifest = (await opts.request('GET', `/kex/code/manifest?compilationId=${encodeURIComponent(compilationId)}`)) as { files?: Record<string, string> };
   const known = manifest.files ?? {};
