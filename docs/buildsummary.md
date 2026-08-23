@@ -261,7 +261,59 @@ Authentication: `ApiKey` header, key stored in `~/.gctrl/config.json`
 Index a source repository (symbols, imports, call graph, chunks) into GCTRL as a knowledge base,
 usable by agents via MCP/CLI first, product connector + UI later. Indexing runs where the code
 lives (`@gctrl/code-indexer`, TypeScript, first shared TS package); the server only stores.
-Contract: `docs/superpowers/specs/2026-08-22-codebase-kb-design.md` section 10 (`IndexBatch`).
+
+### IndexBatch wire contract
+
+The one contract the indexer, the endpoints and the worker all implement. Also section 10 of
+`docs/superpowers/specs/2026-08-22-codebase-kb-design.md` (a local working document, not
+checked in - this copy is the durable one).
+
+```jsonc
+// POST /api/kex/code  (ApiKey or JWT auth; body <= 40 MB; indexer sends batches of <= 200 files)
+{
+  "compilationId": "uuid",                      // REQUIRED. Must be a compilation of type CODE the caller may write.
+  "repo": { "name": "borghive", "root": "d:/N8N/Projekte/Databorg/borghive", "commit": "a1b2c3d" },  // commit may be null
+  "classificationLevelId": "uuid",             // optional, same semantics as /kex/extract
+  "files": [
+    {
+      "path": "services/kex/src/kg_builder.py", // repo-relative, forward slashes
+      "sha256": "hex64",
+      "lang": "python",                          // python | typescript | tsx | javascript | rust | go | java | csharp | other
+      "symbols": [
+        // kind: file | module | class | interface | enum | struct | type | function | method
+        // name: fully-qualified entity name = "<path>::<qualname>" (file symbol: name == path; module: dotted import target)
+        { "kind": "class",    "name": "services/kex/src/kg_builder.py::KGBuilder",            "line_start": 60, "line_end": 560, "signature": "class KGBuilder", "doc": "Writes graphs.", "exported": true },
+        { "kind": "method",   "name": "services/kex/src/kg_builder.py::KGBuilder.build_graph","line_start": 89, "line_end": 234, "signature": "def build_graph(self, job_id, user_id, entities, relations, classification=None, origin=None, source_document_id=None, source_modified_at_ms=None)", "doc": "", "exported": true },
+        // stubs for cross-file edge targets NOT in this batch are allowed and expected: same shape, `stub: true`
+        { "kind": "function", "name": "services/kex/src/embedding.py::build_embedding_client", "stub": true, "file": "services/kex/src/embedding.py" },
+        // every UNRESOLVED import target (external package) is an explicit module symbol - the server never guesses
+        { "kind": "module",   "name": "neo4j" }
+      ],
+      "edges": [
+        // type: CONTAINS | IMPORTS | CALLS | INHERITS | IMPLEMENTS ; head/tail are symbol names as above
+        { "type": "CONTAINS", "head": "services/kex/src/kg_builder.py", "tail": "services/kex/src/kg_builder.py::KGBuilder", "confidence": 1.0, "resolution": "syntax" },
+        { "type": "CALLS",    "head": "services/kex/src/kg_builder.py::KGBuilder.build_graph", "tail": "services/kex/src/kg_builder.py::KGBuilder._write_entities", "confidence": 0.6, "resolution": "heuristic" },
+        { "type": "IMPORTS",  "head": "services/kex/src/kg_builder.py", "tail": "neo4j", "confidence": 1.0, "resolution": "syntax" }   // unresolved external -> module node named "neo4j"
+      ],
+      "chunks": [
+        { "symbol": "services/kex/src/kg_builder.py::KGBuilder.build_graph", "content": "services/kex/src/kg_builder.py:L89-L234 def build_graph(...)\n<body, capped 2000 chars>" }
+      ]
+    }
+  ],
+  "removed": ["services/kex/src/old_module.py"]   // repo-relative paths whose symbols/chunks must be dropped
+}
+// Response: { "jobId": "uuid", "status": "pending" }
+
+// GET /api/kex/code/manifest?compilationId=uuid
+// Response: { "repo": "borghive", "commit": "a1b2c3d" | null, "files": { "services/kex/src/kg_builder.py": "hex64", ... } }
+```
+
+Graph mapping (worker): every symbol becomes an `:Entity` via `KGBuilder.build_graph` with `text=name`, `type=kind`, `coarse_type="code"`, `label=kind`, and `props = {_repo, _file, lang, line_start, line_end, signature, doc, exported, sha256(file only)}`. Every edge gets `props = {_repo, _file: <path of the batch file that owns it>, resolution}`. One extra entity per batch: `{text: repo.name, type: "repo", props: {_repo: repo.name, commit, root, indexed_at}}` plus `CONTAINS repo -> file` for each file.
+
+Identity note: a node's `name` is exactly what the wire carries, but its `uri` is derived from
+`<repo.name>::<name>` - without the repo scope, two repos of the same user sharing a path
+(`src/index.ts`, `main.py`) collapse onto one node. The read tools match by `name` inside a job
+scope, so nothing on the wire changes.
 
 ### Endpoints
 - `POST /api/kex/code` — body `{compilationId, repo:{name,root,commit}, files:[{path,sha256,lang,symbols[],edges[],chunks[]}], removed:[paths]}`, enqueues an async `kex_code` job, returns `{jobId, status}`.
@@ -290,13 +342,16 @@ allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-onl
 `gctrl-code`. `GCTRL_MCP_TOOLS=code` filters an MCP server instance to just the code tools.
 
 ### Measured numbers (dogfood: borghive indexing itself, 2026-08-23)
-- 461 files (Python/TypeScript/Rust) → 7155 symbols, 9188 edges, 3681 chunks.
+- 461 files (Python/TypeScript/Rust) → 7045 symbols, 8924 edges, 3693 chunks.
 - Incremental re-run, no changes: 0/461 files uploaded.
 - Full run wall time: ~2-4 min on the dev box (embeddings dominate).
-- Edge precision (gauntlet): confidence-0.6 tier (import/module-scope resolution) = 997/997 correct
-  for TS/JS against a TypeScript-compiler oracle, 30/30 for Python+Rust against an LLM judge.
-  Confidence-0.4 tier (repo-wide unique bare name, receiver calls only when the method name is
-  unique) is lower and every such edge is labeled `resolution: heuristic, confidence: 0.4`.
+- Edge precision (gauntlet): 1075 CALLS edges scored, 0 incorrect - 1012/1012 for TS/JS against a
+  TypeScript-compiler oracle plus 63 Python/Rust edges against an LLM judge (no compiler oracle
+  wired up for those). Every edge is labeled with its tier, so a caller can weigh it: `confidence
+  0.6, resolution: heuristic` = resolved within file/module scope (import-aware); `confidence 0.4,
+  resolution: heuristic` = repo-wide unique bare name, guarded (length, stop-list, same language
+  family, external-import and local-shadow blocks) - the same guarded tier the INHERITS/IMPLEMENTS
+  fallback uses.
 - Token efficiency vs. grep-style exploration over 5 structural questions: 95.7% overall
   (85.8%-99.9% per question).
 
@@ -305,5 +360,19 @@ allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-onl
 `typecheck-mcp` (build the indexer, typecheck the MCP server against it) added to
 `.github/workflows/ci.yml`.
 
+### Symbol identity
+A code node's `uri` is derived from `<repo>::<name>` (`uri_scope` on the entity dict,
+applied by `kg_builder._scoped_name`), so two repos of the same user indexed into two CODE
+KBs never share a node for a path they have in common. The node's `name` property stays
+unscoped - `code_symbol` / `code_trace` match plain names inside their job scope.
+
 ### Follow-ups (P1b / P2)
-See `tasks/todo.md` under "Codebase KB follow-ups".
+See `tasks/todo.md` under "Codebase KB follow-ups" for the full list (LSP pass, `gctrl_code_changes`,
+GitHub/GitLab connector, Brain UI, package publish order). Deferred from the P1a final review, none
+of them correctness bugs: relationship property index / file-anchored purge for
+`purge_code_file_edges`; a per-compilation long-lived job id (or `_source_jobs` compaction) so the
+list stops growing per incremental run; manifest filter by repo; module nodes (unresolved external
+imports) are never purged because they carry no `_file`; `list_jobs` has no `kex_code` type filter;
+case-folded uris merge `Foo.ts` with `foo.ts`; and the indexer minors (warn on
+`tree.rootNode.hasError`, the double file read, object-literal methods, a CLI CI job, `repo.root`
+being an absolute host path, self-recursive CALLS edges dropped by the `head !== tail` guard).

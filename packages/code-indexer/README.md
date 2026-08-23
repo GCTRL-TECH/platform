@@ -2,8 +2,8 @@
 
 Turns a source repository into an `IndexBatch` (symbols, edges, chunks) and uploads it to a
 GCTRL Codebase KB (compilation `type = CODE`). This is the P1a implementation of the "Codebase KB"
-feature - see the design spec for the full picture:
-`docs/superpowers/specs/2026-08-22-codebase-kb-design.md` section 10 for the `IndexBatch` contract.
+feature. The `IndexBatch` wire contract is in `docs/buildsummary.md` under "Codebase KB (P1a)"
+(also section 10 of the local design spec, `docs/superpowers/specs/2026-08-22-codebase-kb-design.md`).
 
 Indexing runs where the code lives (CLI, MCP server, or any Node process that can inject an HTTP
 `request` function); the server only stores what it receives.
@@ -11,10 +11,11 @@ Indexing runs where the code lives (CLI, MCP server, or any Node process that ca
 ## What it does
 
 1. **Walk** the repo, honoring `.gitignore` plus fixed excludes (`node_modules`, `target`, `dist`,
-   `.git`, lockfiles, binaries). Files over 1 MB are skipped.
+   `build`, `.git`, `__pycache__`, `.venv`/`venv`, `.next`, `.turbo`, `coverage`) and binaries.
+   Files over 1 MB are skipped, and so is any file that cannot be read.
 2. **Parse** every walked file with tree-sitter (symbols: file/module/class/interface/function/method
-   with qualname, line range, signature, doc). Files in unsupported languages still get a `file`
-   symbol and `CONTAINS` structure, nothing deeper.
+   with qualname, line range, signature, doc). Files in a language the indexer has no grammar for
+   are skipped entirely - they produce no symbols and no edges at all.
 3. **Resolve** edges heuristically: `IMPORTS` via a per-language module resolver (relative paths,
    tsconfig `paths`, Python packages), `CALLS` by name resolution within file/module scope and,
    as a fallback, by repo-wide unique bare name. Every edge carries `resolution` and `confidence`
@@ -34,8 +35,8 @@ Indexing runs where the code lives (CLI, MCP server, or any Node process that ca
 |---|---|
 | Python | full: symbols + IMPORTS/CALLS/INHERITS heuristics |
 | TypeScript / TSX / JavaScript | full: symbols + IMPORTS/CALLS/INHERITS/IMPLEMENTS heuristics |
-| Rust | full: symbols + IMPORTS/CALLS heuristics |
-| everything else | structure only: file symbol + `CONTAINS`, no CALLS/IMPORTS |
+| Rust | full: symbols + IMPORTS/CALLS/IMPLEMENTS heuristics |
+| everything else | skipped - not walked into the batch at all (no file symbol, no edges) |
 
 An LSP pass (real language servers - typescript-language-server, pyright, rust-analyzer, then
 gopls/jdtls/csharp-ls) that upgrades heuristic edges to `confidence 1.0, resolution: lsp` is P1b,
@@ -44,11 +45,18 @@ at their heuristic confidence.
 
 ## Edge confidence tiers
 
+- `confidence 1, resolution: syntax` - a structural fact, not a guess: `CONTAINS`, a resolved
+  `IMPORTS` target, and an `INHERITS`/`IMPLEMENTS` parent found in the same file or through an
+  import binding.
 - `confidence 0.6, resolution: heuristic` - call resolved within file/module scope (import-aware).
-  Measured on the borghive dogfood run (gauntlet, 2026-08-23): 997/997 correct against a
-  TypeScript-compiler oracle for TS/JS, 30/30 against an LLM judge for Python + Rust.
-- `confidence 0.4, resolution: heuristic` - repo-wide unique bare name match only (receiver calls
-  are matched this way only when the method name is unique across the indexed repo). Lower
+  Measured on the borghive dogfood run (gauntlet, 2026-08-23): 1075 CALLS edges scored, 0
+  incorrect - 1012/1012 against a TypeScript-compiler oracle for TS/JS, plus 63 Python/Rust edges
+  against an LLM judge.
+- `confidence 0.4, resolution: heuristic` - repo-wide unique bare name match, guarded: at least 4
+  characters, not in the generic-name stop-list, candidate in the same language family, not bound
+  to an external import, not shadowed by a local, and (for receiver calls) the candidate must be a
+  method - never used for rust receiver calls at all. The same guarded tier backs the
+  `INHERITS`/`IMPLEMENTS` fallback and the cross-file rust `impl Type {}` owner lookup. Lower
   precision than the 0.6 tier; every edge at this tier is labeled as such so a caller can decide
   whether to trust it.
 
@@ -93,7 +101,10 @@ only the code tools from a stdio server instance.
 
 ## Limits
 
-- 1 MB per file (larger files are skipped, not truncated).
+- 1 MB per file (larger files are skipped, not truncated); a batch is also cut at 20 MB of
+  serialized JSON, not just at 200 files.
+- One unreadable or unparseable file is a warning, not a failed run - and it is never reported
+  as removed, so its existing symbols survive.
 - Heuristic-only in P1a - no type inference, no cross-language resolution.
 - Deleted symbols are dropped by URI set-difference after each write, so a rename shows up as an
   add + a delete, not an update.
@@ -101,9 +112,10 @@ only the code tools from a stdio server instance.
 
 ## Measured numbers (dogfood: indexing borghive itself, 2026-08-23)
 
-- 461 files (Python/TypeScript/Rust) -> 7155 symbols, 9188 edges, 3681 chunks.
+- 461 files (Python/TypeScript/Rust) -> 7045 symbols, 8924 edges, 3693 chunks.
 - Incremental re-run with no changes: 0/461 files uploaded.
 - Full run wall time: roughly 2-4 minutes on a dev box: embeddings dominate, parsing is fast.
+- Gauntlet: 1075 CALLS edges scored (1012 TS oracle + 63 LLM-judged), 0 incorrect.
 - Token efficiency vs. grep-style exploration over 5 structural questions: 95.7% overall
   (85.8%-99.9% per question) - using `code_symbol`/`code_trace` instead of grepping the repo.
 
