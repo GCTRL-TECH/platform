@@ -342,17 +342,19 @@ allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-onl
 `gctrl-code`. `GCTRL_MCP_TOOLS=code` filters an MCP server instance to just the code tools.
 
 ### Measured numbers (dogfood: borghive indexing itself, 2026-08-23)
-- 461 files (Python/TypeScript/Rust) → 7045 symbols, 8924 edges, 3693 chunks.
-- Incremental re-run, no changes: 0/461 files uploaded.
+- 464 files (Python/TypeScript/Rust) → 7134 symbols, 9080 edges, 3726 chunks.
+- Incremental re-run, no changes: 0/464 files uploaded.
 - Full run wall time: ~2-4 min on the dev box (embeddings dominate).
-- Edge precision (gauntlet): 1075 CALLS edges scored, 0 incorrect - 1012/1012 for TS/JS against a
-  TypeScript-compiler oracle plus 63 Python/Rust edges against an LLM judge (no compiler oracle
-  wired up for those). Every edge is labeled with its tier, so a caller can weigh it: `confidence
-  0.6, resolution: heuristic` = resolved within file/module scope (import-aware); `confidence 0.4,
-  resolution: heuristic` = repo-wide unique bare name, guarded (length, stop-list, same language
-  family, external-import and local-shadow blocks) - the same guarded tier the INHERITS/IMPLEMENTS
-  fallback uses.
-- Token efficiency vs. grep-style exploration over 5 structural questions: 95.7% overall
+- Edge precision (gauntlet): CALLS precision 100% on 1119 scored edges, 0 incorrect - 1031/1031
+  TS/JS edges against a TypeScript-compiler oracle plus 88 Python/Rust/module-level edges against
+  an LLM judge (no compiler oracle wired up for those). By tier: 1114/1114 at `confidence 0.6,
+  resolution: heuristic` (resolved within file/module scope, import-aware); 5/5 Python at
+  `confidence 0.4, resolution: heuristic` (repo-wide unique bare name, guarded - length,
+  stop-list, same language family, external-import and local-shadow blocks; same guarded tier the
+  INHERITS/IMPLEMENTS fallback uses).
+- Module-level (file-head) CALLS edges are scored only for true top-level calls (65 in borghive);
+  25/25 judged correct.
+- Token efficiency vs. grep-style exploration over 5 structural questions: 95.6% overall
   (85.8%-99.9% per question).
 
 ### CI

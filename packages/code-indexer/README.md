@@ -49,16 +49,17 @@ at their heuristic confidence.
   `IMPORTS` target, and an `INHERITS`/`IMPLEMENTS` parent found in the same file or through an
   import binding.
 - `confidence 0.6, resolution: heuristic` - call resolved within file/module scope (import-aware).
-  Measured on the borghive dogfood run (gauntlet, 2026-08-23): 1075 CALLS edges scored, 0
-  incorrect - 1012/1012 against a TypeScript-compiler oracle for TS/JS, plus 63 Python/Rust edges
-  against an LLM judge.
+  Gauntlet (borghive dogfood, 2026-08-23): 1114/1114 edges at this tier scored correct - part of
+  1119 CALLS edges scored overall (100% precision), split as 1031/1031 TS/JS edges against a
+  TypeScript-compiler oracle plus 88 Python/Rust/module-level edges against an LLM judge, 0
+  incorrect.
 - `confidence 0.4, resolution: heuristic` - repo-wide unique bare name match, guarded: at least 4
   characters, not in the generic-name stop-list, candidate in the same language family, not bound
   to an external import, not shadowed by a local, and (for receiver calls) the candidate must be a
   method - never used for rust receiver calls at all. The same guarded tier backs the
   `INHERITS`/`IMPLEMENTS` fallback and the cross-file rust `impl Type {}` owner lookup. Lower
   precision than the 0.6 tier; every edge at this tier is labeled as such so a caller can decide
-  whether to trust it.
+  whether to trust it. Gauntlet: 5/5 Python edges at this tier scored correct.
 
 ## Usage: `indexRepo`
 
@@ -109,14 +110,21 @@ only the code tools from a stdio server instance.
 - Deleted symbols are dropped by URI set-difference after each write, so a rename shows up as an
   add + a delete, not an update.
 - Code jobs currently skip credit metering (product decision, not a bug).
+- Calls inside anonymous callbacks at file top level (e.g. Express route handlers) are
+  attributed to no symbol and produce no edge (precision first; follow-up: anonymous-scope
+  attribution).
 
 ## Measured numbers (dogfood: indexing borghive itself, 2026-08-23)
 
-- 461 files (Python/TypeScript/Rust) -> 7045 symbols, 8924 edges, 3693 chunks.
-- Incremental re-run with no changes: 0/461 files uploaded.
+- 464 files (Python/TypeScript/Rust) -> 7134 symbols, 9080 edges, 3726 chunks.
+- Incremental re-run with no changes: 0/464 files uploaded.
 - Full run wall time: roughly 2-4 minutes on a dev box: embeddings dominate, parsing is fast.
-- Gauntlet: 1075 CALLS edges scored (1012 TS oracle + 63 LLM-judged), 0 incorrect.
-- Token efficiency vs. grep-style exploration over 5 structural questions: 95.7% overall
+- Gauntlet: CALLS precision 100% on 1119 scored edges - 1031/1031 TS/JS edges against a
+  TypeScript-compiler oracle plus 88 Python/Rust/module-level edges against an LLM judge, 0
+  incorrect. By tier: 1114/1114 at confidence 0.6, 5/5 Python at confidence 0.4.
+- Module-level (file-head) CALLS edges are scored only for true top-level calls (65 in borghive);
+  25/25 judged correct.
+- Token efficiency vs. grep-style exploration over 5 structural questions: 95.6% overall
   (85.8%-99.9% per question) - using `code_symbol`/`code_trace` instead of grepping the repo.
 
 ## Bench scripts
