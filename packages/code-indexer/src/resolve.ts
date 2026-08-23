@@ -153,7 +153,7 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
       if (loc && loc.length === 1) tail = localFull(loc[0].qualname);
       else if (binding.has(c.callee)) tail = findIn(binding.get(c.callee)!.file, c.callee);
     }
-    if (!tail) { const g = idx.byBareName.get(c.callee) ?? []; if (g.length === 1) { tail = g[0]; conf = 0.4; } }
+    if (!tail && !c.receiver) { const g = idx.byBareName.get(c.callee) ?? []; if (g.length === 1) { tail = g[0]; conf = 0.4; } }
     if (tail && tail !== head) { stub(tail, kindOf(tail) ?? 'function'); addEdge({ type: 'CALLS', head, tail, confidence: conf, resolution: 'heuristic' }); }
   }
   return { symbols, edges };

@@ -48,8 +48,11 @@ describe('resolver', () => {
     const edges = out.edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
     expect(edges).toContain('CALLS src/index.ts::main -> src/models/user.ts::User');
     expect(edges).toContain('CALLS src/index.ts::main -> src/util.ts::add');
-    expect(edges).toContain('CALLS src/index.ts::main -> src/models/user.ts::User.greet');
     expect(edges).toContain('IMPORTS src/index.ts -> node:fs');
+    // u.greet(...) has an unresolved receiver ('u' is a local var of an imported
+    // class whose type isn't tracked) - must NOT fall back to a repo-wide bare-name
+    // guess (that fallback is reserved for receiver-less calls, see resolve.ts).
+    expect(edges).not.toContain('CALLS src/index.ts::main -> src/models/user.ts::User.greet');
   });
   it('rust: mod and use resolve to files; scoped calls resolve', async () => {
     const idx = await indexFixture('rust');
@@ -59,5 +62,31 @@ describe('resolver', () => {
     const edges = out.edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
     expect(edges).toContain('CALLS src/main.rs::main -> src/lib.rs::Engine.new');
     expect(edges).toContain('CALLS src/main.rs::main -> src/util/math.rs::add');
+  });
+  it('bare-name fallback (0.4) only fires for receiver-less calls; a call with an unresolved receiver emits no edge', () => {
+    const rawSym = (qualname: string, name = qualname) => ({
+      kind: 'function' as const, qualname, name, line_start: 1, line_end: 2,
+      signature: '', doc: '', exported: true,
+    });
+    const walked = (p: string) => ({ path: p, abs: p, sha256: 'x', lang: 'python' as const, size: 0 });
+    const idx = buildRepoIndex([
+      { walked: walked('a.py'), ex: { symbols: [rawSym('info')], imports: [], calls: [], inherits: [] } },
+      {
+        walked: walked('b.py'),
+        ex: {
+          symbols: [rawSym('run')],
+          imports: [],
+          calls: [
+            { callee: 'info', receiver: 'logger', inside: 'run', line: 1 },
+            { callee: 'info', inside: 'run', line: 2 },
+          ],
+          inherits: [],
+        },
+      },
+    ]);
+    const out = fileOutputs(idx, 'b.py');
+    const callsEdges = out.edges.filter(e => e.type === 'CALLS');
+    expect(callsEdges).toHaveLength(1);
+    expect(callsEdges[0]).toMatchObject({ type: 'CALLS', head: 'b.py::run', tail: 'a.py::info', confidence: 0.4 });
   });
 });
