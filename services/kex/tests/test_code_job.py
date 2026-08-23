@@ -130,3 +130,94 @@ class TestDeleteChunksBySource:
         from src.vector_store import VectorStore
         store = VectorStore(qdrant_url="http://fake-qdrant:6333", pg_url="postgresql://fake/db")
         assert store.delete_chunks_by_source("u", "c", []) == {"pg_deleted": 0, "qdrant_ok": True}
+
+
+def _sample_payload():
+    return {
+        "job_id": "job-1", "user_id": "user-1", "compilation_id": "comp-1",
+        "repo": {"name": "demo", "root": "/r", "commit": "abc"},
+        "files": [{
+            "path": "a.py", "sha256": "deadbeef", "lang": "python",
+            "symbols": [
+                {"kind": "function", "name": "a.py::f", "line_start": 1, "line_end": 3,
+                 "signature": "def f()", "doc": "", "exported": True},
+                {"kind": "function", "name": "b.py::g", "stub": True, "file": "b.py"},
+                {"kind": "module", "name": "os"},
+            ],
+            "edges": [
+                {"type": "CONTAINS", "head": "a.py", "tail": "a.py::f", "confidence": 1.0, "resolution": "syntax"},
+                {"type": "CALLS", "head": "a.py::f", "tail": "b.py::g", "confidence": 0.6, "resolution": "heuristic"},
+                {"type": "IMPORTS", "head": "a.py", "tail": "os", "confidence": 1.0, "resolution": "syntax"},
+            ],
+            "chunks": [{"symbol": "a.py::f", "content": "a.py:L1-L3 def f()\n    return 1"}],
+        }],
+        "removed": ["gone.py"],
+    }
+
+
+class TestBuildEntitiesRelations:
+    def test_maps_symbols_edges_repo_and_stubs(self):
+        from src.code_job import build_entities_relations
+        entities, relations, keep = build_entities_relations(_sample_payload())
+        by_name = {e["text"]: e for e in entities}
+        # file node carries sha256 + _file = its own path
+        assert by_name["a.py"]["type"] == "file"
+        assert by_name["a.py"]["props"]["sha256"] == "deadbeef"
+        assert by_name["a.py"]["props"]["_file"] == "a.py"
+        # symbol props
+        f = by_name["a.py::f"]
+        assert f["coarse_type"] == "code" and f["type"] == "function"
+        assert f["props"]["line_start"] == 1 and f["props"]["_repo"] == "demo"
+        # stub gets its own file, not the batch file
+        assert by_name["b.py::g"]["props"]["_file"] == "b.py"
+        # module import target
+        assert by_name["os"]["type"] == "module" and "_file" not in by_name["os"]["props"]
+        # repo node + CONTAINS repo->file
+        assert by_name["demo"]["type"] == "repo" and by_name["demo"]["props"]["commit"] == "abc"
+        assert any(r["head"] == "demo" and r["tail"] == "a.py" and r["type"] == "CONTAINS" for r in relations)
+        # every edge owned by the batch file
+        for r in relations:
+            assert r["props"]["_file"] == "a.py" and r["props"]["_repo"] == "demo"
+        calls = [r for r in relations if r["type"] == "CALLS"][0]
+        assert calls["props"]["resolution"] == "heuristic" and calls["confidence"] == 0.6
+        # keep set: uris of the real symbols of a.py (file + f), not the stub
+        from src.kg_builder import entity_uri
+        assert keep["a.py"] == {entity_uri("user-1", "file", "a.py"), entity_uri("user-1", "function", "a.py::f")}
+
+    def test_chunk_dicts_have_store_chunks_keys(self):
+        from src.code_job import build_chunk_dicts
+        chunks, mentions = build_chunk_dicts(_sample_payload()["files"][0], "user-1")
+        assert set(chunks[0]) >= {"content", "start_char", "end_char", "chunk_sequence"}
+        assert chunks[0]["chunk_sequence"] == 0 and chunks[0]["start_char"] == 0
+        assert mentions[0][0]["text"] == "a.py::f" and mentions[0][0]["uri"].startswith("databorg:")
+
+
+class TestRunCodeJob:
+    def test_orchestrates_purge_write_chunks(self):
+        from src.code_job import run_code_job
+        kg = MagicMock()
+        kg.build_graph.return_value = {"entities_created": 5, "relations_created": 3, "nodes_total": 10, "graph_uris": []}
+        kg.purge_code_file_edges.return_value = 2
+        kg.purge_code_symbols.return_value = 1
+        vs = MagicMock()
+        vs.store_chunks.return_value = 1
+        vs.delete_chunks_by_source.return_value = {"pg_deleted": 1, "qdrant_ok": True}
+        embedder = MagicMock()
+        embedder.embed_batch.side_effect = lambda texts: [[0.0] * 3 for _ in texts]
+
+        result = run_code_job(_sample_payload(), kg, vs, embedder, {"id": None, "name": "PUBLIC", "rank": 0})
+
+        # purge edges for changed + removed, chunks for changed + removed
+        kg.purge_code_file_edges.assert_called_once_with("user-1", "demo", ["a.py", "gone.py"])
+        vs.delete_chunks_by_source.assert_called_once_with("user-1", "comp-1", ["a.py", "gone.py"])
+        # removed file: all symbols dropped
+        kg.purge_code_symbols.assert_any_call("user-1", "demo", "gone.py", [])
+        # changed file: stale symbols dropped after write, keeping the fresh ones
+        changed_call = [c for c in kg.purge_code_symbols.call_args_list if c.args[2] == "a.py"][0]
+        assert len(changed_call.args[3]) == 2
+        # write + chunks
+        assert kg.build_graph.called
+        kw = vs.store_chunks.call_args.kwargs
+        assert kw["compilation_id"] == "comp-1" and kw["source_document_id"] == "a.py"
+        assert result["status"] == "completed" and result["files_indexed"] == 1 and result["files_removed"] == 1
+        assert result["vector_stats"]["chunks_stored"] == 1

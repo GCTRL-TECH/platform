@@ -475,7 +475,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
     publish result/error to 'kex:results'.
 
     Job payload (JSON string):
-      { job_id: str, user_id: str, type: "text"|"url", input: str }
+      { job_id: str, user_id: str, type: "text"|"url"|"code", input: str }
     """
     logger.info(f"KEX worker-{worker_id} started")
 
@@ -619,6 +619,21 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 )
                 origin = inp.get("notePath")
                 logger.info(f"[{job_id}] Obsidian: extracted {len(text)} chars from {inp.get('notePath','<unknown>')}")
+            elif job_type == "code":
+                # Codebase KB (P1a): no text, no NER - the IndexBatch already IS the
+                # structure. Own pipeline, then `continue` like the empty-crawl path.
+                from .code_job import run_code_job
+                classification = resolve_classification(classification_level_id, classification_name)
+                embedder = build_embedding_client(
+                    embedding_base_url=embedding_base_url,
+                    embedding_provider=embedding_provider,
+                    ollama_base=ollama_base,
+                    embedding_model=embedding_model,
+                )
+                result = run_code_job(payload, get_kg_builder(), get_vector_store(), embedder, classification)
+                result["duration_ms"] = int((time.monotonic() - _job_start) * 1000)
+                _publish_result(r, job_id, result)
+                continue
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
