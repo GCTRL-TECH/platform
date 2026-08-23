@@ -36,6 +36,19 @@ def _symbol_props(sym, repo_name, file_path, lang):
     return props
 
 
+def code_symbol_uri(user_id, kind, name, repo_name):
+    """The uri a Codebase KB symbol gets in the graph.
+
+    Repo-scoped (spec section 4: identity is `repo::path::qualname`). Without the repo
+    in the derivation, two repos of the SAME user - indexed into two different CODE
+    KBs - collide on every shared path: both `src/index.ts` files become one node,
+    both `main.py`, both `README.md`. The node's `name` property stays unscoped;
+    only the uri carries the scope, so the read tools keep matching plain names
+    inside their job scope. Mirrors `kg_builder._scoped_name`.
+    """
+    return entity_uri(user_id, kind, f"{repo_name}::{name}")
+
+
 def build_entities_relations(payload):
     """IndexBatch -> (entities, relations, keep_uris_per_changed_file)."""
     user_id = payload.get("user_id", "")
@@ -59,8 +72,12 @@ def build_entities_relations(payload):
                 if v is not None:
                     ex_props[k] = v
             return
+        # `uri_scope` on EVERY code entity (repo, file, symbol, module alike):
+        # kg_builder derives the uri from `uri_scope::name`, keeping `name` itself
+        # untouched. Relations resolve through the same scoped map, so an unscoped
+        # entity mixed in here would silently write to a foreign node.
         entity = {"text": name, "type": etype, "coarse_type": CODE_COARSE,
-                  "label": etype, "props": props}
+                  "label": etype, "uri_scope": repo_name, "props": props}
         by_key[key] = entity
         entities.append(entity)
 
@@ -79,7 +96,7 @@ def build_entities_relations(payload):
         # File node: sha256 lives here (manifest reads it).
         add_entity(path, "file", {"_repo": repo_name, "_file": path, "lang": lang,
                                   "sha256": f.get("sha256") or ""})
-        file_keep.add(entity_uri(user_id, "file", path))
+        file_keep.add(code_symbol_uri(user_id, "file", path, repo_name))
         relations.append({"head": repo_name, "type": "CONTAINS", "tail": path, "confidence": 1.0,
                           "props": {"_repo": repo_name, "_file": path, "resolution": "syntax"}})
 
@@ -93,7 +110,7 @@ def build_entities_relations(payload):
                 continue
             add_entity(name, kind, _symbol_props(sym, repo_name, path, lang))
             if not sym.get("stub"):
-                file_keep.add(entity_uri(user_id, kind, name))
+                file_keep.add(code_symbol_uri(user_id, kind, name, repo_name))
 
         for e in f.get("edges") or []:
             head, tail, rtype = e.get("head") or "", e.get("tail") or "", e.get("type") or ""
@@ -111,8 +128,13 @@ def build_entities_relations(payload):
     return entities, relations, keep
 
 
-def build_chunk_dicts(file_obj, user_id):
-    """One store_chunks-compatible chunk per symbol chunk; mentions link the symbol uri."""
+def build_chunk_dicts(file_obj, user_id, repo_name=""):
+    """One store_chunks-compatible chunk per symbol chunk; mentions link the symbol uri.
+
+    `repo_name` MUST be the batch's repo: a mention's uri has to be the same
+    repo-scoped uri the graph node got (`code_symbol_uri`), or the chunk links to
+    nothing (or, worse, to a same-named symbol of another repo).
+    """
     chunks = []
     mentions = []
     for i, c in enumerate(file_obj.get("chunks") or []):
@@ -124,7 +146,8 @@ def build_chunk_dicts(file_obj, user_id):
         chunks.append({"content": content, "start_char": 0, "end_char": len(content),
                        "chunk_sequence": len(chunks)})
         mentions.append([{"text": sym_name, "type": kind, "label": kind,
-                          "uri": entity_uri(user_id, kind, sym_name)}])
+                          "uri": code_symbol_uri(user_id, kind, sym_name, repo_name) if repo_name
+                                 else entity_uri(user_id, kind, sym_name)}])
     return chunks, mentions
 
 
@@ -162,7 +185,7 @@ def run_code_job(payload, kg, vs, embedder, classification):
     # 5) Chunks: embed + store per file (non-fatal).
     chunks_created = chunks_embedded = chunks_stored = 0
     for f in files:
-        chunks, mentions = build_chunk_dicts(f, user_id)
+        chunks, mentions = build_chunk_dicts(f, user_id, repo_name)
         if not chunks:
             continue
         chunks_created += len(chunks)

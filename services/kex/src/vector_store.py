@@ -453,7 +453,12 @@ class VectorStore:
     def delete_chunks_by_source(self, user_id, compilation_id, source_document_ids):
         """Codebase KB: drop every chunk of the given source documents (file paths)
         inside one compilation, in Postgres (authoritative) and Qdrant (best effort).
-        Paths are coerced to the same UUIDv5 `_as_uuid` used at insert time."""
+
+        The two stores are matched DIFFERENTLY, on purpose, because they store the
+        identity differently: Postgres has a `uuid` column, so the paths are coerced
+        with the same UUIDv5 `_as_uuid` used at insert time, while the Qdrant payload
+        keeps `source_document_id` as the RAW path string and is matched verbatim.
+        Coercing the Qdrant side too would match nothing."""
         ids = [s for s in (source_document_ids or []) if s]
         if not ids:
             return {"pg_deleted": 0, "qdrant_ok": True}

@@ -79,6 +79,68 @@ class TestBuildGraphProps:
         from src import config as kex_config
         assert "code" in kex_config.GRAPH_KEEP_TYPES
 
+    def test_uri_scope_namespaces_the_uri_but_not_the_name(self):
+        from src.kg_builder import KGBuilder, entity_uri
+        from src import config as kex_config
+
+        builder, tx = _builder_with_capturing_tx()
+        entities = [{"text": "src/index.ts", "type": "file", "coarse_type": "code",
+                     "label": "file", "uri_scope": "repo-a", "props": {"_repo": "repo-a"}}]
+        with patch.object(KGBuilder, "_load_corrected_triples", return_value=set()), \
+             patch.object(kex_config, "GRAPH_PRUNE_ISOLATED", False):
+            out = builder.build_graph("job-1", "user-1", entities, [])
+        kwargs = [c for c in tx.run.call_args_list if "MERGE (n:Entity" in c.args[0]][0].kwargs
+        # uri carries the repo scope ...
+        assert kwargs["uri"] == entity_uri("user-1", "file", "repo-a::src/index.ts")
+        assert kwargs["uri"] != entity_uri("user-1", "file", "src/index.ts")
+        # ... the node's own name does not (the read tools match by plain name)
+        assert kwargs["name"] == "src/index.ts"
+        # and the relation map resolves to the SAME scoped uri
+        assert out["graph_uris"] == [kwargs["uri"]]
+
+    def test_uri_scope_is_opt_in_so_text_extractions_are_untouched(self):
+        from src.kg_builder import KGBuilder, entity_uri
+        from src import config as kex_config
+
+        builder, tx = _builder_with_capturing_tx()
+        with patch.object(KGBuilder, "_load_corrected_triples", return_value=set()), \
+             patch.object(kex_config, "GRAPH_PRUNE_ISOLATED", False):
+            builder.build_graph("job-1", "user-1", [{"text": "Microsoft", "type": "organization"}], [])
+        kwargs = [c for c in tx.run.call_args_list if "MERGE (n:Entity" in c.args[0]][0].kwargs
+        assert kwargs["uri"] == entity_uri("user-1", "organization", "Microsoft")
+
+    def test_reserved_props_never_reach_the_write(self):
+        """`n += $props` runs after the SET blocks, so a caller prop named `uri`,
+        `_owner`, `created_at`, ... would overwrite the builder's own bookkeeping."""
+        from src.kg_builder import KGBuilder
+        from src import config as kex_config
+
+        builder, tx = _builder_with_capturing_tx()
+        poison = {"uri": "databorg:evil", "name": "evil", "_owner": "someone-else",
+                  "_source_job": "x", "_source_jobs": ["x"], "_min_rank": 99,
+                  "_classification": "SECRET", "_class_labels": ["x"], "_label_ranks": [9],
+                  "_class_conflict": True, "created_at": 1, "_file": "a.py"}
+        entities = [{"text": "a.py::f", "type": "function", "coarse_type": "code", "props": dict(poison)}]
+        relations = [{"head": "a.py::f", "type": "CALLS", "tail": "a.py::f2", "props": dict(poison)}]
+        entities.append({"text": "a.py::f2", "type": "function", "coarse_type": "code"})
+        with patch.object(KGBuilder, "_load_corrected_triples", return_value=set()), \
+             patch.object(kex_config, "GRAPH_PRUNE_ISOLATED", False):
+            builder.build_graph("job-1", "user-1", entities, relations)
+        node_props = [c for c in tx.run.call_args_list if "MERGE (n:Entity" in c.args[0]][0].kwargs["props"]
+        rel_props = [c for c in tx.run.call_args_list if "MERGE (h)-[r:" in c.args[0]][0].kwargs["props"]
+        assert node_props == {"_file": "a.py"}      # only the non-reserved key survives
+        assert rel_props == {"_file": "a.py"}
+
+    def test_purge_symbol_limit_is_logged_when_hit(self):
+        from src.kg_builder import KGBuilder
+
+        builder, tx = _builder_with_capturing_tx()
+        tx.run.return_value.single.return_value = {"deleted": KGBuilder.PURGE_SYMBOL_LIMIT}
+        with patch("src.kg_builder.logger") as log:
+            deleted = builder.purge_code_symbols("user-1", "demo", "a.py", [])
+        assert deleted == KGBuilder.PURGE_SYMBOL_LIMIT
+        assert log.warning.called
+
 
 class TestPurgeHelpers:
     def test_purge_file_edges_cypher_scopes_owner_repo_file(self):
@@ -180,9 +242,26 @@ class TestBuildEntitiesRelations:
             assert r["props"]["_file"] == "a.py" and r["props"]["_repo"] == "demo"
         calls = [r for r in relations if r["type"] == "CALLS"][0]
         assert calls["props"]["resolution"] == "heuristic" and calls["confidence"] == 0.6
-        # keep set: uris of the real symbols of a.py (file + f), not the stub
+        # keep set: REPO-SCOPED uris of the real symbols of a.py (file + f), not the stub
         from src.kg_builder import entity_uri
-        assert keep["a.py"] == {entity_uri("user-1", "file", "a.py"), entity_uri("user-1", "function", "a.py::f")}
+        assert keep["a.py"] == {entity_uri("user-1", "file", "demo::a.py"),
+                                entity_uri("user-1", "function", "demo::a.py::f")}
+        # every code entity carries the repo scope for its uri derivation
+        assert all(e["uri_scope"] == "demo" for e in entities)
+
+    def test_two_repos_sharing_a_path_get_different_uris(self):
+        """The whole point of the repo scope: one user, two CODE KBs, same file path."""
+        from src.code_job import build_entities_relations
+
+        def payload(repo_name):
+            p = _sample_payload()
+            p["repo"]["name"] = repo_name
+            return p
+
+        _, _, keep_a = build_entities_relations(payload("repo-a"))
+        _, _, keep_b = build_entities_relations(payload("repo-b"))
+        assert keep_a["a.py"] and keep_b["a.py"]
+        assert keep_a["a.py"].isdisjoint(keep_b["a.py"])
 
     def test_chunk_dicts_have_store_chunks_keys(self):
         from src.code_job import build_chunk_dicts
@@ -190,6 +269,18 @@ class TestBuildEntitiesRelations:
         assert set(chunks[0]) >= {"content", "start_char", "end_char", "chunk_sequence"}
         assert chunks[0]["chunk_sequence"] == 0 and chunks[0]["start_char"] == 0
         assert mentions[0][0]["text"] == "a.py::f" and mentions[0][0]["uri"].startswith("databorg:")
+
+    def test_chunk_mentions_use_the_repo_scoped_uri(self):
+        """A mention must point at the uri the graph node actually got, or the chunk
+        links to nothing (P2a grounded-node check) - or to another repo's symbol."""
+        from src.code_job import build_chunk_dicts, build_entities_relations
+        from src.kg_builder import entity_uri
+
+        payload = _sample_payload()
+        _, _, keep = build_entities_relations(payload)
+        _, mentions = build_chunk_dicts(payload["files"][0], "user-1", "demo")
+        assert mentions[0][0]["uri"] == entity_uri("user-1", "function", "demo::a.py::f")
+        assert mentions[0][0]["uri"] in keep["a.py"]
 
     def test_real_symbol_props_win_over_earlier_stub(self):
         from src.code_job import build_entities_relations
@@ -226,8 +317,8 @@ class TestBuildEntitiesRelations:
         assert g["props"]["line_start"] == 3
         assert g["props"]["_file"] == "b.py"
         # keep set: b.py owns the real symbol, a.py's stub does not claim it
-        assert entity_uri("user-1", "function", "b.py::g") in keep["b.py"]
-        assert entity_uri("user-1", "function", "b.py::g") not in keep.get("a.py", set())
+        assert entity_uri("user-1", "function", "demo::b.py::g") in keep["b.py"]
+        assert entity_uri("user-1", "function", "demo::b.py::g") not in keep.get("a.py", set())
 
     def test_real_symbol_props_win_over_later_stub(self):
         from src.code_job import build_entities_relations

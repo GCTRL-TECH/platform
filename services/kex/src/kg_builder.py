@@ -32,6 +32,39 @@ def _make_uri(name: str, entity_type: str, user_id: str = "") -> str:
     return f"databorg:{entity_type}/{slug}"
 
 
+# Node/relationship properties the builder owns itself: identity, ownership,
+# classification provenance, timestamps. `n += $props` / `r += $props` runs AFTER the
+# ON CREATE / ON MATCH SET blocks, so a caller-supplied prop of the same name silently
+# overwrites the graph's own bookkeeping - a code symbol carrying a `name` or `_owner`
+# prop would re-home its own node. Stripped before every write.
+_RESERVED_PROP_KEYS = frozenset({
+    "uri", "name", "_owner", "_source_job", "_source_jobs", "_min_rank",
+    "_classification", "_class_labels", "_label_ranks", "_class_conflict", "created_at",
+})
+
+
+def _safe_props(props):
+    """Caller-supplied `props` minus the keys the builder writes itself."""
+    if not props:
+        return {}
+    return {k: v for k, v in props.items() if k not in _RESERVED_PROP_KEYS}
+
+
+def _scoped_name(entity):
+    """The name a node's uri is derived from.
+
+    Normally the surface form itself. An entity may carry `uri_scope` to namespace
+    that derivation - the Codebase KB sets it to the repo name, because a symbol's
+    identity is `repo::path::qualname` (spec section 4): without it, two repos of the
+    SAME user indexed into two different CODE KBs collide on every shared path
+    (`src/index.ts`, `README.md`, `main.py`) and silently share one node. The node's
+    `name` property stays UNSCOPED - the read tools match by name inside a job scope.
+    """
+    name = (entity.get("text") or "").strip()
+    scope = entity.get("uri_scope")
+    return f"{scope}::{name}" if scope else name
+
+
 def entity_uri(user_id: str, coarse_type: str, name: str) -> str:
     """Public, pure wrapper around the internal URI derivation (`_make_uri`).
 
@@ -191,7 +224,9 @@ class KGBuilder:
                 continue
             etype = ent.get("type") or ent.get("coarse_type") or "other"
             # First mention wins; types are consolidated so this is stable.
-            name_to_uri.setdefault(name.lower(), _make_uri(name, etype, user_id))
+            # `_scoped_name` applies the entity's optional `uri_scope` so relations
+            # resolve to the SAME uri `_write_entities` writes.
+            name_to_uri.setdefault(name.lower(), _make_uri(_scoped_name(ent), etype, user_id))
 
         with self._driver.session() as session:
             entities_created = session.execute_write(
@@ -267,20 +302,32 @@ class KGBuilder:
         with self._driver.session() as session:
             return session.execute_write(self._purge_symbols_tx, owner, repo, path, list(keep_uris))
 
+    #: Safety valve on one purge transaction. Hitting it exactly means MORE stale
+    #: symbols were left behind - logged, because silently under-purging looks
+    #: identical to a clean run from the outside.
+    PURGE_SYMBOL_LIMIT = 5000
+
     @staticmethod
     def _purge_symbols_tx(tx, owner, repo, path, keep):
+        limit = KGBuilder.PURGE_SYMBOL_LIMIT
         rec = tx.run(
-            """
+            f"""
             MATCH (n:Entity)
             WHERE n._owner = $owner AND n._repo = $repo AND n._file = $path
               AND NOT n.uri IN $keep
-            WITH n LIMIT 5000
+            WITH n LIMIT {limit}
             DETACH DELETE n
             RETURN count(*) AS deleted
             """,
             owner=owner, repo=repo, path=path, keep=keep,
         ).single()
-        return int(rec["deleted"]) if rec else 0
+        deleted = int(rec["deleted"]) if rec else 0
+        if deleted >= limit:
+            logger.warning(
+                "KGBuilder: purge_code_symbols hit the %d-node limit for %s:%s - "
+                "stale symbols remain, re-run the index to clear them", limit, repo, path,
+            )
+        return deleted
 
     @staticmethod
     def _load_corrected_triples(user_id: str) -> set:
@@ -347,7 +394,9 @@ class KGBuilder:
             if not name:
                 continue
 
-            uri = _make_uri(name, entity_type, user_id)
+            # `uri_scope` (Codebase KB: the repo name) namespaces the uri only; the
+            # node's `name` property stays the plain surface form.
+            uri = _make_uri(_scoped_name(ent), entity_type, user_id)
 
             result = tx.run(
                 """
@@ -410,7 +459,7 @@ class KGBuilder:
                 owner=user_id,
                 job_id=job_id,
                 origin=origin,
-                props=ent.get("props") or {},
+                props=_safe_props(ent.get("props")),
             )
             summary = result.consume()
             created += summary.counters.nodes_created
@@ -594,7 +643,7 @@ class KGBuilder:
                 source_doc=source_document_id,
                 source_doc_modified_at=source_modified_at_ms,
                 owner=user_id,
-                props=rel.get("props") or {},
+                props=_safe_props(rel.get("props")),
             )
             summary = result.consume()
             created += summary.counters.relationships_created
