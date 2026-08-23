@@ -15,7 +15,7 @@ Exposes Ground Control's knowledge management as MCP tools for Claude and other 
 | `gctrl_list_extractions` | List recent extraction jobs |
 | `gctrl_store` | Store knowledge (like Obsidian notes, but with KG extraction) |
 | `gctrl_schema` | Get the knowledge graph schema |
-| `gctrl_code_index` | Index a local repo into a Codebase KB (compilation type CODE). **Direct mode only** (it indexes THIS machine, so a gateway cannot serve it) and needs the optional `@gctrl/code-indexer` package - without it the tool returns an install hint and every other tool keeps working. |
+| `gctrl_code_index` | Index a local repo into a Codebase KB (compilation type CODE). **Direct mode only** (it indexes THIS machine, so a gateway cannot serve it) and needs the optional `gctrl-code-indexer` package - without it the tool returns an install hint and every other tool keeps working. |
 | `gctrl_code_symbol` | Find code symbols by name/path/regex (proxied to the HTTP gateway) |
 | `gctrl_code_trace` | Trace callers/callees of a symbol (proxied to the HTTP gateway) |
 | `gctrl_code_impact` | Impact analysis for changed symbols/files (proxied to the HTTP gateway) |
@@ -84,7 +84,7 @@ npm run build
 
 ### Working on the code indexer
 
-`@gctrl/code-indexer` is an **optional** dependency and is not on npm yet, so a plain
+`gctrl-code-indexer` is an **optional** dependency and is not on npm yet, so a plain
 `npm install` here will not fetch it. To develop or test `gctrl_code_index` against the
 in-repo package, link it once:
 
@@ -100,9 +100,9 @@ works at runtime or returns its install hint.
 
 ### Publish order
 
-`gctrl-mcp` and `@gctrl/code-indexer` are two npm packages and must go out in this order:
+`gctrl-mcp` and `gctrl-code-indexer` are two npm packages and must go out in this order:
 
-1. Publish `@gctrl/code-indexer@0.1.0`.
+1. Publish `gctrl-code-indexer@0.1.0`.
 2. Switch `optionalDependencies` in `services/mcp/package.json` to a real registry range
    (it already reads `^0.1.0`; confirm it resolves) and re-run `npm install`.
 3. Bump `gctrl-mcp` to `1.1.0` (package.json + package-lock.json root).

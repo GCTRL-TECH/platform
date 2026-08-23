@@ -26,7 +26,7 @@ import { z } from 'zod';
 import * as fs from 'node:fs';
 import * as nodePath from 'node:path';
 
-// ── Optional peer: @gctrl/code-indexer ───────────────────────────────────────
+// ── Optional peer: gctrl-code-indexer ───────────────────────────────────────
 //
 // `gctrl_code_index` needs the indexer, every other tool does not. It is an
 // OPTIONAL dependency (and, until its first npm publish, not on the registry at
@@ -37,9 +37,9 @@ import * as nodePath from 'node:path';
 //
 // Working on this repo? Link the local package once:
 //   cd services/mcp && npm install ../../packages/code-indexer --no-save
-const CODE_INDEXER_PKG = '@gctrl/code-indexer';
+const CODE_INDEXER_PKG = 'gctrl-code-indexer';
 
-/** `IndexSummary` as returned by `@gctrl/code-indexer`'s `indexRepo`. */
+/** `IndexSummary` as returned by `gctrl-code-indexer`'s `indexRepo`. */
 interface CodeIndexSummary {
   compilationId: string; repo: string; commit: string | null;
   filesTotal: number; filesChanged: number; filesRemoved: number;
@@ -68,7 +68,7 @@ async function loadCodeIndexer(): Promise<CodeIndexerModule | null> {
 }
 
 const CODE_INDEXER_MISSING =
-  'Code indexer not installed - run `npm i -g @gctrl/code-indexer` (publish pending) or use the CLI: `gctrl code index <path>`. ' +
+  'Code indexer not installed - run `npm i -g gctrl-code-indexer` (publish pending) or use the CLI: `gctrl code index <path>`. ' +
   'The read tools (gctrl_code_symbol / gctrl_code_trace / gctrl_code_impact / gctrl_code_architecture) work without it.';
 
 const API_BASE = process.env['GCTRL_API_URL'] || 'http://localhost:4000/api';

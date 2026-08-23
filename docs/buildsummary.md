@@ -260,7 +260,7 @@ Authentication: `ApiKey` header, key stored in `~/.gctrl/config.json`
 
 Index a source repository (symbols, imports, call graph, chunks) into GCTRL as a knowledge base,
 usable by agents via MCP/CLI first, product connector + UI later. Indexing runs where the code
-lives (`@gctrl/code-indexer`, TypeScript, first shared TS package); the server only stores.
+lives (`gctrl-code-indexer`, TypeScript, first shared TS package); the server only stores.
 
 CODE compilations are filed under `Users/<name>/Code` automatically when created without an
 explicit `folderPath`/`folderId`; existing unfiled ones are moved there on boot.

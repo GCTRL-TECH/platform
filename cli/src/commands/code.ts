@@ -1,7 +1,7 @@
 import { Command } from 'commander'
 import chalk from 'chalk'
 import path from 'path'
-import { indexRepo } from '@gctrl/code-indexer'
+import { indexRepo } from 'gctrl-code-indexer'
 import { createClient, formatError } from '../api'
 import { createSpinner } from '../utils/spinner'
 

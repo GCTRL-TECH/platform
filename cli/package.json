@@ -12,13 +12,13 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@gctrl/code-indexer": "file:../packages/code-indexer",
     "axios": "^1.7.2",
     "chalk": "^4.1.2",
     "cli-table3": "^0.6.5",
     "commander": "^12.1.0",
     "eventsource": "^2.0.2",
     "form-data": "^4.0.0",
+    "gctrl-code-indexer": "file:../packages/code-indexer",
     "ora": "^5.4.1"
   },
   "devDependencies": {

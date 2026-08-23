@@ -1,4 +1,4 @@
-# @gctrl/code-indexer
+# gctrl-code-indexer
 
 Turns a source repository into an `IndexBatch` (symbols, edges, chunks) and uploads it to a
 GCTRL Codebase KB (compilation `type = CODE`). This is the P1a implementation of the "Codebase KB"
@@ -64,7 +64,7 @@ at their heuristic confidence.
 ## Usage: `indexRepo`
 
 ```ts
-import { indexRepo } from '@gctrl/code-indexer';
+import { indexRepo } from 'gctrl-code-indexer';
 
 const request = async (method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown) => {
   const { data } = await httpClient.request({ method, url: path, data: body });
