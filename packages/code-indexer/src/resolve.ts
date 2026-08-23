@@ -310,6 +310,13 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
   }
   // calls
   for (const c of ex.calls) {
+    // A genuine module-level call (`helper()` at import time, a decorator-ish top-level
+    // invocation) has no enclosing def: the FILE is what performs it. But a call with no
+    // `inside` AND `anonymous: true` sits inside an anonymous callback at top level
+    // (`router.get('/x', async () => { helper() })`) — the FILE did not make that call,
+    // an anonymous function whose actual caller is unknowable from syntax did. Attributing
+    // it to the file is a false "module-level" edge, so skip it entirely (precision first).
+    if (!c.inside && c.anonymous) continue;
     // A module-level call (`helper()` at import time, a decorator-ish top-level
     // invocation) has no enclosing def: the FILE is what performs it, and module-level
     // locals live in scope ''. Dropping these lost every top-level call edge.

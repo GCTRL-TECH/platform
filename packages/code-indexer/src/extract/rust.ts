@@ -95,6 +95,22 @@ function implTarget(node: SyntaxNode, src: string): { self?: string; trait?: str
   return null;
 }
 
+/**
+ * True when walking up from `node` crosses a `closure_expression` before reaching the
+ * nearest enclosing `function_item` or the file root. Rust has no "named closure"
+ * concept (a closure bound via `let f = || ...;` is still anonymous — `enclosingFn`
+ * only ever names `function_item`s).
+ */
+function crossesAnonymous(node: SyntaxNode): boolean {
+  let cur = node.parent;
+  while (cur) {
+    if (cur.type === 'closure_expression') return true;
+    if (cur.type === 'function_item') return false;
+    cur = cur.parent;
+  }
+  return false;
+}
+
 function enclosingFn(node: SyntaxNode, src: string): string | undefined {
   let cur = node.parent;
   while (cur) {
@@ -226,9 +242,10 @@ export const rustExtractor: LanguageExtractor = {
         case 'call_expression': {
           const fn = node.childForFieldName('function'); if (!fn) break;
           const inside = enclosingFn(node, src);
-          if (fn.type === 'identifier') calls.push({ callee: text(src, fn), inside, line: node.startPosition.row + 1 });
-          else if (fn.type === 'field_expression') calls.push({ callee: text(src, fn.childForFieldName('field')), receiver: text(src, fn.childForFieldName('value')), inside, line: node.startPosition.row + 1 });
-          else if (fn.type === 'scoped_identifier') { const p = text(src, fn.childForFieldName('path')); calls.push({ callee: text(src, fn.childForFieldName('name')), receiver: p.split('::').pop(), inside, line: node.startPosition.row + 1 }); }
+          const anonymous = crossesAnonymous(node) || undefined;
+          if (fn.type === 'identifier') calls.push({ callee: text(src, fn), inside, anonymous, line: node.startPosition.row + 1 });
+          else if (fn.type === 'field_expression') calls.push({ callee: text(src, fn.childForFieldName('field')), receiver: text(src, fn.childForFieldName('value')), inside, anonymous, line: node.startPosition.row + 1 });
+          else if (fn.type === 'scoped_identifier') { const p = text(src, fn.childForFieldName('path')); calls.push({ callee: text(src, fn.childForFieldName('name')), receiver: p.split('::').pop(), inside, anonymous, line: node.startPosition.row + 1 }); }
           break;
         }
       }

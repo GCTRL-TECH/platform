@@ -50,4 +50,10 @@ describe('rust extractor', () => {
       expect.objectContaining({ module: 'x', names: ['*'] }),
     ]));
   });
+  it('marks a call inside a closure anonymous, but still attributes it to the enclosing named fn', async () => {
+    const src = 'fn main() {\n    let f = || helper();\n}\n';
+    const ex = await extractFile('rust', src);
+    const call = ex.calls.find(c => c.callee === 'helper');
+    expect(call).toMatchObject({ inside: 'main', anonymous: true });
+  });
 });

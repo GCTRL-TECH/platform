@@ -41,6 +41,17 @@ export interface RawCall {
   receiver?: string;
   /** qualname of the enclosing def */
   inside?: string;
+  /**
+   * True when an anonymous function-like node (TS/JS `arrow_function`/`function_expression`/
+   * anonymous `function`, python `lambda`, rust `closure_expression`) is crossed while
+   * walking up from this call to its nearest NAMED definition (or the file root). A call
+   * with `anonymous: true` and no `inside` sits directly at module/file scope inside an
+   * anonymous callback (`router.get('/x', async () => { helper() })`) — the FILE did not
+   * make that call, the anonymous callback did, so the resolver must not attribute it to
+   * the file. A call with `anonymous: true` and `inside` set (the anonymous function itself
+   * sits inside a named function) is still correctly attributed to that named function.
+   */
+  anonymous?: boolean;
   line: number;
 }
 

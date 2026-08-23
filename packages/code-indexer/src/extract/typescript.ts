@@ -30,6 +30,27 @@ function isFnValue(declarator: SyntaxNode): boolean {
   return !!v && (v.type === 'arrow_function' || v.type === 'function_expression' || v.type === 'function');
 }
 
+const ANON_FN_TYPES = new Set(['arrow_function', 'function_expression', 'function']);
+
+/**
+ * True when walking up from `node` crosses an anonymous function-like node (an
+ * `arrow_function`/`function_expression`/anonymous `function`) before reaching the
+ * nearest NAMED definition (a DEF_TYPES node, or a named arrow-const's
+ * `variable_declarator`) or the file root. Mirrors `enclosing()`'s own walk/stop rules
+ * so a named arrow-const (`const f = () => ...`) is never itself flagged anonymous, but
+ * any other function-like node in between (an inline callback argument, an object-method
+ * value, ...) is.
+ */
+function crossesAnonymous(node: SyntaxNode): boolean {
+  let cur = node.parent;
+  while (cur) {
+    if (ANON_FN_TYPES.has(cur.type)) return !(cur.parent?.type === 'variable_declarator' && isFnValue(cur.parent));
+    if (DEF_TYPES.has(cur.type)) return false;
+    cur = cur.parent;
+  }
+  return false;
+}
+
 function enclosing(node: SyntaxNode, src: string): { qual: string; classQual?: string } {
   const parts: string[] = [];
   let classQual: string | undefined;
@@ -229,8 +250,9 @@ export const tsExtractor: LanguageExtractor = {
         const fn = node.childForFieldName(node.type === 'new_expression' ? 'constructor' : 'function');
         if (!fn) continue;
         const { qual } = enclosing(node, src);
+        const anonymous = crossesAnonymous(node) || undefined;
         if (fn.type === 'identifier') {
-          calls.push({ callee: text(src, fn), inside: qual || undefined, line: node.startPosition.row + 1 });
+          calls.push({ callee: text(src, fn), inside: qual || undefined, anonymous, line: node.startPosition.row + 1 });
         } else if (fn.type === 'member_expression') {
           const prop = fn.childForFieldName('property');
           const obj = fn.childForFieldName('object');
@@ -239,6 +261,7 @@ export const tsExtractor: LanguageExtractor = {
               callee: text(src, prop),
               receiver: obj ? text(src, obj) : undefined,
               inside: qual || undefined,
+              anonymous,
               line: node.startPosition.row + 1,
             });
           }

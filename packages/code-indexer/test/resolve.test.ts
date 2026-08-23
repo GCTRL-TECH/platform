@@ -307,6 +307,51 @@ describe('resolver', () => {
     expectEdgesGrounded(out);
   });
 
+  it('ts: a call inside an anonymous top-level callback is NOT attributed to the file, but the same call inside a named function still is', async () => {
+    const idx = await indexSources({
+      'h.ts': [
+        'export function helper(){}',
+        'export function helper2(){}',
+        'export function helper3(){}',
+      ].join('\n'),
+      'a.ts': [
+        "import { helper } from './h';",
+        'helper();',
+        "router.get('/x', async () => { helper2() });",
+        'export function named(){ [1].map(() => helper3()) }',
+      ].join('\n'),
+    });
+    const out = fileOutputs(idx, 'a.ts');
+    const edges = out.edges.filter(e => e.type === 'CALLS').map(e => `${e.type} ${e.head} -> ${e.tail}`);
+    expect(edges).toContain('CALLS a.ts -> h.ts::helper');           // true module-level call: kept
+    expect(edges.some(e => e.includes('helper2'))).toBe(false);      // anonymous top-level callback: dropped
+    expect(edges).toContain('CALLS a.ts::named -> h.ts::helper3');   // anonymous callback inside a named fn: kept, attributed to it
+    expectEdgesGrounded(out);
+  });
+
+  it('python: a lambda assigned at top level does not make the file the caller', async () => {
+    const idx = await indexSources({
+      'h.py': 'def helper():\n    return 1\n\n\ndef helper2():\n    return 2\n',
+      'a.py': 'from h import helper\n\nhelper()\ncb = lambda: helper2()\n',
+    });
+    const out = fileOutputs(idx, 'a.py');
+    const edges = out.edges.filter(e => e.type === 'CALLS').map(e => `${e.type} ${e.head} -> ${e.tail}`);
+    expect(edges).toContain('CALLS a.py -> h.py::helper');
+    expect(edges.some(e => e.includes('helper2'))).toBe(false);
+    expectEdgesGrounded(out);
+  });
+
+  it('rust: a call inside a closure is still attributed to the enclosing named function', async () => {
+    const idx = await indexSources({
+      'h.rs': 'pub fn helper() {}\n',
+      'a.rs': 'fn main() {\n    let f = || helper();\n    f();\n}\n',
+    });
+    const out = fileOutputs(idx, 'a.rs');
+    const edges = out.edges.filter(e => e.type === 'CALLS').map(e => `${e.type} ${e.head} -> ${e.tail}`);
+    expect(edges).toContain('CALLS a.rs::main -> h.rs::helper');
+    expectEdgesGrounded(out);
+  });
+
   it('tsconfig extends: baseUrl/paths resolve against the config that DECLARED them', async () => {
     const idx = await indexFixture('ts-extends');
     // Child declares neither: both inherited, and baseUrl "./src" is relative to the

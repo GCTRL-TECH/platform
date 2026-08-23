@@ -53,4 +53,11 @@ describe('python extractor', () => {
     const ex = await extractFile('python', src);
     expect(ex.localsByScope['f']).toEqual(expect.arrayContaining(['resolve', 'y', 'z', 'k']));
   });
+  it('marks a call inside a lambda anonymous, even when the lambda is assigned to a name', async () => {
+    const src = 'helper()\ncb = lambda: helper2()\n';
+    const ex = await extractFile('python', src);
+    const byCallee = Object.fromEntries(ex.calls.map(c => [c.callee, c]));
+    expect(byCallee['helper']).toMatchObject({ inside: undefined, anonymous: undefined });
+    expect(byCallee['helper2']).toMatchObject({ inside: undefined, anonymous: true });
+  });
 });

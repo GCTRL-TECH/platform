@@ -51,4 +51,20 @@ describe('typescript extractor', () => {
     expect(ex.localsByScope['App']).toEqual(expect.arrayContaining(['mode', 'setMode']));
     expect(ex.localsByScope['App.inner']).toEqual(['cb']);
   });
+  it('marks calls anonymous when they cross an anonymous callback, but not a named arrow-const or a bare top-level call', async () => {
+    const src = [
+      "helper();",                                                          // true top-level, no anonymous crossing
+      "router.get('/x', async () => { helper2() });",                       // anonymous callback at top level
+      "export function named(){ [1].map(() => helper3()) }",               // anonymous callback nested in a named fn
+      "const f = () => { helper4() };",                                     // named arrow-const: not anonymous
+      "React.forwardRef((props, ref) => { helper5() });",                   // anonymous callback wrapping a call arg
+    ].join('\n');
+    const ex = await extractFile('typescript', src);
+    const byCallee = Object.fromEntries(ex.calls.map(c => [c.callee, c]));
+    expect(byCallee['helper']).toMatchObject({ inside: undefined, anonymous: undefined });
+    expect(byCallee['helper2']).toMatchObject({ inside: undefined, anonymous: true });
+    expect(byCallee['helper3']).toMatchObject({ inside: 'named', anonymous: true });
+    expect(byCallee['helper4']).toMatchObject({ inside: 'f', anonymous: undefined });
+    expect(byCallee['helper5']).toMatchObject({ inside: undefined, anonymous: true });
+  });
 });

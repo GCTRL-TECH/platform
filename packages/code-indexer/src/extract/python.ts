@@ -12,6 +12,22 @@ function ctorFromCallee(fn: SyntaxNode, src: string): string | null {
   return /^[A-Z]/.test(name) ? name : null;
 }
 
+/**
+ * True when walking up from `node` crosses a `lambda` before reaching the nearest
+ * enclosing `function_definition`/`class_definition` or the module root. Unlike TS's
+ * named arrow-consts, python has no equivalent "named lambda" exemption — a lambda
+ * assigned to a variable (`cb = lambda: helper()`) is still anonymous.
+ */
+function crossesAnonymous(node: SyntaxNode): boolean {
+  let cur = node.parent;
+  while (cur) {
+    if (cur.type === 'lambda') return true;
+    if (cur.type === 'function_definition' || cur.type === 'class_definition') return false;
+    cur = cur.parent;
+  }
+  return false;
+}
+
 function enclosingQualname(node: SyntaxNode, src: string): { qual: string; classQual?: string } {
   const parts: string[] = [];
   let classQual: string | undefined;
@@ -215,8 +231,9 @@ export const pythonExtractor: LanguageExtractor = {
         const fn = node.childForFieldName('function');
         if (!fn) continue;
         const { qual } = enclosingQualname(node, src);
+        const anonymous = crossesAnonymous(node) || undefined;
         if (fn.type === 'identifier') {
-          calls.push({ callee: src.slice(fn.startIndex, fn.endIndex), inside: qual || undefined, line: node.startPosition.row + 1 });
+          calls.push({ callee: src.slice(fn.startIndex, fn.endIndex), inside: qual || undefined, anonymous, line: node.startPosition.row + 1 });
         } else if (fn.type === 'attribute') {
           const attr = fn.childForFieldName('attribute');
           const obj = fn.childForFieldName('object');
@@ -225,6 +242,7 @@ export const pythonExtractor: LanguageExtractor = {
               callee: src.slice(attr.startIndex, attr.endIndex),
               receiver: obj ? src.slice(obj.startIndex, obj.endIndex) : undefined,
               inside: qual || undefined,
+              anonymous,
               line: node.startPosition.row + 1,
             });
         }
