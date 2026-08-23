@@ -106,6 +106,30 @@ function enclosingFn(node: SyntaxNode, src: string): string | undefined {
   return undefined;
 }
 
+/** Recursively collect bound identifier names out of a `let`-pattern / fn-parameter
+ * pattern node into `out` (plain `identifier`; `tuple_pattern`/`tuple_struct_pattern`/
+ * `slice_pattern` for destructuring; `reference_pattern`/`mut_pattern` wrapping `&x`/`mut x`).
+ * `self_parameter` is skipped on purpose — `self` is handled separately by the resolver's
+ * receiver-based `self`/`this` branch, not the bare-call local guard. */
+function collectPatternNames(node: SyntaxNode, src: string, out: string[]): void {
+  switch (node.type) {
+    case 'identifier':
+      out.push(text(src, node));
+      break;
+    case 'tuple_pattern':
+    case 'tuple_struct_pattern':
+    case 'slice_pattern':
+      for (const c of namedChildren(node)) collectPatternNames(c, src, out);
+      break;
+    case 'reference_pattern':
+    case 'mut_pattern':
+      for (const c of namedChildren(node)) collectPatternNames(c, src, out);
+      break;
+    default:
+      break;
+  }
+}
+
 function docComment(node: SyntaxNode, src: string): string {
   const prev = node.previousNamedSibling;
   if (prev?.type === 'line_comment' && text(src, prev).startsWith('///')) return text(src, prev).replace(/^\/\/\/\s?/, '').trim().slice(0, 300);
@@ -116,6 +140,13 @@ export const rustExtractor: LanguageExtractor = {
   lang: 'rust',
   extract(tree: Tree, src: string): Extracted {
     const symbols: RawSymbol[] = []; const imports: RawImport[] = []; const calls: RawCall[] = []; const inherits: RawInherit[] = []; const assigns: RawAssign[] = [];
+    const localsByScopeSets = new Map<string, Set<string>>();
+    const addLocals = (scope: string, names: string[]) => {
+      if (!names.length) return;
+      const set = localsByScopeSets.get(scope) ?? new Set<string>();
+      for (const n of names) set.add(n);
+      localsByScopeSets.set(scope, set);
+    };
     for (const node of walk(tree.rootNode)) {
       switch (node.type) {
         case 'function_item': {
@@ -170,6 +201,24 @@ export const rustExtractor: LanguageExtractor = {
             }
             if (ctor) assigns.push({ name: text(src, patternNode), ctor, inside: enclosingFn(node, src), line: node.startPosition.row + 1 });
           }
+          // Every `let` pattern is a local binding in its enclosing fn, independent of
+          // the ctor-tracking above.
+          if (patternNode) {
+            const names: string[] = [];
+            collectPatternNames(patternNode, src, names);
+            addLocals(enclosingFn(node, src) ?? '', names);
+          }
+          break;
+        }
+        case 'parameters': {
+          const scope = enclosingFn(node, src) ?? '';
+          const names: string[] = [];
+          for (const c of namedChildren(node)) {
+            if (c.type === 'self_parameter') continue;
+            const pattern = c.childForFieldName('pattern') ?? (c.type === 'identifier' ? c : null);
+            if (pattern) collectPatternNames(pattern, src, names);
+          }
+          addLocals(scope, names);
           break;
         }
         case 'call_expression': {
@@ -182,6 +231,8 @@ export const rustExtractor: LanguageExtractor = {
         }
       }
     }
-    return { symbols, imports, calls, inherits, assigns };
+    const localsByScope: Record<string, string[]> = {};
+    for (const [scope, names] of localsByScopeSets) localsByScope[scope] = [...names];
+    return { symbols, imports, calls, inherits, assigns, localsByScope };
   },
 };

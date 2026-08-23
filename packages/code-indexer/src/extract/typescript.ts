@@ -56,6 +56,46 @@ function isExported(node: SyntaxNode): boolean {
   return false;
 }
 
+/** Recursively collect bound identifier names out of a destructuring/parameter pattern
+ * node (`identifier`, `array_pattern`, `object_pattern` and their nested sub-node kinds
+ * — `pair_pattern` for `{a: b}`, `rest_pattern` for `...x`, `object_assignment_pattern`
+ * for `{a = 1}`) into `out`. Used for both function parameters and
+ * `const/let/var` declarator names. */
+function collectPatternNames(node: SyntaxNode, src: string, out: string[]): void {
+  switch (node.type) {
+    case 'identifier':
+    case 'shorthand_property_identifier_pattern':
+      out.push(text(src, node));
+      break;
+    case 'array_pattern':
+    case 'object_pattern':
+      for (const c of namedChildren(node)) collectPatternNames(c, src, out);
+      break;
+    case 'pair_pattern': {
+      const v = node.childForFieldName('value');
+      if (v) collectPatternNames(v, src, out);
+      break;
+    }
+    case 'rest_pattern':
+    case 'object_assignment_pattern': {
+      const c = namedChildren(node)[0];
+      if (c) collectPatternNames(c, src, out);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/** One `formal_parameters` child: a plain `identifier`, or a `required_parameter`/
+ * `optional_parameter` wrapping the actual pattern via the `pattern` field (default
+ * value / type annotation live alongside it and are ignored). */
+function collectParamNames(node: SyntaxNode, src: string, out: string[]): void {
+  if (node.type === 'identifier') { out.push(text(src, node)); return; }
+  const pattern = node.childForFieldName('pattern');
+  if (pattern) collectPatternNames(pattern, src, out);
+}
+
 /** First line of a JSDoc `/** ... *\/` comment immediately preceding `node`. */
 function jsdoc(node: SyntaxNode, src: string): string {
   const prev = node.previousNamedSibling;
@@ -79,6 +119,13 @@ export const tsExtractor: LanguageExtractor = {
     const calls: RawCall[] = [];
     const inherits: RawInherit[] = [];
     const assigns: RawAssign[] = [];
+    const localsByScopeSets = new Map<string, Set<string>>();
+    const addLocals = (scope: string, names: string[]) => {
+      if (!names.length) return;
+      const set = localsByScopeSets.get(scope) ?? new Set<string>();
+      for (const n of names) set.add(n);
+      localsByScopeSets.set(scope, set);
+    };
     for (const node of walk(tree.rootNode)) {
       const isArrowConst = node.type === 'variable_declarator' && isFnValue(node);
       if (DEF_TYPES.has(node.type) || isArrowConst) {
@@ -155,6 +202,15 @@ export const tsExtractor: LanguageExtractor = {
           const ctor = ctorName(value, src);
           if (ctor) { const { qual } = enclosing(node, src); assigns.push({ name: text(src, nameNode), ctor, inside: qual || undefined, line: node.startPosition.row + 1 }); }
         }
+        // Every `const|let|var` declarator name is a local binding in its enclosing scope
+        // (simple identifier or destructured array/object pattern), independent of whether
+        // it happens to also be a tracked constructor assignment above.
+        if (nameNode) {
+          const names: string[] = [];
+          collectPatternNames(nameNode, src, names);
+          const { qual } = enclosing(node, src);
+          addLocals(qual, names);
+        }
       } else if (node.type === 'assignment_expression') {
         // `x = new Name(...)` (no declaration keyword)
         const left = node.childForFieldName('left');
@@ -181,8 +237,25 @@ export const tsExtractor: LanguageExtractor = {
             });
           }
         }
+      } else if (node.type === 'formal_parameters') {
+        // `function foo(a, {b, c: d} = {}, ...rest)` / `(a, b) => ...` — all bound as
+        // locals of the enclosing function itself (the formal_parameters' nearest
+        // DEF_TYPES/arrow-const ancestor).
+        const { qual } = enclosing(node, src);
+        const names: string[] = [];
+        for (const c of namedChildren(node)) collectParamNames(c, src, names);
+        addLocals(qual, names);
+      } else if (node.type === 'arrow_function') {
+        // Single-param arrow without parens: `x => x + 1`.
+        const p = node.childForFieldName('parameter');
+        if (p?.type === 'identifier') {
+          const { qual } = enclosing(node, src);
+          addLocals(qual, [text(src, p)]);
+        }
       }
     }
-    return { symbols, imports, calls, inherits, assigns };
+    const localsByScope: Record<string, string[]> = {};
+    for (const [scope, names] of localsByScopeSets) localsByScope[scope] = [...names];
+    return { symbols, imports, calls, inherits, assigns, localsByScope };
   },
 };

@@ -81,12 +81,12 @@ describe('resolver', () => {
     });
     const walked = (p: string) => ({ path: p, abs: p, sha256: 'x', lang: 'python' as const, size: 0 });
     const idx = buildRepoIndex([
-      { walked: walked('installer.py'), ex: { symbols: [rawSym('function', 'info')], imports: [], calls: [], inherits: [], assigns: [] } },
+      { walked: walked('installer.py'), ex: { symbols: [rawSym('function', 'info')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
       {
         walked: walked('kg.py'),
         ex: {
           symbols: [rawSym('class', 'KGBuilder'), rawSym('method', 'KGBuilder.build_graph', 'build_graph', 'KGBuilder')],
-          imports: [], calls: [], inherits: [], assigns: [],
+          imports: [], calls: [], inherits: [], assigns: [], localsByScope: {},
         },
       },
       {
@@ -99,7 +99,7 @@ describe('resolver', () => {
             { callee: 'info', inside: 'run', line: 2 },                          // generic callee, receiver-less -> STILL no edge (stop-list, not just the receiver rule)
             { callee: 'build_graph', receiver: 'kg', inside: 'run', line: 3 },    // non-generic, unique method, unbound receiver -> resolves (0.4)
           ],
-          inherits: [], assigns: [],
+          inherits: [], assigns: [], localsByScope: {},
         },
       },
     ]);
@@ -115,13 +115,13 @@ describe('resolver', () => {
     const walked = (p: string, lang: 'python' | 'typescript' | 'rust' = 'typescript') => ({ path: p, abs: p, sha256: 'x', lang, size: 0 });
     const idx = buildRepoIndex([
       // cross-language guard: a unique `login` lives in Rust; a TS file calls login() bare.
-      { walked: walked('auth.rs', 'rust'), ex: { symbols: [rawSym('function', 'login')], imports: [], calls: [], inherits: [], assigns: [] } },
+      { walked: walked('auth.rs', 'rust'), ex: { symbols: [rawSym('function', 'login')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
       // external-binding guard: `createClient` is both a real repo symbol (cli/api.ts) and
       // imported from an external package ('redis') in the caller file below.
-      { walked: walked('cli/api.ts'), ex: { symbols: [rawSym('function', 'createClient')], imports: [], calls: [], inherits: [], assigns: [] } },
+      { walked: walked('cli/api.ts'), ex: { symbols: [rawSym('function', 'createClient')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
       // stop-list: a unique `resolve` method elsewhere must never satisfy a bare
       // `resolve(...)` Promise-executor-style call.
-      { walked: walked('promise-like.ts'), ex: { symbols: [rawSym('method', 'Deferred.resolve', 'resolve', 'Deferred')], imports: [], calls: [], inherits: [], assigns: [] } },
+      { walked: walked('promise-like.ts'), ex: { symbols: [rawSym('method', 'Deferred.resolve', 'resolve', 'Deferred')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
       {
         walked: walked('app.ts'),
         ex: {
@@ -132,7 +132,7 @@ describe('resolver', () => {
             { callee: 'createClient', inside: 'main', line: 2 }, // bound to an unresolved external import -> no edge
             { callee: 'resolve', inside: 'main', line: 3 },      // stop-list -> no edge
           ],
-          inherits: [], assigns: [],
+          inherits: [], assigns: [], localsByScope: {},
         },
       },
     ]);
@@ -150,8 +150,8 @@ describe('resolver', () => {
       // receiver-call fallback for rust outright, independent of GENERIC_CALLEES also
       // stop-listing `is_empty` by name - the shape rule covers names that aren't
       // explicitly listed too).
-      { walked: walked('session.rs'), ex: { symbols: [rawSym('struct', 'S'), rawSym('method', 'S.is_empty', 'is_empty', 'S')], imports: [], calls: [], inherits: [], assigns: [] } },
-      { walked: walked('other.rs'), ex: { symbols: [rawSym('function', 'helper')], imports: [], calls: [], inherits: [], assigns: [] } },
+      { walked: walked('session.rs'), ex: { symbols: [rawSym('struct', 'S'), rawSym('method', 'S.is_empty', 'is_empty', 'S')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
+      { walked: walked('other.rs'), ex: { symbols: [rawSym('function', 'helper')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
       {
         walked: walked('main.rs'),
         ex: {
@@ -161,7 +161,7 @@ describe('resolver', () => {
             { callee: 'is_empty', receiver: 'name', inside: 'main', line: 1 },  // receiver call, unique method -> NO edge (round 3)
             { callee: 'helper', inside: 'main', line: 2 },                      // bare call, unique fn -> still resolves (0.4)
           ],
-          inherits: [], assigns: [],
+          inherits: [], assigns: [], localsByScope: {},
         },
       },
     ]);
@@ -169,5 +169,33 @@ describe('resolver', () => {
     const callsEdges = out.edges.filter(e => e.type === 'CALLS');
     expect(callsEdges).toHaveLength(1);
     expect(callsEdges[0]).toMatchObject({ type: 'CALLS', head: 'main.rs::main', tail: 'other.rs::helper', confidence: 0.4 });
+  });
+  it('round 3: a bare call whose callee shadows a local binding, directly or via a nested closure, never uses the 0.4 fallback', () => {
+    const rawSym = (kind: 'function' | 'method', qualname: string, name = qualname, parent?: string) => ({
+      kind, qualname, name, line_start: 1, line_end: 2, signature: '', doc: '', exported: true, parent,
+    });
+    const walked = (p: string) => ({ path: p, abs: p, sha256: 'x', lang: 'typescript' as const, size: 0 });
+    const idx = buildRepoIndex([
+      // b.ts defines a `setMode` that is otherwise a unique repo-wide bare name.
+      { walked: walked('b.ts'), ex: { symbols: [rawSym('function', 'setMode')], imports: [], calls: [], inherits: [], assigns: [], localsByScope: {} } },
+      {
+        walked: walked('a.ts'),
+        ex: {
+          symbols: [rawSym('function', 'App')],
+          imports: [],
+          calls: [
+            { callee: 'setMode', inside: 'App', line: 1 },              // bare call, 'setMode' is a local in its OWN scope 'App' -> no edge
+            { callee: 'setMode', inside: 'App.handleBack', line: 2 },    // bare call from a nested named callback that closes over
+                                                                          // 'App''s local without redeclaring it -> still no edge
+          ],
+          inherits: [], assigns: [],
+          // `const [mode, setMode] = useState(...)` lives directly in App's own scope, not
+          // in the nested 'App.handleBack' callback that references it (real closure shape).
+          localsByScope: { App: ['mode', 'setMode'] },
+        },
+      },
+    ]);
+    const out = fileOutputs(idx, 'a.ts');
+    expect(out.edges.filter(e => e.type === 'CALLS')).toHaveLength(0);
   });
 });

@@ -45,4 +45,10 @@ describe('typescript extractor', () => {
       expect.objectContaining({ name: 'u', ctor: 'User', inside: 'main' }),
     ]));
   });
+  it('records localsByScope: destructured hook-setter names and a nested function param, scoped separately', async () => {
+    const src = 'export function App(){ const [mode, setMode] = useState(1); function inner(cb){ cb() } }';
+    const ex = await extractFile('typescript', src);
+    expect(ex.localsByScope['App']).toEqual(expect.arrayContaining(['mode', 'setMode']));
+    expect(ex.localsByScope['App.inner']).toEqual(['cb']);
+  });
 });

@@ -48,4 +48,9 @@ describe('python extractor', () => {
       expect.objectContaining({ name: 't', ctor: 'Thing', inside: 'top' }),
     ]));
   });
+  it('records localsByScope: params, assignment target, and for-loop target', async () => {
+    const src = 'def f(resolve, y):\n    z = 1\n    for k in y:\n        pass\n';
+    const ex = await extractFile('python', src);
+    expect(ex.localsByScope['f']).toEqual(expect.arrayContaining(['resolve', 'y', 'z', 'k']));
+  });
 });

@@ -61,6 +61,16 @@ export interface Extracted {
   calls: RawCall[];
   inherits: RawInherit[];
   assigns: RawAssign[];
+  /**
+   * Identifiers bound as a local within a given scope: parameters (incl. destructured),
+   * and local variable/assignment/loop-target names. Keyed by the enclosing def's
+   * qualname (matching `RawCall.inside`/`RawSymbol.qualname` convention), or '' for
+   * module/top-level scope. Used by the resolver to suppress the repo-wide "unique bare
+   * name" 0.4-tier fallback for a bare call whose callee shadows a local binding in its
+   * own calling scope (e.g. `setMode(...)` from `const [mode, setMode] = useState(...)`
+   * must never be guessed as an unrelated file's `setMode` method).
+   */
+  localsByScope: Record<string, string[]>;
 }
 
 export interface LanguageExtractor {

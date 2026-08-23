@@ -207,6 +207,22 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     localCtor.set(scope, m);
   }
   const ctorOf = (scope: string, name: string): string | undefined => localCtor.get(scope)?.get(name) ?? localCtor.get('')?.get(name);
+  // Is `name` a local binding visible from `scope`, counting lexical closure over every
+  // enclosing scope (not just `scope` itself)? Dot-separated qualnames ('Outer.Inner')
+  // are exactly the lexical nesting chain built by each extractor's `enclosing*()`
+  // helper, so walking it name-segment-by-name-segment up to module scope ('') mirrors
+  // real JS/Python closures: `setMode` destructured in a component's own scope is still
+  // a local from the perspective of a nested named callback (`Component.handleClick`)
+  // that references it without redeclaring it.
+  const isLocalInScope = (scope: string, name: string): boolean => {
+    let cur = scope;
+    while (true) {
+      if (ex.localsByScope[cur]?.includes(name)) return true;
+      if (!cur) return false;
+      const dot = cur.lastIndexOf('.');
+      cur = dot === -1 ? '' : cur.slice(0, dot);
+    }
+  };
   // Resolve a constructor name (`Thing`, `Engine`, ...) to its class/struct symbol:
   // same file first, then via this file's import bindings, then a repo-wide unique bare name.
   const resolveCtorClass = (ctor: string): { file: string; qualname: string } | null => {
@@ -281,14 +297,24 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     //  - external binding: a bare callee already bound to an import that resolved to
     //    NO repo file (an external package, e.g. `createClient` from 'redis') must
     //    never fall through to guessing some unrelated repo symbol of the same name.
-    // Round 3 guard: rust receiver calls never use this fallback at all (`x.foo()` /
-    // `Type::foo()` with an unresolved receiver): Rust's trait system means a same-named
-    // method on an unrelated type (`is_empty`, `into_response`, `from_str`, ...) is the
-    // common case, not the exception - a receiver-less bare call (`helper()`) is still
-    // eligible, since Rust free functions don't have that ambiguity.
+    // Round 3 guards:
+    //  - rust receiver calls never use this fallback at all (`x.foo()` / `Type::foo()`
+    //    with an unresolved receiver): Rust's trait system means a same-named method on
+    //    an unrelated type (`is_empty`, `into_response`, `from_str`, ...) is the common
+    //    case, not the exception - a receiver-less bare call (`helper()`) is still
+    //    eligible, since Rust free functions don't have that ambiguity.
+    //  - local-binding shadow: a BARE call (no receiver) whose callee is declared as a
+    //    local (parameter, destructured binding, loop/with target, or plain const/let/var)
+    //    anywhere in its calling scope's lexical closure chain must never be guessed
+    //    against some unrelated file's same-named symbol (`setMode(...)` from a
+    //    destructured `const [mode, setMode] = useState(...)` at the component's own
+    //    scope, called from a nested named callback that closes over it without
+    //    redeclaring it; a `resolve` callback parameter; an `edgeKey` closure variable) -
+    //    the local wins even when the indexer can't tell where its value came from.
     if (!tail) {
       const rustReceiverCall = lang === 'rust' && !!c.receiver;
-      const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee) && !rustReceiverCall;
+      const isLocalShadow = !c.receiver && isLocalInScope(c.inside ?? '', c.callee);
+      const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee) && !rustReceiverCall && !isLocalShadow;
       if (eligible) {
         const g = idx.byBareName.get(c.callee) ?? [];
         if (g.length === 1) {
