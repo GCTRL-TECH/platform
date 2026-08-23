@@ -341,6 +341,19 @@ allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-onl
 `gctrl_code_index` (stdio, direct mode), CLI `gctrl code index|status`, Anvil sandbox stdio entry
 `gctrl-code`. `GCTRL_MCP_TOOLS=code` filters an MCP server instance to just the code tools.
 
+### Token capability `codeAccess`
+
+Codebase access is a per-access-token capability (`api_keys.code_access`, migration 078,
+default `true` so nothing changes for existing tokens). Switching it off in
+**Settings -> Access Control** takes everything code-related away from that one token: the four
+code tools are refused by `agent::execute_tool` and omitted from the MCP gateway's `tools/list`,
+CODE compilations drop out of the token's grant set / `/kg/compilations` / the agent's
+`list_graphs` and resolve to denied (`i32::MIN`) on an explicit `compilationId` read, and code
+writes (`POST /api/kex/code`, `DELETE /api/kex/code/files`) return 403. The flag rides on
+`JwtClaims.code_access` (always `true` for JWT sessions), is set at creation via
+`{"codeAccess": false}` and toggled afterwards with `PUT /users/api-keys/:id`. Covered end to end
+by the `code_kb` release check.
+
 ### Measured numbers (dogfood: borghive indexing itself, 2026-08-23)
 - 464 files (Python/TypeScript/Rust) → 7134 symbols, 9080 edges, 3726 chunks.
 - Incremental re-run, no changes: 0/464 files uploaded.

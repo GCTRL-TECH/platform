@@ -78,6 +78,7 @@ Go to **Settings → Access Control** and create a token with the three controls
 1. **Clearance ceiling** - pick the maximum classification this token may read. It is automatically capped at your own clearance; you cannot exceed it.
 2. **Per-graph grants** - add one or more knowledge bases this token may access. For each grant, optionally set a **raised clearance** that applies only to that graph.
 3. **KB-scoping** - toggle the token to *scoped* mode so it can only see and write the granted knowledge bases and nothing else (a colleague token).
+4. **Codebase access** - on by default; switch it off and the token can neither see code knowledge bases nor call the code tools (`code_symbol`, `code_trace`, `code_impact`, `code_architecture`).
 
 ```text
 Settings → Access Control → New Token

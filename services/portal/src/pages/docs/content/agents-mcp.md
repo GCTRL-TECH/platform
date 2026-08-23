@@ -92,7 +92,7 @@ The canonical, always-current copy is served at `GET /api/agent/skill.md` on you
 
 ### Create a scoped access token
 
-In the GCTRL portal: **Settings → Access Control → New Token**. Pick a clearance ceiling, grant the knowledge bases the agent may use, and toggle **KB-scoped** mode. The token is sent as:
+In the GCTRL portal: **Settings → Access Control → New Token**. Pick a clearance ceiling, grant the knowledge bases the agent may use, and toggle **KB-scoped** mode. Leave **Codebase access** on for an agent that should work with code knowledge bases and the code tools, or switch it off to keep those out of the agent's reach entirely. The token is sent as:
 
 ```
 Authorization: ApiKey gctrl_your_scoped_token
