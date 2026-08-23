@@ -87,21 +87,50 @@ pub(crate) async fn api_key_scope(
     Some(rows.into_iter().map(|(c,)| c).collect())
 }
 
-/// The set of source-job ids a KB-scoped token may traverse in the graph: the union
-/// of `source_job_ids` across its granted compilations. `None` = JWT/unscoped token
-/// (no restriction). `Some(empty)` = scoped but granted nothing → the caller returns
-/// no results. Graph nodes/edges carry `_source_jobs` (every contributing job), so
-/// `neo4j::job_scope` confines a scoped token to its knowledge base(s) — this
+/// The set of source-job ids a token may traverse in the graph. `None` = no
+/// restriction (JWT session, or a full-owner token with every capability on).
+/// `Some(empty)` = the token may see nothing → the caller returns no results.
+/// Graph nodes/edges carry `_source_jobs` (every contributing job), so
+/// `neo4j::job_scope` confines the request to those knowledge bases — this
 /// closes the hole where the global graph tools (search_entities / get_entity /
 /// get_neighbors / shortest_path / graph_search) enforced only owner + rank and let a
 /// KB-scoped token enumerate the owner's ENTIRE graph across KB boundaries.
+///
+/// Two ways to end up scoped:
+///   * **KB-scoped token** — the union of `source_job_ids` across its granted
+///     compilations (CODE ones already dropped by `api_key_scope` when the
+///     Codebase-access capability is off).
+///   * **Unscoped (full-owner) token with `code_access = false`** (migration 078)
+///     — narrowed to the jobs of the owner's NON-CODE compilations, so code nodes
+///     disappear from every graph read instead of only from the code tools.
+///
+/// Narrowing caveat for that second case: job scope is a positive allow-list, so
+/// an ORPHAN node (one whose `_source_jobs` are not referenced by any compilation
+/// of the owner) becomes invisible to such a token too. That is the conservative
+/// direction — the capability only ever removes access — but it does mean a
+/// no-code full-owner token sees slightly less than "everything except code".
 pub(crate) async fn api_key_scoped_jobs(
     db: &sqlx::PgPool,
     claims: &JwtClaims,
 ) -> Option<Vec<String>> {
-    let set = api_key_scope(db, claims).await?;
-    if set.is_empty() { return Some(Vec::new()); }
-    let comp_ids: Vec<Uuid> = set.into_iter().collect();
+    let comp_ids: Vec<Uuid> = match api_key_scope(db, claims).await {
+        Some(set) => {
+            if set.is_empty() { return Some(Vec::new()); }
+            set.into_iter().collect()
+        }
+        None => {
+            // JWT session, or a full-owner token that still has Codebase access:
+            // no job restriction at all (unchanged behaviour).
+            if claims.api_key_id.is_none() || claims.code_access { return None; }
+            // Migration 078 — unscoped token, Codebase access off: switch the
+            // graph reads onto job scope over the owner's non-CODE knowledge bases.
+            let jobs: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT DISTINCT unnest(source_job_ids) FROM compilations
+                 WHERE user_id = $1 AND type::text <> 'CODE'"
+            ).bind(claims.sub).fetch_all(db).await.unwrap_or_default();
+            return Some(jobs.into_iter().map(|j| j.to_string()).collect());
+        }
+    };
     let jobs: Vec<Uuid> = sqlx::query_scalar(
         "SELECT DISTINCT unnest(source_job_ids) FROM compilations WHERE id = ANY($1)"
     ).bind(&comp_ids).fetch_all(db).await.unwrap_or_default();
@@ -127,6 +156,35 @@ pub(crate) async fn enforce_kb_write_scope(
     Ok(())
 }
 
+/// Is this compilation a CODE knowledge base? One cheap lookup, shared by the
+/// read gate (`effective_rank_for_compilation`) and the write gate
+/// (`enforce_code_capability`) so the two can never disagree on what "code" is.
+pub(crate) async fn compilation_is_code(db: &sqlx::PgPool, compilation_id: Uuid) -> bool {
+    let ctype: Option<String> = sqlx::query_scalar(
+        "SELECT type::text FROM compilations WHERE id = $1"
+    ).bind(compilation_id).fetch_optional(db).await.ok().flatten();
+    ctype.as_deref() == Some("CODE")
+}
+
+/// Codebase-access capability guard for MUTATIONS of a specific compilation
+/// (migration 078). Reads are denied through `effective_rank_for_compilation`
+/// (i32::MIN); this is the other half: a token with the capability off must not
+/// be able to delete, rename, reclassify, refresh, distil or reschedule a CODE
+/// knowledge base either. Costs one query, and only when the capability is off.
+pub(crate) async fn enforce_code_capability(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+    compilation_id: Uuid,
+) -> Result<()> {
+    if claims.code_access { return Ok(()); }
+    if compilation_is_code(db, compilation_id).await {
+        return Err(AppError::Forbidden(
+            "This access token has Codebase access disabled - code knowledge bases cannot be modified".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Effective clearance rank for reading a specific compilation.
 ///
 /// Starts from the request's base clearance (already capped by any API-key rank)
@@ -146,11 +204,8 @@ pub(crate) async fn effective_rank_for_compilation(
     // "Codebase access" off (migration 078): a CODE knowledge base is denied
     // outright for this token, exactly like an out-of-scope compilation. Only
     // costs a query when the capability is actually switched off.
-    if !claims.code_access {
-        let ctype: Option<String> = sqlx::query_scalar(
-            "SELECT type::text FROM compilations WHERE id = $1"
-        ).bind(compilation_id).fetch_optional(db).await.ok().flatten();
-        if ctype.as_deref() == Some("CODE") { return i32::MIN; }
+    if !claims.code_access && compilation_is_code(db, compilation_id).await {
+        return i32::MIN;
     }
     // KB-scoped tokens: deny anything outside the assigned knowledge base(s).
     if let Some(set) = api_key_scope(db, claims).await {
@@ -863,6 +918,12 @@ async fn create(
             )));
         }
     };
+    // Migration 078 - a token without Codebase access may not create a CODE
+    // knowledge base either (it would be invisible to itself the moment it existed).
+    if comp_type == "CODE" && !claims.code_access {
+        return Err(AppError::Forbidden(
+            "This access token has Codebase access disabled - code knowledge bases cannot be created".into()));
+    }
 
     // WIKI compilations must reference a RAW source compilation owned by the
     // same user. Validate before inserting so we never persist a dangling wiki.
@@ -977,8 +1038,17 @@ async fn get_one(
          WHERE c.id = $1"
     ).bind(id).fetch_optional(&state.db).await.ok().flatten();
 
+    // Access gate, computed UNCONDITIONALLY (not just for classified graphs): a
+    // DENIED request - outside a KB-scoped token's grant set, or a CODE graph on a
+    // token with Codebase access off - returns i32::MIN here and must get a plain
+    // NotFound, indistinguishable from a nonexistent id, before ANY metadata
+    // (name, counts, type, privacy posture) leaves this handler. An unclassified
+    // graph used to skip this branch entirely and hand the row straight back.
+    let user_rank = effective_rank_for_compilation(&state.db, &claims, id).await;
+    if user_rank == i32::MIN {
+        return Err(AppError::NotFound);
+    }
     if let Some(rank) = classification_rank {
-        let user_rank = effective_rank_for_compilation(&state.db, &claims, id).await;
         if user_rank < rank {
             return Err(AppError::Forbidden("Insufficient clearance for this compilation".into()));
         }
@@ -1028,6 +1098,7 @@ async fn update(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    enforce_code_capability(&state.db, &claims, id).await?;
     if let Some(name) = req.get("name").and_then(|v| v.as_str()) {
         sqlx::query("UPDATE compilations SET name=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
             .bind(name).bind(id).bind(claims.sub).execute(&state.db).await?;
@@ -1135,6 +1206,7 @@ async fn delete_one(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    enforce_code_capability(&state.db, &claims, id).await?;
     // System compilations (e.g. the default "Knowledge Wiki") are non-deletable —
     // mirrors the canonical default ontology's 403 protection. Checking ownership
     // and the flag together means a non-owner still gets NotFound, not Forbidden.
@@ -1164,6 +1236,7 @@ async fn refresh(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    enforce_code_capability(&state.db, &claims, id).await?;
     sqlx::query("UPDATE users SET tokens_balance=tokens_balance-3 WHERE id=$1").bind(claims.sub).execute(&state.db).await?;
     let source_ids: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT unnest(source_job_ids) FROM compilations WHERE id=$1").bind(id).fetch_all(&state.db).await?;
     let job_id = Uuid::new_v4();
@@ -1191,6 +1264,7 @@ async fn distill(
     Json(req): Json<DistillReq>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    enforce_code_capability(&state.db, &claims, id).await?;
     // Verify ownership + type in one query (NotFound covers "not owned").
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT type::text FROM compilations WHERE id=$1 AND user_id=$2"
@@ -1613,6 +1687,7 @@ async fn set_schedule(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>> {
     enforce_kb_write_scope(&state.db, &claims, id).await?;
+    enforce_code_capability(&state.db, &claims, id).await?;
     let schedule = req.get("schedule")
         .and_then(|v| if v.is_null() { Some(None) } else { v.as_str().map(|s| Some(s.to_string())) })
         .unwrap_or(None);
@@ -2067,6 +2142,9 @@ async fn public_get_graph(
 
     // Best-effort audit entry attributed to the compilation's owner (there's
     // no requester identity to log for a public, unauthenticated read).
+    // Audit-only claims - never used to authorize anything (the embed read above
+    // is already finished and was gated by embed_public + PUBLIC classification),
+    // so `code_access: true` here grants nothing.
     let synthetic_claims = JwtClaims {
         sub: owner_id, email: "public-embed".into(), role: "viewer".into(), clearance: None,
         exp: usize::MAX, api_key_rank: None, api_key_id: None, read_only: true, code_access: true,

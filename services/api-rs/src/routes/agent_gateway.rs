@@ -54,12 +54,16 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Json<Value> {
     }))
 }
 
-/// Turn the agent's `tool_schema()` (`{tools:[{name, description, args}]}`) into
+/// Turn the agent's tool schema (`{tools:[{name, description, args}]}`) into
 /// MCP tool descriptors with a real JSON-Schema `inputSchema`. The `args` hint
 /// map uses values like `"string"`, `"number?"`, `"string[]"` — we translate
 /// those into property types and a `required` list (anything not `…?`).
-fn mcp_tool_descriptors() -> Vec<Value> {
-    let schema = crate::routes::agent::tool_schema();
+///
+/// Starts from `visible_tool_schema(claims)`, so per-token capability filtering
+/// (migration 078: the code tools vanish when Codebase access is off) is applied
+/// once, in agent.rs, for this gateway AND for `GET /api/agent/tools`.
+fn mcp_tool_descriptors(claims: &JwtClaims) -> Vec<Value> {
+    let schema = crate::routes::agent::visible_tool_schema(claims);
     let mut out = Vec::new();
     if let Some(tools) = schema["tools"].as_array() {
         for t in tools {
@@ -166,18 +170,10 @@ async fn mcp_rpc(
 
         // ── Discovery ──────────────────────────────────────────────────────────
         "tools/list" => {
-            // Migration 078 — per-token "Codebase access": a token with the
-            // capability switched off must not even SEE the code tools, so the
-            // connecting model never tries them. tools/call is refused
-            // independently in agent::execute_tool (discovery is not a gate).
-            let mut tools = mcp_tool_descriptors();
-            if !claims.code_access {
-                tools.retain(|t| {
-                    let name = t["name"].as_str().unwrap_or("");
-                    !crate::routes::code_tools::TOOLS.contains(&name)
-                });
-            }
-            rpc_result(id, json!({ "tools": tools })).into_response()
+            // Per-token capability filtering (078: no code tools when Codebase
+            // access is off) happens inside `visible_tool_schema`. Discovery is not
+            // a gate - tools/call is refused independently in agent::execute_tool.
+            rpc_result(id, json!({ "tools": mcp_tool_descriptors(&claims) })).into_response()
         }
 
         // ── Resources: expose the full GCTRL skill so a connecting agent can

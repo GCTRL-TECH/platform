@@ -556,6 +556,54 @@ pub(crate) async fn execute_tool(
 pub(crate) const CODE_ACCESS_DENIED: &str =
     "This access token has Codebase access disabled - code tools are not permitted";
 
+/// The owner's CODE knowledge bases, as `(compilation ids, source job ids)` — both
+/// as strings, matching how KEX/RAG report a chunk's origin. Fetched in ONE query;
+/// only ever called when the Codebase-access capability is off.
+pub(crate) async fn code_chunk_scope(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+    let rows: Vec<(uuid::Uuid, Vec<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT id, COALESCE(source_job_ids, '{}'::uuid[]) FROM compilations
+         WHERE user_id = $1 AND type::text = 'CODE'"
+    ).bind(user_id).fetch_all(db).await.unwrap_or_default();
+    let mut comps = std::collections::HashSet::new();
+    let mut jobs = std::collections::HashSet::new();
+    for (cid, job_ids) in rows {
+        comps.insert(cid.to_string());
+        jobs.extend(job_ids.into_iter().map(|j| j.to_string()));
+    }
+    (comps, jobs)
+}
+
+/// Drop retrieved chunks/sources that came out of a CODE knowledge base.
+///
+/// The code tools are refused outright for a token without Codebase access, but
+/// RAG retrieval reaches the same material through plain text chunks, which are
+/// scoped only by owner + clearance. A chunk is code when its compilation is a
+/// CODE graph, or — for the many chunks whose `compilation_id` is NULL — when the
+/// job that produced it feeds one. Both spellings of each key are checked because
+/// the KEX worker returns snake_case and the RAG handler re-emits camelCase.
+pub(crate) fn drop_code_chunks(
+    chunks: Vec<Value>,
+    code_comp_ids: &std::collections::HashSet<String>,
+    code_job_ids: &std::collections::HashSet<String>,
+) -> Vec<Value> {
+    if code_comp_ids.is_empty() && code_job_ids.is_empty() { return chunks; }
+    chunks
+        .into_iter()
+        .filter(|c| {
+            let hits = |keys: &[&str], set: &std::collections::HashSet<String>| {
+                keys.iter().any(|k| {
+                    c.get(*k).and_then(|v| v.as_str()).is_some_and(|v| set.contains(v))
+                })
+            };
+            !hits(&["compilation_id", "compilationId"], code_comp_ids)
+                && !hits(&["job_id", "jobId", "source_job", "sourceJob"], code_job_ids)
+        })
+        .collect()
+}
+
 async fn execute_tool_inner(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
@@ -587,11 +635,15 @@ async fn execute_tool_inner(
             // NULL-classification branch used to bypass every rank cap. Granted
             // graphs stay visible so scoped/embed tokens can still list them.
             let (rank, rank_capped) = crate::routes::kg::clearance_rank_with_cap(&state.db, claims).await;
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String, String)>(
-                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode, c.type::text
+            // Codebase access off (078): CODE knowledge bases are excluded in SQL,
+            // not after the fact - a post-filter would shorten the LIMIT 50 page and
+            // hide non-code graphs behind the code ones it dropped.
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String)>(
+                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode
                  FROM compilations c
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
                  WHERE c.user_id = $1
+                   AND ($5 OR c.type::text <> 'CODE')
                    AND (cl.rank <= $2
                         OR (c.classification_level_id IS NULL AND NOT $3)
                         OR EXISTS (SELECT 1 FROM api_key_grants g
@@ -602,6 +654,7 @@ async fn execute_tool_inner(
                  ORDER BY c.created_at DESC LIMIT 50"
             )
             .bind(claims.sub).bind(rank).bind(rank_capped).bind(claims.api_key_id)
+            .bind(claims.code_access)
             .fetch_all(&state.db).await.unwrap_or_default();
 
             // KB-scoped token: only its assigned knowledge base(s) are visible.
@@ -609,9 +662,7 @@ async fn execute_tool_inner(
             json!({
                 "graphs": rows.iter()
                     .filter(|(id, ..)| scope.as_ref().map_or(true, |s| s.contains(id)))
-                    // Codebase access off (078): CODE knowledge bases are invisible.
-                    .filter(|(.., ctype)| claims.code_access || ctype != "CODE")
-                    .map(|(id, name, desc, cls, privacy, _ctype)| json!({
+                    .map(|(id, name, desc, cls, privacy)| json!({
                         "id": id, "name": name, "description": desc,
                         "classification": cls, "privacyMode": privacy
                     })).collect::<Vec<_>>()
@@ -888,13 +939,22 @@ async fn execute_tool_inner(
             let client = reqwest::Client::new();
             // Scope to the caller's own chunks (grounding + no cross-user leak).
             let body = json!({ "query": query, "limit": 5, "compilation_id": compilation_id, "user_id": claims.sub, "max_rank": rank });
-            let chunks = match client.post(format!("{}/search", state.cfg.kex_worker_url))
+            let mut chunks = match client.post(format!("{}/search", state.cfg.kex_worker_url))
                 .header("X-Internal-Secret", &state.cfg.internal_secret)
                 .json(&body).timeout(Duration::from_secs(10)).send().await
             {
                 Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "chunks": [] })),
                 Err(_) => json!({ "chunks": [] }),
             };
+            // Migration 078 - Codebase access off: retrieval must not smuggle code
+            // back in as source text. KEX scopes by owner + clearance only, so the
+            // CODE-origin chunks are dropped here.
+            if !claims.code_access {
+                let (code_comps, code_jobs) = code_chunk_scope(&state.db, claims.sub).await;
+                if let Some(arr) = chunks.get_mut("chunks").and_then(|v| v.as_array_mut()) {
+                    *arr = drop_code_chunks(std::mem::take(arr), &code_comps, &code_jobs);
+                }
+            }
             crate::services::audit::log_access(&state.db, claims, "agent.search_chunks", "chunks", "*", rank as i32, None, true, None).await;
             chunks
         }
@@ -1196,7 +1256,7 @@ async fn execute_tool_inner(
             if let Some(cid) = compilation_id {
                 body["compilationId"] = json!(cid);
             }
-            match client.post(format!("{api_base}/rag/query"))
+            let mut answer = match client.post(format!("{api_base}/rag/query"))
                 .bearer_auth(&jwt)
                 .json(&body)
                 .timeout(Duration::from_secs(30))
@@ -1204,7 +1264,17 @@ async fn execute_tool_inner(
             {
                 Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "error": "parse error" })),
                 Err(e) => json!({ "error": format!("RAG query failed: {e}") }),
+            };
+            // Same chunk filter as search_chunks: the RAG answer cites its evidence,
+            // so a CODE-origin source card would leak code paths and snippets to a
+            // token whose Codebase access is off.
+            if !claims.code_access {
+                let (code_comps, code_jobs) = code_chunk_scope(&state.db, claims.sub).await;
+                if let Some(arr) = answer.get_mut("sources").and_then(|v| v.as_array_mut()) {
+                    *arr = drop_code_chunks(std::mem::take(arr), &code_comps, &code_jobs);
+                }
             }
+            answer
         }
 
         // ── Write: extract + link to compilation (mirrors stdio gctrl_store) ──
@@ -1400,6 +1470,9 @@ async fn execute_tool_inner(
             if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
                 return json!({ "error": e.to_string() });
             }
+            if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
+                return json!({ "error": e.to_string() });
+            }
             // Same order as the HTTP handler: the graph footprint goes first,
             // while `source_job_ids` still exists to find it by.
             let owns: bool = sqlx::query_scalar::<_, i64>(
@@ -1429,6 +1502,9 @@ async fn execute_tool_inner(
                 return json!({ "error": "compilationId is required" });
             };
             if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                return json!({ "error": e.to_string() });
+            }
+            if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
                 return json!({ "error": e.to_string() });
             }
             // Owner check + source jobs.
@@ -2256,11 +2332,28 @@ async fn chat(
 
 // ── Tools list endpoint ───────────────────────────────────────────────────────
 
+/// `tool_schema()` as THIS caller may see it. Migration 078 - a token with the
+/// Codebase-access capability off must not be told the code tools exist, on any
+/// discovery surface. Single source of truth for both `GET /api/agent/tools` and
+/// the MCP gateway's `tools/list`; enforcement itself lives in
+/// `execute_tool_inner`, which still refuses a hand-written call.
+pub(crate) fn visible_tool_schema(claims: &JwtClaims) -> Value {
+    let mut schema = tool_schema();
+    if !claims.code_access {
+        if let Some(tools) = schema["tools"].as_array_mut() {
+            tools.retain(|t| {
+                !crate::routes::code_tools::TOOLS.contains(&t["name"].as_str().unwrap_or(""))
+            });
+        }
+    }
+    schema
+}
+
 async fn list_tools(
-    Extension(_claims): Extension<JwtClaims>,
+    Extension(claims): Extension<JwtClaims>,
     State(_state): State<Arc<crate::models::AppState>>,
 ) -> Json<Value> {
-    Json(tool_schema())
+    Json(visible_tool_schema(&claims))
 }
 
 // ── Helper: scan text for embedded {"tool": ...} JSON ────────────────────────
@@ -2305,6 +2398,7 @@ pub(crate) fn find_tool_json(text: &str) -> Option<Value> {
 mod agent_tool_registration_tests {
     use super::tool_schema;
     use super::READ_TOOLS;
+    use serde_json::{json, Value};
 
     fn tool_names() -> Vec<String> {
         let schema = tool_schema();
@@ -2475,6 +2569,71 @@ mod agent_tool_registration_tests {
         for t in &["list_graphs", "query", "store", "search_chunks"] {
             assert!(!gated.contains(t), "'{t}' must NOT be gated by Codebase access");
         }
+    }
+
+    /// A claims stub for the pure capability tests (no DB, no signing involved).
+    fn claims_stub(code_access: bool) -> crate::middleware::auth::JwtClaims {
+        crate::middleware::auth::JwtClaims {
+            sub: uuid::Uuid::nil(),
+            email: "t@example.com".into(),
+            role: "admin".into(),
+            clearance: None,
+            exp: usize::MAX,
+            api_key_rank: None,
+            api_key_id: None,
+            read_only: false,
+            code_access,
+            agent_override_rank: None,
+        }
+    }
+
+    /// Discovery surface: `visible_tool_schema` drops EXACTLY the four code tools
+    /// when the capability is off, and changes nothing when it is on.
+    #[test]
+    fn visible_tool_schema_hides_exactly_the_code_tools() {
+        let names = |schema: &Value| -> Vec<String> {
+            schema["tools"].as_array().unwrap().iter()
+                .map(|t| t["name"].as_str().unwrap_or("").to_string()).collect()
+        };
+        let full = names(&super::visible_tool_schema(&claims_stub(true)));
+        let limited = names(&super::visible_tool_schema(&claims_stub(false)));
+        for t in crate::routes::code_tools::TOOLS {
+            assert!(full.contains(&t.to_string()), "'{t}' must be visible with the capability on");
+            assert!(!limited.contains(&t.to_string()), "'{t}' must be hidden with the capability off");
+        }
+        let dropped: Vec<&String> = full.iter().filter(|n| !limited.contains(n)).collect();
+        assert_eq!(dropped.len(), crate::routes::code_tools::TOOLS.len(),
+            "visible_tool_schema removed something other than the code tools: {dropped:?}");
+    }
+
+    /// Retrieval surface: a chunk is dropped when its compilation OR its job is a
+    /// CODE knowledge base, under either the snake_case (KEX) or camelCase (RAG)
+    /// spelling; everything else survives untouched.
+    #[test]
+    fn drop_code_chunks_removes_only_code_origin_chunks() {
+        let comps: std::collections::HashSet<String> = ["comp-code"].iter().map(|s| s.to_string()).collect();
+        let jobs: std::collections::HashSet<String> = ["job-code"].iter().map(|s| s.to_string()).collect();
+        let chunks = vec![
+            json!({ "text": "keep-plain" }),
+            json!({ "text": "keep-comp", "compilation_id": "comp-doc" }),
+            json!({ "text": "drop-comp-snake", "compilation_id": "comp-code" }),
+            json!({ "text": "drop-comp-camel", "compilationId": "comp-code" }),
+            json!({ "text": "keep-job", "job_id": "job-doc" }),
+            json!({ "text": "drop-job-snake", "job_id": "job-code" }),
+            json!({ "text": "drop-job-camel", "jobId": "job-code" }),
+            json!({ "text": "keep-null-comp", "compilation_id": Value::Null }),
+        ];
+        let kept: Vec<String> = super::drop_code_chunks(chunks, &comps, &jobs).iter()
+            .map(|c| c["text"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(kept, vec!["keep-plain", "keep-comp", "keep-job", "keep-null-comp"]);
+    }
+
+    /// No CODE knowledge bases at all -> the filter is a pure pass-through.
+    #[test]
+    fn drop_code_chunks_is_identity_without_code_graphs() {
+        let empty = std::collections::HashSet::new();
+        let chunks = vec![json!({ "text": "a", "compilation_id": "x" }), json!({ "text": "b" })];
+        assert_eq!(super::drop_code_chunks(chunks.clone(), &empty, &empty), chunks);
     }
 
     /// The gate itself: `!code_access && is_code_tool` refuses, everything else passes.
