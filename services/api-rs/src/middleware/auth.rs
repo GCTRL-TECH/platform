@@ -27,6 +27,14 @@ pub struct JwtClaims {
     /// decode fine (as non-read-only).
     #[serde(default)]
     pub read_only: bool,
+    /// "Codebase access" capability of the API key used for this request
+    /// (`api_keys.code_access`, migration 078). When false the request may not
+    /// call the code tools, may not see CODE compilations, and may not write
+    /// code knowledge. Always true for JWT auth (a logged-in user has full
+    /// access to their own knowledge bases). `#[serde(default = "default_true")]`
+    /// so tokens signed before this field existed keep today's behaviour.
+    #[serde(default = "default_true")]
+    pub code_access: bool,
     /// In-process-only per-session clearance override (NOT part of the JWT). Set
     /// by the agent chat handler so the onboard CTO agent can run at full access
     /// (i32::MAX) for an admin, or a downgraded rank. `#[serde(skip)]` means it is
@@ -34,6 +42,10 @@ pub struct JwtClaims {
     #[serde(skip)]
     pub agent_override_rank: Option<i32>,
 }
+
+/// serde default for `code_access` - absent means "on", so pre-078 tokens and
+/// JWT sessions behave exactly as before.
+fn default_true() -> bool { true }
 
 pub async fn require_auth(
     State(state): State<Arc<crate::models::AppState>>,
@@ -75,8 +87,8 @@ pub async fn require_auth(
 
         // SEC-2: the join also filters out inactive users (api_keys are deleted on
         // deprovision, but the is_active guard is belt-and-suspenders).
-        let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool)>(
-            "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only
+        let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool, bool)>(
+            "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only, ak.code_access
              FROM api_keys ak
              JOIN users u ON u.id = ak.user_id
              WHERE ak.key_hash = $1
@@ -89,7 +101,7 @@ pub async fn require_auth(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-        let (key_id, user_id, max_rank, email, role, read_only) = row;
+        let (key_id, user_id, max_rank, email, role, read_only, code_access) = row;
 
         // Wave 2 — read-only embed tokens: a single chokepoint blocking any
         // mutating request before it ever reaches a route handler.
@@ -125,6 +137,7 @@ pub async fn require_auth(
             api_key_rank: Some(max_rank),
             api_key_id: Some(key_id),
             read_only,
+            code_access,
             agent_override_rank: None,
         }
     } else {
@@ -161,8 +174,8 @@ pub async fn optional_auth(
         Some(v) if v.starts_with("ApiKey ") => {
             let raw_key = v.trim_start_matches("ApiKey ").trim();
             let hash = hex::encode(Sha256::digest(raw_key.as_bytes()));
-            sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool)>(
-                "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only
+            sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool, bool)>(
+                "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only, ak.code_access
                  FROM api_keys ak
                  JOIN users u ON u.id = ak.user_id
                  WHERE ak.key_hash = $1
@@ -174,7 +187,7 @@ pub async fn optional_auth(
             .await
             .ok()
             .flatten()
-            .map(|(key_id, user_id, max_rank, email, role, read_only)| JwtClaims {
+            .map(|(key_id, user_id, max_rank, email, role, read_only, code_access)| JwtClaims {
                 sub: user_id,
                 email,
                 role,
@@ -183,6 +196,7 @@ pub async fn optional_auth(
                 api_key_rank: Some(max_rank),
                 api_key_id: Some(key_id),
                 read_only,
+                code_access,
                 agent_override_rank: None,
             })
         }

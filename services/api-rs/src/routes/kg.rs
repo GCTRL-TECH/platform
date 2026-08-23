@@ -61,18 +61,29 @@ pub(crate) async fn clearance_rank_with_cap(db: &sqlx::PgPool, claims: &JwtClaim
 /// Returns `None` for JWT auth and for unscoped tokens (full owner access; grants
 /// merely raise clearance). The set may be empty (a scoped token with no grants
 /// can see nothing).
+///
+/// Migration 078 - "Codebase access": a token with `code_access = false` never
+/// gets CODE compilations back here, so a granted code knowledge base is simply
+/// not part of its scope (invisible, not merely unreadable).
 pub(crate) async fn api_key_scope(
     db: &sqlx::PgPool,
     claims: &JwtClaims,
 ) -> Option<std::collections::HashSet<Uuid>> {
     let key_id = claims.api_key_id?;
-    let scoped: Option<bool> = sqlx::query_scalar(
-        "SELECT kb_scoped FROM api_keys WHERE id = $1"
+    let row: Option<(bool, bool)> = sqlx::query_as(
+        "SELECT kb_scoped, code_access FROM api_keys WHERE id = $1"
     ).bind(key_id).fetch_optional(db).await.ok().flatten();
-    if scoped != Some(true) { return None; }
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
+    let Some((scoped, code_access)) = row else { return None; };
+    if !scoped { return None; }
+    let sql = if code_access {
         "SELECT compilation_id FROM api_key_grants WHERE api_key_id = $1"
-    ).bind(key_id).fetch_all(db).await.unwrap_or_default();
+    } else {
+        "SELECT g.compilation_id FROM api_key_grants g
+         JOIN compilations c ON c.id = g.compilation_id
+         WHERE g.api_key_id = $1 AND c.type::text <> 'CODE'"
+    };
+    let rows: Vec<(Uuid,)> = sqlx::query_as(sql)
+        .bind(key_id).fetch_all(db).await.unwrap_or_default();
     Some(rows.into_iter().map(|(c,)| c).collect())
 }
 
@@ -132,6 +143,15 @@ pub(crate) async fn effective_rank_for_compilation(
     claims: &JwtClaims,
     compilation_id: Uuid,
 ) -> i32 {
+    // "Codebase access" off (migration 078): a CODE knowledge base is denied
+    // outright for this token, exactly like an out-of-scope compilation. Only
+    // costs a query when the capability is actually switched off.
+    if !claims.code_access {
+        let ctype: Option<String> = sqlx::query_scalar(
+            "SELECT type::text FROM compilations WHERE id = $1"
+        ).bind(compilation_id).fetch_optional(db).await.ok().flatten();
+        if ctype.as_deref() == Some("CODE") { return i32::MIN; }
+    }
     // KB-scoped tokens: deny anything outside the assigned knowledge base(s).
     if let Some(set) = api_key_scope(db, claims).await {
         if !set.contains(&compilation_id) { return i32::MIN; }
@@ -746,9 +766,12 @@ async fn list(
                              AND (g.granted_rank IS NULL
                                   OR c.classification_level_id IS NULL
                                   OR g.granted_rank >= cl.rank)))
+           -- Codebase access off (migration 078): CODE knowledge bases are invisible.
+           AND ($7 OR c.type::text <> 'CODE')
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
-     .bind(rank_capped).bind(claims.api_key_id).fetch_all(&state.db).await?;
+     .bind(rank_capped).bind(claims.api_key_id).bind(claims.code_access)
+     .fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
     // the same constraint) — privacyMode is fetched via one small batched query
@@ -806,8 +829,10 @@ async fn list(
                                WHERE g.api_key_id = $4 AND g.compilation_id = c.id
                                  AND (g.granted_rank IS NULL
                                       OR c.classification_level_id IS NULL
-                                      OR g.granted_rank >= cl.rank)))"
+                                      OR g.granted_rank >= cl.rank)))
+               AND ($5 OR c.type::text <> 'CODE')"
         ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
+         .bind(claims.code_access)
          .fetch_one(&state.db).await?
     };
 
@@ -2044,7 +2069,8 @@ async fn public_get_graph(
     // no requester identity to log for a public, unauthenticated read).
     let synthetic_claims = JwtClaims {
         sub: owner_id, email: "public-embed".into(), role: "viewer".into(), clearance: None,
-        exp: usize::MAX, api_key_rank: None, api_key_id: None, read_only: true, agent_override_rank: None,
+        exp: usize::MAX, api_key_rank: None, api_key_id: None, read_only: true, code_access: true,
+        agent_override_rank: None,
     };
     crate::services::audit::log_access(&state.db, &synthetic_claims, "graph.read.public_embed",
         "compilation", &id.to_string(), 0, None, true, None).await;

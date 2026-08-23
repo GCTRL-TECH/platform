@@ -42,7 +42,16 @@ struct CreateKeyReq {
     /// part of viewing it, not a colleague seat.
     #[serde(default)]
     embed: bool,
+    /// "Codebase access" capability (migration 078). Default true = unchanged
+    /// behaviour. When false the token cannot call the code tools, cannot see
+    /// CODE compilations and cannot write code knowledge.
+    #[serde(rename = "codeAccess", default = "default_true")]
+    code_access: bool,
 }
+
+/// serde default for `codeAccess` - absent means "on", so every existing client
+/// (settings UI, onboarding wizard, MCP full-access mint) keeps full access.
+fn default_true() -> bool { true }
 
 /// Resolve a token's clearance to (rank, level_name, level_id) — preferring an
 /// explicit classification level (system or custom) and falling back to a bare
@@ -84,6 +93,8 @@ struct UpdateKeyReq {
     name: Option<String>,
     #[serde(rename = "maxClearanceRank")] max_clearance_rank: Option<i32>,
     #[serde(rename = "maxClearanceLevelId")] max_clearance_level_id: Option<Uuid>,
+    /// Toggle the token's Codebase access after creation. `None` leaves it as is.
+    #[serde(rename = "codeAccess")] code_access: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -141,13 +152,13 @@ async fn list_keys(
     State(state): State<Arc<crate::models::AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool, bool)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool, bool, bool)>(
         // Hide auto-minted embed throwaways by default — this list is for tokens
         // the admin deliberately created for colleagues, not iframe embed keys.
         // `?includeEmbed=true` returns them (with an `embed` flag) so they can be
         // audited + revoked.
         "SELECT id, name, key_prefix, max_clearance_rank, max_clearance_level, max_clearance_level_id,
-                last_used_at, expires_at, created_at, kb_scoped, read_only, embed
+                last_used_at, expires_at, created_at, kb_scoped, read_only, embed, code_access
          FROM api_keys WHERE user_id = $1 AND (embed = false OR $2)
          ORDER BY created_at DESC"
     )
@@ -158,7 +169,7 @@ async fn list_keys(
     let key_ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     let mut grants = grants_for_keys(&state.db, &key_ids).await;
 
-    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only, embed)| {
+    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only, embed, code_access)| {
         json!({
             "id": id,
             "name": name,
@@ -172,6 +183,7 @@ async fn list_keys(
             "kbScoped": kb_scoped,
             "readOnly": read_only,
             "embed": embed,
+            "codeAccess": code_access,
             "grants": grants.remove(&id).unwrap_or_default(),
         })
     }).collect();
@@ -267,8 +279,8 @@ async fn create_key(
 
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys
-           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only, embed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only, embed, code_access)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING id"
     )
     .bind(claims.sub)
@@ -282,6 +294,7 @@ async fn create_key(
     .bind(kb_scoped)
     .bind(req.read_only)
     .bind(embed)
+    .bind(req.code_access)
     .fetch_one(&state.db).await?;
 
     // Per-graph grants — only for compilations the caller actually owns.
@@ -307,6 +320,7 @@ async fn create_key(
         "expiresAt":        req.expires_at,
         "kbScoped":         kb_scoped,
         "readOnly":         req.read_only,
+        "codeAccess":       req.code_access,
         "grants":           grants_for_keys(&state.db, &[id]).await.remove(&id).unwrap_or_default(),
     })))
 }
@@ -322,7 +336,7 @@ async fn delete_key(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// PUT /api/users/api-keys/:id  { name?, maxClearanceRank? }
+/// PUT /api/users/api-keys/:id  { name?, maxClearanceRank?, codeAccess? }
 /// Edit a token's name and/or base clearance after creation. The secret itself
 /// is never re-issued; only metadata changes.
 async fn update_key(
@@ -348,14 +362,16 @@ async fn update_key(
             name = COALESCE($1, name),
             max_clearance_rank = COALESCE($2, max_clearance_rank),
             max_clearance_level = COALESCE($3, max_clearance_level),
-            max_clearance_level_id = CASE WHEN $4 THEN $5 ELSE max_clearance_level_id END
-          WHERE id = $6 AND user_id = $7"
+            max_clearance_level_id = CASE WHEN $4 THEN $5 ELSE max_clearance_level_id END,
+            code_access = COALESCE($6, code_access)
+          WHERE id = $7 AND user_id = $8"
     )
     .bind(req.name)
     .bind(rank)
     .bind(level_name)
     .bind(set_clear)
     .bind(level_id)
+    .bind(req.code_access)
     .bind(id)
     .bind(claims.sub)
     .execute(&state.db).await?.rows_affected();

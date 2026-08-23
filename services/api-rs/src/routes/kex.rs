@@ -467,6 +467,14 @@ async fn enqueue_code_job(
     removed: Vec<String>,
     classification_level_id: Option<Uuid>,
 ) -> Result<Json<Value>> {
+    // Migration 078 — per-token "Codebase access": writing code knowledge is a
+    // code capability, so a token with it switched off is refused before any
+    // work (or usage accounting) happens.
+    if !claims.code_access {
+        return Err(AppError::Forbidden(
+            "Codebase access is disabled for this access token".into(),
+        ));
+    }
     if files.is_empty() && removed.is_empty() {
         return Err(AppError::BadRequest("files or removed is required".into()));
     }

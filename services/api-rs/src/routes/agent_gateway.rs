@@ -166,7 +166,18 @@ async fn mcp_rpc(
 
         // ── Discovery ──────────────────────────────────────────────────────────
         "tools/list" => {
-            rpc_result(id, json!({ "tools": mcp_tool_descriptors() })).into_response()
+            // Migration 078 — per-token "Codebase access": a token with the
+            // capability switched off must not even SEE the code tools, so the
+            // connecting model never tries them. tools/call is refused
+            // independently in agent::execute_tool (discovery is not a gate).
+            let mut tools = mcp_tool_descriptors();
+            if !claims.code_access {
+                tools.retain(|t| {
+                    let name = t["name"].as_str().unwrap_or("");
+                    !crate::routes::code_tools::TOOLS.contains(&name)
+                });
+            }
+            rpc_result(id, json!({ "tools": tools })).into_response()
         }
 
         // ── Resources: expose the full GCTRL skill so a connecting agent can

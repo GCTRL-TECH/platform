@@ -551,6 +551,11 @@ pub(crate) async fn execute_tool(
     result
 }
 
+/// Refusal returned when a token with `code_access = false` (migration 078)
+/// tries to call one of `code_tools::TOOLS`.
+pub(crate) const CODE_ACCESS_DENIED: &str =
+    "This access token has Codebase access disabled - code tools are not permitted";
+
 async fn execute_tool_inner(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
@@ -561,6 +566,13 @@ async fn execute_tool_inner(
         return json!({ "error": format!(
             "This access token is read-only — tool '{tool_name}' mutates state and is not permitted"
         )});
+    }
+    // Migration 078 — per-token "Codebase access". A token with the capability
+    // switched off may not reach the code tools at all. The MCP gateway also
+    // hides them from tools/list, so a connecting model never sees them; this is
+    // the enforcement half (a hand-written tools/call still lands here).
+    if !claims.code_access && crate::routes::code_tools::TOOLS.contains(&tool_name) {
+        return json!({ "error": CODE_ACCESS_DENIED });
     }
     match tool_name {
         t if crate::routes::code_tools::TOOLS.contains(&t) => {
@@ -575,8 +587,8 @@ async fn execute_tool_inner(
             // NULL-classification branch used to bypass every rank cap. Granted
             // graphs stay visible so scoped/embed tokens can still list them.
             let (rank, rank_capped) = crate::routes::kg::clearance_rank_with_cap(&state.db, claims).await;
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String)>(
-                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String, String)>(
+                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode, c.type::text
                  FROM compilations c
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
                  WHERE c.user_id = $1
@@ -597,7 +609,9 @@ async fn execute_tool_inner(
             json!({
                 "graphs": rows.iter()
                     .filter(|(id, ..)| scope.as_ref().map_or(true, |s| s.contains(id)))
-                    .map(|(id, name, desc, cls, privacy)| json!({
+                    // Codebase access off (078): CODE knowledge bases are invisible.
+                    .filter(|(.., ctype)| claims.code_access || ctype != "CODE")
+                    .map(|(id, name, desc, cls, privacy, _ctype)| json!({
                         "id": id, "name": name, "description": desc,
                         "classification": cls, "privacyMode": privacy
                     })).collect::<Vec<_>>()
@@ -2436,6 +2450,42 @@ mod agent_tool_registration_tests {
             .expect("get_graph must be in tool_schema");
         assert!(tool["args"].get("response_format").is_some(),
             "get_graph descriptor must declare a 'response_format' arg");
+    }
+
+    // ── Codebase-access gate (pure, no DB needed) ─────────────────────────────
+
+    /// The refusal a token with `code_access = false` gets is stable and names
+    /// the capability, so an agent can tell "not permitted" apart from "broken".
+    #[test]
+    fn code_access_denied_message_is_stable() {
+        assert_eq!(
+            super::CODE_ACCESS_DENIED,
+            "This access token has Codebase access disabled - code tools are not permitted"
+        );
+    }
+
+    /// Exactly the four code tools are gated by the capability - nothing else.
+    #[test]
+    fn code_access_gate_covers_the_code_tools_only() {
+        let gated = crate::routes::code_tools::TOOLS;
+        for t in &["code_symbol", "code_trace", "code_impact", "code_architecture"] {
+            assert!(gated.contains(t), "'{t}' must be gated by Codebase access");
+        }
+        assert_eq!(gated.len(), 4, "code tool set changed - revisit the Codebase access gate");
+        for t in &["list_graphs", "query", "store", "search_chunks"] {
+            assert!(!gated.contains(t), "'{t}' must NOT be gated by Codebase access");
+        }
+    }
+
+    /// The gate itself: `!code_access && is_code_tool` refuses, everything else passes.
+    #[test]
+    fn code_access_gate_blocks_only_code_tools_when_disabled() {
+        let blocked = |code_access: bool, tool: &str| {
+            !code_access && crate::routes::code_tools::TOOLS.contains(&tool)
+        };
+        assert!(blocked(false, "code_symbol"), "code tool must be blocked when access is off");
+        assert!(!blocked(false, "list_graphs"), "non-code tool must pass when access is off");
+        assert!(!blocked(true, "code_symbol"), "code tool must pass when access is on");
     }
 
     // ── Admin-gate logic (pure, no DB needed) ─────────────────────────────────

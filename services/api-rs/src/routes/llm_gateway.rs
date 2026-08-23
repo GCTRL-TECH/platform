@@ -133,9 +133,9 @@ async fn authenticate(
     // 1. Try as a gctrl access token (the primary shape — same query the auth
     //    middleware uses). Inactive users / expired keys are filtered by the join.
     let hash = hex::encode(Sha256::digest(token.as_bytes()));
-    if let Ok(Some((key_id, user_id, max_rank, email, role, read_only))) =
-        sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool)>(
-            "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only
+    if let Ok(Some((key_id, user_id, max_rank, email, role, read_only, code_access))) =
+        sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool, bool)>(
+            "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only, ak.code_access
              FROM api_keys ak JOIN users u ON u.id = ak.user_id
              WHERE ak.key_hash = $1 AND u.is_active = true
                AND (ak.expires_at IS NULL OR ak.expires_at > NOW())",
@@ -153,6 +153,7 @@ async fn authenticate(
             api_key_rank: Some(max_rank),
             api_key_id: Some(key_id),
             read_only,
+            code_access,
             agent_override_rank: None,
         });
     }

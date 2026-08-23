@@ -334,6 +334,7 @@ async fn oidc_callback(
         api_key_rank: None,
         api_key_id: None,
         read_only: false,
+        code_access: true,
         agent_override_rank: None,
     };
 
