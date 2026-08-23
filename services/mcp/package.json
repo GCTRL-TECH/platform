@@ -1,6 +1,6 @@
 {
   "name": "gctrl-mcp",
-  "version": "1.1.0",
+  "version": "1.0.1",
   "mcpName": "io.github.GCTRL-TECH/gctrl",
   "license": "AGPL-3.0-or-later",
   "description": "GCTRL MCP Server — exposes KEX, FUSE, KG, and RAG as tools for AI agents",
@@ -36,9 +36,11 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
-    "@gctrl/code-indexer": "file:../../packages/code-indexer",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "zod": "^3.23.4"
+  },
+  "optionalDependencies": {
+    "@gctrl/code-indexer": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",

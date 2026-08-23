@@ -25,7 +25,51 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as fs from 'node:fs';
 import * as nodePath from 'node:path';
-import { indexRepo } from '@gctrl/code-indexer';
+
+// ── Optional peer: @gctrl/code-indexer ───────────────────────────────────────
+//
+// `gctrl_code_index` needs the indexer, every other tool does not. It is an
+// OPTIONAL dependency (and, until its first npm publish, not on the registry at
+// all), so this server must install, start and serve all its other tools without
+// it. Hence: no static import, a runtime `import()` behind a non-literal
+// specifier (so `tsc` never tries to resolve it either), and locally declared
+// types instead of imported ones.
+//
+// Working on this repo? Link the local package once:
+//   cd services/mcp && npm install ../../packages/code-indexer --no-save
+const CODE_INDEXER_PKG = '@gctrl/code-indexer';
+
+/** `IndexSummary` as returned by `@gctrl/code-indexer`'s `indexRepo`. */
+interface CodeIndexSummary {
+  compilationId: string; repo: string; commit: string | null;
+  filesTotal: number; filesChanged: number; filesRemoved: number;
+  batches: number; symbols: number; edges: number; chunks: number;
+  jobIds: string[]; warnings: string[];
+}
+interface CodeIndexerModule {
+  indexRepo(opts: {
+    repoPath: string;
+    compilationId?: string;
+    full?: boolean;
+    classificationLevelId?: string;
+    request: (method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown) => Promise<unknown>;
+    onProgress?: (msg: string) => void;
+  }): Promise<CodeIndexSummary>;
+}
+
+/** The indexer module, or null when it is not installed. */
+async function loadCodeIndexer(): Promise<CodeIndexerModule | null> {
+  try {
+    const mod = (await import(CODE_INDEXER_PKG)) as unknown as CodeIndexerModule;
+    return typeof mod?.indexRepo === 'function' ? mod : null;
+  } catch {
+    return null;
+  }
+}
+
+const CODE_INDEXER_MISSING =
+  'Code indexer not installed - run `npm i -g @gctrl/code-indexer` (publish pending) or use the CLI: `gctrl code index <path>`. ' +
+  'The read tools (gctrl_code_symbol / gctrl_code_trace / gctrl_code_impact / gctrl_code_architecture) work without it.';
 
 const API_BASE = process.env['GCTRL_API_URL'] || 'http://localhost:4000/api';
 const GCTRL_EMAIL = process.env['GCTRL_EMAIL'] || 'admin@gctrl.tech';
@@ -1139,9 +1183,11 @@ registerTool<{ repoPath: string; compilationId?: string; full?: boolean; classif
     classificationLevelId: z.string().optional(),
   },
   async ({ repoPath, compilationId, full, classificationLevelId }) => {
+    const indexer = await loadCodeIndexer();
+    if (!indexer) return { content: [{ type: 'text' as const, text: CODE_INDEXER_MISSING }] };
     const progress: string[] = [];
     try {
-      const s = await indexRepo({
+      const s = await indexer.indexRepo({
         repoPath, compilationId, full, classificationLevelId,
         request: (method, p, body) => apiCall(method, p, body),
         onProgress: (m) => { progress.push(m); console.error(`[gctrl_code_index] ${m}`); },
@@ -1227,6 +1273,16 @@ async function registerRemoteTools(): Promise<void> {
 
 async function main() {
   if (GATEWAY_URL) {
+    // The filter only ever applied to the LOCAL tool registrations; in gateway mode
+    // the remote tool list is proxied verbatim, so a `code`-filtered gateway server
+    // silently exposes everything the gateway exposes. Say so instead of pretending.
+    if (TOOL_FILTER === 'code') {
+      console.error(
+        '[GCTRL MCP] WARNING: GCTRL_MCP_TOOLS=code has no effect in gateway mode - ' +
+          'the gateway\'s own tool list is proxied verbatim. Unset GCTRL_GATEWAY_URL to run ' +
+          'the local code tools (gctrl_code_index needs direct mode: it indexes THIS machine).',
+      );
+    }
     await registerRemoteTools();
   }
 
