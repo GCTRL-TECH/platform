@@ -6,6 +6,22 @@ import type { Extracted, RawImport, RawSymbol } from './extract/types.js';
 export const symName = (p: string, qualname: string) => `${p}::${qualname}`;
 const posix = (p: string) => p.split(path.sep).join('/');
 
+/**
+ * Callees too generic/ubiquitous to trust a repo-wide "unique bare name" guess for,
+ * even when the name happens to be unique across the indexed repo right now (a
+ * second file using the same generic name is only a matter of time). Kept short and
+ * literal, no explanation needed callsite-by-callsite.
+ */
+export const GENERIC_CALLEES = new Set([
+  'get', 'set', 'add', 'put', 'post', 'delete', 'remove', 'update', 'run', 'start', 'stop', 'close', 'open',
+  'read', 'write', 'append', 'push', 'pop', 'find', 'filter', 'map', 'each', 'send', 'recv', 'exec', 'call',
+  'apply', 'bind', 'new', 'init', 'main', 'json', 'text', 'data', 'value', 'len', 'size', 'count', 'next',
+  'parse', 'format', 'log', 'info', 'debug', 'warn', 'warning', 'error', 'print', 'dump', 'load', 'save',
+  'sleep', 'wait', 'join', 'split', 'strip', 'trim', 'clone', 'copy', 'keys', 'values', 'items', 'insert',
+  'index', 'iter', 'into', 'from', 'to', 'as', 'is', 'has', 'ok', 'err', 'unwrap', 'expect', 'default',
+  'min', 'max', 'sum',
+]);
+
 export interface RepoIndex {
   files: Map<string, { walked: WalkedFile; ex: Extracted }>;
   symbolsByFile: Map<string, RawSymbol[]>;
@@ -120,6 +136,38 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     const file = tail.split('::')[0];
     return (idx.symbolsByFile.get(file) ?? []).find(s => symName(file, s.qualname) === tail)?.kind;
   };
+  // Fully-qualified symbol lookup: given a raw symbol name found via idx.byBareName
+  // (already "file::qualname"), fetch its own RawSymbol record (for .kind/.parent checks).
+  const rawSymOf = (full: string): RawSymbol | undefined => {
+    const file = full.split('::')[0]; const qualname = full.slice(file.length + 2);
+    return (idx.symbolsByFile.get(file) ?? []).find(s => s.qualname === qualname);
+  };
+  // local-variable -> constructor-name bindings, scoped by enclosing def ('' = module level)
+  const localCtor = new Map<string, Map<string, string>>();
+  for (const a of ex.assigns) {
+    const scope = a.inside ?? '';
+    const m = localCtor.get(scope) ?? new Map<string, string>();
+    m.set(a.name, a.ctor);
+    localCtor.set(scope, m);
+  }
+  const ctorOf = (scope: string, name: string): string | undefined => localCtor.get(scope)?.get(name) ?? localCtor.get('')?.get(name);
+  // Resolve a constructor name (`Thing`, `Engine`, ...) to its class/struct symbol:
+  // same file first, then via this file's import bindings, then a repo-wide unique bare name.
+  const resolveCtorClass = (ctor: string): { file: string; qualname: string } | null => {
+    const local = localByName.get(ctor)?.find(s => s.kind === 'class' || s.kind === 'struct');
+    if (local) return { file: p, qualname: local.qualname };
+    const b = binding.get(ctor);
+    if (b?.file) {
+      const hit = (idx.symbolsByFile.get(b.file) ?? []).find(s => s.name === ctor && (s.kind === 'class' || s.kind === 'struct'));
+      if (hit) return { file: b.file, qualname: hit.qualname };
+    }
+    const g = idx.byBareName.get(ctor) ?? [];
+    if (g.length === 1) {
+      const sym = rawSymOf(g[0]);
+      if (sym && (sym.kind === 'class' || sym.kind === 'struct')) return { file: g[0].split('::')[0], qualname: sym.qualname };
+    }
+    return null;
+  };
   // inheritance
   for (const inh of ex.inherits) {
     const parentName = inh.parent.split('.').pop()!;
@@ -148,12 +196,45 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
       if (!tail) { // local var of a known class in this file? (t = Thing(); t.run()) -> unique method name in file
         const ms = localByName.get(c.callee)?.filter(s => s.kind === 'method'); if (ms && ms.length === 1) tail = localFull(ms[0].qualname);
       }
+      if (!tail) {
+        // local constructor binding: `x = Thing()` / `let x = Engine::new()` tracked earlier in this
+        // file, then `x.method()` resolves Thing/Engine to its class/struct and looks up the method.
+        const ctor = ctorOf(c.inside, c.receiver);
+        const classLoc = ctor ? resolveCtorClass(ctor) : null;
+        if (classLoc) {
+          const method = (idx.symbolsByFile.get(classLoc.file) ?? []).find(s => s.parent === classLoc.qualname && s.name === c.callee);
+          if (method) tail = symName(classLoc.file, method.qualname);
+        }
+      }
     } else {
       const loc = localByName.get(c.callee)?.filter(s => s.kind !== 'method');
       if (loc && loc.length === 1) tail = localFull(loc[0].qualname);
       else if (binding.has(c.callee)) tail = findIn(binding.get(c.callee)!.file, c.callee);
     }
-    if (!tail && !c.receiver) { const g = idx.byBareName.get(c.callee) ?? []; if (g.length === 1) { tail = g[0]; conf = 0.4; } }
+    // Repo-wide "unique bare name" fallback (low-confidence heuristic). Skipped for
+    // generic/short callees (too likely to collide with an unrelated same-named method
+    // elsewhere) and, when the call has a receiver, unless that receiver is an
+    // unresolved local (not an import binding, not self/this/super/cls) AND the unique
+    // candidate is itself a method (has a `parent`) — a plain top-level function is
+    // never called via a receiver, so `foo.bar()` matching a unique bare *function*
+    // `bar` would be a false positive (e.g. `logger.info(...)` must never match a
+    // top-level `info` function, nor is `info` eligible at all: it's in the stop-list).
+    if (!tail) {
+      const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee);
+      if (eligible) {
+        const g = idx.byBareName.get(c.callee) ?? [];
+        if (g.length === 1) {
+          if (!c.receiver) {
+            tail = g[0]; conf = 0.4;
+          } else {
+            const receiverBound = binding.has(c.receiver);
+            const receiverSpecial = c.receiver === 'self' || c.receiver === 'this' || c.receiver === 'super' || c.receiver === 'cls';
+            const candidateIsMethod = !!rawSymOf(g[0])?.parent;
+            if (!receiverBound && !receiverSpecial && candidateIsMethod) { tail = g[0]; conf = 0.4; }
+          }
+        }
+      }
+    }
     if (tail && tail !== head) { stub(tail, kindOf(tail) ?? 'function'); addEdge({ type: 'CALLS', head, tail, confidence: conf, resolution: 'heuristic' }); }
   }
   return { symbols, edges };

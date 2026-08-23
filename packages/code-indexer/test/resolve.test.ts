@@ -49,10 +49,12 @@ describe('resolver', () => {
     expect(edges).toContain('CALLS src/index.ts::main -> src/models/user.ts::User');
     expect(edges).toContain('CALLS src/index.ts::main -> src/util.ts::add');
     expect(edges).toContain('IMPORTS src/index.ts -> node:fs');
-    // u.greet(...) has an unresolved receiver ('u' is a local var of an imported
-    // class whose type isn't tracked) - must NOT fall back to a repo-wide bare-name
-    // guess (that fallback is reserved for receiver-less calls, see resolve.ts).
-    expect(edges).not.toContain('CALLS src/index.ts::main -> src/models/user.ts::User.greet');
+    // u.greet(...): 'u' has no import binding, but `const u = new User()` is tracked as a
+    // local constructor binding (RawAssign) - resolves User -> its file, then finds the
+    // `greet` method on it. This used to be excluded on purpose (c30ade3, before local
+    // constructor binding existed); now that the receiver's origin is actually known
+    // (not guessed), the repo-wide bare-name path isn't even needed for this case.
+    expect(edges).toContain('CALLS src/index.ts::main -> src/models/user.ts::User.greet');
   });
   it('rust: mod and use resolve to files; scoped calls resolve', async () => {
     const idx = await indexFixture('rust');
@@ -62,31 +64,41 @@ describe('resolver', () => {
     const edges = out.edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
     expect(edges).toContain('CALLS src/main.rs::main -> src/lib.rs::Engine.new');
     expect(edges).toContain('CALLS src/main.rs::main -> src/util/math.rs::add');
+    // let e = Engine::new(); e.run() - local constructor binding resolves 'e' -> Engine
+    // (defined in lib.rs, a different file) -> Engine.run.
+    expect(edges).toContain('CALLS src/main.rs::main -> src/lib.rs::Engine.run');
   });
-  it('bare-name fallback (0.4) only fires for receiver-less calls; a call with an unresolved receiver emits no edge', () => {
-    const rawSym = (qualname: string, name = qualname) => ({
-      kind: 'function' as const, qualname, name, line_start: 1, line_end: 2,
-      signature: '', doc: '', exported: true,
+  it('refined bare-name fallback (0.4): a unique non-generic method resolves through an unresolved receiver; generic/short callees never fall back, receiver or not', () => {
+    const rawSym = (kind: 'function' | 'method' | 'class', qualname: string, name = qualname, parent?: string) => ({
+      kind, qualname, name, line_start: 1, line_end: 2, signature: '', doc: '', exported: true, parent,
     });
     const walked = (p: string) => ({ path: p, abs: p, sha256: 'x', lang: 'python' as const, size: 0 });
     const idx = buildRepoIndex([
-      { walked: walked('a.py'), ex: { symbols: [rawSym('info')], imports: [], calls: [], inherits: [] } },
+      { walked: walked('installer.py'), ex: { symbols: [rawSym('function', 'info')], imports: [], calls: [], inherits: [], assigns: [] } },
+      {
+        walked: walked('kg.py'),
+        ex: {
+          symbols: [rawSym('class', 'KGBuilder'), rawSym('method', 'KGBuilder.build_graph', 'build_graph', 'KGBuilder')],
+          imports: [], calls: [], inherits: [], assigns: [],
+        },
+      },
       {
         walked: walked('b.py'),
         ex: {
-          symbols: [rawSym('run')],
+          symbols: [rawSym('function', 'run')],
           imports: [],
           calls: [
-            { callee: 'info', receiver: 'logger', inside: 'run', line: 1 },
-            { callee: 'info', inside: 'run', line: 2 },
+            { callee: 'info', receiver: 'logger', inside: 'run', line: 1 },       // generic callee + unbound receiver -> no edge
+            { callee: 'info', inside: 'run', line: 2 },                          // generic callee, receiver-less -> STILL no edge (stop-list, not just the receiver rule)
+            { callee: 'build_graph', receiver: 'kg', inside: 'run', line: 3 },    // non-generic, unique method, unbound receiver -> resolves (0.4)
           ],
-          inherits: [],
+          inherits: [], assigns: [],
         },
       },
     ]);
     const out = fileOutputs(idx, 'b.py');
     const callsEdges = out.edges.filter(e => e.type === 'CALLS');
     expect(callsEdges).toHaveLength(1);
-    expect(callsEdges[0]).toMatchObject({ type: 'CALLS', head: 'b.py::run', tail: 'a.py::info', confidence: 0.4 });
+    expect(callsEdges[0]).toMatchObject({ type: 'CALLS', head: 'b.py::run', tail: 'kg.py::KGBuilder.build_graph', confidence: 0.4 });
   });
 });
