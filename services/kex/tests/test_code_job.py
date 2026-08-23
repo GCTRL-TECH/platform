@@ -99,3 +99,34 @@ class TestPurgeHelpers:
         assert "n._file = $path" in cypher and "NOT n.uri IN $keep" in cypher
         assert "DETACH DELETE n" in cypher
         assert kw["keep"] == ["databorg:user1/function/a_py_f"]
+
+
+class TestDeleteChunksBySource:
+    def test_deletes_pg_rows_and_qdrant_points(self):
+        from src.vector_store import VectorStore, _as_uuid
+
+        store = VectorStore(qdrant_url="http://fake-qdrant:6333", pg_url="postgresql://fake/db")
+        fake_conn = MagicMock()
+        fake_cursor = MagicMock()
+        fake_cursor.rowcount = 4
+        fake_conn.cursor.return_value.__enter__.return_value = fake_cursor
+        store._pg_conn = fake_conn
+        qc = MagicMock()
+        store._qdrant = qc
+        store._collection_ready = True
+
+        out = store.delete_chunks_by_source("user-1", "comp-1", ["a.py", "b.py"])
+
+        sql, params = fake_cursor.execute.call_args.args
+        assert "DELETE FROM text_chunks" in sql
+        assert params[2] == [_as_uuid("a.py"), _as_uuid("b.py")]
+        assert out["pg_deleted"] == 4
+        assert qc.delete.called
+        sel = qc.delete.call_args.kwargs["points_selector"]
+        keys = [c.key for c in sel.must if hasattr(c, "key")]
+        assert "user_id" in keys and "compilation_id" in keys and "source_document_id" in keys
+
+    def test_no_ids_is_noop(self):
+        from src.vector_store import VectorStore
+        store = VectorStore(qdrant_url="http://fake-qdrant:6333", pg_url="postgresql://fake/db")
+        assert store.delete_chunks_by_source("u", "c", []) == {"pg_deleted": 0, "qdrant_ok": True}

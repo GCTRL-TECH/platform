@@ -21,7 +21,10 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance, PointStruct, VectorParams,
+    Filter, FieldCondition, MatchValue, MatchAny,
+)
 
 from . import config
 
@@ -446,6 +449,50 @@ class VectorStore:
         # Return count stored in at least one backend
         total = max(qdrant_stored, pg_stored)
         return total
+
+    def delete_chunks_by_source(self, user_id, compilation_id, source_document_ids):
+        """Codebase KB: drop every chunk of the given source documents (file paths)
+        inside one compilation, in Postgres (authoritative) and Qdrant (best effort).
+        Paths are coerced to the same UUIDv5 `_as_uuid` used at insert time."""
+        ids = [s for s in (source_document_ids or []) if s]
+        if not ids:
+            return {"pg_deleted": 0, "qdrant_ok": True}
+        pg_deleted = 0
+        conn = self._get_pg()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM text_chunks "
+                        "WHERE user_id = %s AND compilation_id = %s "
+                        "AND source_document_id = ANY(%s::uuid[])",
+                        (_as_uuid(user_id), _as_uuid(compilation_id), [_as_uuid(s) for s in ids]),
+                    )
+                    pg_deleted = cur.rowcount or 0
+                conn.commit()
+            except Exception as exc:
+                logger.warning(f"VectorStore: chunk delete (PG) failed: {exc}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                self._pg_conn = None
+        qdrant_ok = True
+        client = self._qdrant
+        if client is not None:
+            try:
+                client.delete(
+                    collection_name=self.collection,
+                    points_selector=Filter(must=[
+                        FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                        FieldCondition(key="compilation_id", match=MatchValue(value=compilation_id)),
+                        FieldCondition(key="source_document_id", match=MatchAny(any=ids)),
+                    ]),
+                )
+            except Exception as exc:
+                qdrant_ok = False
+                logger.warning(f"VectorStore: chunk delete (Qdrant) failed: {exc}")
+        return {"pg_deleted": pg_deleted, "qdrant_ok": qdrant_ok}
 
     def close(self) -> None:
         """Release connections."""
