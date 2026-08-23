@@ -96,6 +96,14 @@ Start a fresh agent session in a project with the skill installed and a token sc
 
 Pass: all five answered with tool calls (visible in the transcript), no hallucinated entities, and question 5 produces a write. If the agent answers 2–4 from general knowledge without touching GCTRL, the skill is not loading — check the install path and that the MCP server is listed by the client.
 
+## Codebase KBs
+
+The skill also covers Codebase KBs: `gctrl_code_index` indexes a local repository (tree-sitter
+symbols + IMPORTS/CALLS/INHERITS edges + chunks) into a compilation of type CODE, and the read
+tools `code_symbol`/`code_trace`/`code_impact`/`code_architecture` answer structural questions
+("who calls this", "what breaks if I change this file") without a grep cascade. Index once fully,
+then incrementally after larger edits; run before refactor questions.
+
 ## Honest limits
 
 Retrieval is only as good as what was ingested: if the KB is thin, answers will be thin. The skill makes the agent say "not on record" instead of inventing — it cannot conjure facts that were never extracted. Scoped tokens also hide out-of-scope KBs entirely; a "missing" entity may simply be out of scope.

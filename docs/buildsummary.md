@@ -255,3 +255,55 @@ Authentication: `ApiKey` header, key stored in `~/.gctrl/config.json`
 `028` — retention policies + auto-expiry trigger  
 `029` — SSO configs + SCIM tokens  
 `030` — webhooks + webhook deliveries
+
+## Codebase KB (P1a)
+
+Index a source repository (symbols, imports, call graph, chunks) into GCTRL as a knowledge base,
+usable by agents via MCP/CLI first, product connector + UI later. Indexing runs where the code
+lives (`@gctrl/code-indexer`, TypeScript, first shared TS package); the server only stores.
+Contract: `docs/superpowers/specs/2026-08-22-codebase-kb-design.md` section 10 (`IndexBatch`).
+
+### Endpoints
+- `POST /api/kex/code` — body `{compilationId, repo:{name,root,commit}, files:[{path,sha256,lang,symbols[],edges[],chunks[]}], removed:[paths]}`, enqueues an async `kex_code` job, returns `{jobId, status}`.
+- `GET /api/kex/code/manifest?compilationId=` — `{repo, commit, files:{path: sha256}}` for incremental diffing.
+- `DELETE /api/kex/code/files` — body `{compilationId, repoName, paths}`, enqueues a removal-only `kex_code` job (same worker path, no duplicated purge logic).
+
+### Job type and compilation type
+Job type `kex_code`, worked by `services/kex/src/code_job.py`. Compilation type `CODE` (new enum
+value alongside RAW/WIKI). `GRAPH_KEEP_TYPES` in `services/kex/src/config.py` now includes `code`
+so isolated code symbols survive `GRAPH_PRUNE_ISOLATED`.
+
+### Purge semantics
+Per run: purge edges owned by the changed/removed files first (`purge_code_file_edges`), write the
+new graph (`KGBuilder.build_graph`), then drop stale symbols by URI set-difference
+(`purge_code_symbols`, keep-set = symbols the new write actually produced for that file), then
+delete stale chunks by `source_document_id` (`delete_chunks_by_source`). Node deletion is by URI
+set-difference after the write (not a blanket delete-before-write), so incoming edges from
+unchanged files that still call into a changed file are never severed mid-run.
+
+### Agent tools
+Read tools in `services/api-rs/src/routes/code_tools.rs`, exposed through the HTTP agent gateway
+(so Hermes/Anvil get them without a local index): `code_symbol`, `code_trace`, `code_impact`,
+`code_architecture` — same clearance-rank + KB-grant scoping as `get_neighbors`, read-only tokens
+allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-only: MCP tool
+`gctrl_code_index` (stdio, direct mode), CLI `gctrl code index|status`, Anvil sandbox stdio entry
+`gctrl-code`. `GCTRL_MCP_TOOLS=code` filters an MCP server instance to just the code tools.
+
+### Measured numbers (dogfood: borghive indexing itself, 2026-08-23)
+- 461 files (Python/TypeScript/Rust) → 7155 symbols, 9188 edges, 3681 chunks.
+- Incremental re-run, no changes: 0/461 files uploaded.
+- Full run wall time: ~2-4 min on the dev box (embeddings dominate).
+- Edge precision (gauntlet): confidence-0.6 tier (import/module-scope resolution) = 997/997 correct
+  for TS/JS against a TypeScript-compiler oracle, 30/30 for Python+Rust against an LLM judge.
+  Confidence-0.4 tier (repo-wide unique bare name, receiver calls only when the method name is
+  unique) is lower and every such edge is labeled `resolution: heuristic, confidence: 0.4`.
+- Token efficiency vs. grep-style exploration over 5 structural questions: 95.7% overall
+  (85.8%-99.9% per question).
+
+### CI
+`test-code-indexer` (typecheck + unit tests + build for `packages/code-indexer`) and
+`typecheck-mcp` (build the indexer, typecheck the MCP server against it) added to
+`.github/workflows/ci.yml`.
+
+### Follow-ups (P1b / P2)
+See `tasks/todo.md` under "Codebase KB follow-ups".

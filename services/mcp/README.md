@@ -15,6 +15,11 @@ Exposes Ground Control's knowledge management as MCP tools for Claude and other 
 | `gctrl_list_extractions` | List recent extraction jobs |
 | `gctrl_store` | Store knowledge (like Obsidian notes, but with KG extraction) |
 | `gctrl_schema` | Get the knowledge graph schema |
+| `gctrl_code_index` | Index a local repo into a Codebase KB (compilation type CODE); stdio/direct mode only, uses `@gctrl/code-indexer` |
+| `gctrl_code_symbol` | Find code symbols by name/path/regex (proxied to the HTTP gateway) |
+| `gctrl_code_trace` | Trace callers/callees of a symbol (proxied to the HTTP gateway) |
+| `gctrl_code_impact` | Impact analysis for changed symbols/files (proxied to the HTTP gateway) |
+| `gctrl_code_architecture` | Languages, hotspots, communities for a Codebase KB (proxied to the HTTP gateway) |
 
 ### Deprecated names (alias, removal in v2)
 
@@ -65,6 +70,7 @@ Requires a running GCTRL harness ([get started](https://gctrl.tech)).
 | `GCTRL_GATEWAY_URL` | Recommended: URL of your harness's MCP gateway (`http://<host>:4000/api/agent/mcp`). The stdio server acts as a thin authenticated proxy. |
 | `GCTRL_API_URL` | Alternative direct mode: GCTRL API base URL (`http://<host>:4000/api`); tools run locally against the API. |
 | `GCTRL_API_TOKEN` | Scoped GCTRL Access Token (`gctrl_…`), created in **Settings → Access Control** with a clearance level + per-graph grants. Least privilege — the agent sees exactly what the token is cleared for. |
+| `GCTRL_MCP_TOOLS` | Optional tool-set filter. Set to `code` to register only the local code tools (`gctrl_code_index`, `gctrl_code_symbol`, `gctrl_code_trace`, `gctrl_code_impact`, `gctrl_code_architecture`) — used for the Anvil/Hermes `gctrl-code` stdio entry, kept separate from the HTTP-gateway `gctrl`/`gctrl-projekt` entries. |
 
 Dev-only fallback: `GCTRL_EMAIL` + `GCTRL_PASSWORD` (full-clearance JWT). Avoid in production.
 
