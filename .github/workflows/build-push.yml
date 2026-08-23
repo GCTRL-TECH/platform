@@ -400,6 +400,9 @@ jobs:
       !failure() && !cancelled() &&
       needs.build-api-rs.result == 'success'
     runs-on: ubuntu-latest
+    # Best-effort hygiene: the VPS SSH endpoint occasionally times out (transient
+    # :22 i/o timeout); that must never fail the run or block update-deploy-repo.
+    continue-on-error: true
     steps:
       - name: Remove legacy standalone gctrl-app container (if present)
         uses: appleboy/ssh-action@v1
@@ -417,7 +420,11 @@ jobs:
             docker ps -a --filter status=restarting --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
 
   update-deploy-repo:
-    needs: cleanup-legacy-vps
+    needs: [cleanup-legacy-vps, build-api-rs]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.build-api-rs.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
