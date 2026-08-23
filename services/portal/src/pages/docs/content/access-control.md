@@ -78,7 +78,7 @@ Go to **Settings → Access Control** and create a token with the three controls
 1. **Clearance ceiling** - pick the maximum classification this token may read. It is automatically capped at your own clearance; you cannot exceed it.
 2. **Per-graph grants** - add one or more knowledge bases this token may access. For each grant, optionally set a **raised clearance** that applies only to that graph.
 3. **KB-scoping** - toggle the token to *scoped* mode so it can only see and write the granted knowledge bases and nothing else (a colleague token).
-4. **Codebase access** - on by default. Switch it off and the token loses everything code-related: the code tools (`code_symbol`, `code_trace`, `code_impact`, `code_architecture`), CODE knowledge-base visibility (graph lists, grants, an explicitly named id, and graph or chunk reads), code writes and changes to a code knowledge base. A full-owner token with the flag off is narrowed to job-scoped reads of its non-code knowledge bases, so code never surfaces through a general search either.
+4. **Codebase access** - on by default. Switch it off and the token loses everything code-related: the code tools (`code_symbol`, `code_trace`, `code_impact`, `code_architecture`), CODE knowledge-base visibility (graph lists, grants, an explicitly named id, graph reads, chunk reads and RAG answers), code writes and every change to a code knowledge base. A full-owner token with the flag off is narrowed to job-scoped reads of its non-code knowledge bases, so code never surfaces through a general search either.
 
 ```text
 Settings → Access Control → New Token

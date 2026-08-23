@@ -344,7 +344,7 @@ allowed, no ad-hoc Cypher accepted from the caller. Indexing itself is local-onl
 ### Token capability `codeAccess`
 
 Codebase access is a per-access-token capability (`api_keys.code_access`, migration 078,
-restated in 079, default `true` so nothing changes for existing tokens). Switching it off in
+restated in 079 and 080, default `true` so nothing changes for existing tokens). Switching it off in
 **Settings -> Access Control** takes everything code-related away from that one token: code
 tools, CODE knowledge-base visibility (lists, grants, explicit ids, graph/chunk reads), code
 writes and CODE-KB mutations. Concretely:
@@ -357,12 +357,23 @@ writes and CODE-KB mutations. Concretely:
   shortened), and an explicit `GET /kg/compilations/{id}` of a code graph returns **404** - the
   access rank is now computed unconditionally, so a denied graph is indistinguishable from one
   that does not exist.
-- **Reads** - `search_chunks` and the agent `query` tool drop retrieved chunks/sources whose
-  compilation or origin job belongs to a CODE graph, so RAG cannot smuggle code back as text.
-- **Writes** - `POST /api/kex/code` and `DELETE /api/kex/code/files` return 403, and so do
-  create / update / delete / refresh / distill / schedule on a CODE compilation
-  (`kg::enforce_code_capability`, also wired into the `delete_compilation` /
-  `refresh_compilation` agent tools).
+- **Reads** - every path that returns source TEXT drops CODE-origin material: the agent
+  `search_chunks` and `query` tools, the REST `POST /api/rag/query` (filtered right after
+  retrieval, so a code passage never even grounds the answer, let alone gets cited), and
+  `GET /api/kex/chunks` (excluded in SQL, so the paging `total` stays honest). A chunk counts as
+  code when its compilation - or, for the NULL-compilation majority, the job that produced it -
+  belongs to a CODE graph (`agent::code_chunk_scope`).
+- **Writes** - `POST /api/kex/code` and `DELETE /api/kex/code/files` return 403, and so does
+  every other change to a CODE knowledge base: create / update / delete / refresh / distill /
+  schedule, ACL (`PUT /kg/compilations/:id/acl`), community detection, wiki sources, privacy
+  mode, node and relationship edits (REST `DELETE /api/kg/node` + `/relationship` and their
+  agent tool arms - all gated once at `kg::resolve_mutation_scope`), `delete_chunk`, and
+  ingesting into one (`POST /api/kex/extract` with an explicit CODE `compilationId` → 403;
+  `store` / `ingest_file` refuse, and every other ingest path leaves the job unlinked rather
+  than writing into a code graph). All via `kg::enforce_code_capability`.
+- **Source-level invariant tests** - `routes::kg::code_capability_source_invariants` reads the
+  handler bodies and fails if one of those call sites disappears (a DB-backed test would need a
+  live Postgres; this is the cheap guard against a silent regression).
 
 **Full-owner (unscoped) tokens** with the flag off are additionally narrowed to *job-scoped*
 reads of their non-code knowledge bases: `kg::api_key_scoped_jobs` returns the source jobs of

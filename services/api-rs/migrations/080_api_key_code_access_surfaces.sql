@@ -1,0 +1,25 @@
+-- 080: final restatement of the "Codebase access" capability (078, restated in
+-- 079) now that the LAST surfaces are closed. Like 079 this is comment-only:
+-- sqlx checksums every applied migration, so a corrected description has to
+-- arrive as a new file rather than an edit to an old one.
+--
+-- What changed since 079 - code_access = false now ALSO covers:
+--   * plain RAG retrieval - POST /api/rag/query drops CODE-origin chunks BEFORE
+--     the model sees them (not just off the cited `sources`), so a code passage
+--     can neither ground nor be quoted in an answer;
+--   * GET /api/kex/chunks - CODE-origin rows are excluded in SQL (the paging
+--     `total` stays honest);
+--   * every remaining CODE-KB mutation - ACL (PUT /kg/compilations/:id/acl),
+--     community detection (POST .../communities), wiki sources
+--     (PUT .../wiki/sources), privacy mode (agent set_privacy_mode), node and
+--     relationship edits (DELETE /api/kg/node, DELETE /api/kg/relationship and
+--     their agent tool arms - all gated at resolve_mutation_scope), chunk
+--     deletion (agent delete_chunk), and INGESTING into a CODE knowledge base
+--     (POST /api/kex/extract with an explicit CODE compilationId -> 403; every
+--     other ingest path leaves the job unlinked rather than writing into it).
+--
+-- Together with 078/079 the rule is now simply: a token with the capability off
+-- can neither READ code (tools, lists, graph, chunks, RAG answers) nor CHANGE a
+-- code knowledge base in any way. Default true - existing tokens are unaffected.
+COMMENT ON COLUMN api_keys.code_access IS
+  'Capability switch. False = this token gets no code tools, no CODE knowledge-base visibility (lists, grants, explicit ids, graph reads, chunk reads and RAG answers/sources), and no CODE-KB mutation of any kind (create/update/delete/refresh/distill/schedule, ACL, communities, wiki sources, privacy mode, node/relationship edits, chunk deletion, and ingesting into one); a full-owner token with the flag off is narrowed to job-scoped reads of its non-code knowledge bases. Default true (unchanged behaviour).';
