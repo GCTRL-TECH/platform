@@ -6,6 +6,7 @@ import { registerGraph } from './commands/graph'
 import { registerSource } from './commands/source'
 import { registerAgent, runAgentRepl } from './commands/agent'
 import { registerClassify } from './commands/classify'
+import { registerCode } from './commands/code'
 
 const program = new Command()
   .name('gctrl')
@@ -18,6 +19,7 @@ registerGraph(program)
 registerSource(program)
 registerAgent(program)
 registerClassify(program)
+registerCode(program)
 
 // Bare `gctrl` (no subcommand) launches the GCTRL agent (Pi) REPL.
 program.action(async () => {

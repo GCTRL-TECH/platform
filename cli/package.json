@@ -3,25 +3,28 @@
   "version": "0.1.0",
   "license": "AGPL-3.0-or-later",
   "description": "GCTRL Ground Control CLI",
-  "bin": { "gctrl": "./dist/index.js" },
+  "bin": {
+    "gctrl": "./dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@gctrl/code-indexer": "file:../packages/code-indexer",
     "axios": "^1.7.2",
-    "commander": "^12.1.0",
     "chalk": "^4.1.2",
-    "ora": "^5.4.1",
     "cli-table3": "^0.6.5",
+    "commander": "^12.1.0",
     "eventsource": "^2.0.2",
-    "form-data": "^4.0.0"
+    "form-data": "^4.0.0",
+    "ora": "^5.4.1"
   },
   "devDependencies": {
-    "@types/node": "^20",
     "@types/eventsource": "^1.1.15",
-    "typescript": "^5.4",
-    "ts-node": "^10.9"
+    "@types/node": "^20",
+    "ts-node": "^10.9",
+    "typescript": "^5.4"
   }
 }
