@@ -89,6 +89,37 @@ async fn scope_jobs(
 
 fn parse_uuid(v: &Value) -> Option<Uuid> { v.as_str().and_then(|s| Uuid::parse_str(s).ok()) }
 
+/// Longest audited `resource_id`. The audit row is an index, not a payload store, and
+/// `code_impact` can be handed hundreds of paths.
+const MAX_RESOURCE_ID: usize = 200;
+/// Most `changedFiles`/`changedSymbols` entries honoured per `code_impact` call. Past
+/// this the Cypher `IN $files` list stops being a lookup and starts being a scan.
+pub(crate) const MAX_IMPACT_ITEMS: usize = 200;
+/// `direction: "both"` walks CALLS undirected, so the frontier grows in both directions
+/// at once - depth 4-5 there is an accidental full-graph traversal.
+pub(crate) const MAX_TRACE_DEPTH_BOTH: i64 = 3;
+
+fn cap(s: &str) -> String { s.chars().take(MAX_RESOURCE_ID).collect() }
+
+/// Run one fixed Cypher and collect its rows, surfacing BOTH the execute error and any
+/// mid-stream error. The previous `if let Ok(mut stream)` / `while let Ok(Some(row))`
+/// shape swallowed every Neo4j failure into an empty result set - which for
+/// `code_impact` reads as "nothing depends on this change, risk: low", the exact
+/// opposite of the truth, and got audited as a granted access.
+async fn fetch_rows(
+    state: &Arc<crate::models::AppState>, nq: neo4rs::Query,
+) -> std::result::Result<Vec<neo4rs::Row>, String> {
+    let mut stream = state.neo.execute(nq).await.map_err(|e| format!("graph query failed: {e}"))?;
+    let mut rows = Vec::new();
+    loop {
+        match stream.next().await {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => return Ok(rows),
+            Err(e) => return Err(format!("graph query failed: {e}")),
+        }
+    }
+}
+
 /// Entry point called from agent.rs. Returns None when `tool_name` is not ours.
 pub(crate) async fn execute(
     state: &Arc<crate::models::AppState>, claims: &JwtClaims, tool_name: &str, args: &Value,
@@ -106,16 +137,16 @@ pub(crate) async fn execute(
     // Same resource_id convention as get_neighbors: the thing being looked up,
     // not a wildcard, for the audited entries that have one.
     let resource_id: String = match tool_name {
-        "code_symbol" => args["query"].as_str().unwrap_or("").trim().to_string(),
-        "code_trace" => args["symbol"].as_str().unwrap_or("").trim().to_string(),
+        "code_symbol" => cap(args["query"].as_str().unwrap_or("").trim()),
+        "code_trace" => cap(args["symbol"].as_str().unwrap_or("").trim()),
         "code_impact" => {
             let mut items: Vec<String> = args["changedFiles"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
             items.extend(args["changedSymbols"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<String>>()).unwrap_or_default());
-            items.join(",").chars().take(200).collect()
+            cap(&items.join(","))
         }
-        "code_architecture" => args["compilationId"].as_str().unwrap_or("").trim().to_string(),
+        "code_architecture" => cap(args["compilationId"].as_str().unwrap_or("").trim()),
         _ => "*".to_string(),
     };
     let out = match tool_name {
@@ -130,10 +161,10 @@ pub(crate) async fn execute(
                 .param("re", re).param("uid", uid.clone()).param("rank", rank as i64)
                 .param("limit", limit).param("offset", offset).param("types", types);
             if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
-            let mut rows = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(nq).await {
-                while let Ok(Some(row)) = stream.next().await {
-                    rows.push(json!({
+            match fetch_rows(state, nq).await {
+                Err(e) => json!({ "error": e }),
+                Ok(raw) => {
+                    let rows: Vec<Value> = raw.iter().map(|row| json!({
                         "name": row.get::<String>("name").unwrap_or_default(),
                         "type": row.get::<String>("type").unwrap_or_default(),
                         "file": row.get::<String>("file").ok(),
@@ -145,46 +176,57 @@ pub(crate) async fn execute(
                         "exported": row.get::<bool>("exported").ok(),
                         "callers": row.get::<i64>("callers").unwrap_or(0),
                         "callees": row.get::<i64>("callees").unwrap_or(0),
-                    }));
+                    })).collect();
+                    json!({ "query": q, "results": rows, "offset": offset, "limit": limit })
                 }
             }
-            json!({ "query": q, "results": rows, "offset": offset, "limit": limit })
         }
         "code_trace" => {
             let name = args["symbol"].as_str().unwrap_or("").trim().to_string();
             if name.is_empty() { return Some(json!({ "error": "symbol is required (use code_symbol to find the exact name)" })); }
             let direction = match args["direction"].as_str().unwrap_or("callers") { "callees" => "callees", "both" => "both", _ => "callers" };
-            let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 5);
+            // "both" is undirected: the frontier grows both ways at once, so it gets a
+            // tighter ceiling than the one-way directions.
+            let max_depth = if direction == "both" { MAX_TRACE_DEPTH_BOTH } else { 5 };
+            let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, max_depth);
             let (sauth, mauth) = (node_auth_clause("s", &scoped), node_auth_clause("m", &scoped));
             let mut nq = neo4rs::query(&code_trace_cypher(&sauth, &mauth, direction, depth))
                 .param("name", name.clone()).param("uid", uid.clone()).param("rank", rank as i64);
             if let Some(jobs) = &scoped { nq = nq.param("jobs", jobs.clone()); }
-            let mut rows = Vec::new();
-            if let Ok(mut stream) = state.neo.execute(nq).await {
-                while let Ok(Some(row)) = stream.next().await {
-                    let confs = row.get::<Vec<f64>>("confs").unwrap_or_default();
-                    let ress = row.get::<Vec<String>>("ress").unwrap_or_default();
-                    let steps: Vec<Value> = confs.into_iter().zip(ress.into_iter())
-                        .map(|(c, r)| json!({ "confidence": c, "resolution": r }))
-                        .collect();
-                    rows.push(json!({
-                        "name": row.get::<String>("name").unwrap_or_default(),
-                        "type": row.get::<String>("type").unwrap_or_default(),
-                        "file": row.get::<String>("file").ok(),
-                        "line_start": row.get::<i64>("line_start").ok(),
-                        "hops": row.get::<i64>("hops").unwrap_or(0),
-                        "path": row.get::<Vec<String>>("names").unwrap_or_default(),
-                        "steps": steps,
-                    }));
+            match fetch_rows(state, nq).await {
+                Err(e) => json!({ "error": e }),
+                Ok(raw) => {
+                    let rows: Vec<Value> = raw.iter().map(|row| {
+                        let confs = row.get::<Vec<f64>>("confs").unwrap_or_default();
+                        let ress = row.get::<Vec<String>>("ress").unwrap_or_default();
+                        let steps: Vec<Value> = confs.into_iter().zip(ress.into_iter())
+                            .map(|(c, r)| json!({ "confidence": c, "resolution": r }))
+                            .collect();
+                        json!({
+                            "name": row.get::<String>("name").unwrap_or_default(),
+                            "type": row.get::<String>("type").unwrap_or_default(),
+                            "file": row.get::<String>("file").ok(),
+                            "line_start": row.get::<i64>("line_start").ok(),
+                            "hops": row.get::<i64>("hops").unwrap_or(0),
+                            "path": row.get::<Vec<String>>("names").unwrap_or_default(),
+                            "steps": steps,
+                        })
+                    }).collect();
+                    json!({ "symbol": name, "direction": direction, "depth": depth, "results": rows })
                 }
             }
-            json!({ "symbol": name, "direction": direction, "depth": depth, "results": rows })
         }
         "code_impact" => impact(state, claims, &auth, &scoped, rank, &uid, args).await,
         "code_architecture" => architecture(state, &auth, &scoped, rank, &uid, args).await,
         _ => unreachable!(),
     };
-    crate::services::audit::log_access(&state.db, claims, &format!("agent.{tool_name}"), "code", &resource_id, rank, None, true, None).await;
+    // A tool that could not answer (bad args, graph unreachable) is NOT a granted
+    // access to code knowledge - audit it as the denial it is, with the reason.
+    let failure = out.get("error").and_then(|e| e.as_str()).map(cap);
+    crate::services::audit::log_access(
+        &state.db, claims, &format!("agent.{tool_name}"), "code", &resource_id, rank, None,
+        failure.is_none(), failure.as_deref(),
+    ).await;
     Some(out)
 }
 
@@ -226,41 +268,54 @@ async fn impact(
     state: &Arc<crate::models::AppState>, _claims: &JwtClaims, auth: &str,
     scoped: &Option<Vec<String>>, rank: i32, uid: &str, args: &Value,
 ) -> Value {
-    let files: Vec<String> = args["changedFiles"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.replace('\\', "/"))).collect()).unwrap_or_default();
-    let symbols: Vec<String> = args["changedSymbols"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let mut files: Vec<String> = args["changedFiles"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.replace('\\', "/"))).collect()).unwrap_or_default();
+    let mut symbols: Vec<String> = args["changedSymbols"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     if files.is_empty() && symbols.is_empty() {
         return json!({ "error": "changedFiles or changedSymbols is required" });
     }
+    // Caps are visible in the response: an answer computed over the first 200 of 900
+    // changed files is not an answer about the change, and the caller has to know.
+    let truncated = files.len() > MAX_IMPACT_ITEMS || symbols.len() > MAX_IMPACT_ITEMS;
+    files.truncate(MAX_IMPACT_ITEMS);
+    symbols.truncate(MAX_IMPACT_ITEMS);
     let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 3);
     let mauth = node_auth_clause("m", scoped);
     let mut nq = neo4rs::query(&code_impact_cypher(auth, &mauth, depth))
         .param("files", files.clone()).param("symbols", symbols.clone())
         .param("uid", uid.to_string()).param("rank", rank as i64);
     if let Some(jobs) = scoped { nq = nq.param("jobs", jobs.clone()); }
+    let raw = match fetch_rows(state, nq).await {
+        // Never report "risk: low" because the graph was unreachable.
+        Err(e) => return json!({ "error": e }),
+        Ok(r) => r,
+    };
     let mut affected = Vec::new();
     let mut by_file: std::collections::BTreeMap<String, i64> = Default::default();
     let mut max_fan_in = 0i64;
-    if let Ok(mut stream) = state.neo.execute(nq).await {
-        while let Ok(Some(row)) = stream.next().await {
-            let hops = row.get::<i64>("hops").unwrap_or(0);
-            let file = row.get::<String>("file").unwrap_or_default();
-            let fan_in = row.get::<i64>("fan_in").unwrap_or(0);
-            if hops > 0 {
-                *by_file.entry(file.clone()).or_insert(0) += 1;
-                max_fan_in = max_fan_in.max(fan_in);
-            }
-            affected.push(json!({
-                "changed": row.get::<String>("changed").unwrap_or_default(),
-                "affected": row.get::<String>("affected").unwrap_or_default(),
-                "file": file, "type": row.get::<String>("type").unwrap_or_default(),
-                "hops": hops, "fan_in": fan_in,
-            }));
+    for row in &raw {
+        let hops = row.get::<i64>("hops").unwrap_or(0);
+        let file = row.get::<String>("file").unwrap_or_default();
+        let fan_in = row.get::<i64>("fan_in").unwrap_or(0);
+        if hops > 0 {
+            *by_file.entry(file.clone()).or_insert(0) += 1;
+            max_fan_in = max_fan_in.max(fan_in);
         }
+        affected.push(json!({
+            "changed": row.get::<String>("changed").unwrap_or_default(),
+            "affected": row.get::<String>("affected").unwrap_or_default(),
+            "file": file, "type": row.get::<String>("type").unwrap_or_default(),
+            "hops": hops, "fan_in": fan_in,
+        }));
     }
     let n_affected = affected.iter().filter(|a| a["hops"].as_i64().unwrap_or(0) > 0).count();
     let risk = if n_affected == 0 { "low" } else if n_affected < 10 && max_fan_in < 5 { "medium" } else { "high" };
-    json!({ "changedFiles": files, "changedSymbols": symbols, "depth": depth,
-            "affected": affected, "affectedFiles": by_file, "affectedCount": n_affected, "risk": risk })
+    let mut out = json!({ "changedFiles": files, "changedSymbols": symbols, "depth": depth,
+            "affected": affected, "affectedFiles": by_file, "affectedCount": n_affected, "risk": risk });
+    if truncated {
+        out["truncated"] = json!(true);
+        out["note"] = json!(format!("only the first {MAX_IMPACT_ITEMS} changedFiles and changedSymbols were analysed"));
+    }
+    out
 }
 
 async fn architecture(
@@ -273,19 +328,23 @@ async fn architecture(
     for (key, cypher) in code_architecture_cyphers(auth) {
         let mut nq = neo4rs::query(&cypher).param("uid", uid.to_string()).param("rank", rank as i64);
         if let Some(jobs) = scoped { nq = nq.param("jobs", jobs.clone()); }
+        let raw = match fetch_rows(state, nq).await {
+            // One failed sub-query would otherwise render as a legitimately empty
+            // section ("no hotspots", "no dead code") - report the failure instead.
+            Err(e) => return json!({ "error": format!("{key}: {e}") }),
+            Ok(r) => r,
+        };
         let mut rows = Vec::new();
-        if let Ok(mut stream) = state.neo.execute(nq).await {
-            while let Ok(Some(row)) = stream.next().await {
-                if key == "hotspots" {
-                    rows.push(json!({ "name": row.get::<String>("name").unwrap_or_default(), "file": row.get::<String>("file").ok(),
-                        "type": row.get::<String>("type").unwrap_or_default(), "callers": row.get::<i64>("callers").unwrap_or(0),
-                        "callees": row.get::<i64>("callees").unwrap_or(0), "degree": row.get::<i64>("degree").unwrap_or(0) }));
-                } else if key == "dead_candidates" {
-                    rows.push(json!({ "name": row.get::<String>("name").unwrap_or_default(), "file": row.get::<String>("file").ok(),
-                        "line_start": row.get::<i64>("line_start").ok() }));
-                } else {
-                    rows.push(json!({ "key": row.get::<String>("k").unwrap_or_default(), "count": row.get::<i64>("v").unwrap_or(0) }));
-                }
+        for row in &raw {
+            if key == "hotspots" {
+                rows.push(json!({ "name": row.get::<String>("name").unwrap_or_default(), "file": row.get::<String>("file").ok(),
+                    "type": row.get::<String>("type").unwrap_or_default(), "callers": row.get::<i64>("callers").unwrap_or(0),
+                    "callees": row.get::<i64>("callees").unwrap_or(0), "degree": row.get::<i64>("degree").unwrap_or(0) }));
+            } else if key == "dead_candidates" {
+                rows.push(json!({ "name": row.get::<String>("name").unwrap_or_default(), "file": row.get::<String>("file").ok(),
+                    "line_start": row.get::<i64>("line_start").ok() }));
+            } else {
+                rows.push(json!({ "key": row.get::<String>("k").unwrap_or_default(), "count": row.get::<i64>("v").unwrap_or(0) }));
             }
         }
         out.insert(key.to_string(), Value::Array(rows));
@@ -332,6 +391,27 @@ mod tests {
     #[test]
     fn regex_escape_neutralises_metachars() {
         assert_eq!(regex_escape("a.b(c)"), r"a\.b\(c\)");
+    }
+
+    #[test]
+    fn audited_resource_ids_are_capped() {
+        // Applies to every tool's resource_id, not just code_impact's joined list:
+        // an audit row is an index, not a payload store.
+        let long = "x".repeat(1000);
+        assert_eq!(cap(&long).len(), MAX_RESOURCE_ID);
+        assert_eq!(cap("short"), "short");
+        // char-, not byte-based: never splits a multi-byte character.
+        let wide = "ü".repeat(1000);
+        assert_eq!(cap(&wide).chars().count(), MAX_RESOURCE_ID);
+    }
+
+    #[test]
+    fn impact_and_trace_caps_are_the_documented_ones() {
+        assert_eq!(MAX_IMPACT_ITEMS, 200);
+        // `both` is undirected, so it stops at 3 while the one-way directions go to 5.
+        assert_eq!(MAX_TRACE_DEPTH_BOTH, 3);
+        assert!(code_trace_cypher("(s._owner = $uid)", "(m._owner = $uid)", "both", MAX_TRACE_DEPTH_BOTH)
+            .contains("-[rs:CALLS*1..3]-"));
     }
 
     #[test]
