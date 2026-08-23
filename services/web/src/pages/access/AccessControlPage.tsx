@@ -2,7 +2,7 @@ import { useState, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Shield, KeyRound, ScrollText, Plus, Trash2, X, Copy, Check,
-  Loader2, Coins, Pencil, Bot, ChevronDown, ChevronUp,
+  Loader2, Coins, Pencil, Bot, ChevronDown, ChevronUp, Code2,
 } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
@@ -24,10 +24,12 @@ interface ApiKey {
   expiresAt: string | null
   createdAt: string
   kbScoped?: boolean
+  /** Capability switch (server: api_keys.code_access). Undefined = on. */
+  codeAccess?: boolean
   grants: Grant[]
 }
 interface Level { id: string; name: string; display_name: string; rank: number; color: string; is_system?: boolean }
-interface Compilation { id: string; name: string; classification: string }
+interface Compilation { id: string; name: string; classification: string; type?: string }
 
 const CLEARANCE_BADGE: Record<string, string> = {
   PUBLIC: 'badge-green', INTERNAL: 'badge-blue',
@@ -90,6 +92,8 @@ function TokensSection() {
   const [expiryDays, setExpiryDays] = useState<number | null>(null)
   const [grantIds, setGrantIds] = useState<Set<string>>(new Set())
   const [kbScoped, setKbScoped] = useState(false)
+  // Codebase access defaults ON - a new token behaves exactly like before.
+  const [codeAccess, setCodeAccess] = useState(true)
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [freshKey, setFreshKey] = useState<string | null>(null)
@@ -107,7 +111,8 @@ function TokensSection() {
   }
 
   function reset() {
-    setName(''); setLevelId(''); setExpiryDays(null); setGrantIds(new Set()); setKbScoped(false); setError(null)
+    setName(''); setLevelId(''); setExpiryDays(null); setGrantIds(new Set()); setKbScoped(false)
+    setCodeAccess(true); setError(null)
   }
 
   async function handleCreate() {
@@ -124,6 +129,7 @@ function TokensSection() {
       const { data } = await api.post<{ key: string }>('/users/api-keys', {
         name: name.trim(), maxClearanceLevelId: levelId || defaultLevelId, expiresAt, grants,
         kbScoped: kbScoped || grants.length > 0,
+        codeAccess,
       })
       setFreshKey(data.key)
       setShowForm(false); reset()
@@ -136,6 +142,11 @@ function TokensSection() {
   async function handleDelete(id: string) {
     if (!window.confirm('Revoke this access token? Agents using it lose access immediately.')) return
     await api.delete(`/users/api-keys/${id}`)
+    qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
+  }
+
+  async function toggleCodeAccess(keyId: string, next: boolean) {
+    await api.put(`/users/api-keys/${keyId}`, { codeAccess: next })
     qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
   }
 
@@ -223,6 +234,32 @@ function TokensSection() {
             </span>
           </label>
 
+          {/* Codebase access - turns the code knowledge bases AND the code tools
+              (code_symbol / code_trace / code_impact / code_architecture) off for
+              this token. Default on, so nothing changes unless you switch it off. */}
+          <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+            <input type="checkbox" checked={codeAccess}
+              onChange={(e) => {
+                const next = e.target.checked
+                setCodeAccess(next)
+                // Dropping code graphs from the selection keeps the form honest:
+                // the server would ignore them for this token anyway.
+                if (!next) setGrantIds((prev) => {
+                  const n = new Set(prev)
+                  for (const c of comps) if (c.type === 'CODE') n.delete(c.id)
+                  return n
+                })
+              }}
+              className="mt-0.5" />
+            <span>
+              <span className="text-xs font-medium text-slate-200">Codebase access (code knowledge bases + code tools)</span>
+              <span className="mt-0.5 block text-[11px] text-slate-500">
+                Off means this token cannot see code knowledge bases and cannot call the code tools
+                (code_symbol, code_trace, code_impact, code_architecture).
+              </span>
+            </span>
+          </label>
+
           <div>
             <label className="label">Knowledge bases this token may access (exclusive)</label>
             <p className="mb-2 text-[11px] text-slate-600">
@@ -234,11 +271,20 @@ function TokensSection() {
                 <p className="px-2 py-3 text-center text-[11px] text-slate-600">No graphs yet.</p>
               ) : comps.map((c) => {
                 const checked = grantIds.has(c.id)
+                const isCode = c.type === 'CODE'
+                // A code graph cannot be granted to a token without Codebase access.
+                const locked = isCode && !codeAccess
                 return (
-                  <label key={c.id} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 hover:bg-slate-800/50">
-                    <input type="checkbox" checked={checked}
+                  <label key={c.id} className={cn('flex items-center gap-2 rounded px-2 py-1.5',
+                    locked ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-slate-800/50')}>
+                    <input type="checkbox" checked={checked} disabled={locked}
                       onChange={() => setGrantIds((prev) => { const n = new Set(prev); checked ? n.delete(c.id) : n.add(c.id); return n })} />
                     <span className="flex-1 text-xs text-slate-300">{c.name}</span>
+                    {isCode && (
+                      <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
+                        Code
+                      </span>
+                    )}
                     <span className={cn('text-[10px]', CLEARANCE_BADGE[c.classification] ?? 'badge-slate')}>{c.classification}</span>
                   </label>
                 )
@@ -303,6 +349,18 @@ function TokensSection() {
                           KB-scoped
                         </span>
                       )}
+                      {k.codeAccess === false && (
+                        <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-300 ring-1 ring-amber-500/30" title="Codebase access is off: no code knowledge bases, no code tools">
+                          No code
+                        </span>
+                      )}
+                      <button
+                        onClick={() => void toggleCodeAccess(k.id, k.codeAccess === false)}
+                        className={cn('rounded p-0.5 hover:bg-slate-700',
+                          k.codeAccess === false ? 'text-slate-600 hover:text-slate-300' : 'text-cyan-400/70 hover:text-cyan-300')}
+                        title={k.codeAccess === false ? 'Turn Codebase access on' : 'Turn Codebase access off'}>
+                        <Code2 size={11} />
+                      </button>
                       <code className="font-mono text-[11px] text-slate-600">{k.keyPrefix}…</code>
                     </div>
                     <p className="mt-0.5 text-[11px] text-slate-600">
