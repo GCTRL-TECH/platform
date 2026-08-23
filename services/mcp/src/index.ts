@@ -714,7 +714,7 @@ registerToolWithAlias<{ compilationId: string }>(
 registerToolWithAlias<{ files: Array<{ path: string; content: string }>; classificationLevelId?: string; repoName?: string }>(
   'gctrl_ingest_repo',
   'borghive_ingest_repo',
-  'Ingest a (Python) code repository into the knowledge graph: parses files into File/Class/Function/Module entities + CONTAINS/IMPORTS/CALLS/INHERITS edges (fully local, no LLM). Classification flows in like any other knowledge. Pass files as [{path, content}].',
+  'LEGACY (Python-only, structure only). Prefer gctrl_code_index for a real Codebase KB. Ingest a (Python) code repository into the knowledge graph: parses files into File/Class/Function/Module entities + CONTAINS/IMPORTS/CALLS/INHERITS edges (fully local, no LLM). Classification flows in like any other knowledge. Pass files as [{path, content}].',
   {
     files: z.array(z.object({ path: z.string(), content: z.string() })).describe('Repo files as {path, content} (Python .py files are parsed; others skipped)'),
     classificationLevelId: z.string().optional().describe('Optional classification level UUID for the ingested code'),
@@ -1106,6 +1106,44 @@ registerToolWithAlias<{ compilationId: string; mode: 'cloaked' | 'local_only' }>
     if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
     return { content: [{ type: 'text' as const, text: `Privacy for ${compilationId} set to "${r.privacyMode}" (was "${r.previous}").` }] };
   },
+);
+
+// ── Tools: Codebase KB reads (P1a) ─────────────────────────────────────────
+// Thin passthroughs to the agent tool endpoints so direct-mode clients get the
+// same code tools the HTTP gateway exposes. Indexing lives in gctrl_code_index.
+
+const codeRead = (name: string, args: Record<string, unknown>) =>
+  apiCall('POST', `/agent/tools/${name}`, args) as Promise<Record<string, unknown>>;
+
+registerTool<{ query: string; compilationId?: string; types?: string[]; limit?: number; offset?: number }>(
+  'gctrl_code_symbol',
+  'Codebase KB: find code symbols (functions, classes, methods, files) by name/path substring - file, line range, signature, caller/callee counts. Start here for "where is X defined".',
+  {
+    query: z.string(), compilationId: z.string().optional(),
+    types: z.array(z.string()).optional(), limit: z.number().optional(), offset: z.number().optional(),
+  },
+  async (a) => ({ content: [{ type: 'text' as const, text: JSON.stringify(await codeRead('code_symbol', a)) }] }),
+);
+
+registerTool<{ symbol: string; direction?: string; depth?: number; compilationId?: string }>(
+  'gctrl_code_trace',
+  'Codebase KB: follow CALLS edges from an exact symbol name. direction callers|callees|both, depth 1-5.',
+  { symbol: z.string(), direction: z.string().optional(), depth: z.number().optional(), compilationId: z.string().optional() },
+  async (a) => ({ content: [{ type: 'text' as const, text: JSON.stringify(await codeRead('code_trace', a)) }] }),
+);
+
+registerTool<{ changedFiles?: string[]; changedSymbols?: string[]; depth?: number; compilationId?: string }>(
+  'gctrl_code_impact',
+  'Codebase KB: what breaks if these files/symbols change - affected callers grouped by file + risk. Use BEFORE refactors.',
+  { changedFiles: z.array(z.string()).optional(), changedSymbols: z.array(z.string()).optional(), depth: z.number().optional(), compilationId: z.string().optional() },
+  async (a) => ({ content: [{ type: 'text' as const, text: JSON.stringify(await codeRead('code_impact', a)) }] }),
+);
+
+registerTool<{ compilationId: string }>(
+  'gctrl_code_architecture',
+  'Codebase KB: one-call repo overview - languages, packages, symbol counts, hotspots, dead-code candidates.',
+  { compilationId: z.string() },
+  async (a) => ({ content: [{ type: 'text' as const, text: JSON.stringify(await codeRead('code_architecture', a)) }] }),
 );
 
 // ── Start server ─────────────────────────────────────────────────────────────
