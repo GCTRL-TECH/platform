@@ -31,4 +31,17 @@ describe('rust extractor', () => {
       expect.objectContaining({ callee: 'add', receiver: 'math', inside: 'main' }),
     ]));
   });
+  it('flattens nested use-tree groups, self, aliases, and globs', async () => {
+    const src = 'use std::{fmt::{self, Display}, io};\nuse crate::routes::{kex, kg::enforce_kb_write_scope};\nuse a::b as c;\nuse x::*;\n';
+    const ex = await extractFile('rust', src);
+    expect(ex.imports).toEqual(expect.arrayContaining([
+      expect.objectContaining({ module: 'std::fmt', names: ['Display'] }),
+      expect.objectContaining({ module: 'std::fmt', names: [] }),
+      expect.objectContaining({ module: 'std', names: ['io'] }),
+      expect.objectContaining({ module: 'crate::routes', names: ['kex'] }),
+      expect.objectContaining({ module: 'crate::routes::kg', names: ['enforce_kb_write_scope'] }),
+      expect.objectContaining({ module: 'a', names: ['b'], alias: 'c' }),
+      expect.objectContaining({ module: 'x', names: ['*'] }),
+    ]));
+  });
 });

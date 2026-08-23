@@ -5,6 +5,82 @@ import { firstLine, walk } from './engine.js';
 function text(src: string, n: SyntaxNode | null): string { return n ? src.slice(n.startIndex, n.endIndex) : ''; }
 function isPub(node: SyntaxNode): boolean { return node.namedChildren.some(c => c?.type === 'visibility_modifier'); }
 
+/** Non-null named children — web-tree-sitter's `namedChildren` is typed `(Node | null)[]`. */
+function namedChildren(n: SyntaxNode): SyntaxNode[] {
+  return n.namedChildren.filter((c): c is SyntaxNode => c !== null);
+}
+
+/**
+ * Recursively flatten a `use` tree into RawImport entries, walking tree-sitter-rust's
+ * use-tree nodes directly instead of text-splitting (so nested brace groups like
+ * `use a::{b::{c, d}, e};` resolve correctly instead of leaking literal `{`/`}`).
+ * `node` is a use-tree node (`identifier` | `scoped_identifier` | `scoped_use_list` |
+ * `use_list` | `use_as_clause` | `use_wildcard` | `self`); `prefix` is the module
+ * path accumulated from enclosing `scoped_use_list` groups (possibly '').
+ */
+function flattenUse(node: SyntaxNode, prefix: string, src: string, line: number, imports: RawImport[]): void {
+  switch (node.type) {
+    case 'self': {
+      // `use foo::{self, bar}` -> bare module import for `foo` itself.
+      imports.push({ module: prefix, names: [], line });
+      break;
+    }
+    case 'identifier': {
+      const name = text(src, node);
+      if (prefix) imports.push({ module: prefix, names: [name], line });
+      else imports.push({ module: name, names: [], line }); // top-level bare `use foo;`
+      break;
+    }
+    case 'scoped_identifier': {
+      const full = text(src, node);
+      const parts = full.split('::');
+      const name = parts.pop() ?? '';
+      const modulePath = parts.join('::');
+      const module = prefix ? (modulePath ? `${prefix}::${modulePath}` : prefix) : modulePath;
+      imports.push({ module, names: [name], line });
+      break;
+    }
+    case 'use_wildcard': {
+      const inner = namedChildren(node)[0];
+      const innerText = inner ? text(src, inner) : '';
+      const module = prefix ? (innerText ? `${prefix}::${innerText}` : prefix) : innerText;
+      imports.push({ module, names: ['*'], line });
+      break;
+    }
+    case 'use_as_clause': {
+      const pathNode = node.childForFieldName('path');
+      const aliasNode = node.childForFieldName('alias');
+      const alias = aliasNode ? text(src, aliasNode) : undefined;
+      if (pathNode?.type === 'scoped_identifier') {
+        const full = text(src, pathNode);
+        const parts = full.split('::');
+        const name = parts.pop() ?? '';
+        const modulePath = parts.join('::');
+        const module = prefix ? (modulePath ? `${prefix}::${modulePath}` : prefix) : modulePath;
+        imports.push({ module, names: [name], alias, line });
+      } else {
+        const name = pathNode ? text(src, pathNode) : '';
+        imports.push({ module: prefix || name, names: prefix ? [name] : [], alias, line });
+      }
+      break;
+    }
+    case 'scoped_use_list': {
+      const pathNode = node.childForFieldName('path');
+      const listNode = node.childForFieldName('list');
+      const pathText = pathNode ? text(src, pathNode) : '';
+      const newPrefix = prefix ? (pathText ? `${prefix}::${pathText}` : prefix) : pathText;
+      if (listNode) for (const child of namedChildren(listNode)) flattenUse(child, newPrefix, src, line, imports);
+      break;
+    }
+    case 'use_list': {
+      for (const child of namedChildren(node)) flattenUse(child, prefix, src, line, imports);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 function implTarget(node: SyntaxNode, src: string): { self?: string; trait?: string } | null {
   let cur = node.parent;
   while (cur) {
@@ -71,15 +147,7 @@ export const rustExtractor: LanguageExtractor = {
         }
         case 'use_declaration': {
           const arg = node.childForFieldName('argument') ?? node.namedChildren[node.namedChildCount - 1] ?? null;
-          const full = text(src, arg).replace(/\s+/g, '');
-          // a::b::{c, d} | a::b::c | a::b::* | a::b as x
-          const m = full.match(/^(.*?)::\{(.*)\}$/);
-          if (m) imports.push({ module: m[1], names: m[2].split(',').map(s => s.replace(/as.*$/, '').trim()).filter(Boolean), line: node.startPosition.row + 1 });
-          else {
-            const parts = full.replace(/as\w+$/, '').split('::');
-            const last = parts.pop() ?? '';
-            imports.push({ module: parts.join('::'), names: last === '*' ? ['*'] : [last], line: node.startPosition.row + 1 });
-          }
+          if (arg) flattenUse(arg, '', src, node.startPosition.row + 1, imports);
           break;
         }
         case 'call_expression': {
