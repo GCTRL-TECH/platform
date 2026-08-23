@@ -390,7 +390,12 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "get_sync_status",    "description": "Summarize connector sync health for the caller: per connector (Drive/SharePoint) the last sync time and live job counts by status, plus the last 5 failed source files with their errors. Use to answer 'is my Drive sync working / what failed'. No args", "args": {} },
             // ── OPERATE / self-repair tier — admin only, NEVER a knowledge/scoped token ──
             { "name": "platform_health",    "description": "OPERATE tier (admin only). Liveness of the platform's OWN services — Postgres, Neo4j, KEX, FUSE — each up/down with latency. Use to diagnose 'is the stack healthy / which service is down' before a restart. No args", "args": {} },
-            { "name": "restart_service",     "description": "OPERATE tier (admin only). Restart ONE GCTRL service container to self-heal a hung/failed worker. Args: { service: 'gctrl-kex'|'gctrl-fuse'|'gctrl-api'|'gctrl-web'|'gctrl-resolver'|'gctrl-neo4j'|'gctrl-qdrant' }. Only gctrl-* containers are allowed; every call is audited.", "args": { "service": "string" } }
+            { "name": "restart_service",     "description": "OPERATE tier (admin only). Restart ONE GCTRL service container to self-heal a hung/failed worker. Args: { service: 'gctrl-kex'|'gctrl-fuse'|'gctrl-api'|'gctrl-web'|'gctrl-resolver'|'gctrl-neo4j'|'gctrl-qdrant' }. Only gctrl-* containers are allowed; every call is audited.", "args": { "service": "string" } },
+            // ── Codebase KB read tools (P1a) ──────────────────────────────────────
+            { "name": "code_symbol",       "description": "Codebase KB: find code symbols (functions, classes, methods, files) by name/path substring. Returns file, line range, signature, caller/callee counts. Start here for any 'where is X defined / what is X' question about indexed code. Args: { query, compilationId?, types?: string[] (function|method|class|file|...), limit?, offset? }", "args": { "query": "string", "compilationId": "string?", "types": "string[]?", "limit": "number?", "offset": "number?" } },
+            { "name": "code_trace",        "description": "Codebase KB: follow CALLS edges from an exact symbol name (from code_symbol). direction = callers (who calls X, default) | callees (what X calls) | both; depth 1-5 (default 2). Each hop carries confidence/resolution (syntax 1.0, lsp 1.0, heuristic 0.6).", "args": { "symbol": "string", "direction": "string?", "depth": "number?", "compilationId": "string?" } },
+            { "name": "code_impact",       "description": "Codebase KB: what breaks if these files/symbols change? Pass changedFiles (repo-relative paths) and/or changedSymbols (exact names); returns affected callers up to depth (default 2), grouped by file, with a risk estimate. Use BEFORE refactors.", "args": { "changedFiles": "string[]?", "changedSymbols": "string[]?", "depth": "number?", "compilationId": "string?" } },
+            { "name": "code_architecture", "description": "Codebase KB: one-call overview of an indexed repo (compilationId required): languages, top-level packages, symbol counts, hotspots (highest degree), dead-code candidates (functions with zero callers, not exported), and community counts if detect_communities was run.", "args": { "compilationId": "string" } }
         ]
     })
 }
@@ -409,6 +414,7 @@ const READ_TOOLS: &[&str] = &[
     "find_file", "get_sync_status", "get_user_profile", "memory_health",
     "get_hardware", "recommend_runtime", "list_runtimes", "get_active_runtime",
     "list_models",
+    "code_symbol", "code_trace", "code_impact", "code_architecture",
 ];
 
 /// Cypher WHERE-fragment that authorizes ONE graph node bound to `alias`, given the
@@ -459,7 +465,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn node_auth_clause(alias: &str, scoped: &Option<Vec<String>>) -> String {
+pub(crate) fn node_auth_clause(alias: &str, scoped: &Option<Vec<String>>) -> String {
     if scoped.is_some() {
         // Membership, not last-touched: a node URI-merged across several jobs
         // carries only its LATEST contributor in `_source_job`, so testing that
@@ -549,6 +555,11 @@ async fn execute_tool_inner(
         )});
     }
     match tool_name {
+        t if crate::routes::code_tools::TOOLS.contains(&t) => {
+            crate::routes::code_tools::execute(state, claims, t, args).await
+                .unwrap_or_else(|| json!({ "error": format!("unknown tool {t}") }))
+        }
+
         // ── Read: list graphs the caller may see ──────────────────────────────
         "list_graphs" => {
             // Same visibility rule as /kg/compilations (routes/kg.rs list): a
@@ -2271,6 +2282,7 @@ pub(crate) fn find_tool_json(text: &str) -> Option<Value> {
 #[cfg(test)]
 mod agent_tool_registration_tests {
     use super::tool_schema;
+    use super::READ_TOOLS;
 
     fn tool_names() -> Vec<String> {
         let schema = tool_schema();
@@ -2464,5 +2476,18 @@ mod agent_tool_registration_tests {
             .expect("switch_runtime must be in tool_schema");
         assert!(tool["args"].get("runtime").is_some(),
             "switch_runtime descriptor must declare a 'runtime' arg");
+    }
+
+    // ── Codebase KB read tools registered (P1a) ───────────────────────────────
+
+    #[test] fn code_symbol_registered()       { assert!(tool_names().contains(&"code_symbol".to_string())); }
+    #[test] fn code_trace_registered()        { assert!(tool_names().contains(&"code_trace".to_string())); }
+    #[test] fn code_impact_registered()       { assert!(tool_names().contains(&"code_impact".to_string())); }
+    #[test] fn code_architecture_registered() { assert!(tool_names().contains(&"code_architecture".to_string())); }
+    #[test]
+    fn code_tools_are_read_tools() {
+        for t in ["code_symbol", "code_trace", "code_impact", "code_architecture"] {
+            assert!(READ_TOOLS.contains(&t), "{t} must be allowed for read-only tokens");
+        }
     }
 }
