@@ -72,3 +72,27 @@ jobs:
           cache-dependency-path: services/agent/package-lock.json
       - run: cd services/agent && npm ci
       - run: cd services/agent && npm test
+
+  test-code-indexer:
+    name: Test code-indexer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: packages/code-indexer/package-lock.json
+      - run: cd packages/code-indexer && npm ci
+      - run: cd packages/code-indexer && npm run typecheck && npm test && npm run build
+
+  typecheck-mcp:
+    name: Typecheck MCP server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: cd packages/code-indexer && npm ci && npm run build
+      - run: cd services/mcp && npm ci && npx tsc --noEmit
