@@ -34,6 +34,8 @@ describe('resolver', () => {
     expect(out.symbols).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'function', name: 'pkg/b.py::helper', stub: true, file: 'pkg/b.py' }),
       expect.objectContaining({ kind: 'module', name: 'os' }),
+      // INHERITS stub kind must come from a real lookup (Base is a class), not a hardcoded default
+      expect.objectContaining({ name: 'pkg/b.py::Base', stub: true, kind: 'class' }),
     ]));
     // never an edge to a non-existent target
     expect(out.edges.every(e => e.type !== 'CALLS' || out.symbols.some(s => s.name === e.tail))).toBe(true);

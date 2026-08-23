@@ -114,6 +114,12 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     const hit = syms.filter(s => s.name === name && s.kind !== 'method'); if (hit.length === 1) return symName(file, hit[0].qualname);
     const anyHit = syms.filter(s => s.name === name); return anyHit.length === 1 ? symName(file, anyHit[0].qualname) : null;
   };
+  // Look up a fully-qualified symbol name's own kind in the repo index (works for
+  // local-file and cross-file targets alike, since symbolsByFile covers every indexed file).
+  const kindOf = (tail: string): SymbolOut['kind'] | undefined => {
+    const file = tail.split('::')[0];
+    return (idx.symbolsByFile.get(file) ?? []).find(s => symName(file, s.qualname) === tail)?.kind;
+  };
   // inheritance
   for (const inh of ex.inherits) {
     const parentName = inh.parent.split('.').pop()!;
@@ -121,7 +127,7 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     let tail: string | null = local ? localFull(local.qualname) : null;
     if (!tail) { const b = binding.get(parentName) ?? binding.get(inh.parent.split('.')[0]); tail = b ? findIn(b.file, parentName) : null; }
     if (!tail) { const g = idx.byBareName.get(parentName) ?? []; if (g.length === 1) tail = g[0]; }
-    if (tail) { stub(tail, local?.kind ?? 'class'); addEdge({ type: inh.kind, head: localFull(inh.child), tail, confidence: 1, resolution: 'syntax' }); }
+    if (tail) { stub(tail, kindOf(tail) ?? 'class'); addEdge({ type: inh.kind, head: localFull(inh.child), tail, confidence: 1, resolution: 'syntax' }); }
   }
   // calls
   for (const c of ex.calls) {
@@ -134,12 +140,11 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     } else if (c.receiver && binding.has(c.receiver)) {
       tail = findIn(binding.get(c.receiver)!.file, c.callee);
     } else if (c.receiver) {
-      // receiver may be a local class/var: Engine::new, Thing.run ; try Class.method locally, then via imported class, then unique method globally
+      // receiver may be a local class/var: Engine::new, Thing.run ; try Class.method locally, then unique method globally.
+      // (binding.has(c.receiver) is always false here -- the preceding branch already handled that case.)
       const cls = localByName.get(c.receiver)?.find(s => s.kind === 'class' || s.kind === 'struct');
       const m = cls ? localByName.get(c.callee)?.find(s => s.parent === cls.qualname) : undefined;
       if (m) tail = localFull(m.qualname);
-      else if (binding.has(c.receiver)) tail = findIn(binding.get(c.receiver)!.file, c.callee);
-      else { const b = binding.get(c.receiver); const viaFile = b ? findIn(b.file, c.callee) : null; tail = viaFile; }
       if (!tail) { // local var of a known class in this file? (t = Thing(); t.run()) -> unique method name in file
         const ms = localByName.get(c.callee)?.filter(s => s.kind === 'method'); if (ms && ms.length === 1) tail = localFull(ms[0].qualname);
       }
@@ -149,7 +154,7 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
       else if (binding.has(c.callee)) tail = findIn(binding.get(c.callee)!.file, c.callee);
     }
     if (!tail) { const g = idx.byBareName.get(c.callee) ?? []; if (g.length === 1) { tail = g[0]; conf = 0.4; } }
-    if (tail && tail !== head) { const kind = (idx.symbolsByFile.get(tail.split('::')[0]) ?? []).find(s => symName(tail!.split('::')[0], s.qualname) === tail)?.kind ?? 'function'; stub(tail, kind); addEdge({ type: 'CALLS', head, tail, confidence: conf, resolution: 'heuristic' }); }
+    if (tail && tail !== head) { stub(tail, kindOf(tail) ?? 'function'); addEdge({ type: 'CALLS', head, tail, confidence: conf, resolution: 'heuristic' }); }
   }
   return { symbols, edges };
 }
