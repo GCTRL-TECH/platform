@@ -238,6 +238,10 @@ struct CreateComp {
     /// find-or-create and wins over `folderId`. Without one of these a caller has
     /// to create and then move, which is two round-trips and — far worse — a step
     /// every caller has so far been free to forget, leaving graphs in the root.
+    /// Exception: a CODE compilation with neither is never left unfiled — it
+    /// defaults to `Users/<name>/Code` (see `default_code_folder`), because a
+    /// Codebase KB left at the tree root is exactly the clutter this field
+    /// exists to prevent, and callers ingesting a repo already forget it most.
     #[serde(rename = "folderId")] folder_id: Option<Uuid>,
     #[serde(rename = "folderPath")] folder_path: Option<Vec<String>>,
     /// Privacy posture of the NEW graph ("open" | "cloaked" | "local_only").
@@ -423,6 +427,33 @@ pub(crate) async fn ensure_folder_path(db: &sqlx::PgPool, user_id: Uuid, segment
         });
     }
     parent.ok_or_else(|| AppError::BadRequest("Folder path must not be empty".into()))
+}
+
+/// Pure: the `Users/<local-part-of-email>` path segments a user's default
+/// folder lives under. Splits at '@', trims, and falls back to the raw user id
+/// when the email is absent or empty after trimming. `auth::seed_user_folder`
+/// delegates here so the two call sites can never drift apart.
+pub(crate) fn user_folder_segments(email: Option<&str>, user_id: Uuid) -> Vec<String> {
+    let local = email
+        .and_then(|e| e.split('@').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| user_id.to_string());
+    vec!["Users".to_string(), local]
+}
+
+/// The default home for a CODE compilation when the caller passed neither
+/// `folderPath` nor `folderId`: `Users/<name>/Code`, find-or-create. Reads the
+/// owner's email once so this stays in lock-step with `user_folder_segments`
+/// (and therefore with wherever `Users/<name>` was already seeded).
+pub(crate) async fn default_code_folder(db: &sqlx::PgPool, user_id: Uuid) -> Result<Uuid> {
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(user_id).fetch_optional(db).await?;
+    let mut segs = user_folder_segments(email.as_deref(), user_id);
+    segs.push("Code".to_string());
+    let segs_ref: Vec<&str> = segs.iter().map(String::as_str).collect();
+    ensure_folder_path(db, user_id, &segs_ref).await
 }
 
 async fn list_folders(
@@ -956,6 +987,8 @@ async fn create(
         }
         _ => match req.folder_id {
             Some(fid) => { folder_owned(&state.db, claims.sub, fid).await?; Some(fid) }
+            // CODE compilations never sit at the KB-tree root by default.
+            None if comp_type == "CODE" => Some(default_code_folder(&state.db, claims.sub).await?),
             None => None,
         },
     };
@@ -4101,6 +4134,59 @@ mod code_capability_source_invariants {
         assert!(
             body(kex, "list_chunks").contains("c.type::text = 'CODE'"),
             "routes/kex.rs::list_chunks no longer excludes CODE-origin chunks in SQL"
+        );
+    }
+}
+
+// ── CODE compilations default to Users/<name>/Code — pure segment logic ──────
+
+#[cfg(test)]
+mod user_folder_segments_tests {
+    use super::user_folder_segments;
+    use uuid::Uuid;
+
+    #[test]
+    fn normal_email_uses_local_part() {
+        let uid = Uuid::new_v4();
+        assert_eq!(
+            user_folder_segments(Some("fabio@5monti.com"), uid),
+            vec!["Users".to_string(), "fabio".to_string()]
+        );
+    }
+
+    #[test]
+    fn none_email_falls_back_to_user_id() {
+        let uid = Uuid::new_v4();
+        assert_eq!(
+            user_folder_segments(None, uid),
+            vec!["Users".to_string(), uid.to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_local_part_falls_back_to_user_id() {
+        let uid = Uuid::new_v4();
+        assert_eq!(
+            user_folder_segments(Some("@example.com"), uid),
+            vec!["Users".to_string(), uid.to_string()]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_local_part_falls_back_to_user_id() {
+        let uid = Uuid::new_v4();
+        assert_eq!(
+            user_folder_segments(Some("   @example.com"), uid),
+            vec!["Users".to_string(), uid.to_string()]
+        );
+    }
+
+    #[test]
+    fn whitespace_around_local_part_is_trimmed() {
+        let uid = Uuid::new_v4();
+        assert_eq!(
+            user_folder_segments(Some("  fabio  @5monti.com"), uid),
+            vec!["Users".to_string(), "fabio".to_string()]
         );
     }
 }

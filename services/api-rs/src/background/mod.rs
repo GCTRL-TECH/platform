@@ -140,6 +140,17 @@ pub fn spawn_all(state: Arc<AppState>) {
         backfill_source_jobs(&s).await;
     });
 
+    // One-time (idempotent) filing sweep: CODE compilations created before
+    // `Users/<name>/Code` became the default sit unfiled at the KB-tree root.
+    // File them the same way a fresh create() now does — safe on every boot,
+    // since the `folder_id IS NULL` filter naturally finds nothing after the
+    // first successful pass.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(45)).await; // after migrations
+        file_unfiled_code_compilations(&s).await;
+    });
+
     // A4/A5/A7 — Memory-governance cycle: ONE ordered pass (decay → dedup →
     // promote → evict → dossier-refresh) on a slow cadence (default 600s, env
     // GCTRL_MEMORY_TICK_SECS), independent of the 60s cron. Each run records a
@@ -1155,6 +1166,43 @@ async fn backfill_source_jobs(state: &AppState) {
 
     if nodes + rels > 0 {
         tracing::info!("backfill: gave {nodes} nodes and {rels} relationships a _source_jobs list");
+    }
+}
+
+/// Move every pre-existing CODE compilation that predates the
+/// `Users/<name>/Code` default into that folder. Idempotent by construction:
+/// the WHERE clause only ever matches rows still at `folder_id IS NULL`, so a
+/// repeat boot after the first successful pass simply finds nothing to do —
+/// no separate marker table needed.
+async fn file_unfiled_code_compilations(state: &AppState) {
+    let rows: Vec<(Uuid, Uuid)> = match sqlx::query_as(
+        "SELECT id, user_id FROM compilations WHERE type::text = 'CODE' AND folder_id IS NULL"
+    ).fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => { tracing::warn!("file_unfiled_code_compilations: query failed: {e}"); return; }
+    };
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut filed = 0i64;
+    for (id, user_id) in rows {
+        let folder_id = match crate::routes::kg::default_code_folder(&state.db, user_id).await {
+            Ok(fid) => fid,
+            Err(e) => {
+                tracing::warn!(%id, %user_id, "file_unfiled_code_compilations: default_code_folder failed: {e}");
+                continue;
+            }
+        };
+        match sqlx::query(
+            "UPDATE compilations SET folder_id = $1, updated_at = NOW() WHERE id = $2"
+        ).bind(folder_id).bind(id).execute(&state.db).await {
+            Ok(_) => filed += 1,
+            Err(e) => tracing::warn!(%id, "file_unfiled_code_compilations: update failed: {e}"),
+        }
+    }
+    if filed > 0 {
+        tracing::info!("file_unfiled_code_compilations: filed {filed} unfiled CODE compilation(s) under Users/<name>/Code");
     }
 }
 

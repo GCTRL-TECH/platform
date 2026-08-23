@@ -281,13 +281,9 @@ async fn seed_default_workspace(db: &sqlx::PgPool, user_id: Uuid) {
 async fn seed_user_folder(db: &sqlx::PgPool, user_id: Uuid) -> Option<Uuid> {
     let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
         .bind(user_id).fetch_optional(db).await.ok().flatten();
-    let local = email.as_deref()
-        .and_then(|e| e.split('@').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| user_id.to_string());
-    match crate::routes::kg::ensure_folder_path(db, user_id, &["Users", &local]).await {
+    let segs = crate::routes::kg::user_folder_segments(email.as_deref(), user_id);
+    let segs_ref: Vec<&str> = segs.iter().map(String::as_str).collect();
+    match crate::routes::kg::ensure_folder_path(db, user_id, &segs_ref).await {
         Ok(id) => Some(id),
         Err(e) => { tracing::warn!(?e, %user_id, "ensure_folder_path(Users/<name>) failed"); None }
     }

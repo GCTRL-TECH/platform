@@ -262,6 +262,9 @@ Index a source repository (symbols, imports, call graph, chunks) into GCTRL as a
 usable by agents via MCP/CLI first, product connector + UI later. Indexing runs where the code
 lives (`@gctrl/code-indexer`, TypeScript, first shared TS package); the server only stores.
 
+CODE compilations are filed under `Users/<name>/Code` automatically when created without an
+explicit `folderPath`/`folderId`; existing unfiled ones are moved there on boot.
+
 ### IndexBatch wire contract
 
 The one contract the indexer, the endpoints and the worker all implement. Also section 10 of
