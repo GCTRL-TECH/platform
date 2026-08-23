@@ -17,11 +17,12 @@ A GCTRL knowledge base is connected over MCP — the user's persistent memory ab
 3. `gctrl_query` (question) — blended answer for open questions.
 4. Only if needed: `search_chunks` (raw evidence), `gctrl_get_neighbors` depth 1 / `gctrl_shortest_path` (relations), `get_entity` (provenance).
 5. `gctrl_wiki_page` — curated prose.
+6. Code questions (indexed repo): `gctrl_code_symbol` → `gctrl_code_trace` → `gctrl_code_impact` before refactors; `gctrl_code_architecture` for an overview.
 
 Never bulk-dump with `get_graph` unprompted; keep default limits; never re-fetch what you already have; summarize chunk sets instead of pasting them. Max ~3 read calls per question.
 
 **Conflicts:** dossiers are authoritative. If facts conflict or are superseded, present the current value with its source and date and mention the stale variant.
 
-**Write back after substantive work.** When a decision is made, a task finishes, or a fact is learned/corrected: `gctrl_store` (text, compilationId) with a short factual note — first call `gctrl_list_graphs` once per session and cache your assigned compilationId. Longer material: `gctrl_extract` / `create_extraction`. Wrong facts: `gctrl_memory_feedback` (entity, "down", + triple) instead of ignoring them. Never store secrets or ephemeral chatter.
+**Write back after substantive work.** When a decision is made, a task finishes, or a fact is learned/corrected: `gctrl_store` (text, compilationId) with a short factual note — first call `gctrl_list_graphs` once per session and cache your assigned compilationId. Longer material: `gctrl_extract` / `create_extraction`. Wrong facts: `gctrl_memory_feedback` (entity, "down", + triple) instead of ignoring them. Decisions about code: `gctrl_store` into the repo's CODE compilation, naming the symbol as returned by `gctrl_code_symbol`. Never store secrets or ephemeral chatter.
 
 **Limits:** retrieval quality depends on what was ingested, and your token is scoped to granted knowledge bases. Absence from GCTRL means "not on record", never "does not exist".

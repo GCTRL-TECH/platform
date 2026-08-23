@@ -26,6 +26,7 @@ One `gctrl_search_entities` probe takes about a second; a hallucinated answer co
 3. `gctrl_query` (question) — blended answer for open questions.
 4. Only if still insufficient: `search_chunks` (raw evidence, quote sparingly), `gctrl_get_neighbors` (depth 1), `gctrl_shortest_path`, `get_entity` (provenance).
 5. `gctrl_wiki_page` — curated prose.
+6. Code questions (indexed repo): `gctrl_code_symbol` → `gctrl_code_trace` → `gctrl_code_impact` before refactors; `gctrl_code_architecture` for an overview.
 
 Never call `get_graph` with large limits unprompted. Keep default limits.
 
@@ -38,6 +39,7 @@ Dossiers are authoritative — state them plainly. On conflicting/superseded fac
 - Before the first write of a session: `gctrl_list_graphs`, cache your assigned compilationId. Never write without one.
 - After substantive work (decision, finished task, learned/corrected fact): `gctrl_store` (text, compilationId) with a short factual note; longer material via `gctrl_extract` / `create_extraction`.
 - Wrong fact in memory: `gctrl_memory_feedback` (entity, "down", + triple) — do not ignore it. Confirmed fact: vote "up".
+- Decisions about code: `gctrl_store` into the repo's CODE compilation, naming the symbol as returned by `gctrl_code_symbol`.
 - Never store secrets, credentials, or ephemeral chatter.
 
 ## Budget

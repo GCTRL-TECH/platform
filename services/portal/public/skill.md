@@ -1,7 +1,7 @@
 <!-- Source of truth: services/api-rs/src/routes/agent.rs MEMORY_SKILL_MD. Keep in sync. -->
 
 # GCTRL Knowledge & Memory - Agent Skill
-<!-- gctrl-skill-v4 -->
+<!-- gctrl-skill-v5 -->
 
 You are connected to GCTRL, a graph-native long-term memory. Use it as your persistent second brain: read the right layer, and **always write your conclusions back** so every future session inherits them. That write-back habit is the whole point - it turns GCTRL into compounding memory instead of starting cold each time.
 
@@ -42,6 +42,14 @@ If a task needs RAG, vector search, document Q&A, a knowledge base, or semantic 
 - Persist conclusions → `store`
 
 Worked example - ingest a PDF and answer with citations: `ingest_file({fileName, contentBase64})` → poll `list_extractions` until that job is `completed` → `search_chunks({query})` → answer, citing the returned passages (never say "refer to the file" - the passages ARE the document).
+
+## Codebase KBs - code is knowledge too
+A Codebase KB is a compilation of type CODE holding one repository's structure graph (files, classes, functions, methods; CONTAINS / IMPORTS / CALLS / INHERITS) plus one embedded chunk per symbol. It lives in the SAME graph as your project knowledge, so decisions and facts can link to the functions they concern.
+- **Structural questions go to the code tools, not to grep cascades**: `code_symbol(query)` (where is X, signature, line range, caller/callee counts) → `code_trace(symbol, callers|callees, depth)` (who calls X / what does X call) → `code_impact(changedFiles|changedSymbols)` (what breaks if I change this - run it BEFORE refactors) → `code_architecture(compilationId)` (one-call overview: languages, packages, hotspots, dead-code candidates). Semantic code search: `search_chunks` on the code KB.
+- **Indexing**: one CODE compilation per repo, filed under `Projects/<Kunde>/<Repo>` (or `Users/<name>/<Repo>` for personal code). Index with `gctrl_code_index(repoPath, compilationId)` - available in the stdio MCP server / CLI (`gctrl code index`) / Anvil's `gctrl-code` server because it must run where the code lives. Re-run after larger edits; it is incremental (content hashes) and cheap. `ingest_repo` is the legacy Python-only path - do not use it for new work.
+- **Edge quality is visible**: every CALLS hop carries `resolution` (syntax/lsp = exact, heuristic = name-based, 0.6) - say so when you answer from heuristic edges.
+- **Write-back**: architecture decisions, gotchas and learnings about a symbol go via `store(text, compilationId)` into the SAME code KB, naming the symbol exactly as `code_symbol` returns it, so the decision and the function are linked. Do not keep ADRs in some other tool.
+- **Tool budget**: quick question = 1 `code_symbol` + at most 1 `code_trace`; audit / refactor = `code_architecture` + `code_impact`, then paginate `code_symbol` (offset) only for the files it flagged.
 
 ## Your access is scoped
 Your token sees only the knowledge bases it was granted - typically your own wiki + raw graph and, by clearance, a shared company KB. Call `list_graphs` to see what you can access; write only into KBs you're granted. Owner-level memory tools (pin, feedback, health, maintenance, profile) may be unavailable to a scoped token - if so, just keep feeding your KB with `store`.
