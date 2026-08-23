@@ -193,9 +193,9 @@ pub(crate) fn code_impact_cypher(auth: &str, mauth: &str, depth: i64) -> String 
     format!(
         "MATCH (n:Entity) WHERE n.coarse_type = 'code' AND {auth} AND coalesce(n._min_rank,0) <= $rank \
            AND (n._file IN $files OR n.name IN $symbols) \
-         OPTIONAL MATCH p = (n)<-[rs:CALLS*1..{depth}]-(m) \
+         OPTIONAL MATCH (n)<-[rs:CALLS*1..{depth}]-(m) \
            WHERE {mauth} AND coalesce(m._min_rank,0) <= $rank \
-         WITH n, m, CASE WHEN m IS NULL THEN 0 ELSE size(rs) END AS hops \
+         WITH n, m, min(CASE WHEN m IS NULL THEN 0 ELSE size(rs) END) AS hops \
          RETURN n.name AS changed, coalesce(m.name, n.name) AS affected, m._file AS file, \
                 coalesce(m.type, n.type) AS type, hops, \
                 CASE WHEN m IS NULL THEN 0 ELSE size([(m)<-[:CALLS]-() | 1]) END AS fan_in \
@@ -341,6 +341,8 @@ mod tests {
         assert!(c.contains("<-[rs:CALLS*1..2]-"));
         assert!(c.contains("(m._owner = $uid)"));
         assert!(c.contains("m._file AS file"));
+        assert!(c.contains("min(CASE WHEN m IS NULL"));
+        assert!(!c.contains("MATCH p ="));
     }
 
     #[test]
