@@ -11,6 +11,12 @@ use crate::routes::agent::node_auth_clause;
 
 pub(crate) const TOOLS: &[&str] = &["code_symbol", "code_trace", "code_impact", "code_architecture"];
 
+/// Shared "not found" message for `scope_jobs`: identical whether the
+/// compilation truly does not exist or exists but belongs to someone else and
+/// isn't kb-scope-granted to this caller — a foreign id must never be
+/// distinguishable from a nonexistent one.
+const COMPILATION_NOT_FOUND: &str = "compilation not found";
+
 /// Escape a user string for use inside a Cypher `=~` regex.
 pub(crate) fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
@@ -56,16 +62,26 @@ pub(crate) fn code_trace_cypher(sauth: &str, mauth: &str, direction: &str, depth
 
 /// Resolve the job scope for a tool call: explicit compilation (must be granted)
 /// or the token's grants. `Some(vec![])` means "scoped but nothing visible".
+/// Owner or kb-scoped grant required; foreign ids behave as not found.
 async fn scope_jobs(
     state: &Arc<crate::models::AppState>, claims: &JwtClaims, compilation_id: Option<Uuid>,
 ) -> std::result::Result<Option<Vec<String>>, Value> {
     if let Some(cid) = compilation_id {
         let eff = crate::routes::kg::effective_rank_for_compilation(&state.db, claims, cid).await;
         if eff == i32::MIN { return Err(json!({ "error": "compilation not granted to this token" })); }
-        let row: Option<(Vec<Uuid>,)> = sqlx::query_as(
-            "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id = $1"
+        let row: Option<(Vec<Uuid>, Uuid)> = sqlx::query_as(
+            "SELECT COALESCE(source_job_ids,'{}'::uuid[]), user_id FROM compilations WHERE id = $1"
         ).bind(cid).fetch_optional(&state.db).await.ok().flatten();
-        let Some((jobs,)) = row else { return Err(json!({ "error": "compilation not found" })); };
+        let Some((jobs, owner_id)) = row else { return Err(json!({ "error": COMPILATION_NOT_FOUND })); };
+        // Owner or kb-scoped grant required; foreign ids return the SAME "not
+        // found" message as a nonexistent id — never reveal that a compilation
+        // exists but belongs to someone else. Mirrors code_manifest (kex.rs).
+        if owner_id != claims.sub {
+            match crate::routes::kg::api_key_scope(&state.db, claims).await {
+                Some(ref s) if s.contains(&cid) => {}
+                _ => return Err(json!({ "error": COMPILATION_NOT_FOUND })),
+            }
+        }
         return Ok(Some(jobs.iter().map(|u| u.to_string()).collect()));
     }
     Ok(crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await)
@@ -87,6 +103,13 @@ pub(crate) async fn execute(
         return Some(json!({ "results": [], "note": "no code knowledge base granted to this token" }));
     }
     let auth = node_auth_clause("n", &scoped);
+    // Same resource_id convention as get_neighbors: the thing being looked up,
+    // not a wildcard, for the audited entries that have one.
+    let resource_id: String = match tool_name {
+        "code_symbol" => args["query"].as_str().unwrap_or("").trim().to_string(),
+        "code_trace" => args["symbol"].as_str().unwrap_or("").trim().to_string(),
+        _ => "*".to_string(),
+    };
     let out = match tool_name {
         "code_symbol" => {
             let q = args["query"].as_str().unwrap_or("").trim().to_string();
@@ -153,7 +176,7 @@ pub(crate) async fn execute(
         "code_architecture" => architecture(state, &auth, &scoped, rank, &uid, args).await,
         _ => unreachable!(),
     };
-    crate::services::audit::log_access(&state.db, claims, &format!("agent.{tool_name}"), "code", "*", rank, None, true, None).await;
+    crate::services::audit::log_access(&state.db, claims, &format!("agent.{tool_name}"), "code", &resource_id, rank, None, true, None).await;
     Some(out)
 }
 
@@ -164,6 +187,16 @@ async fn architecture(_: &Arc<crate::models::AppState>, _: &str, _: &Option<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compilation_not_found_message_is_a_single_shared_constant() {
+        // scope_jobs's not-found branch (missing row) and its foreign-owner
+        // branch (owner_id != claims.sub, not kb-scope-granted) must return the
+        // identical message — a foreign compilation id can't be distinguished
+        // from a nonexistent one. Both branches read this one const, so any
+        // future edit that drifts one literal away from the other fails here.
+        assert_eq!(COMPILATION_NOT_FOUND, "compilation not found");
+    }
 
     #[test]
     fn symbol_cypher_is_scoped_rank_filtered_and_code_only() {
