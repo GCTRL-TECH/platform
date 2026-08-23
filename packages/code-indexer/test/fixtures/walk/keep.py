@@ -1,0 +1,2 @@
+def keep():
+    return True
