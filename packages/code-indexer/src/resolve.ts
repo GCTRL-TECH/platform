@@ -27,6 +27,16 @@ export const GENERIC_CALLEES = new Set([
   // Promise((resolve, reject) => ...)` executor is never a call to some other file's
   // `resolve` method).
   'resolve', 'reject', 'callback', 'cb', 'done', 'next', 'then', 'catch', 'finally', 'emit', 'on', 'off', 'once',
+  // Round 3: common Rust std/trait method names (Option/Result/String/Vec/Iterator/
+  // Display/Hash/...) that are near-ubiquitously reimplemented per-type across a repo -
+  // a repo-wide "unique name" match for one of these is a coincidence of the sample,
+  // not evidence of a real cross-file call (e.g. `x.is_empty()` matching some unrelated
+  // `CloakSession::is_empty` must never become a CALLS edge).
+  'is_empty', 'is_some', 'is_none', 'is_ok', 'is_err', 'into_response', 'from_str', 'to_string', 'to_owned',
+  'to_vec', 'as_str', 'as_ref', 'as_mut', 'unwrap_or', 'unwrap_or_else', 'unwrap_or_default', 'ok_or',
+  'ok_or_else', 'map_err', 'and_then', 'or_else', 'collect', 'into_iter', 'contains', 'starts_with',
+  'ends_with', 'push_str', 'extend', 'retain', 'get_mut', 'entry', 'or_insert', 'with_capacity', 'first',
+  'last', 'build', 'builder', 'try_from', 'try_into', 'eq', 'ne', 'cmp', 'hash', 'fmt',
 ]);
 
 /** Language "families" for the 0.4-tier same-language guard: a unique bare-name match is
@@ -271,8 +281,14 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     //  - external binding: a bare callee already bound to an import that resolved to
     //    NO repo file (an external package, e.g. `createClient` from 'redis') must
     //    never fall through to guessing some unrelated repo symbol of the same name.
+    // Round 3 guard: rust receiver calls never use this fallback at all (`x.foo()` /
+    // `Type::foo()` with an unresolved receiver): Rust's trait system means a same-named
+    // method on an unrelated type (`is_empty`, `into_response`, `from_str`, ...) is the
+    // common case, not the exception - a receiver-less bare call (`helper()`) is still
+    // eligible, since Rust free functions don't have that ambiguity.
     if (!tail) {
-      const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee);
+      const rustReceiverCall = lang === 'rust' && !!c.receiver;
+      const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee) && !rustReceiverCall;
       if (eligible) {
         const g = idx.byBareName.get(c.callee) ?? [];
         if (g.length === 1) {

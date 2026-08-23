@@ -139,4 +139,35 @@ describe('resolver', () => {
     const out = fileOutputs(idx, 'app.ts');
     expect(out.edges.filter(e => e.type === 'CALLS')).toHaveLength(0);
   });
+  it('round 3: rust receiver calls never use the 0.4 fallback (bare calls still may)', () => {
+    const rawSym = (kind: 'function' | 'method' | 'struct', qualname: string, name = qualname, parent?: string) => ({
+      kind, qualname, name, line_start: 1, line_end: 2, signature: '', doc: '', exported: true, parent,
+    });
+    const walked = (p: string) => ({ path: p, abs: p, sha256: 'x', lang: 'rust' as const, size: 0 });
+    const idx = buildRepoIndex([
+      // `struct S; impl S { fn is_empty(&self) -> bool { true } }` - a receiver call to
+      // this unique-in-fixture method must never fall back (round 3 disables the
+      // receiver-call fallback for rust outright, independent of GENERIC_CALLEES also
+      // stop-listing `is_empty` by name - the shape rule covers names that aren't
+      // explicitly listed too).
+      { walked: walked('session.rs'), ex: { symbols: [rawSym('struct', 'S'), rawSym('method', 'S.is_empty', 'is_empty', 'S')], imports: [], calls: [], inherits: [], assigns: [] } },
+      { walked: walked('other.rs'), ex: { symbols: [rawSym('function', 'helper')], imports: [], calls: [], inherits: [], assigns: [] } },
+      {
+        walked: walked('main.rs'),
+        ex: {
+          symbols: [rawSym('function', 'main')],
+          imports: [],
+          calls: [
+            { callee: 'is_empty', receiver: 'name', inside: 'main', line: 1 },  // receiver call, unique method -> NO edge (round 3)
+            { callee: 'helper', inside: 'main', line: 2 },                      // bare call, unique fn -> still resolves (0.4)
+          ],
+          inherits: [], assigns: [],
+        },
+      },
+    ]);
+    const out = fileOutputs(idx, 'main.rs');
+    const callsEdges = out.edges.filter(e => e.type === 'CALLS');
+    expect(callsEdges).toHaveLength(1);
+    expect(callsEdges[0]).toMatchObject({ type: 'CALLS', head: 'main.rs::main', tail: 'other.rs::helper', confidence: 0.4 });
+  });
 });
