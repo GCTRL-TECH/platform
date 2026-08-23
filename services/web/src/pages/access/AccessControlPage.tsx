@@ -146,8 +146,14 @@ function TokensSection() {
   }
 
   async function toggleCodeAccess(keyId: string, next: boolean) {
-    await api.put(`/users/api-keys/${keyId}`, { codeAccess: next })
-    qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
+    setError(null)
+    try {
+      await api.put(`/users/api-keys/${keyId}`, { codeAccess: next })
+      qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
+    } catch (e: unknown) {
+      setError((e as { response?: { data?: { error?: string } } })?.response?.data?.error
+        ?? 'Failed to change Codebase access for this token')
+    }
   }
 
   async function toggleGrant(keyId: string, compId: string, has: boolean) {
@@ -356,9 +362,13 @@ function TokensSection() {
                       )}
                       <button
                         onClick={() => void toggleCodeAccess(k.id, k.codeAccess === false)}
+                        aria-pressed={k.codeAccess !== false}
+                        aria-label="Codebase access"
                         className={cn('rounded p-0.5 hover:bg-slate-700',
                           k.codeAccess === false ? 'text-slate-600 hover:text-slate-300' : 'text-cyan-400/70 hover:text-cyan-300')}
-                        title={k.codeAccess === false ? 'Turn Codebase access on' : 'Turn Codebase access off'}>
+                        title={k.codeAccess === false
+                          ? 'Turn Codebase access on. Takes effect immediately for this token.'
+                          : 'Turn Codebase access off. Takes effect immediately: the token loses the code tools and its code knowledge bases right away.'}>
                         <Code2 size={11} />
                       </button>
                       <code className="font-mono text-[11px] text-slate-600">{k.keyPrefix}…</code>
@@ -376,7 +386,9 @@ function TokensSection() {
                           <button onClick={() => void toggleGrant(k.id, g.compilationId, true)} className="hover:text-red-300"><X size={9} /></button>
                         </span>
                       ))}
-                      <GrantAdder keyId={k.id} comps={comps} existing={new Set(k.grants.map((g) => g.compilationId))} onAdd={(cid) => toggleGrant(k.id, cid, false)} />
+                      <GrantAdder keyId={k.id} comps={comps} codeAccess={k.codeAccess !== false}
+                        existing={new Set(k.grants.map((g) => g.compilationId))}
+                        onAdd={(cid) => toggleGrant(k.id, cid, false)} />
                     </div>
                   </div>
                   <button onClick={() => void handleDelete(k.id)} className="rounded p-1.5 text-slate-500 hover:bg-slate-700 hover:text-red-400" title="Revoke">
@@ -392,8 +404,11 @@ function TokensSection() {
   )
 }
 
-function GrantAdder({ comps, existing, onAdd }: {
-  keyId: string; comps: Compilation[]; existing: Set<string>; onAdd: (compId: string) => void
+function GrantAdder({ comps, existing, codeAccess, onAdd }: {
+  keyId: string; comps: Compilation[]; existing: Set<string>
+  /** The token's Codebase access capability. False = code graphs cannot be granted. */
+  codeAccess: boolean
+  onAdd: (compId: string) => void
 }) {
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
@@ -422,12 +437,26 @@ function GrantAdder({ comps, existing, onAdd }: {
           <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
           <div className="fixed z-[61] max-h-56 w-56 overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 p-1 shadow-2xl"
             style={{ top: pos.top, left: pos.left }}>
-            {available.map((c) => (
-              <button key={c.id} onClick={() => { onAdd(c.id); setOpen(false) }}
-                className="block w-full rounded px-2 py-1.5 text-left text-xs text-slate-300 hover:bg-slate-800">
-                {c.name}
-              </button>
-            ))}
+            {available.map((c) => {
+              // A code graph cannot be granted to a token whose Codebase access is
+              // off - the server would drop it from the token's scope anyway, so the
+              // entry is shown disabled rather than silently accepted.
+              const locked = c.type === 'CODE' && !codeAccess
+              return (
+                <button key={c.id} disabled={locked}
+                  onClick={() => { if (!locked) { onAdd(c.id); setOpen(false) } }}
+                  title={locked ? 'Codebase access is off for this token' : undefined}
+                  className={cn('flex w-full items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs',
+                    locked ? 'cursor-not-allowed text-slate-600' : 'text-slate-300 hover:bg-slate-800')}>
+                  <span className="flex-1 truncate">{c.name}</span>
+                  {c.type === 'CODE' && (
+                    <span className="rounded bg-cyan-500/15 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
+                      Code
+                    </span>
+                  )}
+                </button>
+              )
+            })}
           </div>
         </>,
         document.body,
