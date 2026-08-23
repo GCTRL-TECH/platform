@@ -39,4 +39,10 @@ describe('typescript extractor', () => {
       expect.objectContaining({ callee: 'add', receiver: 'util', inside: 'main' }),
     ]));
   });
+  it('records local constructor-binding assignments', async () => {
+    const ex = await extractFile('typescript', read('src/index.ts'));
+    expect(ex.assigns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'u', ctor: 'User', inside: 'main' }),
+    ]));
+  });
 });

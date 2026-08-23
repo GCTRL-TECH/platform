@@ -42,4 +42,10 @@ describe('python extractor', () => {
     ]));
     expect(ex.inherits).toEqual([{ child: 'Thing', parent: 'Base', kind: 'INHERITS' }]);
   });
+  it('records local constructor-binding assignments', async () => {
+    const ex = await extractFile('python', read('pkg/a.py'));
+    expect(ex.assigns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 't', ctor: 'Thing', inside: 'top' }),
+    ]));
+  });
 });

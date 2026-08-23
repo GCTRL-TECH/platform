@@ -1,6 +1,16 @@
 import type { SyntaxNode, Tree } from '../parser.js';
-import type { Extracted, LanguageExtractor, RawCall, RawImport, RawInherit, RawSymbol } from './types.js';
+import type { Extracted, LanguageExtractor, RawAssign, RawCall, RawImport, RawInherit, RawSymbol } from './types.js';
 import { firstLine, unquote, walk } from './engine.js';
+
+/** `Name` in `x = Name(...)` or `x = mod.Name(...)`, from the call's `function` node — last segment, iff it starts uppercase. */
+function ctorFromCallee(fn: SyntaxNode, src: string): string | null {
+  let last: SyntaxNode | null = null;
+  if (fn.type === 'identifier') last = fn;
+  else if (fn.type === 'attribute') last = fn.childForFieldName('attribute');
+  if (!last) return null;
+  const name = src.slice(last.startIndex, last.endIndex);
+  return /^[A-Z]/.test(name) ? name : null;
+}
 
 function enclosingQualname(node: SyntaxNode, src: string): { qual: string; classQual?: string } {
   const parts: string[] = [];
@@ -34,6 +44,7 @@ export const pythonExtractor: LanguageExtractor = {
     const imports: RawImport[] = [];
     const calls: RawCall[] = [];
     const inherits: RawInherit[] = [];
+    const assigns: RawAssign[] = [];
     for (const node of walk(tree.rootNode)) {
       if (node.type === 'function_definition' || node.type === 'class_definition') {
         const nameNode = node.childForFieldName('name');
@@ -109,6 +120,17 @@ export const pythonExtractor: LanguageExtractor = {
           } else if (c.type === 'wildcard_import') names.push('*');
         }
         imports.push({ module, names, relativeLevel: level || undefined, line: node.startPosition.row + 1 });
+      } else if (node.type === 'assignment') {
+        const left = node.childForFieldName('left');
+        const right = node.childForFieldName('right');
+        if (left?.type === 'identifier' && right?.type === 'call') {
+          const fn = right.childForFieldName('function');
+          const ctor = fn ? ctorFromCallee(fn, src) : null;
+          if (ctor) {
+            const { qual } = enclosingQualname(node, src);
+            assigns.push({ name: src.slice(left.startIndex, left.endIndex), ctor, inside: qual || undefined, line: node.startPosition.row + 1 });
+          }
+        }
       } else if (node.type === 'call') {
         const fn = node.childForFieldName('function');
         if (!fn) continue;
@@ -128,6 +150,6 @@ export const pythonExtractor: LanguageExtractor = {
         }
       }
     }
-    return { symbols, imports, calls, inherits };
+    return { symbols, imports, calls, inherits, assigns };
   },
 };

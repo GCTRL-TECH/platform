@@ -44,11 +44,23 @@ export interface RawInherit {
   kind: 'INHERITS' | 'IMPLEMENTS';
 }
 
+/** A local-variable binding to a constructed instance, e.g. `x = Thing()` / `let x = Name::new()`. */
+export interface RawAssign {
+  /** the bound identifier */
+  name: string;
+  /** last-segment of the constructor callee (`Thing`, `Engine`, `Name`) */
+  ctor: string;
+  /** qualname of the enclosing def, or undefined at module/top level */
+  inside?: string;
+  line: number;
+}
+
 export interface Extracted {
   symbols: RawSymbol[];
   imports: RawImport[];
   calls: RawCall[];
   inherits: RawInherit[];
+  assigns: RawAssign[];
 }
 
 export interface LanguageExtractor {

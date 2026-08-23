@@ -14,7 +14,7 @@ const EXTRACTORS: Partial<Record<Lang, LanguageExtractor>> = {
 
 export async function extractFile(lang: Lang, source: string): Promise<Extracted> {
   const ex = EXTRACTORS[lang];
-  if (!ex) return { symbols: [], imports: [], calls: [], inherits: [] };
+  if (!ex) return { symbols: [], imports: [], calls: [], inherits: [], assigns: [] };
   const tree = await parseSource(lang, source);
   try {
     return ex.extract(tree, source);

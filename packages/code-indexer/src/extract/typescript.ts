@@ -1,6 +1,15 @@
 import type { SyntaxNode, Tree } from '../parser.js';
-import type { Extracted, LanguageExtractor, RawCall, RawImport, RawInherit, RawSymbol } from './types.js';
+import type { Extracted, LanguageExtractor, RawAssign, RawCall, RawImport, RawInherit, RawSymbol } from './types.js';
 import { firstLine, walk } from './engine.js';
+
+/** last segment of a `new_expression`'s constructor (identifier or member_expression). */
+function ctorName(newExpr: SyntaxNode, src: string): string | null {
+  const ctor = newExpr.childForFieldName('constructor');
+  if (!ctor) return null;
+  if (ctor.type === 'identifier') return text(src, ctor);
+  if (ctor.type === 'member_expression') { const prop = ctor.childForFieldName('property'); return prop ? text(src, prop) : null; }
+  return null;
+}
 
 const DEF_TYPES = new Set([
   'function_declaration', 'class_declaration', 'abstract_class_declaration', 'method_definition',
@@ -69,6 +78,7 @@ export const tsExtractor: LanguageExtractor = {
     const imports: RawImport[] = [];
     const calls: RawCall[] = [];
     const inherits: RawInherit[] = [];
+    const assigns: RawAssign[] = [];
     for (const node of walk(tree.rootNode)) {
       const isArrowConst = node.type === 'variable_declarator' && isFnValue(node);
       if (DEF_TYPES.has(node.type) || isArrowConst) {
@@ -137,6 +147,22 @@ export const tsExtractor: LanguageExtractor = {
           }
         }
         imports.push({ module, names, alias, line: node.startPosition.row + 1 });
+      } else if (node.type === 'variable_declarator') {
+        // `const|let|var x = new Name(...)`
+        const nameNode = node.childForFieldName('name');
+        const value = node.childForFieldName('value');
+        if (nameNode?.type === 'identifier' && value?.type === 'new_expression') {
+          const ctor = ctorName(value, src);
+          if (ctor) { const { qual } = enclosing(node, src); assigns.push({ name: text(src, nameNode), ctor, inside: qual || undefined, line: node.startPosition.row + 1 }); }
+        }
+      } else if (node.type === 'assignment_expression') {
+        // `x = new Name(...)` (no declaration keyword)
+        const left = node.childForFieldName('left');
+        const right = node.childForFieldName('right');
+        if (left?.type === 'identifier' && right?.type === 'new_expression') {
+          const ctor = ctorName(right, src);
+          if (ctor) { const { qual } = enclosing(node, src); assigns.push({ name: text(src, left), ctor, inside: qual || undefined, line: node.startPosition.row + 1 }); }
+        }
       } else if (node.type === 'call_expression' || node.type === 'new_expression') {
         const fn = node.childForFieldName(node.type === 'new_expression' ? 'constructor' : 'function');
         if (!fn) continue;
@@ -157,6 +183,6 @@ export const tsExtractor: LanguageExtractor = {
         }
       }
     }
-    return { symbols, imports, calls, inherits };
+    return { symbols, imports, calls, inherits, assigns };
   },
 };

@@ -1,5 +1,5 @@
 import type { SyntaxNode, Tree } from '../parser.js';
-import type { Extracted, LanguageExtractor, RawCall, RawImport, RawInherit, RawSymbol } from './types.js';
+import type { Extracted, LanguageExtractor, RawAssign, RawCall, RawImport, RawInherit, RawSymbol } from './types.js';
 import { firstLine, walk } from './engine.js';
 
 function text(src: string, n: SyntaxNode | null): string { return n ? src.slice(n.startIndex, n.endIndex) : ''; }
@@ -115,7 +115,7 @@ function docComment(node: SyntaxNode, src: string): string {
 export const rustExtractor: LanguageExtractor = {
   lang: 'rust',
   extract(tree: Tree, src: string): Extracted {
-    const symbols: RawSymbol[] = []; const imports: RawImport[] = []; const calls: RawCall[] = []; const inherits: RawInherit[] = [];
+    const symbols: RawSymbol[] = []; const imports: RawImport[] = []; const calls: RawCall[] = []; const inherits: RawInherit[] = []; const assigns: RawAssign[] = [];
     for (const node of walk(tree.rootNode)) {
       switch (node.type) {
         case 'function_item': {
@@ -150,6 +150,28 @@ export const rustExtractor: LanguageExtractor = {
           if (arg) flattenUse(arg, '', src, node.startPosition.row + 1, imports);
           break;
         }
+        case 'let_declaration': {
+          // `let x = Name::new(...)` / `Name::default()` / `Name::assoc_fn(...)` / `let x = Name { .. }`
+          const patternNode = node.childForFieldName('pattern');
+          const valueNode = node.childForFieldName('value');
+          if (patternNode?.type === 'identifier' && valueNode) {
+            let ctor: string | null = null;
+            if (valueNode.type === 'call_expression') {
+              const fn = valueNode.childForFieldName('function');
+              if (fn?.type === 'scoped_identifier') {
+                const pathNode = fn.childForFieldName('path');
+                const seg = (pathNode ? text(src, pathNode) : '').split('::').pop() ?? '';
+                if (/^[A-Z]/.test(seg)) ctor = seg;
+              }
+            } else if (valueNode.type === 'struct_expression') {
+              const typeNode = valueNode.childForFieldName('name');
+              const t = typeNode ? text(src, typeNode).replace(/<.*$/, '') : '';
+              if (/^[A-Z]/.test(t)) ctor = t;
+            }
+            if (ctor) assigns.push({ name: text(src, patternNode), ctor, inside: enclosingFn(node, src), line: node.startPosition.row + 1 });
+          }
+          break;
+        }
         case 'call_expression': {
           const fn = node.childForFieldName('function'); if (!fn) break;
           const inside = enclosingFn(node, src);
@@ -160,6 +182,6 @@ export const rustExtractor: LanguageExtractor = {
         }
       }
     }
-    return { symbols, imports, calls, inherits };
+    return { symbols, imports, calls, inherits, assigns };
   },
 };
