@@ -108,6 +108,14 @@ pub(crate) async fn execute(
     let resource_id: String = match tool_name {
         "code_symbol" => args["query"].as_str().unwrap_or("").trim().to_string(),
         "code_trace" => args["symbol"].as_str().unwrap_or("").trim().to_string(),
+        "code_impact" => {
+            let mut items: Vec<String> = args["changedFiles"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            items.extend(args["changedSymbols"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<String>>()).unwrap_or_default());
+            items.join(",").chars().take(200).collect()
+        }
+        "code_architecture" => args["compilationId"].as_str().unwrap_or("").trim().to_string(),
         _ => "*".to_string(),
     };
     let out = match tool_name {
@@ -180,9 +188,111 @@ pub(crate) async fn execute(
     Some(out)
 }
 
-// placeholders replaced in Task 7:
-async fn impact(_: &Arc<crate::models::AppState>, _: &JwtClaims, _: &str, _: &Option<Vec<String>>, _: i32, _: &str, _: &Value) -> Value { json!({ "error": "not implemented" }) }
-async fn architecture(_: &Arc<crate::models::AppState>, _: &str, _: &Option<Vec<String>>, _: i32, _: &str, _: &Value) -> Value { json!({ "error": "not implemented" }) }
+/// `auth` / `mauth` are `node_auth_clause("n", ..)` / `node_auth_clause("m", ..)`.
+pub(crate) fn code_impact_cypher(auth: &str, mauth: &str, depth: i64) -> String {
+    format!(
+        "MATCH (n:Entity) WHERE n.coarse_type = 'code' AND {auth} AND coalesce(n._min_rank,0) <= $rank \
+           AND (n._file IN $files OR n.name IN $symbols) \
+         OPTIONAL MATCH p = (n)<-[rs:CALLS*1..{depth}]-(m) \
+           WHERE {mauth} AND coalesce(m._min_rank,0) <= $rank \
+         WITH n, m, CASE WHEN m IS NULL THEN 0 ELSE size(rs) END AS hops \
+         RETURN n.name AS changed, coalesce(m.name, n.name) AS affected, m._file AS file, \
+                coalesce(m.type, n.type) AS type, hops, \
+                CASE WHEN m IS NULL THEN 0 ELSE size([(m)<-[:CALLS]-() | 1]) END AS fan_in \
+         ORDER BY hops ASC, fan_in DESC LIMIT 500"
+    )
+}
+
+pub(crate) fn code_architecture_cyphers(auth: &str) -> Vec<(&'static str, String)> {
+    let base = format!("MATCH (n:Entity) WHERE n.coarse_type = 'code' AND {auth} AND coalesce(n._min_rank,0) <= $rank");
+    vec![
+        ("languages", format!("{base} AND n.type = 'file' RETURN coalesce(n.lang,'other') AS k, count(*) AS v ORDER BY v DESC")),
+        ("packages", format!("{base} AND n.type = 'file' WITH split(coalesce(n._file,''),'/') AS parts \
+            RETURN CASE WHEN size(parts) > 1 THEN parts[0] ELSE '.' END AS k, count(*) AS v ORDER BY v DESC LIMIT 25")),
+        ("symbol_counts", format!("{base} RETURN n.type AS k, count(*) AS v ORDER BY v DESC")),
+        ("hotspots", format!("{base} AND n.type IN ['function','method','class','interface','struct'] \
+            WITH n, size([(n)<-[:CALLS]-() | 1]) AS callers, size([(n)-[:CALLS]->() | 1]) AS callees \
+            RETURN n.name AS name, n._file AS file, n.type AS type, callers, callees, callers + callees AS degree \
+            ORDER BY degree DESC LIMIT 15")),
+        ("dead_candidates", format!("{base} AND n.type IN ['function','method'] \
+            AND coalesce(n.exported,false) = false AND NOT EXISTS {{ (n)<-[:CALLS]-() }} \
+            AND NOT n.name ENDS WITH '::main' AND NOT n.name CONTAINS '::test' \
+            RETURN n.name AS name, n._file AS file, n.line_start AS line_start ORDER BY n._file, n.line_start LIMIT 25")),
+        ("communities", format!("{base} AND n._community IS NOT NULL RETURN toString(n._community) AS k, count(*) AS v ORDER BY v DESC LIMIT 20")),
+    ]
+}
+
+async fn impact(
+    state: &Arc<crate::models::AppState>, _claims: &JwtClaims, auth: &str,
+    scoped: &Option<Vec<String>>, rank: i32, uid: &str, args: &Value,
+) -> Value {
+    let files: Vec<String> = args["changedFiles"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.replace('\\', "/"))).collect()).unwrap_or_default();
+    let symbols: Vec<String> = args["changedSymbols"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    if files.is_empty() && symbols.is_empty() {
+        return json!({ "error": "changedFiles or changedSymbols is required" });
+    }
+    let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 3);
+    let mauth = node_auth_clause("m", scoped);
+    let mut nq = neo4rs::query(&code_impact_cypher(auth, &mauth, depth))
+        .param("files", files.clone()).param("symbols", symbols.clone())
+        .param("uid", uid.to_string()).param("rank", rank as i64);
+    if let Some(jobs) = scoped { nq = nq.param("jobs", jobs.clone()); }
+    let mut affected = Vec::new();
+    let mut by_file: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut max_fan_in = 0i64;
+    if let Ok(mut stream) = state.neo.execute(nq).await {
+        while let Ok(Some(row)) = stream.next().await {
+            let hops = row.get::<i64>("hops").unwrap_or(0);
+            let file = row.get::<String>("file").unwrap_or_default();
+            let fan_in = row.get::<i64>("fan_in").unwrap_or(0);
+            if hops > 0 {
+                *by_file.entry(file.clone()).or_insert(0) += 1;
+                max_fan_in = max_fan_in.max(fan_in);
+            }
+            affected.push(json!({
+                "changed": row.get::<String>("changed").unwrap_or_default(),
+                "affected": row.get::<String>("affected").unwrap_or_default(),
+                "file": file, "type": row.get::<String>("type").unwrap_or_default(),
+                "hops": hops, "fan_in": fan_in,
+            }));
+        }
+    }
+    let n_affected = affected.iter().filter(|a| a["hops"].as_i64().unwrap_or(0) > 0).count();
+    let risk = if n_affected == 0 { "low" } else if n_affected < 10 && max_fan_in < 5 { "medium" } else { "high" };
+    json!({ "changedFiles": files, "changedSymbols": symbols, "depth": depth,
+            "affected": affected, "affectedFiles": by_file, "affectedCount": n_affected, "risk": risk })
+}
+
+async fn architecture(
+    state: &Arc<crate::models::AppState>, auth: &str, scoped: &Option<Vec<String>>, rank: i32, uid: &str, args: &Value,
+) -> Value {
+    if parse_uuid(&args["compilationId"]).is_none() {
+        return json!({ "error": "compilationId is required" });
+    }
+    let mut out = serde_json::Map::new();
+    for (key, cypher) in code_architecture_cyphers(auth) {
+        let mut nq = neo4rs::query(&cypher).param("uid", uid.to_string()).param("rank", rank as i64);
+        if let Some(jobs) = scoped { nq = nq.param("jobs", jobs.clone()); }
+        let mut rows = Vec::new();
+        if let Ok(mut stream) = state.neo.execute(nq).await {
+            while let Ok(Some(row)) = stream.next().await {
+                if key == "hotspots" {
+                    rows.push(json!({ "name": row.get::<String>("name").unwrap_or_default(), "file": row.get::<String>("file").ok(),
+                        "type": row.get::<String>("type").unwrap_or_default(), "callers": row.get::<i64>("callers").unwrap_or(0),
+                        "callees": row.get::<i64>("callees").unwrap_or(0), "degree": row.get::<i64>("degree").unwrap_or(0) }));
+                } else if key == "dead_candidates" {
+                    rows.push(json!({ "name": row.get::<String>("name").unwrap_or_default(), "file": row.get::<String>("file").ok(),
+                        "line_start": row.get::<i64>("line_start").ok() }));
+                } else {
+                    rows.push(json!({ "key": row.get::<String>("k").unwrap_or_default(), "count": row.get::<i64>("v").unwrap_or(0) }));
+                }
+            }
+        }
+        out.insert(key.to_string(), Value::Array(rows));
+    }
+    out.insert("hint".into(), json!("Run detect_communities(compilationId) to populate communities; use code_trace on a hotspot to see its callers."));
+    Value::Object(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -222,5 +332,26 @@ mod tests {
     #[test]
     fn regex_escape_neutralises_metachars() {
         assert_eq!(regex_escape("a.b(c)"), r"a\.b\(c\)");
+    }
+
+    #[test]
+    fn impact_cypher_matches_files_or_symbols_and_walks_callers() {
+        let c = code_impact_cypher("(n._owner = $uid)", "(m._owner = $uid)", 2);
+        assert!(c.contains("n._file IN $files OR n.name IN $symbols"));
+        assert!(c.contains("<-[rs:CALLS*1..2]-"));
+        assert!(c.contains("(m._owner = $uid)"));
+        assert!(c.contains("m._file AS file"));
+    }
+
+    #[test]
+    fn architecture_cyphers_cover_languages_hotspots_dead() {
+        let cs = code_architecture_cyphers("(n._owner = $uid)");
+        let keys: Vec<&str> = cs.iter().map(|(k, _)| *k).collect();
+        for k in ["languages", "packages", "symbol_counts", "hotspots", "dead_candidates", "communities"] {
+            assert!(keys.contains(&k), "missing {k}");
+        }
+        let dead = &cs.iter().find(|(k, _)| *k == "dead_candidates").unwrap().1;
+        assert!(dead.contains("NOT EXISTS { (n)<-[:CALLS]-() }"));
+        assert!(dead.contains("coalesce(n.exported,false) = false"));
     }
 }
