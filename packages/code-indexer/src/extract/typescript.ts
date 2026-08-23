@@ -176,6 +176,7 @@ export const tsExtractor: LanguageExtractor = {
         const srcNode = node.childForFieldName('source');
         const module = text(src, srcNode).replace(/^['"]|['"]$/g, '');
         const names: string[] = [];
+        const aliases: Record<string, string> = {};
         let alias: string | undefined;
         const clause = namedChildren(node).find(c => c.type === 'import_clause');
         if (clause) {
@@ -188,12 +189,17 @@ export const tsExtractor: LanguageExtractor = {
               if (ns) alias = text(src, ns);
             } else if (c.type === 'named_imports') {
               for (const spec of namedChildren(c)) {
-                if (spec.type === 'import_specifier') names.push(text(src, spec.childForFieldName('name')));
+                if (spec.type !== 'import_specifier') continue;
+                const original = text(src, spec.childForFieldName('name'));
+                names.push(original);
+                // `import { add as plus }` — the alias is what call sites write.
+                const local = spec.childForFieldName('alias');
+                if (local) aliases[text(src, local)] = original;
               }
             }
           }
         }
-        imports.push({ module, names, alias, line: node.startPosition.row + 1 });
+        imports.push({ module, names, alias, aliases: Object.keys(aliases).length ? aliases : undefined, line: node.startPosition.row + 1 });
       } else if (node.type === 'variable_declarator') {
         // `const|let|var x = new Name(...)`
         const nameNode = node.childForFieldName('name');

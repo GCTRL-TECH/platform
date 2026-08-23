@@ -8,7 +8,9 @@ import path from 'node:path';
  * and multi-level `extends` chains - see resolveNearestTsconfig below).
  */
 export interface TsPathsConfig {
-  /** absolute, native-separator directory containing the tsconfig.json */
+  /** absolute, native-separator base for `paths` targets when `baseUrl` is unset: the
+   * directory of the tsconfig that DECLARED `paths` (which may be an `extends` parent,
+   * several directories up), matching TS 4.1+ semantics. */
   configDir: string;
   /** absolute, native-separator baseUrl dir, or null when compilerOptions.baseUrl is unset */
   baseUrl: string | null;
@@ -64,26 +66,48 @@ function readTsconfigJson(absPath: string): RawTsconfig | null {
   try { return JSON.parse(stripTrailingCommas(stripJsonComments(raw))); } catch { return null; }
 }
 
+/** `baseUrl`/`paths` as declared by ONE tsconfig in the extends chain, each carrying the
+ * directory of the file that declared it - TS resolves both relative to the declaring
+ * config, so a `baseUrl` inherited from `../../tsconfig.base.json` must resolve against
+ * THAT file's directory, not the child's. */
+interface DeclaredOptions {
+  baseUrl?: { value: string; dir: string };
+  paths?: { value: Record<string, string[]>; dir: string };
+}
+
+/** Resolve one config's own `compilerOptions.baseUrl`/`paths` plus everything it inherits
+ * through relative `extends`, child overriding parent PER KEY (a child that declares only
+ * `paths` still inherits the parent's `baseUrl`). Only relative `extends` targets are
+ * followed - a package name like "@tsconfig/node20" would need node resolution and never
+ * carries baseUrl/paths worth resolving. `seen` breaks extends cycles. */
+function declaredOptions(absConfigPath: string, seen: Set<string>): DeclaredOptions {
+  if (seen.has(absConfigPath)) return {};
+  seen.add(absConfigPath);
+  const json = readTsconfigJson(absConfigPath);
+  if (!json) return {};
+  const dir = path.dirname(absConfigPath);
+  let inherited: DeclaredOptions = {};
+  if (typeof json.extends === 'string' && json.extends.startsWith('.')) {
+    const parentAbs = path.resolve(dir, json.extends);
+    const parentPath = parentAbs.endsWith('.json') ? parentAbs : `${parentAbs}.json`;
+    inherited = declaredOptions(parentPath, seen);
+  }
+  const co = json.compilerOptions ?? {};
+  const own: DeclaredOptions = { ...inherited };
+  if (co.baseUrl) own.baseUrl = { value: co.baseUrl, dir };
+  if (co.paths) own.paths = { value: co.paths, dir };
+  return own;
+}
+
 function buildConfig(absConfigPath: string): TsPathsConfig | null {
   if (parsedConfigCache.has(absConfigPath)) return parsedConfigCache.get(absConfigPath)!;
-  const json = readTsconfigJson(absConfigPath);
-  if (!json) { parsedConfigCache.set(absConfigPath, null); return null; }
-  let co = json.compilerOptions ?? {};
-  // Single-level `extends`: only a relative path is worth following cheaply (a package
-  // name like "@tsconfig/node20" would need node resolution - not worth it here). No
-  // recursion into the parent's own `extends`.
-  if (!co.baseUrl && !co.paths && typeof json.extends === 'string' && json.extends.startsWith('.')) {
-    const parentAbs = path.resolve(path.dirname(absConfigPath), json.extends);
-    const parentPath = parentAbs.endsWith('.json') ? parentAbs : `${parentAbs}.json`;
-    const parentJson = readTsconfigJson(parentPath);
-    if (parentJson?.compilerOptions) co = parentJson.compilerOptions;
-  }
-  if (!co.baseUrl && !co.paths) { parsedConfigCache.set(absConfigPath, null); return null; }
+  const declared = declaredOptions(absConfigPath, new Set());
+  if (!declared.baseUrl && !declared.paths) { parsedConfigCache.set(absConfigPath, null); return null; }
   const configDir = path.dirname(absConfigPath);
-  const baseUrl = co.baseUrl ? path.resolve(configDir, co.baseUrl) : null;
+  const baseUrl = declared.baseUrl ? path.resolve(declared.baseUrl.dir, declared.baseUrl.value) : null;
   const paths: TsPathsConfig['paths'] = [];
-  if (co.paths) {
-    for (const [pattern, targets] of Object.entries(co.paths)) {
+  if (declared.paths) {
+    for (const [pattern, targets] of Object.entries(declared.paths.value)) {
       const star = pattern.indexOf('*');
       paths.push(star >= 0
         ? { prefix: pattern.slice(0, star), suffix: pattern.slice(star + 1), star: true, targets }
@@ -91,9 +115,17 @@ function buildConfig(absConfigPath: string): TsPathsConfig | null {
     }
     paths.sort((a, b) => b.prefix.length - a.prefix.length); // longest (most specific) prefix wins
   }
-  const result: TsPathsConfig = { configDir, baseUrl, paths };
+  // `paths` targets are relative to baseUrl when set, else to the config that DECLARED them.
+  const result: TsPathsConfig = { configDir: declared.paths?.dir ?? configDir, baseUrl, paths };
   parsedConfigCache.set(absConfigPath, result);
   return result;
+}
+
+/** Drop both tsconfig caches. Called at the start of every `indexRepo` run so a long-lived
+ * process (MCP server, watch mode) never resolves imports against a stale tsconfig. */
+export function clearTsconfigCache(): void {
+  parsedConfigCache.clear();
+  nearestConfigCache.clear();
 }
 
 /** Walk up from `startDirAbs` to `repoRootAbs` (inclusive) looking for a tsconfig.json. */

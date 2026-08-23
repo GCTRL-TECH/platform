@@ -57,10 +57,12 @@ function flattenUse(node: SyntaxNode, prefix: string, src: string, line: number,
         const name = parts.pop() ?? '';
         const modulePath = parts.join('::');
         const module = prefix ? (modulePath ? `${prefix}::${modulePath}` : prefix) : modulePath;
-        imports.push({ module, names: [name], alias, line });
+        // `use x::y as z;` — call sites write `z`, the target file defines `y`.
+        imports.push({ module, names: [name], alias, aliases: alias ? { [alias]: name } : undefined, line });
       } else {
         const name = pathNode ? text(src, pathNode) : '';
-        imports.push({ module: prefix || name, names: prefix ? [name] : [], alias, line });
+        const names = prefix ? [name] : [];
+        imports.push({ module: prefix || name, names, alias, aliases: alias && names.length ? { [alias]: name } : undefined, line });
       }
       break;
     }

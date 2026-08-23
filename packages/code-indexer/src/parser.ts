@@ -48,9 +48,14 @@ export function getLanguage(lang: Lang): Promise<Language> {
 export async function parseSource(lang: Lang, source: string): Promise<Tree> {
   const language = await getLanguage(lang);
   const parser = new Parser();
-  parser.setLanguage(language);
-  const tree = parser.parse(source);
-  parser.delete();
+  let tree: Tree | null;
+  try {
+    parser.setLanguage(language);
+    tree = parser.parse(source);
+  } finally {
+    // A throwing setLanguage/parse must never leak the wasm parser handle.
+    parser.delete();
+  }
   if (!tree) throw new Error(`tree-sitter failed to parse source as ${lang}`);
   return tree;
 }

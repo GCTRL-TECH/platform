@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { indexRepo } from '../src/indexer.js';
+import { indexRepo, makeBatches, MAX_BATCH_BYTES } from '../src/indexer.js';
 import { buildChunks } from '../src/chunks.js';
+import type { FileOut } from '../src/types.js';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 
@@ -59,5 +60,65 @@ describe('indexRepo', () => {
     };
     const s = await indexRepo({ repoPath: path.join(here, 'fixtures', 'ts'), request, pollMs: 1 });
     expect(s.compilationId).toBe('comp-new');
+  });
+
+  it('a file that fails to parse is neither uploaded nor reported as removed', async () => {
+    // Reporting an unparseable-but-present file as "removed" makes the server purge its
+    // symbols, edges and chunks - the file is still on disk, so it must simply be skipped.
+    let manifest: Record<string, string> = {};
+    const bodies: any[] = [];
+    const request = async (method: any, p: string, body?: any) => {
+      if (p.startsWith('/kex/code/manifest')) return { files: manifest };
+      if (p === '/kex/code') { bodies.push(body); return { jobId: 'j' }; }
+      if (p.startsWith('/kex/jobs/')) return { job: { status: 'completed' } };
+      throw new Error('unexpected ' + p);
+    };
+    const repoPath = path.join(here, 'fixtures', 'py');
+    const boom = async (lang: any, source: string) => {
+      if (source.includes('class Base')) throw new Error('synthetic parse failure');
+      const { extractFile } = await import('../src/extract/engine.js');
+      return extractFile(lang, source);
+    };
+    // First run: the server already knows every file (so nothing is "changed"), including
+    // the one that now fails to parse.
+    const probe = await indexRepo({ repoPath, compilationId: 'c', request, pollMs: 1 });
+    manifest = Object.fromEntries(bodies[0].files.map((f: any) => [f.path, f.sha256]));
+    expect(Object.keys(manifest)).toContain('pkg/b.py');
+    bodies.length = 0;
+    const s = await indexRepo({ repoPath, compilationId: 'c', request, pollMs: 1, full: true, extract: boom });
+    expect(probe.filesTotal).toBe(4);
+    expect(s.filesTotal).toBe(3);                                   // pkg/b.py failed to parse
+    expect(s.warnings.some(w => w.startsWith('parse failed pkg/b.py'))).toBe(true);
+    expect(s.filesRemoved).toBe(0);                                 // NOT purged
+    expect(bodies[0].removed).toEqual([]);
+    expect(bodies[0].files.map((f: any) => f.path)).not.toContain('pkg/b.py');
+  });
+});
+
+describe('makeBatches', () => {
+  const file = (p: string, bytes: number): FileOut =>
+    ({ path: p, sha256: 'x', lang: 'python', symbols: [], edges: [], chunks: [{ symbol: p, kind: 'file', content: 'y'.repeat(bytes) }] }) as unknown as FileOut;
+
+  it('cuts on the file count', () => {
+    const batches = makeBatches([file('a', 1), file('b', 1), file('c', 1)], [], 2);
+    expect(batches.map(b => b.files.length)).toEqual([2, 1]);
+  });
+
+  it('cuts on the accumulated byte budget as well', () => {
+    const budget = 5000;
+    const batches = makeBatches([file('a', 3000), file('b', 3000), file('c', 1000)], [], 200, budget);
+    expect(batches.map(b => b.files.map(f => f.path))).toEqual([['a'], ['b', 'c']]);
+    for (const b of batches) expect(JSON.stringify(b.files).length).toBeLessThanOrEqual(budget + 200);
+  });
+
+  it('a single oversized file still ships alone rather than being dropped', () => {
+    const batches = makeBatches([file('big', 9000), file('small', 10)], [], 200, 5000);
+    expect(batches.map(b => b.files.map(f => f.path))).toEqual([['big'], ['small']]);
+  });
+
+  it('removed paths ride along with the first batch; default budget is 20 MB', () => {
+    expect(MAX_BATCH_BYTES).toBe(20 * 1024 * 1024);
+    expect(makeBatches([file('a', 1)], ['gone.py'], 200)[0].removed).toEqual(['gone.py']);
+    expect(makeBatches([], ['gone.py'], 200)).toEqual([{ files: [], removed: ['gone.py'] }]);
   });
 });

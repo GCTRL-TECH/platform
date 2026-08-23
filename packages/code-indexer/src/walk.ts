@@ -55,7 +55,10 @@ export async function walkRepo(root: string): Promise<WalkedFile[]> {
   const stack: Array<{ dir: string; ig: Ignore | null }> = [{ dir: absRoot, ig: loadIgnore(absRoot, null) }];
   while (stack.length) {
     const { dir, ig } = stack.pop()!;
-    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { continue; }                                  // unreadable directory: skip its subtree
+    for (const ent of entries) {
       const abs = path.join(dir, ent.name);
       const rel = path.relative(absRoot, abs).split(path.sep).join('/');
       if (ent.isDirectory()) {
@@ -66,17 +69,24 @@ export async function walkRepo(root: string): Promise<WalkedFile[]> {
       }
       if (!ent.isFile()) continue;
       if (ig && ig.ignores(rel)) continue;
-      const st = fs.statSync(abs);
-      if (st.size > MAX_FILE_BYTES) continue;
-      const buf = fs.readFileSync(abs);
-      if (looksBinary(buf)) continue;
-      out.push({
-        path: rel,
-        abs,
-        size: st.size,
-        sha256: crypto.createHash('sha256').update(buf).digest('hex'),
-        lang: langForPath(rel),
-      });
+      // One unreadable entry (permission denied, broken symlink, file deleted
+      // between readdir and stat) must never abort the whole walk - skip it and
+      // keep going, exactly like an ignored file.
+      try {
+        const st = fs.statSync(abs);
+        if (st.size > MAX_FILE_BYTES) continue;
+        const buf = fs.readFileSync(abs);
+        if (looksBinary(buf)) continue;
+        out.push({
+          path: rel,
+          abs,
+          size: st.size,
+          sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+          lang: langForPath(rel),
+        });
+      } catch {
+        continue;
+      }
     }
   }
   out.sort((a, b) => (a.path < b.path ? -1 : 1));

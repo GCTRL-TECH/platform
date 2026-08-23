@@ -43,6 +43,11 @@ export const GENERIC_CALLEES = new Set([
  * only trusted when the candidate symbol's file is written in the same family as the
  * caller - a TS file calling a bare `login()` must never match a Rust `login` just
  * because tree-sitter happened to give it a unique name repo-wide. */
+/** Kinds a type-position guess (base class, implemented interface, rust `impl` target)
+ * may resolve to. A unique bare-name match of any other kind (a function, a method, a
+ * variable-ish symbol) is a coincidence, not a supertype. */
+const TYPE_KINDS: ReadonlySet<SymbolOut['kind']> = new Set<SymbolOut['kind']>(['class', 'interface', 'struct', 'enum', 'type']);
+
 const LANG_FAMILY: Record<string, string> = {
   typescript: 'ts', tsx: 'ts', javascript: 'ts',
   python: 'python',
@@ -166,9 +171,9 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
   for (const s of ex.symbols) { const a = localByName.get(s.name) ?? []; a.push(s); localByName.set(s.name, a); }
 
   addSym({ kind: 'file', name: p, lang });
+  const localQualnames = new Set(ex.symbols.map(s => s.qualname));
   for (const s of ex.symbols) {
     addSym({ kind: s.kind, name: localFull(s.qualname), line_start: s.line_start, line_end: s.line_end, signature: s.signature, doc: s.doc, exported: s.exported, lang });
-    addEdge({ type: 'CONTAINS', head: s.parent ? localFull(s.parent) : p, tail: localFull(s.qualname), confidence: 1, resolution: 'syntax' });
   }
   // imports -> file or module ; remember name -> (file, name) bindings for call resolution
   const binding = new Map<string, { file: string | null; name?: string }>();   // local identifier -> where it comes from
@@ -179,6 +184,9 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     if (imp.alias && imp.alias !== 'mod') binding.set(imp.alias, { file: target });                // ns.x() / pb.helper()
     for (const n of imp.names) if (n !== '*' && n !== 'default') binding.set(n, { file: target, name: n });
     if (imp.names.includes('default') && imp.alias) binding.set(imp.alias, { file: target, name: 'default' });
+    // Renamed named imports LAST so the alias wins over the bare `alias -> file` binding
+    // above (`use x::y as z` sets both): the alias resolves to the ORIGINAL exported name.
+    for (const [local, original] of Object.entries(imp.aliases ?? {})) binding.set(local, { file: target, name: original });
     if (lang === 'python' && !imp.names.length && !imp.alias && !imp.relativeLevel) binding.set(imp.module.split('.')[0], { file: target }); // import pkg.b ; pkg.b.helper()
   }
   const findIn = (file: string | null, name: string): string | null => {
@@ -198,6 +206,44 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     const file = full.split('::')[0]; const qualname = full.slice(file.length + 2);
     return (idx.symbolsByFile.get(file) ?? []).find(s => s.qualname === qualname);
   };
+  /**
+   * The one repo-wide "unique bare name" guess, with the full 0.4-tier eligibility applied:
+   * long enough, not stop-listed, not bound to an external import, exactly one candidate
+   * repo-wide, that candidate in the SAME language family and of an accepted kind. Used by
+   * the CALLS fallback, the INHERITS/IMPLEMENTS fallback and the rust cross-file `impl`
+   * CONTAINS head - every one of them a guess, never a syntax-grade fact.
+   */
+  const uniqueBareCandidate = (name: string, kinds: ReadonlySet<SymbolOut['kind']>): string | null => {
+    if (name.length < 4 || GENERIC_CALLEES.has(name)) return null;
+    const b = binding.get(name);
+    if (b && b.file === null) return null;                       // bound to an unresolved (external) import
+    const g = idx.byBareName.get(name) ?? [];
+    if (g.length !== 1) return null;
+    const candidateLang = idx.files.get(g[0].split('::')[0])?.walked.lang;
+    if ((LANG_FAMILY[lang] ?? lang) !== (LANG_FAMILY[candidateLang ?? ''] ?? candidateLang)) return null;
+    const sym = rawSymOf(g[0]);
+    if (!sym || !kinds.has(sym.kind)) return null;
+    return g[0];
+  };
+  /**
+   * Head of a symbol's CONTAINS edge. Same-file parents (every TS/Python nested def, and
+   * a rust `impl` next to its own type) are the qualname as extracted. A rust
+   * `impl ForeignType {}` names a type declared in ANOTHER file, where `localFull(parent)`
+   * would invent a symbol that does not exist - resolve it through this file's import
+   * bindings, then the guarded unique bare name, and stub whatever we land on. When
+   * nothing resolves, the file itself owns the symbol rather than a phantom parent.
+   */
+  const containsHead = (parent: string): string => {
+    if (localQualnames.has(parent)) return localFull(parent);
+    const bare = parent.split('.').pop()!;
+    const b = binding.get(bare);
+    const resolved = (b ? findIn(b.file, b.name ?? bare) : null) ?? uniqueBareCandidate(bare, TYPE_KINDS);
+    if (resolved) { stub(resolved, kindOf(resolved) ?? 'class'); return resolved; }
+    return p;
+  };
+  for (const s of ex.symbols) {
+    addEdge({ type: 'CONTAINS', head: s.parent ? containsHead(s.parent) : p, tail: localFull(s.qualname), confidence: 1, resolution: 'syntax' });
+  }
   // local-variable -> constructor-name bindings, scoped by enclosing def ('' = module level)
   const localCtor = new Map<string, Map<string, string>>();
   for (const a of ex.assigns) {
@@ -230,7 +276,8 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     if (local) return { file: p, qualname: local.qualname };
     const b = binding.get(ctor);
     if (b?.file) {
-      const hit = (idx.symbolsByFile.get(b.file) ?? []).find(s => s.name === ctor && (s.kind === 'class' || s.kind === 'struct'));
+      const want = b.name ?? ctor;                                // `import { Thing as T }` -> look for `Thing`
+      const hit = (idx.symbolsByFile.get(b.file) ?? []).find(s => s.name === want && (s.kind === 'class' || s.kind === 'struct'));
       if (hit) return { file: b.file, qualname: hit.qualname };
     }
     const g = idx.byBareName.get(ctor) ?? [];
@@ -245,16 +292,31 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     const parentName = inh.parent.split('.').pop()!;
     const local = localByName.get(parentName)?.find(s => s.kind !== 'method');
     let tail: string | null = local ? localFull(local.qualname) : null;
-    if (!tail) { const b = binding.get(parentName) ?? binding.get(inh.parent.split('.')[0]); tail = b ? findIn(b.file, parentName) : null; }
-    if (!tail) { const g = idx.byBareName.get(parentName) ?? []; if (g.length === 1) tail = g[0]; }
-    if (tail) { stub(tail, kindOf(tail) ?? 'class'); addEdge({ type: inh.kind, head: localFull(inh.child), tail, confidence: 1, resolution: 'syntax' }); }
+    let conf = 1;
+    let resolution: EdgeOut['resolution'] = 'syntax';
+    if (!tail) {
+      const b = binding.get(parentName) ?? binding.get(inh.parent.split('.')[0]);
+      tail = b ? findIn(b.file, b.name ?? parentName) : null;
+    }
+    if (!tail) {
+      // Repo-wide unique bare name — a GUESS, and it used to be emitted at
+      // confidence 1/'syntax' with no guard at all, so a python
+      // `class Config(BaseModel)` happily "inherited" from an unrelated rust
+      // `struct BaseModel`. Same eligibility as the CALLS 0.4 tier, same label.
+      tail = uniqueBareCandidate(parentName, TYPE_KINDS);
+      if (tail) { conf = 0.4; resolution = 'heuristic'; }
+    }
+    if (tail) { stub(tail, kindOf(tail) ?? 'class'); addEdge({ type: inh.kind, head: localFull(inh.child), tail, confidence: conf, resolution }); }
   }
   // calls
   for (const c of ex.calls) {
-    if (!c.inside) continue;
-    const head = localFull(c.inside);
+    // A module-level call (`helper()` at import time, a decorator-ish top-level
+    // invocation) has no enclosing def: the FILE is what performs it, and module-level
+    // locals live in scope ''. Dropping these lost every top-level call edge.
+    const scope = c.inside ?? '';
+    const head = c.inside ? localFull(c.inside) : p;
     let tail: string | null = null; let conf = 0.6;
-    const enclosingClass = c.inside.includes('.') ? c.inside.split('.').slice(0, -1).join('.') : null;
+    const enclosingClass = scope.includes('.') ? scope.split('.').slice(0, -1).join('.') : null;
     if ((c.receiver === 'self' || c.receiver === 'this') && enclosingClass) {
       const m = localByName.get(c.callee)?.find(s => s.parent === enclosingClass); if (m) tail = localFull(m.qualname);
     } else if (c.receiver && binding.has(c.receiver)) {
@@ -271,7 +333,7 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
       if (!tail) {
         // local constructor binding: `x = Thing()` / `let x = Engine::new()` tracked earlier in this
         // file, then `x.method()` resolves Thing/Engine to its class/struct and looks up the method.
-        const ctor = ctorOf(c.inside, c.receiver);
+        const ctor = ctorOf(scope, c.receiver);
         const classLoc = ctor ? resolveCtorClass(ctor) : null;
         if (classLoc) {
           const method = (idx.symbolsByFile.get(classLoc.file) ?? []).find(s => s.parent === classLoc.qualname && s.name === c.callee);
@@ -281,7 +343,7 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     } else {
       const loc = localByName.get(c.callee)?.filter(s => s.kind !== 'method');
       if (loc && loc.length === 1) tail = localFull(loc[0].qualname);
-      else if (binding.has(c.callee)) tail = findIn(binding.get(c.callee)!.file, c.callee);
+      else if (binding.has(c.callee)) { const b = binding.get(c.callee)!; tail = findIn(b.file, b.name ?? c.callee); }
     }
     // Repo-wide "unique bare name" fallback (low-confidence heuristic). Skipped for
     // generic/short callees (too likely to collide with an unrelated same-named method
@@ -313,7 +375,7 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     //    the local wins even when the indexer can't tell where its value came from.
     if (!tail) {
       const rustReceiverCall = lang === 'rust' && !!c.receiver;
-      const isLocalShadow = !c.receiver && isLocalInScope(c.inside ?? '', c.callee);
+      const isLocalShadow = !c.receiver && isLocalInScope(scope, c.callee);
       const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee) && !rustReceiverCall && !isLocalShadow;
       if (eligible) {
         const g = idx.byBareName.get(c.callee) ?? [];

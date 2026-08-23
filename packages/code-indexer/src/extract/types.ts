@@ -21,6 +21,14 @@ export interface RawImport {
   names: string[];
   /** `import x as y` / `import * as ns` */
   alias?: string;
+  /**
+   * Renamed named imports: local alias -> original exported name, for
+   * `import { add as plus } from './util'` / `from x import a as b` /
+   * `use x::y as z;`. The ORIGINAL name is what appears in `names` (and in the
+   * target file's symbol table); the alias is what the calling code writes, so
+   * the resolver binds the alias to the original when looking a call up.
+   */
+  aliases?: Record<string, string>;
   /** python dots */
   relativeLevel?: number;
   line: number;

@@ -148,6 +148,7 @@ export const pythonExtractor: LanguageExtractor = {
           module = module.slice(1);
         }
         const names: string[] = [];
+        const aliases: Record<string, string> = {};
         for (let i = 0; i < node.namedChildCount; i++) {
           const c = node.namedChild(i)!;
           // web-tree-sitter returns a fresh wrapper object per accessor call, so
@@ -157,10 +158,16 @@ export const pythonExtractor: LanguageExtractor = {
           if (c.type === 'dotted_name') names.push(src.slice(c.startIndex, c.endIndex));
           else if (c.type === 'aliased_import') {
             const n = c.childForFieldName('name');
-            if (n) names.push(src.slice(n.startIndex, n.endIndex));
+            const a = c.childForFieldName('alias');
+            if (n) {
+              const original = src.slice(n.startIndex, n.endIndex);
+              names.push(original);
+              // `from x import a as b` — call sites write `b`, the target file defines `a`.
+              if (a) aliases[src.slice(a.startIndex, a.endIndex)] = original;
+            }
           } else if (c.type === 'wildcard_import') names.push('*');
         }
-        imports.push({ module, names, relativeLevel: level || undefined, line: node.startPosition.row + 1 });
+        imports.push({ module, names, aliases: Object.keys(aliases).length ? aliases : undefined, relativeLevel: level || undefined, line: node.startPosition.row + 1 });
       } else if (node.type === 'assignment') {
         const left = node.childForFieldName('left');
         const right = node.childForFieldName('right');

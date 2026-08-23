@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { walkRepo } from './walk.js';
 import { extractFile } from './extract/engine.js';
 import { buildRepoIndex, fileOutputs } from './resolve.js';
+import { clearTsconfigCache } from './tsPaths.js';
 import { buildChunks } from './chunks.js';
 import type { FileOut, IndexBatch } from './types.js';
 import type { Lang } from './parser.js';
@@ -11,17 +12,33 @@ import type { Extracted } from './extract/types.js';
 import type { WalkedFile } from './types.js';
 
 export type RequestFn = (method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown) => Promise<unknown>;
-export interface IndexOptions { repoPath: string; compilationId?: string; request: RequestFn; full?: boolean; classificationLevelId?: string; batchFiles?: number; pollMs?: number; onProgress?: (msg: string) => void; createCompilationIfMissing?: boolean }
+/** Seam for tests: the per-file parse step, defaulting to `extractFile`. */
+export type ExtractFn = (lang: Lang, source: string) => Promise<Extracted>;
+export interface IndexOptions { repoPath: string; compilationId?: string; request: RequestFn; full?: boolean; classificationLevelId?: string; batchFiles?: number; batchBytes?: number; pollMs?: number; onProgress?: (msg: string) => void; createCompilationIfMissing?: boolean; extract?: ExtractFn }
 export interface IndexSummary { compilationId: string; repo: string; commit: string | null; filesTotal: number; filesChanged: number; filesRemoved: number; batches: number; symbols: number; edges: number; chunks: number; jobIds: string[]; warnings: string[] }
+
+/** Wire-size ceiling per batch. The server accepts a body up to 40 MB; a batch of 200
+ * dense files can blow past that on its own, so cut on accumulated JSON bytes too. */
+export const MAX_BATCH_BYTES = 20 * 1024 * 1024;
 
 export function gitCommit(repoPath: string): string | null {
   try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoPath, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || null; }
   catch { return null; }
 }
 
-export function makeBatches(files: FileOut[], removed: string[], batchFiles: number): Array<{ files: FileOut[]; removed: string[] }> {
+export function makeBatches(files: FileOut[], removed: string[], batchFiles: number, batchBytes: number = MAX_BATCH_BYTES): Array<{ files: FileOut[]; removed: string[] }> {
   const out: Array<{ files: FileOut[]; removed: string[] }> = [];
-  for (let i = 0; i < files.length; i += batchFiles) out.push({ files: files.slice(i, i + batchFiles), removed: [] });
+  let cur: FileOut[] = [];
+  let bytes = 0;
+  for (const f of files) {
+    const size = JSON.stringify(f).length;
+    // Cut BEFORE adding when this file would overflow either budget, but never emit an
+    // empty batch: a single file over the byte budget still ships alone (the alternative
+    // is silently dropping it).
+    if (cur.length && (cur.length >= batchFiles || bytes + size > batchBytes)) { out.push({ files: cur, removed: [] }); cur = []; bytes = 0; }
+    cur.push(f); bytes += size;
+  }
+  if (cur.length) out.push({ files: cur, removed: [] });
   if (removed.length) { if (out.length) out[0].removed = removed; else out.push({ files: [], removed }); }
   return out;
 }
@@ -40,6 +57,9 @@ async function waitJob(request: RequestFn, jobId: string, pollMs: number, log: (
 
 export async function indexRepo(opts: IndexOptions): Promise<IndexSummary> {
   const log = opts.onProgress ?? (() => {});
+  // Long-lived hosts (MCP server, watch mode) index more than one repo per process, and
+  // tsconfigs change between runs - start every run from a cold tsconfig cache.
+  clearTsconfigCache();
   const repoPath = path.resolve(opts.repoPath);
   if (!fs.existsSync(repoPath)) throw new Error(`repoPath does not exist: ${repoPath}`);
   const repoName = path.basename(repoPath);
@@ -56,11 +76,16 @@ export async function indexRepo(opts: IndexOptions): Promise<IndexSummary> {
 
   log('walking repo...');
   const walked = await walkRepo(repoPath);
+  const extract = opts.extract ?? extractFile;
   const parsed: Array<{ walked: WalkedFile; ex: Extracted; source: string }> = [];
   for (const w of walked) {
     if (w.lang === 'other') continue;
-    const source = fs.readFileSync(w.abs, 'utf8');
-    try { parsed.push({ walked: w, ex: await extractFile(w.lang as Lang, source), source }); }
+    // Read INSIDE the try: an unreadable file is a per-file warning like a parse
+    // failure, never an aborted run.
+    try {
+      const source = fs.readFileSync(w.abs, 'utf8');
+      parsed.push({ walked: w, ex: await extract(w.lang as Lang, source), source });
+    }
     catch (e) { warnings.push(`parse failed ${w.path}: ${(e as Error).message}`); }
   }
   log(`parsed ${parsed.length}/${walked.length} files`);
@@ -68,7 +93,10 @@ export async function indexRepo(opts: IndexOptions): Promise<IndexSummary> {
 
   const manifest = (await opts.request('GET', `/kex/code/manifest?compilationId=${encodeURIComponent(compilationId)}`)) as { files?: Record<string, string> };
   const known = manifest.files ?? {};
-  const localPaths = new Set(parsed.map(p => p.walked.path));
+  // Presence on DISK decides what is "removed", not parse success: a file that failed to
+  // parse this run is still there, and reporting it as removed would make the server purge
+  // its symbols and edges.
+  const localPaths = new Set(walked.map(w => w.path));
   const changed = parsed.filter(p => opts.full || known[p.walked.path] !== p.walked.sha256);
   const removed = Object.keys(known).filter(k => !localPaths.has(k));
 
@@ -76,7 +104,7 @@ export async function indexRepo(opts: IndexOptions): Promise<IndexSummary> {
     const { symbols, edges } = fileOutputs(idx, p.walked.path);
     return { path: p.walked.path, sha256: p.walked.sha256, lang: p.walked.lang, symbols, edges, chunks: buildChunks(p.walked.path, p.source, p.ex.symbols) };
   });
-  const batches = makeBatches(files, removed, opts.batchFiles ?? 200);
+  const batches = makeBatches(files, removed, opts.batchFiles ?? 200, opts.batchBytes ?? MAX_BATCH_BYTES);
   const jobIds: string[] = [];
   let symbols = 0, edges = 0, chunks = 0;
   for (const [i, b] of batches.entries()) {

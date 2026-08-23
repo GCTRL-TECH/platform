@@ -5,13 +5,38 @@ import { fileURLToPath } from 'node:url';
 import { walkRepo } from '../src/walk.js';
 import { extractFile } from '../src/extract/engine.js';
 import { buildRepoIndex, fileOutputs, resolveImport } from '../src/resolve.js';
+import { clearTsconfigCache } from '../src/tsPaths.js';
+import { langForPath, type Lang } from '../src/parser.js';
+import type { EdgeOut, SymbolOut } from '../src/types.js';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 async function indexFixture(name: string) {
+  clearTsconfigCache();
   const walked = await walkRepo(path.join(here, 'fixtures', name));
   const files = [];
   for (const w of walked) if (w.lang !== 'other') files.push({ walked: w, ex: await extractFile(w.lang, fs.readFileSync(w.abs, 'utf8')) });
   return buildRepoIndex(files);
+}
+
+/** Index a handful of in-memory sources (real tree-sitter parse, no fixture dir). */
+async function indexSources(sources: Record<string, string>) {
+  const files = [];
+  for (const [p, src] of Object.entries(sources)) {
+    const lang = langForPath(p) as Lang;
+    files.push({ walked: { path: p, abs: p, size: src.length, sha256: 'x', lang }, ex: await extractFile(lang, src) });
+  }
+  return buildRepoIndex(files);
+}
+
+/** Structural invariant of every `fileOutputs` result: an edge may only reference symbols
+ * the same output actually declares (real or stub). A dangling head/tail becomes a phantom
+ * node server-side, which is how the rust cross-file `impl` bug showed up. */
+function expectEdgesGrounded(out: { symbols: SymbolOut[]; edges: EdgeOut[] }) {
+  const known = new Set(out.symbols.map(s => s.name));
+  for (const e of out.edges) {
+    expect(known, `head of ${e.type} ${e.head} -> ${e.tail}`).toContain(e.head);
+    expect(known, `tail of ${e.type} ${e.head} -> ${e.tail}`).toContain(e.tail);
+  }
 }
 
 describe('resolver', () => {
@@ -37,8 +62,10 @@ describe('resolver', () => {
       // INHERITS stub kind must come from a real lookup (Base is a class), not a hardcoded default
       expect.objectContaining({ name: 'pkg/b.py::Base', stub: true, kind: 'class' }),
     ]));
-    // never an edge to a non-existent target
-    expect(out.edges.every(e => e.type !== 'CALLS' || out.symbols.some(s => s.name === e.tail))).toBe(true);
+    // never an edge to a non-existent target — head AND tail, every edge type
+    expectEdgesGrounded(out);
+    expectEdgesGrounded(fileOutputs(idx, 'main.py'));
+    expectEdgesGrounded(fileOutputs(idx, 'pkg/b.py'));
   });
   it('typescript: relative imports with/without extension, namespace import calls', async () => {
     const idx = await indexFixture('ts');
@@ -68,6 +95,8 @@ describe('resolver', () => {
     expect(resolveImport('src/lib.rs', { module: 'util', names: [], alias: 'mod', line: 1 }, 'rust', idx)).toBe('src/util/mod.rs');
     expect(resolveImport('src/main.rs', { module: 'mylib::util', names: ['math'], line: 1 }, 'rust', idx)).toBe('src/util/math.rs');
     const out = fileOutputs(idx, 'src/main.rs');
+    expectEdgesGrounded(out);
+    expectEdgesGrounded(fileOutputs(idx, 'src/lib.rs'));
     const edges = out.edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
     expect(edges).toContain('CALLS src/main.rs::main -> src/lib.rs::Engine.new');
     expect(edges).toContain('CALLS src/main.rs::main -> src/util/math.rs::add');
@@ -197,5 +226,97 @@ describe('resolver', () => {
     ]);
     const out = fileOutputs(idx, 'a.ts');
     expect(out.edges.filter(e => e.type === 'CALLS')).toHaveLength(0);
+  });
+
+  it('INHERITS/IMPLEMENTS bare-name fallback is guarded and labeled heuristic (never confidence 1)', async () => {
+    // Cross-language: a python `class Config(BaseModel)` must not inherit from a rust
+    // `struct BaseModel` just because the name happens to be repo-wide unique.
+    const crossLang = await indexSources({
+      'types.rs': 'pub struct BaseModel { pub n: u32 }\n',
+      'conf.py': 'class Config(BaseModel):\n    pass\n',
+    });
+    const py = fileOutputs(crossLang, 'conf.py');
+    expect(py.edges.filter(e => e.type === 'INHERITS')).toHaveLength(0);
+    expectEdgesGrounded(py);
+
+    // Same language, unique class in another file, no import statement: still only a
+    // guess, so it lands at 0.4/heuristic instead of the old unguarded 1/syntax.
+    const sameLang = await indexSources({
+      'models.py': 'class BaseModel:\n    pass\n',
+      'conf.py': 'class Config(BaseModel):\n    pass\n',
+    });
+    const inh = fileOutputs(sameLang, 'conf.py').edges.filter(e => e.type === 'INHERITS');
+    expect(inh).toHaveLength(1);
+    expect(inh[0]).toMatchObject({ head: 'conf.py::Config', tail: 'models.py::BaseModel', confidence: 0.4, resolution: 'heuristic' });
+
+    // An import-resolved parent stays a syntax-grade fact at confidence 1.
+    const imported = await indexSources({
+      'models.py': 'class BaseModel:\n    pass\n',
+      'conf.py': 'from models import BaseModel\n\n\nclass Config(BaseModel):\n    pass\n',
+    });
+    const inh2 = fileOutputs(imported, 'conf.py').edges.filter(e => e.type === 'INHERITS');
+    expect(inh2[0]).toMatchObject({ tail: 'models.py::BaseModel', confidence: 1, resolution: 'syntax' });
+  });
+
+  it('rust cross-file `impl Type {}`: CONTAINS head is the real (stubbed) type, never a phantom local symbol', async () => {
+    const idx = await indexSources({
+      'a.rs': 'pub struct Engine { pub n: u32 }\n',
+      'b.rs': 'impl Engine {\n    pub fn run(&self) {}\n}\n',
+    });
+    const out = fileOutputs(idx, 'b.rs');
+    const contains = out.edges.filter(e => e.type === 'CONTAINS');
+    expect(contains).toContainEqual(expect.objectContaining({ head: 'a.rs::Engine', tail: 'b.rs::Engine.run' }));
+    expect(out.symbols).toContainEqual(expect.objectContaining({ name: 'a.rs::Engine', stub: true, kind: 'struct' }));
+    expectEdgesGrounded(out);
+  });
+
+  it('unresolvable `impl` target falls back to the file as the CONTAINS head', async () => {
+    // `Engine` is not local, not imported, and not repo-wide unique -> no head to point
+    // at, so the file owns the method rather than a symbol that does not exist.
+    const idx = await indexSources({
+      'a.rs': 'pub struct Engine { pub n: u32 }\n',
+      'c.rs': 'pub struct Engine { pub m: u32 }\n',
+      'b.rs': 'impl Engine {\n    pub fn run(&self) {}\n}\n',
+    });
+    const out = fileOutputs(idx, 'b.rs');
+    expect(out.edges).toContainEqual(expect.objectContaining({ type: 'CONTAINS', head: 'b.rs', tail: 'b.rs::Engine.run' }));
+    expectEdgesGrounded(out);
+  });
+
+  it('import aliases bind the alias to the original name (ts and python)', async () => {
+    const ts = await indexSources({
+      'util.ts': 'export function add(a: number, b: number): number { return a + b }\n',
+      'app.ts': "import { add as plus } from './util';\n\nexport function main() { plus(1, 2) }\n",
+    });
+    const tsEdges = fileOutputs(ts, 'app.ts').edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
+    expect(tsEdges).toContain('CALLS app.ts::main -> util.ts::add');
+
+    const py = await indexSources({
+      'pkg/__init__.py': '',
+      'pkg/b.py': 'def helper(v):\n    return v\n',
+      'pkg/a.py': 'from .b import helper as h\n\n\ndef go(x):\n    return h(x)\n',
+    });
+    const pyEdges = fileOutputs(py, 'pkg/a.py').edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
+    expect(pyEdges).toContain('CALLS pkg/a.py::go -> pkg/b.py::helper');
+  });
+
+  it('module-level calls are owned by the file symbol', async () => {
+    const idx = await indexSources({ 'x.py': 'def helper():\n    return 1\n\n\nhelper()\n' });
+    const out = fileOutputs(idx, 'x.py');
+    expect(out.edges.map(e => `${e.type} ${e.head} -> ${e.tail}`)).toContain('CALLS x.py -> x.py::helper');
+    expectEdgesGrounded(out);
+  });
+
+  it('tsconfig extends: baseUrl/paths resolve against the config that DECLARED them', async () => {
+    const idx = await indexFixture('ts-extends');
+    // Child declares neither: both inherited, and baseUrl "./src" is relative to the
+    // ROOT tsconfig.base.json, not to packages/app/.
+    expect(resolveImport('packages/app/src/app.ts', { module: '~shared/util', names: ['shared_add'], line: 1 }, 'typescript', idx))
+      .toBe('src/shared/util.ts');
+    // Child declares only `paths`; `baseUrl` still comes from the extends parent.
+    expect(resolveImport('packages/app2/src/app2.ts', { module: '@own/util', names: ['shared_add'], line: 1 }, 'typescript', idx))
+      .toBe('src/shared/util.ts');
+    const edges = fileOutputs(idx, 'packages/app/src/app.ts').edges.map(e => `${e.type} ${e.head} -> ${e.tail}`);
+    expect(edges).toContain('CALLS packages/app/src/app.ts::run -> src/shared/util.ts::shared_add');
   });
 });

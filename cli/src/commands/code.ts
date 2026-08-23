@@ -29,7 +29,7 @@ export function registerCode(program: Command): void {
           repoPath: path.resolve(repoPath), compilationId: opts.kb, full: opts.full, classificationLevelId: opts.classification,
           request, onProgress: (m) => { spinner.text = m },
         })
-        spinner.succeed(`${s.repo}: ${s.filesChanged}/${s.filesTotal} files uploaded, ${s.symbols} symbols, ${s.edges} edges, ${s.chunks} chunks -> KB ${chalk.cyan(s.compilationId)}`)
+        spinner.succeed(`${s.repo}: ${s.filesChanged}/${s.filesTotal} code files uploaded, ${s.symbols} symbols, ${s.edges} edges, ${s.chunks} chunks -> KB ${chalk.cyan(s.compilationId)}`)
         if (s.warnings.length) console.log(chalk.yellow('Warnings: ' + s.warnings.join('; ')))
       } catch (err) {
         spinner.fail(formatError(err))
@@ -46,7 +46,7 @@ export function registerCode(program: Command): void {
         const { data } = await client.get(`/kex/code/manifest?compilationId=${encodeURIComponent(cid)}`)
         const m = data as { repo?: string; commit?: string | null; files?: Record<string, string> }
         const n = Object.keys(m.files ?? {}).length
-        console.log(`${chalk.bold(m.repo ?? '?')} @ ${m.commit ?? 'no commit'} - ${n} indexed files`)
+        console.log(`${chalk.bold(m.repo ?? '?')} @ ${m.commit ?? 'no commit'} - ${n} indexed code files`)
       } catch (err) {
         console.error(chalk.red(formatError(err)))
         process.exit(1)
