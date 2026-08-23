@@ -21,7 +21,23 @@ export const GENERIC_CALLEES = new Set([
   'sleep', 'wait', 'join', 'split', 'strip', 'trim', 'clone', 'copy', 'keys', 'values', 'items', 'insert',
   'index', 'iter', 'into', 'from', 'to', 'as', 'is', 'has', 'ok', 'err', 'unwrap', 'expect', 'default',
   'min', 'max', 'sum',
+  // Round 2: bare callback-parameter names (Promise executors, event emitters, iteratee
+  // callbacks) that collide with unrelated same-named methods elsewhere far too often to
+  // trust a repo-wide unique-name guess (e.g. `resolve(...)`/`reject(...)` inside a `new
+  // Promise((resolve, reject) => ...)` executor is never a call to some other file's
+  // `resolve` method).
+  'resolve', 'reject', 'callback', 'cb', 'done', 'next', 'then', 'catch', 'finally', 'emit', 'on', 'off', 'once',
 ]);
+
+/** Language "families" for the 0.4-tier same-language guard: a unique bare-name match is
+ * only trusted when the candidate symbol's file is written in the same family as the
+ * caller - a TS file calling a bare `login()` must never match a Rust `login` just
+ * because tree-sitter happened to give it a unique name repo-wide. */
+const LANG_FAMILY: Record<string, string> = {
+  typescript: 'ts', tsx: 'ts', javascript: 'ts',
+  python: 'python',
+  rust: 'rust',
+};
 
 export interface RepoIndex {
   files: Map<string, { walked: WalkedFile; ex: Extracted }>;
@@ -249,18 +265,30 @@ export function fileOutputs(idx: RepoIndex, p: string): { symbols: SymbolOut[]; 
     // never called via a receiver, so `foo.bar()` matching a unique bare *function*
     // `bar` would be a false positive (e.g. `logger.info(...)` must never match a
     // top-level `info` function, nor is `info` eligible at all: it's in the stop-list).
+    // Round 2 guards, both gated on the same `g.length === 1` unique-name candidate:
+    //  - same-language family: a TS caller must never match a Rust/Python candidate
+    //    just because the name happens to be repo-wide unique right now.
+    //  - external binding: a bare callee already bound to an import that resolved to
+    //    NO repo file (an external package, e.g. `createClient` from 'redis') must
+    //    never fall through to guessing some unrelated repo symbol of the same name.
     if (!tail) {
       const eligible = c.callee.length >= 4 && !GENERIC_CALLEES.has(c.callee);
       if (eligible) {
         const g = idx.byBareName.get(c.callee) ?? [];
         if (g.length === 1) {
-          if (!c.receiver) {
-            tail = g[0]; conf = 0.4;
-          } else {
-            const receiverBound = binding.has(c.receiver);
-            const receiverSpecial = c.receiver === 'self' || c.receiver === 'this' || c.receiver === 'super' || c.receiver === 'cls';
-            const candidateIsMethod = !!rawSymOf(g[0])?.parent;
-            if (!receiverBound && !receiverSpecial && candidateIsMethod) { tail = g[0]; conf = 0.4; }
+          const candidateLang = idx.files.get(g[0].split('::')[0])?.walked.lang;
+          const sameFamily = (LANG_FAMILY[lang] ?? lang) === (LANG_FAMILY[candidateLang ?? ''] ?? candidateLang);
+          if (sameFamily) {
+            if (!c.receiver) {
+              const calleeBinding = binding.get(c.callee);
+              const externallyBound = !!calleeBinding && calleeBinding.file === null;
+              if (!externallyBound) { tail = g[0]; conf = 0.4; }
+            } else {
+              const receiverBound = binding.has(c.receiver);
+              const receiverSpecial = c.receiver === 'self' || c.receiver === 'this' || c.receiver === 'super' || c.receiver === 'cls';
+              const candidateIsMethod = !!rawSymOf(g[0])?.parent;
+              if (!receiverBound && !receiverSpecial && candidateIsMethod) { tail = g[0]; conf = 0.4; }
+            }
           }
         }
       }

@@ -108,4 +108,35 @@ describe('resolver', () => {
     expect(callsEdges).toHaveLength(1);
     expect(callsEdges[0]).toMatchObject({ type: 'CALLS', head: 'b.py::run', tail: 'kg.py::KGBuilder.build_graph', confidence: 0.4 });
   });
+  it('round 2 guards: same-language family, external-binding block, extended stop-list', () => {
+    const rawSym = (kind: 'function' | 'method' | 'class', qualname: string, name = qualname, parent?: string) => ({
+      kind, qualname, name, line_start: 1, line_end: 2, signature: '', doc: '', exported: true, parent,
+    });
+    const walked = (p: string, lang: 'python' | 'typescript' | 'rust' = 'typescript') => ({ path: p, abs: p, sha256: 'x', lang, size: 0 });
+    const idx = buildRepoIndex([
+      // cross-language guard: a unique `login` lives in Rust; a TS file calls login() bare.
+      { walked: walked('auth.rs', 'rust'), ex: { symbols: [rawSym('function', 'login')], imports: [], calls: [], inherits: [], assigns: [] } },
+      // external-binding guard: `createClient` is both a real repo symbol (cli/api.ts) and
+      // imported from an external package ('redis') in the caller file below.
+      { walked: walked('cli/api.ts'), ex: { symbols: [rawSym('function', 'createClient')], imports: [], calls: [], inherits: [], assigns: [] } },
+      // stop-list: a unique `resolve` method elsewhere must never satisfy a bare
+      // `resolve(...)` Promise-executor-style call.
+      { walked: walked('promise-like.ts'), ex: { symbols: [rawSym('method', 'Deferred.resolve', 'resolve', 'Deferred')], imports: [], calls: [], inherits: [], assigns: [] } },
+      {
+        walked: walked('app.ts'),
+        ex: {
+          symbols: [rawSym('function', 'main')],
+          imports: [{ module: 'redis', names: ['createClient'], line: 1 }],
+          calls: [
+            { callee: 'login', inside: 'main', line: 1 },        // unique but cross-language (Rust) -> no edge
+            { callee: 'createClient', inside: 'main', line: 2 }, // bound to an unresolved external import -> no edge
+            { callee: 'resolve', inside: 'main', line: 3 },      // stop-list -> no edge
+          ],
+          inherits: [], assigns: [],
+        },
+      },
+    ]);
+    const out = fileOutputs(idx, 'app.ts');
+    expect(out.edges.filter(e => e.type === 'CALLS')).toHaveLength(0);
+  });
 });
