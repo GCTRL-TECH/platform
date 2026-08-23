@@ -43,16 +43,26 @@ def build_entities_relations(payload):
     repo_name = repo.get("name") or "repo"
     entities = []
     relations = []
-    seen = set()
+    by_key = {}
     keep = {}
 
     def add_entity(name, etype, props):
         key = (name, etype)
-        if key in seen:
+        existing = by_key.get(key)
+        if existing is not None:
+            # Merge, but never let a stub (no line_start) erase a real symbol's
+            # richer props that arrived earlier in the batch from another file.
+            ex_props = existing["props"]
+            if "line_start" in ex_props and "line_start" not in props:
+                return
+            for k, v in props.items():
+                if v is not None:
+                    ex_props[k] = v
             return
-        seen.add(key)
-        entities.append({"text": name, "type": etype, "coarse_type": CODE_COARSE,
-                         "label": etype, "props": props})
+        entity = {"text": name, "type": etype, "coarse_type": CODE_COARSE,
+                  "label": etype, "props": props}
+        by_key[key] = entity
+        entities.append(entity)
 
     # Repo node (one per batch; MERGE keeps it single per user+name).
     add_entity(repo_name, "repo", {

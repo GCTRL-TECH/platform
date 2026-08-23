@@ -191,6 +191,75 @@ class TestBuildEntitiesRelations:
         assert chunks[0]["chunk_sequence"] == 0 and chunks[0]["start_char"] == 0
         assert mentions[0][0]["text"] == "a.py::f" and mentions[0][0]["uri"].startswith("databorg:")
 
+    def test_real_symbol_props_win_over_earlier_stub(self):
+        from src.code_job import build_entities_relations
+        from src.kg_builder import entity_uri
+        payload = {
+            "job_id": "job-1", "user_id": "user-1", "compilation_id": "comp-1",
+            "repo": {"name": "demo", "root": "/r", "commit": "abc"},
+            "files": [
+                {
+                    "path": "a.py", "sha256": "aaa", "lang": "python",
+                    "symbols": [
+                        {"kind": "function", "name": "b.py::g", "stub": True, "file": "b.py"},
+                    ],
+                    "edges": [],
+                    "chunks": [],
+                },
+                {
+                    "path": "b.py", "sha256": "bbb", "lang": "python",
+                    "symbols": [
+                        {"kind": "function", "name": "b.py::g", "line_start": 3, "line_end": 5,
+                         "signature": "def g()", "exported": True},
+                    ],
+                    "edges": [],
+                    "chunks": [],
+                },
+            ],
+            "removed": [],
+        }
+        entities, relations, keep = build_entities_relations(payload)
+        by_name = {e["text"]: e for e in entities}
+        # single entity for the symbol, not two
+        assert sum(1 for e in entities if e["text"] == "b.py::g") == 1
+        g = by_name["b.py::g"]
+        assert g["props"]["line_start"] == 3
+        assert g["props"]["_file"] == "b.py"
+        # keep set: b.py owns the real symbol, a.py's stub does not claim it
+        assert entity_uri("user-1", "function", "b.py::g") in keep["b.py"]
+        assert entity_uri("user-1", "function", "b.py::g") not in keep.get("a.py", set())
+
+    def test_real_symbol_props_win_over_later_stub(self):
+        from src.code_job import build_entities_relations
+        payload = {
+            "job_id": "job-1", "user_id": "user-1", "compilation_id": "comp-1",
+            "repo": {"name": "demo", "root": "/r", "commit": "abc"},
+            "files": [
+                {
+                    "path": "b.py", "sha256": "bbb", "lang": "python",
+                    "symbols": [
+                        {"kind": "function", "name": "b.py::g", "line_start": 3, "line_end": 5,
+                         "signature": "def g()", "exported": True},
+                    ],
+                    "edges": [],
+                    "chunks": [],
+                },
+                {
+                    "path": "a.py", "sha256": "aaa", "lang": "python",
+                    "symbols": [
+                        {"kind": "function", "name": "b.py::g", "stub": True, "file": "b.py"},
+                    ],
+                    "edges": [],
+                    "chunks": [],
+                },
+            ],
+            "removed": [],
+        }
+        entities, relations, keep = build_entities_relations(payload)
+        by_name = {e["text"]: e for e in entities}
+        assert sum(1 for e in entities if e["text"] == "b.py::g") == 1
+        assert by_name["b.py::g"]["props"]["line_start"] == 3
+
 
 class TestRunCodeJob:
     def test_orchestrates_purge_write_chunks(self):
