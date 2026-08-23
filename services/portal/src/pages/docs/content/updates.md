@@ -9,7 +9,15 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 12511d1 -->
+<!-- baseline-sha: b0f53b3 -->
+
+## v0.9.0 - Your code becomes a knowledge base
+
+*23 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Point GCTRL at a repository and its structure becomes a knowledge base.** A new knowledge base type, CODE, holds files, classes, functions and methods as graph nodes, connected by CONTAINS, IMPORTS, CALLS, INHERITS and IMPLEMENTS edges, with one searchable chunk per symbol. Indexing runs wherever the code already lives: `gctrl code index <path>` from the CLI, `gctrl_code_index` from the MCP server, or a `gctrl-code` entry inside an Anvil agent. Python, TypeScript/JavaScript and Rust are parsed with tree-sitter, and re-indexing is incremental - only files whose content hash changed are uploaded, and files that were removed are cleaned up. Agents get four tools built on the graph: `code_symbol` (where is X defined), `code_trace` (who calls X, what does X call), `code_impact` (what breaks if these files change - run it before a refactor) and `code_architecture` (one call for languages, packages, hotspots and dead-code candidates). Decisions and notes can live in the same knowledge base as the symbols they concern, so the why and the where stay together. Measured on GCTRL's own repository (464 code files, 7,134 symbols, 9,080 edges): call-graph edges were 100% correct on 1,119 independently checked edges (cross-checked against the TypeScript compiler and by hand), every edge carries its own resolution quality (exact vs heuristic), and answering structural questions through the tools used 95.6% fewer tokens than grep-style exploration. Code knowledge bases file themselves under `Users/<name>/Code` automatically.
+- **Access tokens now have a dedicated switch for code.** Creating or editing an access token exposes a "Codebase access" toggle that decides whether that token can see code knowledge bases and use the code tools at all - off means no code tools, no code knowledge bases in any list or grant, no code chunks in search or chat answers, and no code writes or changes, for both scoped colleague tokens and full tokens. Existing tokens keep what they already had (the default is on); turn it off per token from the Access page.
+- **A dead container on gctrl.tech is gone for good.** A legacy standalone API container, left over from an older deployment path and silently recreated by every release since, had been restarting every few seconds for weeks without ever serving a request. It is removed, and the release pipeline no longer creates it. Builds are leaner too: build contexts no longer drag along multi-gigabyte local build artefacts.
 
 ## v0.8.8 - A new knowledge base starts empty, as it should
 
