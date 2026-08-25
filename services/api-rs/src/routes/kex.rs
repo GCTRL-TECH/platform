@@ -281,8 +281,8 @@ async fn extract(
 
     let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
-         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5, $6)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({
@@ -295,6 +295,7 @@ async fn extract(
     }))
     .bind(req.classification_level_id)
     .bind(source_document_id)
+    .bind(claims.api_key_id)
     .execute(&state.db).await?;
 
     // Record the spend locally so the heartbeat task can ship it upstream.
@@ -369,12 +370,13 @@ async fn ingest_repo(
     let job_id = Uuid::new_v4();
     let repo_name = req.repo_name.clone().unwrap_or_else(|| "repo".into());
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_extract', 'processing', $3, $4)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
+         VALUES ($1, $2, 'kex_extract', 'processing', $3, $4, $5)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({ "source": "repo", "repoName": repo_name, "fileCount": file_count }))
     .bind(req.classification_level_id)
+    .bind(claims.api_key_id)
     .execute(&state.db).await?;
 
     let url = format!("{}/repo", state.cfg.kex_worker_url.trim_end_matches('/'));
@@ -517,13 +519,14 @@ async fn enqueue_code_job(
 
     let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_code', 'pending', $3, $4)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
+         VALUES ($1, $2, 'kex_code', 'pending', $3, $4, $5)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({ "source": "code", "repoName": repo_name, "fileCount": files.len(),
                   "removedCount": removed.len(), "commit": repo["commit"] }))
     .bind(classification_level_id)
+    .bind(claims.api_key_id)
     .execute(&state.db).await?;
     record_usage(&state.db, claims.sub, "kex_code", 5, Some(job_id)).await;
     link_job_to_compilation(&state.db, claims.sub, compilation_id, job_id).await;
@@ -729,13 +732,14 @@ pub(crate) async fn submit_upload(
     let source_document_id = source_doc.as_ref().map(|d| d.id);
 
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
-         VALUES ($1, $2, 'kex_upload', 'pending', $3, $4, $5)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+         VALUES ($1, $2, 'kex_upload', 'pending', $3, $4, $5, $6)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({ "fileName": file_name, "ontologyId": resolved_ontology_id }))
     .bind(classification_level_id)
     .bind(source_document_id)
+    .bind(claims.api_key_id)
     .execute(&state.db).await?;
 
     record_usage(&state.db, claims.sub, "kex_upload", 5, Some(job_id)).await;

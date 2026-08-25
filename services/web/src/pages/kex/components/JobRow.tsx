@@ -23,6 +23,11 @@ export interface KexJob {
   }
   error?: string
   batchId?: string | null
+  /** Provenance (migration 081): name of the access token that triggered the
+   *  job. Null/absent for web-login (JWT) jobs → rendered as "Web-Login". */
+  tokenName?: string | null
+  /** Email of the user who owns the job. */
+  userEmail?: string | null
 }
 
 const STATUS_BADGE: Record<string, { className: string; label: string; dot: string }> = {
@@ -43,6 +48,20 @@ export function getJobName(job: KexJob): string {
   if (source) return `[${source}]`
   const t = (job.input['text'] as string) ?? ''
   return t.length > 40 ? t.slice(0, 40) + '...' : t || '—'
+}
+
+// Maps a job to a coarse German source-kind label for the provenance sub-line.
+// Order matters: upload is keyed on type, agent-store/repo on input.source, and
+// connectors on the job type prefix.
+export function getSourceKind(job: KexJob): string {
+  const type = job.type || ''
+  const source = (job.input?.['source'] as string | undefined) ?? ''
+  if (type === 'kex_upload') return 'Datei'
+  if (source === 'agent_store') return 'Agent-Store'
+  if (source === 'repo' || type.includes('repo')) return 'Repo'
+  const connectorTypes = ['kex_sharepoint', 'kex_obsidian', 'kex_connector', 'gmail', 'github', 'drive']
+  if (connectorTypes.some((c) => type.includes(c))) return 'Connector'
+  return 'Text'
 }
 
 function getJobEntities(job: KexJob): number | null {
@@ -82,6 +101,9 @@ export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProp
   const entities = getJobEntities(job)
   const duration = getJobDuration(job)
   const name = getJobName(job)
+  // Provenance sub-line: who triggered it (token name, else Web-Login) · source kind.
+  const trigger = job.tokenName || 'Web-Login'
+  const sourceKind = getSourceKind(job)
 
   return (
     <div
@@ -94,7 +116,10 @@ export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProp
       {/* Status dot */}
       <div className="flex items-center gap-2 min-w-0 flex-1">
         <div className={cn('h-2 w-2 shrink-0 rounded-full', badge.dot, isRunning && 'animate-pulse')} />
-        <span className="truncate text-xs text-slate-300 font-medium">{name}</span>
+        <div className="flex min-w-0 flex-col">
+          <span className="truncate text-xs text-slate-300 font-medium">{name}</span>
+          <span className="truncate text-[10px] text-slate-500">{trigger} · {sourceKind}</span>
+        </div>
       </div>
 
       {/* Status badge — fixed width */}
