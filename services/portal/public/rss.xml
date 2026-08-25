@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>How to Improve Basic FAISS RAG Pipeline Performance</title>
+      <link>https://gctrl.tech/blog/beyond-basic-faiss-optimizing-your-rag-retrieval-pipeline</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/beyond-basic-faiss-optimizing-your-rag-retrieval-pipeline</guid>
+      <description>Learn how to improve basic faiss rag pipeline results using recursive chunking, retrieval gates, and RAGAS evaluations to stop hallucinations.</description>
+      <pubDate>Tue, 25 Aug 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>Best Tools for LLM Product Analytics: Evals and Monitoring</title>
       <link>https://gctrl.tech/blog/llm-product-analytics-the-stack-for-evals-and-monitoring</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/llm-product-analytics-the-stack-for-evals-and-monitoring</guid>
