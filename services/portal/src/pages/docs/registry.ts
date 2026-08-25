@@ -46,6 +46,7 @@ export const DOC_GROUPS: DocGroup[] = [
       { slug: 'tech-cloaking', title: 'Cloaking - Private Memory for Cloud Models' },
       { slug: 'tech-sovereign', title: 'Sovereign & On-Prem' },
       { slug: 'tech-talk-to-graph', title: 'Talk to Graph - Grounded, GDPR-Compliant RAG' },
+      { slug: 'tech-code-brain', title: 'Codebase KB - Your Code Brain' },
       { slug: 'tech-memory-layer', title: 'Why a Memory Layer' },
     ],
   },

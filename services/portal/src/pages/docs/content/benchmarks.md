@@ -98,6 +98,21 @@ See **FAQ / Troubleshooting** for how to point GCTRL at your own vector store vi
 
 ---
 
+## Coding with the graph
+
+What a coding agent pays to answer structural questions about a repository through the Codebase KB versus grep-and-read, on the **same checkout** and the **same twelve questions** (where is X · who calls X · what does X call · what breaks if X changes · repository overview). Harness: `packages/code-indexer/bench/protocol-bench.mjs`; full method and per-question tables in `docs/code-kb-protocol-bench.md` of the platform repository.
+
+- **Graph side** = the tool calls the coding protocol prescribes (`code_symbol`, then `code_trace` / `code_impact`; both calls charged). Cost = bytes of tool results the model reads.
+- **Grep side** = `grep -rn <name>` over the source tree plus a **40-line window around every hit** (the definition for *where*, every hit for callers/impact - only reading a hit tells the agent whether it is a call, a comment or a string). Whole-file reads are deliberately not charged; the baseline is generous to grep.
+- Tokens at 4 bytes per token. An empty tool result counts as a wrong answer.
+
+| repository | language mix | graph tokens | grep tokens | saving | correct |
+|---|---|---:|---:|---:|---|
+| GCTRL platform (468 code files, 7,209 symbols) | Rust + TypeScript + Python | 7,699 | 132,981 | **94.2 %** | 12/12 |
+| Anvil (1,019 code files, 15,668 symbols) | TypeScript | 11,803 | 115,635 | **89.8 %** | 12/12 |
+
+With bare symbol names (one call instead of the two-call chain, server 0.9.2+): 94.9 % and 90.5 %, still 12/12. Call-graph correctness was measured separately on the platform repository: **100 % on 1,119 CALLS edges** cross-checked against the TypeScript compiler and an independent judge.
+
 ## Summary
 
 | Area | Result | Framing |
