@@ -56,35 +56,74 @@ function definitionFiles(name, grep) {
   }
   return [...files];
 }
+// A careful agent does not read whole files: it opens a WINDOW around each grep hit
+// (the definition, or every call site it has to inspect). 40 lines per window is what a
+// typical `Read` with offset/limit costs; the baseline is deliberately generous to grep.
+const WINDOW = 40;
+function windowBytes(file, line) {
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    const from = Math.max(0, line - 1 - WINDOW / 2), to = Math.min(lines.length, line - 1 + WINDOW / 2);
+    return Buffer.byteLength(lines.slice(from, to).join('\n'));
+  } catch { return 0; }
+}
 function grepAndRead(name) {
   const g = grepOut(name);
   const defs = definitionFiles(name, g);
-  // An agent reads the defining file(s) in full to understand the symbol; for "who calls X"
-  // it additionally opens every file grep hit (that is the honest cost of grep for callers).
-  const fileBytes = defs.reduce((n, f) => n + (fs.existsSync(f) ? fs.statSync(f).size : 0), 0);
-  const hitFiles = new Set(g.split('\n').map(l => l.split(':')[0]).filter(Boolean));
-  const hitBytes = [...hitFiles].reduce((n, f) => n + (fs.existsSync(f) ? fs.statSync(f).size : 0), 0);
-  return { grepBytes: Buffer.byteLength(g), defFiles: defs.map(f => path.relative(repo, f)), defBytes: fileBytes, hitFiles: hitFiles.size, hitBytes };
+  const hits = g.split('\n').map(l => l.match(/^(.+?):(\d+):/)).filter(Boolean).map(m => ({ file: m[1], line: +m[2] }));
+  // "where is X": grep + a window around each definition.
+  const defBytes = hits.filter(h => defs.includes(h.file) && DEF_RE(name).test(g.split('\n').find(l => l.startsWith(`${h.file}:${h.line}:`)) ?? '')).reduce((n, h) => n + windowBytes(h.file, h.line), 0);
+  // "who calls X / what breaks": grep + a window around EVERY hit, because only reading the
+  // hit tells the agent whether it is a call, a definition, a comment or a string.
+  const hitBytes = hits.reduce((n, h) => n + windowBytes(h.file, h.line), 0);
+  return { grepBytes: Buffer.byteLength(g), defFiles: defs.map(f => path.relative(repo, f)), defBytes, hitFiles: new Set(hits.map(h => h.file)).size, hitBytes };
+}
+// "give me an overview": the cheapest grep-side equivalent is a listing of every source file.
+function listingBytes() {
+  let n = 0;
+  const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (EXCL.includes(e.name)) continue; const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/\.(ts|tsx|js|mjs|py|rs)$/.test(e.name)) n += Buffer.byteLength(path.relative(repo, p)) + 1; } };
+  walk(repo); return n;
 }
 
 // ── run ──────────────────────────────────────────────────────────────────────────────────
 const rows = [];
 for (const q of questions) {
-  const base = grepAndRead(q.symbol);
+  const base = q.kind === 'architecture' ? null : grepAndRead(q.symbol);
+  // The graph side follows the protocol: a structural question about X is code_symbol(X)
+  // first (which returns the exact graph name, e.g. "path/kg.rs::api_key_scope"), then the
+  // trace/impact call with that name. Both calls are charged. With --bare the second call
+  // uses the bare name the agent typed instead (servers >= 0.9.2 resolve it too).
   let graph; let calls = 0;
+  const resolve = async () => {
+    if (args.bare !== undefined) return { name: q.symbol, bytes: 0 };
+    const r = await tool('gctrl_code_symbol', { query: q.symbol, limit: 3 });
+    let name = q.symbol; try { name = JSON.parse(r.text).results?.[0]?.name ?? q.symbol; } catch {}
+    return { name, bytes: r.bytes };
+  };
   if (q.kind === 'where') { graph = await tool('gctrl_code_symbol', { query: q.symbol, limit: 5 }); calls = 1; }
-  else if (q.kind === 'callers') { graph = await tool('gctrl_code_trace', { symbol: q.symbol, direction: 'callers', depth: 1 }); calls = 1; }
-  else if (q.kind === 'callees') { graph = await tool('gctrl_code_trace', { symbol: q.symbol, direction: 'callees', depth: 1 }); calls = 1; }
-  else if (q.kind === 'impact') { graph = await tool('gctrl_code_impact', { changedSymbols: [q.symbol], depth: 2 }); calls = 1; }
+  else if (q.kind === 'callers' || q.kind === 'callees') {
+    const r = await resolve(); const t = await tool('gctrl_code_trace', { symbol: r.name, direction: q.kind, depth: 1 });
+    graph = { text: t.text, bytes: t.bytes + r.bytes }; calls = r.bytes ? 2 : 1;
+  }
+  else if (q.kind === 'impact') {
+    const r = await resolve(); const t = await tool('gctrl_code_impact', { changedSymbols: [r.name], depth: 2 });
+    graph = { text: t.text, bytes: t.bytes + r.bytes }; calls = r.bytes ? 2 : 1;
+  }
   else if (q.kind === 'architecture') { graph = await tool('gctrl_code_architecture', {}); calls = 1; }
-  // Correctness: the graph answer must name the defining file grep found (where/callers/callees/impact).
-  const defFile = base.defFiles[0] ? base.defFiles[0].replace(/\\/g, '/') : null;
-  const hit = q.kind === 'architecture' ? graph.bytes > 0 : (defFile ? graph.text.replace(/\\\\/g, '/').includes(defFile) || graph.text.includes(path.basename(defFile)) : null);
-  // grep cost: "where" = grep + defining files; callers/callees/impact = grep + every hit file
-  // (an agent has to open them to see whether the hit is a call); architecture = a tree walk
-  // approximated by every source file's first 40 lines is not modelled - counted as grep of the top-level.
-  const grepCost = q.kind === 'where' ? base.grepBytes + base.defBytes : q.kind === 'architecture' ? base.grepBytes : base.grepBytes + base.hitBytes;
-  rows.push({ id: q.id, kind: q.kind, symbol: q.symbol, graphCalls: calls, graphBytes: graph.bytes, graphTokens: T(graph.bytes), grepBytes: grepCost, grepTokens: T(grepCost), grepFiles: q.kind === 'where' ? base.defFiles.length : base.hitFiles, correct: hit, saving: grepCost ? +(1 - graph.bytes / grepCost).toFixed(3) : null });
+  // Correctness. where: the answer names the defining file grep found. callers/impact: the answer
+  // lists at least one caller and grep also found a call site outside the definition. callees:
+  // the answer is non-empty. architecture: non-empty. Empty results count as WRONG - a tool
+  // that answers nothing sends the agent back to grep, which is the cost we are measuring.
+  let parsed = null; try { parsed = JSON.parse(graph.text); } catch {}
+  const defFile = base?.defFiles[0] ? base.defFiles[0].replace(/\\/g, '/') : null;
+  let hit;
+  if (q.kind === 'architecture') hit = graph.bytes > 200;
+  else if (q.kind === 'where') hit = defFile ? base.defFiles.some(f => graph.text.replace(/\\\\/g, '/').includes(f.replace(/\\/g, '/'))) : null;
+  else if (q.kind === 'callers') hit = (parsed?.results?.length ?? 0) > 0;
+  else if (q.kind === 'callees') hit = (parsed?.results?.length ?? 0) > 0;
+  else if (q.kind === 'impact') hit = (parsed?.affectedCount ?? 0) > 0;
+  const grepCost = q.kind === 'where' ? base.grepBytes + base.defBytes : q.kind === 'architecture' ? listingBytes() : base.grepBytes + base.hitBytes;
+  rows.push({ id: q.id, kind: q.kind, symbol: q.symbol, graphCalls: calls, graphBytes: graph.bytes, graphTokens: T(graph.bytes), grepBytes: grepCost, grepTokens: T(grepCost), grepFiles: base ? (q.kind === 'where' ? base.defFiles.length : base.hitFiles) : null, correct: hit, saving: grepCost ? +(1 - graph.bytes / grepCost).toFixed(3) : null });
   console.error(`${q.id.padEnd(28)} ${q.kind.padEnd(12)} graph ${String(T(graph.bytes)).padStart(6)} tok | grep ${String(T(grepCost)).padStart(7)} tok | correct=${hit}`);
 }
 child.kill();

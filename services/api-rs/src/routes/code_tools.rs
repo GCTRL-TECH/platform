@@ -49,7 +49,7 @@ pub(crate) fn code_trace_cypher(sauth: &str, mauth: &str, direction: &str, depth
         _         => format!("(s)-[rs:CALLS*1..{depth}]-(m)"),
     };
     format!(
-        "MATCH (s:Entity {{name: $name}}) WHERE s.coarse_type = 'code' AND {sauth} AND coalesce(s._min_rank,0) <= $rank \
+        "MATCH (s:Entity) WHERE s.coarse_type = 'code' AND (s.name = $name OR s.name ENDS WITH ('::' + $name)) AND {sauth} AND coalesce(s._min_rank,0) <= $rank \
          MATCH p = {pattern} WHERE {mauth} AND coalesce(m._min_rank,0) <= $rank \
          WITH m, p, size(rs) AS hops, \
               [r IN rs | coalesce(r.confidence,1.0)] AS confs, \
@@ -234,7 +234,7 @@ pub(crate) async fn execute(
 pub(crate) fn code_impact_cypher(auth: &str, mauth: &str, depth: i64) -> String {
     format!(
         "MATCH (n:Entity) WHERE n.coarse_type = 'code' AND {auth} AND coalesce(n._min_rank,0) <= $rank \
-           AND (n._file IN $files OR n.name IN $symbols) \
+           AND (n._file IN $files OR n.name IN $symbols OR any(sym IN $symbols WHERE n.name ENDS WITH ('::' + sym))) \
          OPTIONAL MATCH (n)<-[rs:CALLS*1..{depth}]-(m) \
            WHERE {mauth} AND coalesce(m._min_rank,0) <= $rank \
          WITH n, m, min(CASE WHEN m IS NULL THEN 0 ELSE size(rs) END) AS hops \
@@ -412,6 +412,20 @@ mod tests {
         assert_eq!(MAX_TRACE_DEPTH_BOTH, 3);
         assert!(code_trace_cypher("(s._owner = $uid)", "(m._owner = $uid)", "both", MAX_TRACE_DEPTH_BOTH)
             .contains("-[rs:CALLS*1..3]-"));
+    }
+
+    /// Symbol names in the graph are file-scoped ("path/kg.rs::api_key_scope") while an
+    /// agent types the bare name it read in the code. Before this, `code_trace` and
+    /// `code_impact` with a bare name returned an EMPTY result - which reads as "no callers",
+    /// the most dangerous wrong answer before a refactor - and sent the agent back to grep
+    /// (measured in the protocol bench: 0/7 trace/impact questions answered). Both cyphers
+    /// must accept the exact name AND the bare `::name` suffix.
+    #[test]
+    fn trace_and_impact_resolve_bare_symbol_names() {
+        let t = code_trace_cypher("(s._owner = $uid)", "(m._owner = $uid)", "callers", 1);
+        assert!(t.contains("s.name = $name OR s.name ENDS WITH ('::' + $name)"));
+        let i = code_impact_cypher("(n._owner = $uid)", "(m._owner = $uid)", 2);
+        assert!(i.contains("any(sym IN $symbols WHERE n.name ENDS WITH ('::' + sym))"));
     }
 
     #[test]

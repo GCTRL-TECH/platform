@@ -1,0 +1,14 @@
+[
+  { "id": "where-createKnowledgeBase",        "kind": "where",        "symbol": "createKnowledgeBase" },
+  { "id": "where-ensureUserGctrlMcpConfig",   "kind": "where",        "symbol": "ensureUserGctrlMcpConfig" },
+  { "id": "where-provisionProjectGraph",      "kind": "where",        "symbol": "provisionProjectGraph" },
+  { "id": "where-placementSegments",          "kind": "where",        "symbol": "placementSegments" },
+  { "id": "callers-createKnowledgeBase",      "kind": "callers",      "symbol": "createKnowledgeBase" },
+  { "id": "callers-ensureUserGctrlMcpConfig", "kind": "callers",      "symbol": "ensureUserGctrlMcpConfig" },
+  { "id": "callers-gctrlFetch",               "kind": "callers",      "symbol": "gctrlFetch" },
+  { "id": "callees-provisionProjectGraph",    "kind": "callees",      "symbol": "provisionProjectGraphOnce" },
+  { "id": "callees-ensureProjectGraphKey",    "kind": "callees",      "symbol": "ensureProjectGraphKey" },
+  { "id": "impact-placementSegments",         "kind": "impact",       "symbol": "placementSegments" },
+  { "id": "impact-getUserGctrlToken",         "kind": "impact",       "symbol": "getUserGctrlToken" },
+  { "id": "architecture",                     "kind": "architecture", "symbol": "" }
+]
