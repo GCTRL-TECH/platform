@@ -210,10 +210,20 @@ async function appendJobToCompilation(compilationId: string, jobId: string): Pro
 
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
+// The coding protocol every GCTRL-connected agent follows when it works in a repository.
+// One CODE knowledge base per repository, kept current, queried BEFORE files are read:
+// structural questions answered from the graph cost a fraction of grep-and-read (95.6 %
+// fewer tokens on GCTRL's own repo), and decisions stored next to the symbols they concern
+// are found by the next session instead of being rediscovered. Mirrored verbatim in the
+// served skill (GET /api/agent/skill.md) - keep the two in step.
+const CODING_PROTOCOL =
+  "CODING WITH GCTRL (whenever you work in a repository): (1) Make sure the repo is indexed: gctrl_code_index({repoPath}) once per session — incremental, seconds after the first run; omit compilationId unless one is pinned for you (GCTRL_CODE_COMPILATION_ID / your project context), the graph files itself under Users/<you>/Code or the project's Code folder. (2) Navigate through the graph BEFORE opening files: gctrl_code_symbol for 'where is X / what is X', gctrl_code_trace for 'who calls X / what does X call', gctrl_code_architecture for a repo overview — then read ONLY the file ranges the tools point to. Do not grep or read whole trees for questions the graph answers. (3) Before changing a function, file or API run gctrl_code_impact({changedSymbols|changedFiles}) and handle every caller it lists. (4) After a larger edit or commit run gctrl_code_index again so the graph matches the code. (5) Knowledge and code together: gctrl_query blends decisions, docs and code chunks — ask it for the WHY, the code tools for the WHERE. (6) Write decisions, conventions and gotchas about the code back with gctrl_store into the repo's CODE knowledge base, naming symbols exactly, so the next session inherits them.";
+
 // Surfaced to the connecting model by MCP clients: how to use the memory layers
 // and the write-back discipline (the point of GCTRL).
 const GCTRL_INSTRUCTIONS =
-  "GCTRL is your long-term memory. ON FIRST CONNECTION run a one-time setup: call gctrl_get_dossier('GCTRL Agent Setup') — if absent, ask the user (one message) which knowledge base to use, whether you're a cloud or local model, and whether to cloak entities for cloud models (recommend gctrl_set_privacy_mode(cloaked) when you're a cloud model), how eagerly to remember, and whether to auto-ingest dropped files; then gctrl_store those preferences with title 'GCTRL Agent Setup' so you never ask again. READ the right layer (gctrl_get_dossier = HOT/authoritative — state it, don't hedge; gctrl_query = blended answer; gctrl_search_entities/get_neighbors/shortest_path = graph; gctrl_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via gctrl_list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call gctrl_list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with gctrl_ingest_file (PDF/DOCX/binary) or gctrl_store/gctrl_extract (text), then retrieve with gctrl_search_chunks or gctrl_query.";
+  "GCTRL is your long-term memory. ON FIRST CONNECTION run a one-time setup: call gctrl_get_dossier('GCTRL Agent Setup') — if absent, ask the user (one message) which knowledge base to use, whether you're a cloud or local model, and whether to cloak entities for cloud models (recommend gctrl_set_privacy_mode(cloaked) when you're a cloud model), how eagerly to remember, and whether to auto-ingest dropped files; then gctrl_store those preferences with title 'GCTRL Agent Setup' so you never ask again. READ the right layer (gctrl_get_dossier = HOT/authoritative — state it, don't hedge; gctrl_query = blended answer; gctrl_search_entities/get_neighbors/shortest_path = graph; gctrl_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with gctrl_store/gctrl_extract into your assigned compilationId (find it via gctrl_list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call gctrl_list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with gctrl_ingest_file (PDF/DOCX/binary) or gctrl_store/gctrl_extract (text), then retrieve with gctrl_search_chunks or gctrl_query. " +
+  CODING_PROTOCOL;
 
 const server = new McpServer(
   {
@@ -1288,6 +1298,50 @@ async function registerRemoteTools(): Promise<void> {
   console.error(`[GCTRL MCP] Remote mode: proxying ${(listed.tools ?? []).length} tools to ${GATEWAY_URL}`);
 }
 
+/**
+ * GCTRL_CODE_AUTO_INDEX: make the Codebase KB automatic instead of a habit the agent has to
+ * remember. Set it to a repository path, or to `cwd` for the directory the MCP client
+ * launched this server in (Claude Code / Cursor start it inside the project). The repo is
+ * indexed in the background right after the server is up - incremental, so a warm repo
+ * costs seconds - and the agent's first gctrl_code_symbol already hits a current graph.
+ * Failures are logged, never fatal: a missing indexer or an unreachable server must not
+ * take the knowledge tools down with it. Skipped in gateway mode (nothing local to index).
+ */
+async function autoIndexOnStartup(): Promise<void> {
+  const setting = (process.env['GCTRL_CODE_AUTO_INDEX'] ?? '').trim();
+  if (!setting || GATEWAY_URL) return;
+  const repoPath = setting === 'cwd' || setting === '1' || setting === 'true' ? process.cwd() : setting;
+  if (!fs.existsSync(nodePath.join(repoPath, '.git'))) {
+    console.error(`[GCTRL MCP] auto-index: ${repoPath} is not a git repository - skipped`);
+    return;
+  }
+  const indexer = await loadCodeIndexer();
+  if (!indexer) { console.error(`[GCTRL MCP] auto-index: ${CODE_INDEXER_MISSING}`); return; }
+  try {
+    const target = codeIndexTarget(undefined, process.env);
+    let compilationId = target.compilationId;
+    if (!compilationId && target.folderPath) {
+      const repoName = nodePath.basename(nodePath.resolve(repoPath));
+      const created = (await apiCall('POST', '/kg/compilations', {
+        name: `${repoName} (code)`, type: 'CODE', folderPath: target.folderPath,
+        description: `Codebase KB for ${repoName}`,
+      })) as { id?: string };
+      compilationId = created?.id;
+    }
+    const s = await indexer.indexRepo({
+      repoPath, compilationId,
+      request: (method, p, body) => apiCall(method, p, body),
+      onProgress: (m) => console.error(`[GCTRL MCP] auto-index: ${m}`),
+    });
+    console.error(
+      `[GCTRL MCP] auto-index: ${s.repo} -> CODE compilation ${s.compilationId} ` +
+        `(${s.filesChanged}/${s.filesTotal} files changed, ${s.symbols} symbols)`,
+    );
+  } catch (err) {
+    console.error(`[GCTRL MCP] auto-index failed for ${repoPath}: ${(err as Error).message}`);
+  }
+}
+
 async function main() {
   if (GATEWAY_URL) {
     // The filter only ever applied to the LOCAL tool registrations; in gateway mode
@@ -1306,6 +1360,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[GCTRL MCP] Server running on stdio');
+  void autoIndexOnStartup();
   if (GATEWAY_URL) {
     console.error(`[GCTRL MCP] Remote mode active — bridging to gateway ${GATEWAY_URL}`);
   } else {

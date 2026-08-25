@@ -93,6 +93,27 @@ TASK LOOP
   4. Write conclusions back → store / correct / add_relationships / pin_dossier
 ```
 
+## Rule 3 - Code is knowledge: the coding protocol
+
+A repository becomes a Codebase KB (a compilation of type CODE: files, classes, functions and methods with CONTAINS / IMPORTS / CALLS / INHERITS edges, one embedded chunk per symbol). The skill makes every connected agent work through that graph instead of grepping - on GCTRL's own repository that cost 95.6 % fewer tokens for structural questions.
+
+```text
+CODING LOOP (whenever the agent works in a repository)
+  1. Index once per session      → gctrl_code_index(repoPath)   incremental, seconds when warm;
+                                    hosts with GCTRL_CODE_AUTO_INDEX do this at start-up
+  2. Navigate BEFORE reading     → code_symbol (where is X) · code_trace (who calls X)
+                                    · code_architecture (overview) → read only those ranges
+  3. Before changing a symbol    → code_impact, handle every caller it lists
+  4. After larger edits          → gctrl_code_index again
+  5. Why vs where                → query blends decisions, docs and code chunks (the WHY);
+                                    the code tools answer the WHERE
+  6. Write back                  → store decisions and gotchas into the repo's CODE KB,
+                                    naming symbols exactly
+```
+
+- **Automatic for every token.** A token with Codebase access (the default) may create the code graph of the repository it indexes - a KB-scoped colleague token included; the graph is granted onto that token at once and filed under `Users/<name>/Code` (or a project's `Code` folder). Nothing for an administrator to prepare.
+- **Set it up in one command.** `gctrl init` in the repository writes the MCP config with the gateway entry plus a `gctrl-code` stdio entry that indexes the repository when the agent starts; the Access page shows the same two-entry config for copy-paste.
+
 ## Scoped-token awareness
 
 An agent **only sees the knowledge bases it is granted** by its scoped token (`GCTRL_API_TOKEN`). The skill makes the agent aware of this:

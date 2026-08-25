@@ -17,7 +17,7 @@ A GCTRL knowledge base is connected over MCP — the user's persistent memory ab
 3. `gctrl_query` (question) — blended answer for open questions.
 4. Only if needed: `search_chunks` (raw evidence), `gctrl_get_neighbors` depth 1 / `gctrl_shortest_path` (relations), `get_entity` (provenance).
 5. `gctrl_wiki_page` — curated prose.
-6. Code questions (indexed repo): `gctrl_code_symbol` → `gctrl_code_trace` → `gctrl_code_impact` before refactors; `gctrl_code_architecture` for an overview.
+6. Coding in a repository: index it once per session (`gctrl_code_index(repoPath)`, incremental, files itself under Users/<you>/Code); then `gctrl_code_symbol` (where is X) → `gctrl_code_trace` (who calls X) → `gctrl_code_architecture` (overview) BEFORE reading files - read only the ranges they point to, never grep whole trees; `gctrl_code_impact` before changing a symbol; re-index after larger edits; `gctrl_query` for the WHY, code tools for the WHERE.
 
 Never bulk-dump with `get_graph` unprompted; keep default limits; never re-fetch what you already have; summarize chunk sets instead of pasting them. Max ~3 read calls per question.
 

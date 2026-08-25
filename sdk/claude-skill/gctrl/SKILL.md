@@ -6,7 +6,7 @@ description: Use the connected GCTRL knowledge base as long-term memory over MCP
 <!-- Source of truth: services/api-rs/src/routes/agent.rs MEMORY_SKILL_MD. Keep in sync. -->
 
 # GCTRL Knowledge & Memory — Agent Skill
-<!-- gctrl-skill-v5 -->
+<!-- gctrl-skill-v6 -->
 
 You are connected to GCTRL, a graph-native long-term memory. Use it as your persistent second brain: read the right layer, and **always write your conclusions back** so every future session inherits them. That write-back habit is the whole point — it turns GCTRL into compounding memory instead of starting cold each time.
 
@@ -46,14 +46,20 @@ If a task needs RAG, vector search, document Q&A, a knowledge base, or semantic 
 - Entity-centric answers → `get_dossier` / `search_entities`
 - Persist conclusions → `store`
 
-Worked example — ingest a PDF and answer with citations: `ingest_file({fileName, contentBase64})` → poll `list_extractions` until that job is `completed` → `search_chunks({query})` → answer, citing the returned passages (never say "refer to the file" — the passages ARE the document).
+Worked example — ingest a PDF and answer with citations: `ingest_file({fileName, contentBase64})` → poll `list_extractions` until that job is `completed` (or `completed_degraded` — finished, but a phase was skipped: report its `degradedReason` instead of claiming a clean import) → `search_chunks({query})` → answer, citing the returned passages (never say "refer to the file" — the passages ARE the document).
 
 ## Codebase KBs — code is knowledge too
-A Codebase KB is a compilation of type CODE holding one repository's structure graph (files, classes, functions, methods; CONTAINS / IMPORTS / CALLS / INHERITS) plus one embedded chunk per symbol. It lives in the SAME graph as your project knowledge, so decisions and facts can link to the functions they concern.
-- **Structural questions go to the code tools, not to grep cascades**: `code_symbol(query)` (where is X, signature, line range, caller/callee counts) → `code_trace(symbol, callers|callees, depth)` (who calls X / what does X call) → `code_impact(changedFiles|changedSymbols)` (what breaks if I change this — run it BEFORE refactors) → `code_architecture(compilationId)` (one-call overview: languages, packages, hotspots, dead-code candidates). Semantic code search: `search_chunks` on the code KB.
-- **Indexing**: one CODE compilation per repo, filed under `Projects/<Kunde>/<Repo>` (or `Users/<name>/<Repo>` for personal code; default folder Users/<name>/Code unless you pass folderPath). Index with `gctrl_code_index(repoPath, compilationId)` — available in the stdio MCP server / CLI (`gctrl code index`) / Anvil's `gctrl-code` server because it must run where the code lives. Re-run after larger edits; it is incremental (content hashes) and cheap. `ingest_repo` is the legacy Python-only path — do not use it for new work.
+A Codebase KB is a compilation of type CODE holding one repository's structure graph (files, classes, functions, methods; CONTAINS / IMPORTS / CALLS / INHERITS) plus one embedded chunk per symbol. It lives in the SAME graph as your project knowledge, so decisions and facts can link to the functions they concern. Measured on GCTRL's own repository: structural questions answered through the graph cost 95.6 % fewer tokens than grep-and-read.
+
+**The coding protocol — follow it whenever you work in a repository:**
+1. **Index once per session**: `gctrl_code_index(repoPath)` from the stdio MCP server (or `gctrl code index <path>` from the CLI) — it must run where the code lives, and it is incremental: seconds after the first run. Omit `compilationId` unless one is pinned for you (`GCTRL_CODE_COMPILATION_ID`, your project context): the graph files itself under `Users/<you>/Code` or the project's `Code` folder, one CODE compilation per repository. A scoped token with Codebase access may create its own code graph and is granted it automatically. Hosts that set `GCTRL_CODE_AUTO_INDEX` index for you at start-up. `ingest_repo` is legacy — do not use it.
+2. **Navigate through the graph BEFORE opening files**: `code_symbol(query)` for "where is X / what is X" (file, line range, signature, caller/callee counts) → `code_trace(symbol, callers|callees, depth)` for "who calls X / what does X call" → `code_architecture(compilationId)` for a repo overview (languages, packages, hotspots, dead-code candidates). Then read ONLY the file ranges the tools point to. Do not grep or read whole trees for questions the graph answers; semantic code search is `search_chunks` on the code KB.
+3. **Before changing a function, file or API**: `code_impact(changedSymbols|changedFiles)` and handle every caller it lists.
+4. **After a larger edit or commit**: `gctrl_code_index` again so the graph matches the code.
+5. **Knowledge and code together**: `query` blends decisions, docs and code chunks — ask it for the WHY, the code tools for the WHERE.
+6. **Write-back**: architecture decisions, conventions and gotchas about a symbol go via `store(text, compilationId)` into the SAME code KB, naming the symbol exactly as `code_symbol` returns it, so the decision and the function are linked. Do not keep ADRs in some other tool.
+
 - **Edge quality is visible**: every CALLS hop carries `resolution` (syntax/lsp = exact, heuristic = name-based, 0.6) — say so when you answer from heuristic edges.
-- **Write-back**: architecture decisions, gotchas and learnings about a symbol go via `store(text, compilationId)` into the SAME code KB, naming the symbol exactly as `code_symbol` returns it, so the decision and the function are linked. Do not keep ADRs in some other tool.
 - **Tool budget**: quick question = 1 `code_symbol` + at most 1 `code_trace`; audit / refactor = `code_architecture` + `code_impact`, then paginate `code_symbol` (offset) only for the files it flagged.
 
 ## Your access is scoped

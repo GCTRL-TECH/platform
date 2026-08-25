@@ -63,6 +63,33 @@ official MCP Registry as `io.github.GCTRL-TECH/gctrl`. Add to your MCP client co
 
 Requires a running GCTRL harness ([get started](https://gctrl.tech)).
 
+### Coding with GCTRL (recommended for coding agents)
+
+Run the server in **direct mode** next to your gateway entry so the agent gets the local
+code tools, and let it keep the repository's Codebase KB current on its own:
+
+```json
+{
+  "mcpServers": {
+    "gctrl":      { "command": "npx", "args": ["-y", "gctrl-mcp"],
+                    "env": { "GCTRL_GATEWAY_URL": "https://<host>/api/agent/mcp", "GCTRL_API_TOKEN": "gctrl_..." } },
+    "gctrl-code": { "command": "npx", "args": ["-y", "gctrl-mcp"],
+                    "env": { "GCTRL_API_URL": "https://<host>/api", "GCTRL_API_TOKEN": "gctrl_...",
+                             "GCTRL_MCP_TOOLS": "code", "GCTRL_CODE_AUTO_INDEX": "cwd" } }
+  }
+}
+```
+
+With `GCTRL_CODE_AUTO_INDEX=cwd` the server indexes the directory the MCP client launched it
+in (incremental - a warm repo takes seconds) right after start-up, and the agent's first
+`gctrl_code_symbol` hits a current graph. The server's instructions carry the coding
+protocol every connected agent follows: index once per session, navigate through
+`gctrl_code_symbol` / `gctrl_code_trace` / `gctrl_code_architecture` BEFORE reading files,
+run `gctrl_code_impact` before changing a symbol, re-index after larger edits, ask
+`gctrl_query` for the why and store decisions next to the symbols with `gctrl_store`.
+Measured on GCTRL's own repository: structural questions answered through the graph used
+95.6 % fewer tokens than grep-and-read.
+
 ### Configuration
 
 | Env var | Purpose |
@@ -71,6 +98,10 @@ Requires a running GCTRL harness ([get started](https://gctrl.tech)).
 | `GCTRL_API_URL` | Alternative direct mode: GCTRL API base URL (`http://<host>:4000/api`); tools run locally against the API. |
 | `GCTRL_API_TOKEN` | Scoped GCTRL Access Token (`gctrl_…`), created in **Settings → Access Control** with a clearance level + per-graph grants. Least privilege — the agent sees exactly what the token is cleared for. |
 | `GCTRL_MCP_TOOLS` | Optional tool-set filter. Set to `code` to register only the local code tools (`gctrl_code_index`, `gctrl_code_symbol`, `gctrl_code_trace`, `gctrl_code_impact`, `gctrl_code_architecture`) — used for the Anvil/Hermes `gctrl-code` stdio entry, kept separate from the HTTP-gateway `gctrl`/`gctrl-projekt` entries. Direct mode only: in gateway mode the gateway's own tool list is proxied verbatim, so the filter has no effect and the server says so on startup. |
+
+| `GCTRL_CODE_AUTO_INDEX` | Direct mode: `cwd` (or a repository path) indexes that repository in the background right after start-up - incremental, never fatal. Makes the Codebase KB automatic instead of a habit. |
+| `GCTRL_CODE_COMPILATION_ID` | Direct mode: the CODE compilation `gctrl_code_index` uses when the agent passes none (one project = one repo = one code graph). An explicit `compilationId` from the agent still wins. |
+| `GCTRL_CODE_FOLDER` | Direct mode: folder path (`Users/<name>/Code`) for a code graph the server auto-creates as `<repo> (code)`. Hosts that launch the server per user (Anvil) set it so every colleague's code lands in their own folder; without it GCTRL files under the account owner's `Users/<owner>/Code`. |
 
 Dev-only fallback: `GCTRL_EMAIL` + `GCTRL_PASSWORD` (full-clearance JWT). Avoid in production.
 

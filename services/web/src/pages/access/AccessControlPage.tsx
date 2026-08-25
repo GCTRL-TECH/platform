@@ -530,6 +530,11 @@ function AgentSnippet({ token }: { token: string }) {
   // Recommended: zero-install remote HTTP-MCP — point any agent harness (Claude
   // Code, Cursor, OpenClaw, Codex …) at the GCTRL gateway with this scoped token.
   // The agent sees ONLY what the token is cleared & scoped for. No local build.
+  // The second entry is what makes the Codebase KB automatic for a coding agent: the
+  // published stdio server runs next to the gateway entry, filtered to the code tools,
+  // and indexes the repository it was started in (incremental) so the agent's first
+  // code_symbol already hits a current graph. Indexing has to run where the code is -
+  // the gateway cannot do it.
   const remote = JSON.stringify({
     mcpServers: {
       gctrl: {
@@ -537,16 +542,26 @@ function AgentSnippet({ token }: { token: string }) {
         url: `${origin}/api/agent/mcp`,
         headers: { Authorization: `ApiKey ${token}` },
       },
+      'gctrl-code': {
+        command: 'npx',
+        args: ['-y', 'gctrl-mcp'],
+        env: {
+          GCTRL_API_URL: `${origin}/api`,
+          GCTRL_API_TOKEN: token,
+          GCTRL_MCP_TOOLS: 'code',
+          GCTRL_CODE_AUTO_INDEX: 'cwd',
+        },
+      },
     },
   }, null, 2)
 
-  // Fallback: run the bundled MCP server locally (stdio transport).
+  // Fallback: run the bundled MCP server locally for everything (stdio transport).
   const local = JSON.stringify({
     mcpServers: {
       gctrl: {
-        command: 'node',
-        args: ['/path/to/gctrl/services/mcp/dist/index.js'],
-        env: { GCTRL_API_URL: `${origin}/api`, GCTRL_API_TOKEN: token },
+        command: 'npx',
+        args: ['-y', 'gctrl-mcp'],
+        env: { GCTRL_API_URL: `${origin}/api`, GCTRL_API_TOKEN: token, GCTRL_CODE_AUTO_INDEX: 'cwd' },
       },
     },
   }, null, 2)
@@ -572,11 +587,16 @@ function AgentSnippet({ token }: { token: string }) {
           Remote MCP over HTTP — works in Claude Code, Cursor, OpenClaw, Codex and any MCP client. The agent
           authenticates as this token, seeing exactly its clearance + knowledge-base scope and nothing more.
           Requires the gateway to be enabled (<code className="text-slate-400">GCTRL_AGENT_GATEWAY_ENABLED=true</code>).
+          The <code className="text-slate-400">gctrl-code</code> entry adds the Codebase KB: it indexes the repository
+          the agent is started in (incremental, a warm repo takes seconds) into <span className="text-slate-300">Users/&lt;you&gt;/Code</span>,
+          and the agent answers &quot;where is X / who calls X / what breaks&quot; from the graph instead of grepping —
+          measured at 95.6&nbsp;% fewer tokens on GCTRL&apos;s own repository. Needs Node.js; drop the entry if this token
+          should not index code.
         </p>
       </div>
 
       <details className="text-[10px] text-slate-500">
-        <summary className="cursor-pointer text-slate-400">Prefer a local MCP server (stdio)?</summary>
+        <summary className="cursor-pointer text-slate-400">Prefer a single local MCP server (stdio)?</summary>
         <div className="relative mt-1.5">
           <pre className="max-h-52 overflow-auto rounded bg-slate-950 p-3 text-[10px] leading-relaxed text-slate-300"><code>{local}</code></pre>
           <button onClick={() => copy('local', local)}

@@ -930,12 +930,6 @@ async fn create(
     State(state): State<Arc<crate::models::AppState>>,
     Json(req): Json<CreateComp>,
 ) -> Result<Json<Value>> {
-    // A KB-scoped token writes only into its assigned KB(s); creating a brand-new
-    // knowledge base is an owner action (mirrors the agent-surface block).
-    if api_key_scope(&state.db, &claims).await.is_some() {
-        return Err(AppError::Forbidden(
-            "This access token is scoped to specific knowledge bases and cannot create new ones".into()));
-    }
     // Normalise the requested compilation type. Anything other than an explicit
     // "WIKI" (case-insensitive) is treated as the default RAW.
     let comp_type = match req.comp_type.as_deref().map(|s| s.trim().to_uppercase()) {
@@ -949,11 +943,13 @@ async fn create(
             )));
         }
     };
-    // Migration 078 - a token without Codebase access may not create a CODE
-    // knowledge base either (it would be invisible to itself the moment it existed).
-    if comp_type == "CODE" && !claims.code_access {
-        return Err(AppError::Forbidden(
-            "This access token has Codebase access disabled - code knowledge bases cannot be created".into()));
+    // Who may create what: an owner anything; a KB-scoped token only a CODE knowledge
+    // base, and only with Codebase access (see `create_permission`). The new CODE
+    // graph is granted onto the creating key below, so the scoped agent that indexed
+    // the repository can read it back at once.
+    let scoped = api_key_scope(&state.db, &claims).await.is_some();
+    if let Err(msg) = create_permission(scoped, claims.code_access, comp_type) {
+        return Err(AppError::Forbidden(msg.into()));
     }
 
     // WIKI compilations must reference a RAW source compilation owned by the
@@ -1016,12 +1012,72 @@ async fn create(
         .bind(folder_id)
         .bind(&privacy_mode)
         .execute(&state.db).await?;
+    // A KB-scoped token sees only its grants: without this row the CODE graph it just
+    // created would be invisible to it, and the very next call (the manifest read of the
+    // indexer) would 404. `granted_rank` NULL = the key's own clearance ceiling applies.
+    if scoped {
+        if let Some(key_id) = claims.api_key_id {
+            sqlx::query(
+                "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank)
+                 VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING"
+            ).bind(key_id).bind(id).execute(&state.db).await?;
+        }
+    }
     // `privacyMode` is echoed so a caller can tell whether this server honoured the field
     // (older builds silently ignore unknown keys and leave the graph "open").
     Ok(Json(json!({
         "id": id, "name": req.name, "type": comp_type,
         "folderId": folder_id, "privacyMode": privacy_mode,
     })))
+}
+
+/// May this caller create a compilation of `comp_type`? Pure so the rule is testable.
+///
+/// * Owner session / unscoped token: anything (a CODE graph still needs Codebase access).
+/// * KB-scoped token: ONLY a CODE graph, and only with Codebase access. A colleague's
+///   agent that indexes the repository it works in must be able to get its own code
+///   graph without an administrator creating one first - that is what makes the
+///   Codebase feature automatic for every token. Knowledge bases stay an owner action:
+///   a scoped token writes knowledge into the KB(s) it was granted, never into new ones.
+pub(crate) fn create_permission(
+    scoped: bool,
+    code_access: bool,
+    comp_type: &str,
+) -> std::result::Result<(), &'static str> {
+    if comp_type == "CODE" && !code_access {
+        return Err("This access token has Codebase access disabled - code knowledge bases cannot be created");
+    }
+    if scoped && comp_type != "CODE" {
+        return Err("This access token is scoped to specific knowledge bases and cannot create new ones (a scoped token may only create CODE knowledge bases for the repositories it indexes)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod create_permission_tests {
+    use super::create_permission;
+
+    #[test]
+    fn owner_creates_anything() {
+        for t in ["RAW", "WIKI", "CODE"] {
+            assert!(create_permission(false, true, t).is_ok(), "{t}");
+        }
+    }
+
+    #[test]
+    fn code_access_off_blocks_code_for_everyone() {
+        assert!(create_permission(false, false, "CODE").is_err());
+        assert!(create_permission(true, false, "CODE").is_err());
+        // ...but an unscoped token without code access still creates knowledge bases.
+        assert!(create_permission(false, false, "RAW").is_ok());
+    }
+
+    #[test]
+    fn scoped_token_creates_only_code_graphs() {
+        assert!(create_permission(true, true, "CODE").is_ok());
+        assert!(create_permission(true, true, "RAW").is_err());
+        assert!(create_permission(true, true, "WIKI").is_err());
+    }
 }
 
 // Frontend KGDetailPage expects `{ compilation: ... }` wrapper with full row fields.

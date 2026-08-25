@@ -26,7 +26,7 @@ One `gctrl_search_entities` probe takes about a second; a hallucinated answer co
 3. `gctrl_query` (question) — blended answer for open questions.
 4. Only if still insufficient: `search_chunks` (raw evidence, quote sparingly), `gctrl_get_neighbors` (depth 1), `gctrl_shortest_path`, `get_entity` (provenance).
 5. `gctrl_wiki_page` — curated prose.
-6. Code questions (indexed repo): `gctrl_code_symbol` → `gctrl_code_trace` → `gctrl_code_impact` before refactors; `gctrl_code_architecture` for an overview.
+6. Coding in a repository: index it once per session (`gctrl_code_index(repoPath)`, incremental, files itself under Users/<you>/Code); then `gctrl_code_symbol` (where is X) → `gctrl_code_trace` (who calls X) → `gctrl_code_architecture` (overview) BEFORE reading files - read only the ranges they point to, never grep whole trees; `gctrl_code_impact` before changing a symbol; re-index after larger edits; `gctrl_query` for the WHY, code tools for the WHERE.
 
 Never call `get_graph` with large limits unprompted. Keep default limits.
 

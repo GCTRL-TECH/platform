@@ -23,7 +23,7 @@ use crate::{
 // the connect UI's copyable "drop into your agent" block.
 
 pub const MEMORY_SKILL_MD: &str = r#"# GCTRL Knowledge & Memory — Agent Skill
-<!-- gctrl-skill-v5 -->
+<!-- gctrl-skill-v6 -->
 
 You are connected to GCTRL, a graph-native long-term memory. Use it as your persistent second brain: read the right layer, and **always write your conclusions back** so every future session inherits them. That write-back habit is the whole point — it turns GCTRL into compounding memory instead of starting cold each time.
 
@@ -66,11 +66,17 @@ If a task needs RAG, vector search, document Q&A, a knowledge base, or semantic 
 Worked example — ingest a PDF and answer with citations: `ingest_file({fileName, contentBase64})` → poll `list_extractions` until that job is `completed` (or `completed_degraded` — finished, but a phase was skipped: report its `degradedReason` instead of claiming a clean import) → `search_chunks({query})` → answer, citing the returned passages (never say "refer to the file" — the passages ARE the document).
 
 ## Codebase KBs — code is knowledge too
-A Codebase KB is a compilation of type CODE holding one repository's structure graph (files, classes, functions, methods; CONTAINS / IMPORTS / CALLS / INHERITS) plus one embedded chunk per symbol. It lives in the SAME graph as your project knowledge, so decisions and facts can link to the functions they concern.
-- **Structural questions go to the code tools, not to grep cascades**: `code_symbol(query)` (where is X, signature, line range, caller/callee counts) → `code_trace(symbol, callers|callees, depth)` (who calls X / what does X call) → `code_impact(changedFiles|changedSymbols)` (what breaks if I change this — run it BEFORE refactors) → `code_architecture(compilationId)` (one-call overview: languages, packages, hotspots, dead-code candidates). Semantic code search: `search_chunks` on the code KB.
-- **Indexing**: one CODE compilation per repo, filed under `Projects/<Kunde>/<Repo>` (or `Users/<name>/<Repo>` for personal code; default folder Users/<name>/Code unless you pass folderPath). Index with `gctrl_code_index(repoPath, compilationId)` — available in the stdio MCP server / CLI (`gctrl code index`) / Anvil's `gctrl-code` server because it must run where the code lives. Re-run after larger edits; it is incremental (content hashes) and cheap. `ingest_repo` is the legacy Python-only path — do not use it for new work.
+A Codebase KB is a compilation of type CODE holding one repository's structure graph (files, classes, functions, methods; CONTAINS / IMPORTS / CALLS / INHERITS) plus one embedded chunk per symbol. It lives in the SAME graph as your project knowledge, so decisions and facts can link to the functions they concern. Measured on GCTRL's own repository: structural questions answered through the graph cost 95.6 % fewer tokens than grep-and-read.
+
+**The coding protocol — follow it whenever you work in a repository:**
+1. **Index once per session**: `gctrl_code_index(repoPath)` from the stdio MCP server (or `gctrl code index <path>` from the CLI) — it must run where the code lives, and it is incremental: seconds after the first run. Omit `compilationId` unless one is pinned for you (`GCTRL_CODE_COMPILATION_ID`, your project context): the graph files itself under `Users/<you>/Code` or the project's `Code` folder, one CODE compilation per repository. A scoped token with Codebase access may create its own code graph and is granted it automatically. Hosts that set `GCTRL_CODE_AUTO_INDEX` index for you at start-up. `ingest_repo` is legacy — do not use it.
+2. **Navigate through the graph BEFORE opening files**: `code_symbol(query)` for "where is X / what is X" (file, line range, signature, caller/callee counts) → `code_trace(symbol, callers|callees, depth)` for "who calls X / what does X call" → `code_architecture(compilationId)` for a repo overview (languages, packages, hotspots, dead-code candidates). Then read ONLY the file ranges the tools point to. Do not grep or read whole trees for questions the graph answers; semantic code search is `search_chunks` on the code KB.
+3. **Before changing a function, file or API**: `code_impact(changedSymbols|changedFiles)` and handle every caller it lists.
+4. **After a larger edit or commit**: `gctrl_code_index` again so the graph matches the code.
+5. **Knowledge and code together**: `query` blends decisions, docs and code chunks — ask it for the WHY, the code tools for the WHERE.
+6. **Write-back**: architecture decisions, conventions and gotchas about a symbol go via `store(text, compilationId)` into the SAME code KB, naming the symbol exactly as `code_symbol` returns it, so the decision and the function are linked. Do not keep ADRs in some other tool.
+
 - **Edge quality is visible**: every CALLS hop carries `resolution` (syntax/lsp = exact, heuristic = name-based, 0.6) — say so when you answer from heuristic edges.
-- **Write-back**: architecture decisions, gotchas and learnings about a symbol go via `store(text, compilationId)` into the SAME code KB, naming the symbol exactly as `code_symbol` returns it, so the decision and the function are linked. Do not keep ADRs in some other tool.
 - **Tool budget**: quick question = 1 `code_symbol` + at most 1 `code_trace`; audit / refactor = `code_architecture` + `code_impact`, then paginate `code_symbol` (offset) only for the files it flagged.
 
 ## Your access is scoped
@@ -80,7 +86,7 @@ Your token sees only the knowledge bases it was granted — typically your own w
 Read HOT/blended first → answer → **write the new conclusion back** with `store` into your `compilationId`. Do this every time and your GCTRL becomes a second brain that gets sharper with every task.
 "#;
 
-pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. ON FIRST CONNECTION, run a one-time setup: call get_dossier('GCTRL Agent Setup') — if absent, ask the user (one message) which knowledge base to use, whether you're a cloud or local model, and whether to cloak entities for cloud models (recommend set_privacy_mode(cloaked) when you're a cloud model), how eagerly to remember, and whether to auto-ingest dropped files; then store those preferences with title 'GCTRL Agent Setup' so you never ask again. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; get_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with store/create_extraction into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with ingest_file (PDF/DOCX/binary) or store/create_extraction (text), then retrieve with search_chunks or query. Code questions about an indexed repository go to code_symbol/code_trace/code_impact/code_architecture. (The stdio MCP server prefixes these tool names with gctrl_.)";
+pub const MEMORY_INSTRUCTIONS: &str = "GCTRL is your long-term memory. ON FIRST CONNECTION, run a one-time setup: call get_dossier('GCTRL Agent Setup') — if absent, ask the user (one message) which knowledge base to use, whether you're a cloud or local model, and whether to cloak entities for cloud models (recommend set_privacy_mode(cloaked) when you're a cloud model), how eagerly to remember, and whether to auto-ingest dropped files; then store those preferences with title 'GCTRL Agent Setup' so you never ask again. READ the right layer (get_dossier = HOT/authoritative — state it, don't hedge; query = blended answer; search_entities/get_entity/get_neighbors/shortest_path = graph; get_wiki_page = curated prose). After ANY substantive task, WRITE your conclusions back with store/create_extraction into your assigned compilationId (find it via list_graphs) so future sessions inherit them — that write-back habit is the point of GCTRL. Your token is scoped: you only see and write the knowledge bases you're granted; call list_graphs first. GCTRL is your RAG infrastructure — do not scaffold ad-hoc vector stores, chunkers, or retrieval loops; ingest with ingest_file (PDF/DOCX/binary) or store/create_extraction (text), then retrieve with search_chunks or query. CODING WITH GCTRL (whenever you work in a repository): (1) make sure the repo is indexed once per session - gctrl_code_index(repoPath) from the stdio MCP server / `gctrl code index` from the CLI, incremental, filed automatically under Users/<you>/Code or the project's Code folder; (2) navigate through the graph BEFORE opening files - code_symbol for 'where is X', code_trace for 'who calls X / what does X call', code_architecture for an overview - then read only the file ranges they point to, never grep whole trees for questions the graph answers; (3) run code_impact before changing a function, file or API and handle every caller; (4) re-index after larger edits; (5) query blends decisions, docs and code chunks - the WHY - while the code tools give the WHERE; (6) store decisions and gotchas about code into the repo's CODE knowledge base, naming symbols exactly. (The stdio MCP server prefixes these tool names with gctrl_.)";
 
 /// Core agent-discipline habits folded into Pi's system prompt. Four principles
 /// (think-first, simplicity, surgical edits, goal-driven verification) that make
@@ -376,7 +382,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
             { "name": "create_extraction",  "description": "Ingest text into the knowledge graph", "args": { "text": "string", "classificationLevelId": "string?" } },
             { "name": "fuse_graphs",        "description": "Merge graphs by their source job ids", "args": { "name": "string", "sourceJobIds": "string[]" } },
-            { "name": "create_compilation", "description": "Create a new empty knowledge graph. ALWAYS pass folderPath so the graph is filed where it belongs (find-or-create): personal graphs under [\"Users\",\"<name>\"], project graphs under [\"Projects\",\"<Kunde>\"]; a graph created without folderPath lands unfiled at the tree root.", "args": { "name": "string", "description": "string?", "folderPath": "string[]?" } },
+            { "name": "create_compilation", "description": "Create a new empty knowledge graph. ALWAYS pass folderPath so the graph is filed where it belongs (find-or-create): personal graphs under [\"Users\",\"<name>\"], project graphs under [\"Projects\",\"<Kunde>\"]; a graph created without folderPath lands unfiled at the tree root. type 'CODE' creates a Codebase KB (one per repository, default folder Users/<name>/Code) - the only kind a KB-scoped token may create; it is granted onto that token automatically.", "args": { "name": "string", "description": "string?", "folderPath": "string[]?", "type": "string?" } },
             { "name": "delete_compilation", "description": "Delete a compilation the caller owns", "args": { "compilationId": "string" } },
             { "name": "refresh_compilation","description": "Re-run fusion to refresh a compilation", "args": { "compilationId": "string" } },
             { "name": "set_privacy_mode",   "description": "Raise a knowledge graph's privacy for cloud LLMs: 'cloaked' (entities/PII pseudonymized before any cloud model sees them) or 'local_only' (never sent to a cloud model). Can only INCREASE privacy (open->cloaked->local_only); loosening it back requires a signed-in user session.", "args": { "compilationId": "string", "mode": "string (cloaked|local_only)" } },
@@ -1450,10 +1456,18 @@ async fn execute_tool_inner(
 
         // ── Action: create an empty compilation ───────────────────────────────
         "create_compilation" => {
-            // Creating a new knowledge base is an owner action; a KB-scoped token
-            // may only write into its assigned KB(s), not spawn new ones.
-            if crate::routes::kg::api_key_scope(&state.db, claims).await.is_some() {
-                return json!({ "error": "this access token is scoped to specific knowledge bases and cannot create new ones" });
+            // Same rule as POST /kg/compilations (kg::create_permission): an owner creates
+            // anything; a KB-scoped token only a CODE graph, and only with Codebase access -
+            // so a colleague's agent can bootstrap the code graph of the repository it works
+            // in without an administrator. Knowledge bases stay an owner action.
+            let comp_type = match args["type"].as_str().map(|s| s.trim().to_uppercase()) {
+                None => "RAW".to_string(),
+                Some(t) if t == "RAW" || t == "CODE" => t,
+                Some(other) => return json!({ "error": format!("invalid type '{other}' (expected 'RAW' or 'CODE')") }),
+            };
+            let scoped = crate::routes::kg::api_key_scope(&state.db, claims).await.is_some();
+            if let Err(msg) = crate::routes::kg::create_permission(scoped, claims.code_access, &comp_type) {
+                return json!({ "error": msg });
             }
             let name = args["name"].as_str().unwrap_or("").trim().to_string();
             if name.is_empty() { return json!({ "error": "name is required" }); }
@@ -1473,18 +1487,33 @@ async fn execute_tool_inner(
                         }
                     }
                 }
+                // A Codebase KB never sits at the tree root: same default as the REST create.
+                None if comp_type == "CODE" => match crate::routes::kg::default_code_folder(&state.db, claims.sub).await {
+                    Ok(id) => Some(id),
+                    Err(_) => return json!({ "error": "default code folder could not be created" }),
+                },
                 None => None,
             };
             let comp_id = uuid::Uuid::new_v4();
             if sqlx::query(
-                "INSERT INTO compilations (id, user_id, name, description, classification, version, folder_id) \
-                 VALUES ($1,$2,$3,$4,'PUBLIC',1,$5)"
-            ).bind(comp_id).bind(claims.sub).bind(&name).bind(desc.as_deref()).bind(folder_id)
+                "INSERT INTO compilations (id, user_id, name, description, classification, version, folder_id, type) \
+                 VALUES ($1,$2,$3,$4,'PUBLIC',1,$5,$6::compilation_type)"
+            ).bind(comp_id).bind(claims.sub).bind(&name).bind(desc.as_deref()).bind(folder_id).bind(&comp_type)
              .execute(&state.db).await.is_err() {
                 return json!({ "error": "failed to create compilation (name may already exist)" });
             }
+            // A scoped token sees only its grants - without this row the graph it just
+            // created would be invisible to it (and every follow-up call would 404).
+            if scoped {
+                if let Some(key_id) = claims.api_key_id {
+                    let _ = sqlx::query(
+                        "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank) \
+                         VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING"
+                    ).bind(key_id).bind(comp_id).execute(&state.db).await;
+                }
+            }
             crate::services::audit::log_access(&state.db, claims, "agent.create_compilation", "compilation", &comp_id.to_string(), 0, None, true, None).await;
-            json!({ "compilationId": comp_id, "name": name })
+            json!({ "compilationId": comp_id, "name": name, "type": comp_type, "folderId": folder_id })
         }
 
         // ── Action: delete a compilation (owner-scoped) ───────────────────────
@@ -2485,6 +2514,36 @@ mod agent_tool_registration_tests {
     fn tool_schema_contains_set_model() {
         assert!(tool_names().contains(&"set_model".to_string()),
             "tool_schema() must include 'set_model'");
+    }
+
+    /// The published skill copies are generated from MEMORY_SKILL_MD
+    /// (scripts/sync-skill.mjs). A copy that still carries an older marker means
+    /// someone edited the source and forgot to sync - agents on that copy follow
+    /// stale rules. Fails here instead of drifting silently.
+    #[test]
+    fn skill_copies_carry_the_current_marker() {
+        let marker = super::MEMORY_SKILL_MD.lines()
+            .find(|l| l.starts_with("<!-- gctrl-skill-v"))
+            .expect("MEMORY_SKILL_MD must carry a gctrl-skill-vN marker");
+        let copies: [(&str, &str); 2] = [
+            ("sdk/claude-skill/gctrl/SKILL.md", include_str!("../../../../sdk/claude-skill/gctrl/SKILL.md")),
+            ("services/portal/public/skill.md", include_str!("../../../../services/portal/public/skill.md")),
+        ];
+        for (path, text) in copies {
+            assert!(text.contains(marker),
+                "{path} is behind MEMORY_SKILL_MD ({marker}) - run `node scripts/sync-skill.mjs`");
+        }
+    }
+
+    /// The gateway create tool mirrors the REST rule: a CODE graph may be created
+    /// by a scoped token; the schema must advertise `type` for that to be reachable.
+    #[test]
+    fn create_compilation_advertises_type() {
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().expect("tools")
+            .iter().find(|t| t["name"] == "create_compilation")
+            .expect("create_compilation must be registered");
+        assert_eq!(tool["args"]["type"], json!("string?"));
     }
 
     /// Remote agents file their graphs on creation: the tool must advertise

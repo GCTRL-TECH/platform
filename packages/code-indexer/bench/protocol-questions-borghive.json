@@ -1,0 +1,14 @@
+[
+  { "id": "where-resolve_purpose",      "kind": "where",        "symbol": "resolve_purpose" },
+  { "id": "where-ensure_folder_path",   "kind": "where",        "symbol": "ensure_folder_path" },
+  { "id": "where-indexRepo",            "kind": "where",        "symbol": "indexRepo" },
+  { "id": "where-api_key_scope",        "kind": "where",        "symbol": "api_key_scope" },
+  { "id": "callers-ensure_folder_path", "kind": "callers",      "symbol": "ensure_folder_path" },
+  { "id": "callers-api_key_scope",      "kind": "callers",      "symbol": "api_key_scope" },
+  { "id": "callers-job_scope",          "kind": "callers",      "symbol": "job_scope" },
+  { "id": "callees-enqueue_code_job",   "kind": "callees",      "symbol": "enqueue_code_job" },
+  { "id": "callees-resolve_for_user",   "kind": "callees",      "symbol": "resolve_for_user" },
+  { "id": "impact-api_key_scope",       "kind": "impact",       "symbol": "api_key_scope" },
+  { "id": "impact-default_code_folder", "kind": "impact",       "symbol": "default_code_folder" },
+  { "id": "architecture",               "kind": "architecture", "symbol": "" }
+]
