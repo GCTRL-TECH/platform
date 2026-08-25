@@ -9,7 +9,7 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: b0f53b3 -->
+<!-- baseline-sha: 88d0ab2 -->
 
 ## v0.9.2 - Every agent codes with the graph
 
