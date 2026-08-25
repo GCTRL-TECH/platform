@@ -11,6 +11,15 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: b0f53b3 -->
 
+## v0.9.2 - Every agent codes with the graph
+
+*25 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The Codebase KB is now automatic for every access token.** A token with Codebase access - the default - can create the code graph of the repository its agent works in, a KB-scoped colleague token included, and is granted it the moment it exists; nothing for an administrator to prepare. The published MCP server (`gctrl-mcp` 1.2.0) indexes the repository it is started in right after start-up when `GCTRL_CODE_AUTO_INDEX` is set (incremental - a warm repository takes seconds), the Access page's connect snippet sets it, and `gctrl init` writes the same two-entry config into `.mcp.json`, `.cursor/mcp.json` or `.codex/mcp.json` in one command. Auto-indexing stays explicit on purpose: code leaves the machine only where someone wrote that line.
+- **The skill teaches the coding protocol.** Skill v6 tells every connected agent how to work in a repository: index once per session, navigate through `code_symbol` / `code_trace` / `code_architecture` BEFORE opening files and read only the ranges they point to, run `code_impact` before changing a symbol, re-index after larger edits, ask `query` for the why and the code tools for the where, and store decisions next to the symbols they concern. It is one text in one place now - the served skill, the MCP server instructions, the gateway instructions and the Cursor/Codex copies are generated from it, and a test fails when a copy falls behind.
+- **Measured, not assumed.** A new protocol bench answers the same structural questions once through the graph and once by grep-and-read (grep plus a 40-line window around every hit - deliberately generous to grep). On GCTRL's own repository (Rust, TypeScript, Python), twelve questions: 94.2 % fewer tokens, 12 of 12 answered correctly; on a 1,000-file TypeScript application: 89.8 % fewer, 12 of 12. The bench also caught a trap before it shipped: `code_trace` and `code_impact` answered a bare symbol name with an empty result - "no callers", exactly the wrong answer before a refactor - because graph names are file-scoped. Both now resolve bare names too.
+- **Agents file what they create.** `create_compilation` on the agent gateway takes `folderPath` and `type`, so a graph an agent creates lands in `Users/<name>/…` or `Projects/<client>/…` instead of unfiled at the tree root.
+
 ## v0.9.1 - Knowledge bases land where they belong
 
 *25 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
