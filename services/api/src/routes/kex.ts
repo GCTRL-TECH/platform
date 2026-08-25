@@ -6,7 +6,7 @@ import { eq, and, desc, sql, isNull, like, or } from 'drizzle-orm';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../models/db.js';
-import { jobs, jobBatches, ontologyEntityTypes } from '../models/schema.js';
+import { jobs, jobBatches, ontologyEntityTypes, apiKeys, users } from '../models/schema.js';
 import { config } from '../config.js';
 import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
@@ -247,8 +247,15 @@ router.get(
           completedAt: jobs.completedAt,
           error: jobs.error,
           batchId: jobs.batchId,
+          // Provenance (migration 081): which token/user triggered the job. The
+          // token is null for web-login (JWT) jobs; the frontend renders that as
+          // "Web-Login". userEmail comes from the owning user.
+          tokenName: apiKeys.name,
+          userEmail: users.email,
         })
         .from(jobs)
+        .leftJoin(apiKeys, eq(jobs.apiKeyId, apiKeys.id))
+        .leftJoin(users, eq(jobs.userId, users.id))
         .where(and(baseWhere, isNull(jobs.batchId)))
         .orderBy(desc(jobs.createdAt))
         .limit(limit)

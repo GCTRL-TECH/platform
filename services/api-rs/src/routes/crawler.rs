@@ -89,8 +89,8 @@ async fn crawl(
 
     let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
+         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({
@@ -103,6 +103,7 @@ async fn crawl(
         "discoveryMode": req.discovery_mode.clone().unwrap_or_else(|| "discover".into()),
     }))
     .bind(req.classification_level_id)
+    .bind(claims.api_key_id)
     .execute(&state.db).await?;
 
     // Record the spend locally so the heartbeat task can ship it upstream.

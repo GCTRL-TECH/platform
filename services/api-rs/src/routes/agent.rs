@@ -1021,9 +1021,9 @@ async fn execute_tool_inner(
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
                 .bind(claims.sub).execute(&state.db).await;
             let _ = sqlx::query(
-                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-                 VALUES ($1, $2, 'kex_extract', 'pending', $3, $4)"
-            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent" })).bind(clf).execute(&state.db).await;
+                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
+                 VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5)"
+            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent" })).bind(clf).bind(claims.api_key_id).execute(&state.db).await;
             crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
             let clf_name: Option<String> = if let Some(c) = clf {
                 sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1").bind(c).fetch_optional(&state.db).await.ok().flatten()
@@ -1302,9 +1302,9 @@ async fn execute_tool_inner(
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
                 .bind(claims.sub).execute(&state.db).await;
             let _ = sqlx::query(
-                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-                 VALUES ($1, $2, 'kex_extract', 'pending', $3, NULL)"
-            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent_store" })).execute(&state.db).await;
+                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
+                 VALUES ($1, $2, 'kex_extract', 'pending', $3, NULL, $4)"
+            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent_store" })).bind(claims.api_key_id).execute(&state.db).await;
             crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
             let mut payload = json!({
                 "job_id": job_id, "user_id": claims.sub, "type": "text",
