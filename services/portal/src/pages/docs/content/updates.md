@@ -11,6 +11,13 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: b0f53b3 -->
 
+## v0.9.1 - Knowledge bases land where they belong
+
+*25 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Agents file the knowledge bases they create.** The `create_compilation` tool of the agent gateway now takes a `folderPath` and files the new knowledge base on creation, find-or-create, exactly like the web app and the REST API already did. Until now every knowledge base an agent created over MCP sat unfiled at the root of the tree, next to the `Users/` and `Projects/` folders everyone else keeps - on a shared instance that was most of them. The tool tells the agent to always pass a path.
+- **Code graphs go to the right person's folder.** `gctrl_code_index` reads two new settings from its environment: `GCTRL_CODE_COMPILATION_ID` pins the compilation a session indexes into (one project, one repository, one code graph), and `GCTRL_CODE_FOLDER` names the folder an auto-created code graph is filed in. A host that launches the MCP server per user - Anvil does - sets them, so a colleague's repository lands in `Users/<colleague>/Code` and a project's in `Projects/<client>/<project>/Code`, instead of in the account owner's default folder. An explicit `compilationId` from the agent still wins.
+
 ## v0.9.0 - Your code becomes a knowledge base
 
 *23 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

@@ -25,6 +25,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as fs from 'node:fs';
 import * as nodePath from 'node:path';
+import { codeIndexTarget } from './code-target.js';
 
 // ── Optional peer: gctrl-code-indexer ───────────────────────────────────────
 //
@@ -1175,10 +1176,10 @@ const codeRead = (name: string, args: Record<string, unknown>) =>
 
 registerTool<{ repoPath: string; compilationId?: string; full?: boolean; classificationLevelId?: string }>(
   'gctrl_code_index',
-  'Index a local code repository into a GCTRL Codebase KB (compilation of type CODE): walks the repo (.gitignore-aware), parses Python/TypeScript/JavaScript/Rust with tree-sitter, uploads symbols + CONTAINS/IMPORTS/CALLS/INHERITS edges + one chunk per symbol. Incremental: only files whose content hash changed since the last run are uploaded. Omit compilationId to create a new CODE compilation named after the repo. Afterwards use gctrl_code_symbol / gctrl_code_trace / gctrl_code_impact / gctrl_code_architecture.',
+  'Index a local code repository into a GCTRL Codebase KB (compilation of type CODE): walks the repo (.gitignore-aware), parses Python/TypeScript/JavaScript/Rust with tree-sitter, uploads symbols + CONTAINS/IMPORTS/CALLS/INHERITS edges + one chunk per symbol. Incremental: only files whose content hash changed since the last run are uploaded. Omit compilationId to use the session default (GCTRL_CODE_COMPILATION_ID) or to create a new CODE compilation named after the repo (in GCTRL_CODE_FOLDER when set). Afterwards use gctrl_code_symbol / gctrl_code_trace / gctrl_code_impact / gctrl_code_architecture.',
   {
     repoPath: z.string().describe('Absolute path of the repository root on this machine'),
-    compilationId: z.string().optional().describe('Target CODE compilation. Omit to create one.'),
+    compilationId: z.string().optional().describe('Target CODE compilation. Omit to use the session default or create one.'),
     full: z.boolean().optional().describe('Force re-upload of every file (default: incremental)'),
     classificationLevelId: z.string().optional(),
   },
@@ -1187,8 +1188,24 @@ registerTool<{ repoPath: string; compilationId?: string; full?: boolean; classif
     if (!indexer) return { content: [{ type: 'text' as const, text: CODE_INDEXER_MISSING }] };
     const progress: string[] = [];
     try {
+      // Session default from the environment (see code-target.ts): a pinned compilation, or
+      // a folder to auto-create the repo's graph in. Creating it HERE (not in the indexer)
+      // keeps the published indexer package untouched - it only ever sees a compilationId.
+      const target = codeIndexTarget(compilationId, process.env);
+      let targetId = target.compilationId;
+      if (!targetId && target.folderPath) {
+        const repoName = nodePath.basename(nodePath.resolve(repoPath));
+        const created = (await apiCall('POST', '/kg/compilations', {
+          name: `${repoName} (code)`, type: 'CODE', folderPath: target.folderPath,
+          description: `Codebase KB for ${repoName}`,
+        })) as { id?: string };
+        if (!created?.id) throw new Error(`could not create CODE compilation under ${target.folderPath.join('/')}`);
+        targetId = created.id;
+        const m = `created CODE compilation ${targetId} under ${target.folderPath.join('/')}`;
+        progress.push(m); console.error(`[gctrl_code_index] ${m}`);
+      }
       const s = await indexer.indexRepo({
-        repoPath, compilationId, full, classificationLevelId,
+        repoPath, compilationId: targetId, full, classificationLevelId,
         request: (method, p, body) => apiCall(method, p, body),
         onProgress: (m) => { progress.push(m); console.error(`[gctrl_code_index] ${m}`); },
       });

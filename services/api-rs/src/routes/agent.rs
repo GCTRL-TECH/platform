@@ -376,7 +376,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
             { "name": "create_extraction",  "description": "Ingest text into the knowledge graph", "args": { "text": "string", "classificationLevelId": "string?" } },
             { "name": "fuse_graphs",        "description": "Merge graphs by their source job ids", "args": { "name": "string", "sourceJobIds": "string[]" } },
-            { "name": "create_compilation", "description": "Create a new empty knowledge graph", "args": { "name": "string", "description": "string?" } },
+            { "name": "create_compilation", "description": "Create a new empty knowledge graph. ALWAYS pass folderPath so the graph is filed where it belongs (find-or-create): personal graphs under [\"Users\",\"<name>\"], project graphs under [\"Projects\",\"<Kunde>\"]; a graph created without folderPath lands unfiled at the tree root.", "args": { "name": "string", "description": "string?", "folderPath": "string[]?" } },
             { "name": "delete_compilation", "description": "Delete a compilation the caller owns", "args": { "compilationId": "string" } },
             { "name": "refresh_compilation","description": "Re-run fusion to refresh a compilation", "args": { "compilationId": "string" } },
             { "name": "set_privacy_mode",   "description": "Raise a knowledge graph's privacy for cloud LLMs: 'cloaked' (entities/PII pseudonymized before any cloud model sees them) or 'local_only' (never sent to a cloud model). Can only INCREASE privacy (open->cloaked->local_only); loosening it back requires a signed-in user session.", "args": { "compilationId": "string", "mode": "string (cloaked|local_only)" } },
@@ -1458,11 +1458,28 @@ async fn execute_tool_inner(
             let name = args["name"].as_str().unwrap_or("").trim().to_string();
             if name.is_empty() { return json!({ "error": "name is required" }); }
             let desc = args["description"].as_str().map(|s| s.to_string());
+            // File the graph on creation. Remote agents used to create at the tree root
+            // (the REST create takes `folderPath`, this tool did not), so every agent-made
+            // graph on a shared instance sat unfiled next to the folder tree the UI and
+            // Anvil keep for everyone else. Same find-or-create as POST /kg/compilations.
+            let folder_id: Option<uuid::Uuid> = match args["folderPath"].as_array() {
+                Some(path) => {
+                    let segs: Vec<&str> = path.iter()
+                        .filter_map(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).collect();
+                    if segs.is_empty() { None } else {
+                        match crate::routes::kg::ensure_folder_path(&state.db, claims.sub, &segs).await {
+                            Ok(id) => Some(id),
+                            Err(_) => return json!({ "error": "folderPath could not be created" }),
+                        }
+                    }
+                }
+                None => None,
+            };
             let comp_id = uuid::Uuid::new_v4();
             if sqlx::query(
-                "INSERT INTO compilations (id, user_id, name, description, classification, version) \
-                 VALUES ($1,$2,$3,$4,'PUBLIC',1)"
-            ).bind(comp_id).bind(claims.sub).bind(&name).bind(desc.as_deref())
+                "INSERT INTO compilations (id, user_id, name, description, classification, version, folder_id) \
+                 VALUES ($1,$2,$3,$4,'PUBLIC',1,$5)"
+            ).bind(comp_id).bind(claims.sub).bind(&name).bind(desc.as_deref()).bind(folder_id)
              .execute(&state.db).await.is_err() {
                 return json!({ "error": "failed to create compilation (name may already exist)" });
             }
@@ -2468,6 +2485,18 @@ mod agent_tool_registration_tests {
     fn tool_schema_contains_set_model() {
         assert!(tool_names().contains(&"set_model".to_string()),
             "tool_schema() must include 'set_model'");
+    }
+
+    /// Remote agents file their graphs on creation: the tool must advertise
+    /// `folderPath`, or every agent keeps creating at the unfiled tree root.
+    #[test]
+    fn create_compilation_advertises_folder_path() {
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().expect("tools")
+            .iter().find(|t| t["name"] == "create_compilation")
+            .expect("create_compilation must be registered");
+        assert_eq!(tool["args"]["folderPath"], json!("string[]?"),
+            "create_compilation must accept folderPath");
     }
 
     #[test]
