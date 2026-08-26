@@ -45,6 +45,7 @@ On your FIRST connection to a GCTRL instance, configure how you'll use it, then 
 
 ## Read the right layer
 - **HOT — dossiers** · `get_dossier(name)`: the authoritative compiled profile of an entity (summary, key facts with confidence, origin files, timeline). When a dossier exists, state it directly — do not hedge.
+- **Where things live** · `list_graphs`: every graph with its `type` (RAW / WIKI / CODE), `folderPath` (`Users/<you>/...` = personal, `Projects/<client>/...` = shared with the team and distilled into the wiki, `Global/...` = company-wide) and size. Personal learnings go to `Users/<you>`, confirmed team facts to the project, code decisions to the repo's CODE graph.
 - **Blended answer** · `query(message)`: blends all tiers (dense + keyword + graph + dossiers). Prefer this for open questions. Use `search_chunks` for raw evidence passages.
 - **COLD — graph** · `search_entities`, `get_entity` (includes provenance / origin file), `get_neighbors`, `shortest_path`: structure, dependencies, "how is A connected to B".
 - **WIKI — curated prose** · `list_wiki_pages` / `get_wiki_page`: distilled, cross-linked pages over a knowledge base.
@@ -355,7 +356,7 @@ pub(crate) async fn build_system_prompt(
 pub(crate) fn tool_schema() -> Value {
     json!({
         "tools": [
-            { "name": "list_graphs",        "description": "List knowledge graphs the caller can access", "args": {} },
+            { "name": "list_graphs",        "description": "List knowledge graphs the caller can access - id, name, type (RAW | WIKI | CODE), folderPath (Users/<name>/..., Projects/<client>/..., Global/...), nodeCount/edgeCount/sourceCount, classification, privacyMode. Pick your target knowledge base by placement and type, never by name alone", "args": {} },
             { "name": "get_graph",          "description": "Read a compilation's entities and relationships. Start with response_format='summary' (default) — returns {name,type,degree} + relation-type counts, much cheaper than 'full'. Only use 'full' if you need the complete edge list. Default limit 100; max 500.", "args": { "compilationId": "string", "limit": "number?", "response_format": "string?" } },
             { "name": "query",              "description": "Blended answer over graph + chunks + dossiers (RAG). Preferred first read tool for open questions — blends all memory tiers automatically and returns a grounded answer with sources + confidence. Args: { message: string, compilationId?: string }", "args": { "message": "string", "compilationId": "string?" } },
             { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call after ANY substantive task to persist conclusions. Always pass compilationId (find via list_graphs). Args: { text: string, compilationId?: string }", "args": { "text": "string", "compilationId": "string?" } },
@@ -644,8 +645,10 @@ async fn execute_tool_inner(
             // Codebase access off (078): CODE knowledge bases are excluded in SQL,
             // not after the fact - a post-filter would shorten the LIMIT 50 page and
             // hide non-code graphs behind the code ones it dropped.
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String)>(
-                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String,
+                                             String, Option<uuid::Uuid>, Vec<uuid::Uuid>)>(
+                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode,
+                        c.type::text, c.folder_id, COALESCE(c.source_job_ids, '{}'::uuid[])
                  FROM compilations c
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
                  WHERE c.user_id = $1
@@ -657,7 +660,7 @@ async fn execute_tool_inner(
                                      AND (g.granted_rank IS NULL
                                           OR c.classification_level_id IS NULL
                                           OR g.granted_rank >= cl.rank)))
-                 ORDER BY c.created_at DESC LIMIT 50"
+                 ORDER BY c.created_at DESC LIMIT 200"
             )
             .bind(claims.sub).bind(rank).bind(rank_capped).bind(claims.api_key_id)
             .bind(claims.code_access)
@@ -665,14 +668,27 @@ async fn execute_tool_inner(
 
             // KB-scoped token: only its assigned knowledge base(s) are visible.
             let scope = crate::routes::kg::api_key_scope(&state.db, claims).await;
-            json!({
-                "graphs": rows.iter()
-                    .filter(|(id, ..)| scope.as_ref().map_or(true, |s| s.contains(id)))
-                    .map(|(id, name, desc, cls, privacy)| json!({
-                        "id": id, "name": name, "description": desc,
-                        "classification": cls, "privacyMode": privacy
-                    })).collect::<Vec<_>>()
-            })
+            // The skill tells a model to pick its knowledge base from this list -
+            // so the list must say what each graph IS (RAW / WIKI / CODE), WHERE
+            // it lives (Users/<name>/Code, Projects/<client>/..., Global/...) and
+            // how big it is. Name-only rows made "Team Wave" vs "Team Wave (code)"
+            // a guess and hid empty graphs behind identical labels.
+            let paths = crate::routes::kg::folder_paths(&state.db, claims.sub).await;
+            let mut graphs: Vec<Value> = Vec::with_capacity(rows.len());
+            for (id, name, desc, cls, privacy, ctype, folder_id, sji) in rows.iter() {
+                if let Some(s) = &scope { if !s.contains(id) { continue; } }
+                let (nodes, edges) = crate::routes::kg::live_counts(&state.neo, sji).await;
+                graphs.push(json!({
+                    "id": id, "name": name, "description": desc,
+                    "classification": cls, "privacyMode": privacy,
+                    "type": ctype,
+                    "folderId": folder_id,
+                    "folderPath": folder_id.and_then(|f| paths.get(&f).cloned()),
+                    "nodeCount": nodes, "edgeCount": edges,
+                    "sourceCount": sji.len(),
+                }));
+            }
+            json!({ "graphs": graphs })
         }
 
         // ── Read: search entities by name (clearance-filtered) ────────────────
@@ -873,6 +889,12 @@ async fn execute_tool_inner(
             // keeps running in the background (spawn survives disconnect), gets
             // stored, and the NEXT call hits the stored dossier instantly.
             let mut row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+            // Evicted (soft-archived) dossiers are revived, not rebuilt: the old
+            // path treated them as absent, answered "no dossier" once and paid an
+            // LLM build for knowledge that was already compiled.
+            if row.is_none() && crate::routes::kg::revive_archived_dossier(&state.db, claims.sub, &name).await {
+                row = crate::routes::kg::fetch_dossier_row_scoped(state, claims, &name).await;
+            }
             if row.is_none() {
                 const BUILD_INLINE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
                 match crate::routes::kg::api_key_scoped_jobs(&state.db, claims).await {

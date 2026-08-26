@@ -242,7 +242,7 @@ def run_dedup(
                 # Soft-archive the duplicates (lexical retrieval skips archived rows).
                 # id is UUID — cast the text[] param so `id = ANY(...)` type-matches.
                 cur.execute(
-                    "UPDATE text_chunks SET archived = true "
+                    "UPDATE text_chunks SET archived = true, archived_reason = 'dedup' "
                     "WHERE id = ANY(%s::uuid[])",
                     ([d["chunk_id"] for d in dups],),
                 )

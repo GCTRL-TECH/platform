@@ -43,6 +43,10 @@ interface UserRow {
   creditsUsed: number | null
   emailVerified: boolean
   createdAt: string
+  /** users.is_active — enforced on login, every request and API-key auth. */
+  isActive?: boolean
+  apiKeys?: number
+  graphs?: number
 }
 
 interface License {
@@ -282,9 +286,15 @@ function LicenseRows({ userId }: { userId: string }) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-export default function AdminPanel() {
+interface AdminPanelProps {
+  /** Rendered inside Settings → Users: no page header, users tab up front. */
+  embedded?: boolean
+  initialTab?: Tab
+}
+
+export default function AdminPanel({ embedded = false, initialTab = 'overview' }: AdminPanelProps = {}) {
   const { user } = useAuth()
-  const [tab, setTab] = useState<Tab>('overview')
+  const [tab, setTab] = useState<Tab>(initialTab)
   const [stats, setStats] = useState<Stats | null>(null)
   const [allUsers, setAllUsers] = useState<UserRow[]>([])
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([])
@@ -314,6 +324,15 @@ export default function AdminPanel() {
       await api.put(`/admin/users/${userId}/role`, { role })
       await loadUsers()
     } catch { alert('Failed to update role') }
+  }
+
+  async function updateActive(userId: string, active: boolean) {
+    const verb = active ? 'Activate' : 'Deactivate'
+    if (!active && !confirm(`${verb} this account? The user is signed out on their next request and every API key they hold stops working until reactivated.`)) return
+    try {
+      await api.put(`/admin/users/${userId}/active`, { active })
+      await loadUsers()
+    } catch { alert(`Failed to ${verb.toLowerCase()} user`) }
   }
 
   async function updateTier(userId: string, tier: string) {
@@ -346,11 +365,13 @@ export default function AdminPanel() {
   }
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6 p-6">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-100">Admin Panel</h1>
-        <p className="text-sm text-slate-500">System administration and user management</p>
-      </div>
+    <div className={cn('space-y-6', embedded ? '' : 'mx-auto max-w-6xl p-6')}>
+      {!embedded && (
+        <div>
+          <h1 className="text-2xl font-bold text-slate-100">Admin Panel</h1>
+          <p className="text-sm text-slate-500">System administration and user management</p>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 rounded-lg border border-slate-800 bg-slate-900/50 p-1">
@@ -405,6 +426,18 @@ export default function AdminPanel() {
       {/* Users */}
       {tab === 'users' && (
         <div className="rounded-xl border border-slate-800 bg-slate-900/50">
+          {/* Who is on this instance, at a glance: every registration lands
+              here, and an admin decides role + active state per account. */}
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-1 border-b border-slate-800 px-4 py-3 text-xs text-slate-500">
+            <span><span className="font-semibold text-slate-200">{allUsers.length}</span> accounts</span>
+            <span><span className="font-semibold text-emerald-400">{allUsers.filter((u) => u.isActive !== false).length}</span> active</span>
+            <span><span className="font-semibold text-red-400">{allUsers.filter((u) => u.isActive === false).length}</span> deactivated</span>
+            <span><span className="font-semibold text-amber-400">{allUsers.filter((u) => !u.emailVerified).length}</span> unverified</span>
+            <span><span className="font-semibold text-slate-200">{allUsers.filter((u) => u.role === 'admin').length}</span> admins</span>
+            <span className="ml-auto">
+              {allUsers.filter((u) => Date.now() - new Date(u.createdAt).getTime() < 7 * 86_400_000).length} registered in the last 7 days
+            </span>
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
@@ -416,6 +449,7 @@ export default function AdminPanel() {
                   <th className="px-4 py-3 font-medium text-slate-500">Token Balance</th>
                   <th className="px-4 py-3 font-medium text-slate-500">Tier</th>
                   <th className="px-4 py-3 font-medium text-slate-500">Verified</th>
+                  <th className="px-4 py-3 font-medium text-slate-500">Status</th>
                   <th className="px-4 py-3 font-medium text-slate-500">Joined</th>
                 </tr>
               </thead>
@@ -440,8 +474,13 @@ export default function AdminPanel() {
                         </td>
 
                         <td className="px-4 py-3">
-                          <p className="font-medium text-slate-200">{u.name}</p>
+                          <p className={cn('font-medium', u.isActive === false ? 'text-slate-500 line-through' : 'text-slate-200')}>{u.name}</p>
                           <p className="text-slate-500">{u.email}</p>
+                          {(u.graphs !== undefined || u.apiKeys !== undefined) && (
+                            <p className="mt-0.5 text-[10px] text-slate-600">
+                              {u.graphs ?? 0} {u.graphs === 1 ? 'graph' : 'graphs'} · {u.apiKeys ?? 0} {u.apiKeys === 1 ? 'API key' : 'API keys'}
+                            </p>
+                          )}
                         </td>
 
                         <td className="px-4 py-3">
@@ -511,6 +550,22 @@ export default function AdminPanel() {
                           {u.emailVerified
                             ? <CheckCircle size={14} className="text-emerald-400" />
                             : <XCircle size={14} className="text-slate-600" />}
+                        </td>
+
+                        <td className="px-4 py-3">
+                          <button
+                            onClick={() => void updateActive(u.id, u.isActive === false)}
+                            disabled={u.id === user?.id}
+                            title={u.id === user?.id ? 'You cannot deactivate your own account' : (u.isActive === false ? 'Reactivate account' : 'Deactivate account')}
+                            className={cn(
+                              'rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+                              u.isActive === false
+                                ? 'border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20'
+                                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                            )}
+                          >
+                            {u.isActive === false ? 'Deactivated' : 'Active'}
+                          </button>
                         </td>
 
                         <td className="px-4 py-3 text-slate-500">

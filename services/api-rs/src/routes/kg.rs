@@ -257,7 +257,14 @@ struct CreateComp {
 }
 
 #[derive(Deserialize)]
-struct ListQuery { limit: Option<i64>, offset: Option<i64> }
+struct ListQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// Filter to one folder (`"root"` = graphs without a folder). The folder view
+    /// used to filter the 20 newest graphs client-side, so a folder holding older
+    /// graphs opened empty under a non-zero card count.
+    #[serde(rename = "folderId")] folder_id: Option<String>,
+}
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
@@ -469,11 +476,33 @@ async fn list_folders(
     // `GET /kg/compilations`, which serves the 20 newest by default — so every
     // folder whose graphs were older than that window reported "0 graphs", and
     // the number also moved while you typed in the search box.
-    let direct: std::collections::HashMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT folder_id, COUNT(*) FROM compilations \
-         WHERE user_id = $1 AND folder_id IS NOT NULL AND COALESCE(is_system, false) = false \
-         GROUP BY folder_id"
-    ).bind(claims.sub).fetch_all(&state.db).await?.into_iter().collect();
+    //
+    // Counted with the SAME visibility rule as `list` (clearance cap, grants,
+    // Codebase access, KB-scope). The old GROUP BY counted every compilation of
+    // the owner, so a folder card said "7 graphs" while the folder listed 3 -
+    // and a KB-scoped colleague token learned the size of graphs it may not see.
+    let (clearance_rank, rank_capped) = clearance_rank_with_cap(&state.db, &claims).await;
+    let scope = api_key_scope(&state.db, &claims).await;
+    let visible: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT c.id, c.folder_id FROM compilations c \
+         LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id \
+         WHERE c.user_id = $1 AND c.folder_id IS NOT NULL AND COALESCE(c.is_system, false) = false \
+           AND (cl.rank <= $2 \
+                OR (c.classification_level_id IS NULL AND NOT $3) \
+                OR EXISTS (SELECT 1 FROM api_key_grants g \
+                           WHERE g.api_key_id = $4 AND g.compilation_id = c.id \
+                             AND (g.granted_rank IS NULL \
+                                  OR c.classification_level_id IS NULL \
+                                  OR g.granted_rank >= cl.rank))) \
+           AND ($5 OR c.type::text <> 'CODE')"
+    ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
+     .bind(claims.code_access)
+     .fetch_all(&state.db).await?;
+    let mut direct: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
+    for (id, fid) in visible {
+        if let Some(set) = &scope { if !set.contains(&id) { continue; } }
+        if let Some(f) = fid { *direct.entry(f).or_insert(0) += 1; }
+    }
 
     let mut children: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
     for (id, _, parent, _, _) in &rows {
@@ -784,7 +813,7 @@ pub(crate) async fn resolve_graph_uri(
 ///
 /// UUIDs are passed as `Vec<String>` because the Neo4j Bolt protocol has no
 /// native UUID type — `kg_builder.py` writes them as strings.
-async fn live_counts(
+pub(crate) async fn live_counts(
     neo: &neo4rs::Graph,
     source_job_ids: &[Uuid],
 ) -> (i64, i64) {
@@ -821,8 +850,12 @@ async fn list(
     let (clearance_rank, rank_capped) = clearance_rank_with_cap(&state.db, &claims).await;
     // KB-scoped tokens see only their assigned knowledge base(s).
     let scope = api_key_scope(&state.db, &claims).await;
-    let limit  = q.limit.unwrap_or(20).min(100);
+    // Default 100 (was 20): every list consumer - folder view, FUSE picker, MCP
+    // list_graphs - read the 20 newest and silently dropped the rest.
+    let limit  = q.limit.unwrap_or(100).min(500);
     let offset = q.offset.unwrap_or(0);
+    let folder_filter: Option<String> = q.folder_id.as_ref()
+        .map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
     // Visibility, per row:
     //   - classified within clearance (cl.rank <= $2), OR
     //   - unclassified — but ONLY for uncapped requests ($5): a rank-limited
@@ -854,9 +887,13 @@ async fn list(
                                   OR g.granted_rank >= cl.rank)))
            -- Codebase access off (migration 078): CODE knowledge bases are invisible.
            AND ($7 OR c.type::text <> 'CODE')
+           AND ($8::text IS NULL
+                OR ($8::text = 'root' AND c.folder_id IS NULL)
+                OR c.folder_id::text = $8::text)
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
      .bind(rank_capped).bind(claims.api_key_id).bind(claims.code_access)
+     .bind(folder_filter.as_deref())
      .fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
@@ -916,9 +953,12 @@ async fn list(
                                  AND (g.granted_rank IS NULL
                                       OR c.classification_level_id IS NULL
                                       OR g.granted_rank >= cl.rank)))
-               AND ($5 OR c.type::text <> 'CODE')"
+               AND ($5 OR c.type::text <> 'CODE')
+               AND ($6::text IS NULL
+                    OR ($6::text = 'root' AND c.folder_id IS NULL)
+                    OR c.folder_id::text = $6::text)"
         ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
-         .bind(claims.code_access)
+         .bind(claims.code_access).bind(folder_filter.as_deref())
          .fetch_one(&state.db).await?
     };
 
@@ -2807,6 +2847,46 @@ pub(crate) async fn bump_dossier_heat(db: &sqlx::PgPool, dossier_id: Uuid) {
                 last_accessed = NOW(), archived = false \
           WHERE id = $1"
     ).bind(dossier_id).execute(db).await;
+}
+
+/// A soft-archived (evicted) dossier is still the compiled truth - bring it back
+/// instead of paying an LLM rebuild and answering "no dossier" in the meantime.
+/// Returns true when a row was revived.
+pub(crate) async fn revive_archived_dossier(db: &sqlx::PgPool, user_id: Uuid, name: &str) -> bool {
+    sqlx::query(
+        "UPDATE entity_dossiers \
+            SET archived = false, archived_reason = NULL, heat = GREATEST(heat, 1.0), \
+                last_accessed = NOW(), updated_at = NOW() \
+          WHERE user_id = $1 AND lower(entity_name) = lower($2) AND archived = true"
+    ).bind(user_id).bind(name).execute(db).await
+     .map(|r| r.rows_affected() > 0).unwrap_or(false)
+}
+
+/// "Users/fabio/Code"-style path for every folder of a user. The agent gateway's
+/// `list_graphs` shows where a graph lives so a model picks its knowledge base by
+/// placement (personal / project / global), not by guessing from names.
+pub(crate) async fn folder_paths(db: &sqlx::PgPool, user_id: Uuid) -> std::collections::HashMap<Uuid, String> {
+    let rows: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, name, parent_folder_id FROM kg_folders WHERE user_id = $1"
+    ).bind(user_id).fetch_all(db).await.unwrap_or_default();
+    let by_id: std::collections::HashMap<Uuid, (String, Option<Uuid>)> =
+        rows.into_iter().map(|(i, n, p)| (i, (n, p))).collect();
+    let mut out = std::collections::HashMap::new();
+    for id in by_id.keys() {
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = Some(*id);
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        while let Some(c) = cur {
+            if !seen.insert(c) { break; } // cyclic tree: stop, never hang
+            match by_id.get(&c) {
+                Some((n, p)) => { segs.push(n.clone()); cur = *p; }
+                None => break,
+            }
+        }
+        segs.reverse();
+        out.insert(*id, segs.join("/"));
+    }
+    out
 }
 
 #[derive(Deserialize)]

@@ -58,7 +58,7 @@ async fn list_users(
 ) -> Result<Json<Vec<SafeUser>>> {
     require_role(&claims, "admin")?;
     let users = sqlx::query_as::<_, SafeUser>(
-        "SELECT id, email, name, role, clearance, tier, tokens_balance, default_ontology_id, created_at
+        "SELECT id, email, name, role::TEXT, clearance::TEXT, tier, tokens_balance, default_ontology_id, created_at
          FROM users ORDER BY created_at DESC"
     )
     .fetch_all(&state.db).await?;

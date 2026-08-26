@@ -23,6 +23,7 @@ On your FIRST connection to a GCTRL instance, configure how you'll use it, then 
 
 ## Read the right layer
 - **HOT - dossiers** · `get_dossier(name)`: the authoritative compiled profile of an entity (summary, key facts with confidence, origin files, timeline). When a dossier exists, state it directly - do not hedge.
+- **Where things live** · `list_graphs`: every graph with its `type` (RAW / WIKI / CODE), `folderPath` (`Users/<you>/...` = personal, `Projects/<client>/...` = shared with the team and distilled into the wiki, `Global/...` = company-wide) and size. Personal learnings go to `Users/<you>`, confirmed team facts to the project, code decisions to the repo's CODE graph.
 - **Blended answer** · `query(message)`: blends all tiers (dense + keyword + graph + dossiers). Prefer this for open questions. Use `search_chunks` for raw evidence passages.
 - **COLD - graph** · `search_entities`, `get_entity` (includes provenance / origin file), `get_neighbors`, `shortest_path`: structure, dependencies, "how is A connected to B".
 - **WIKI - curated prose** · `list_wiki_pages` / `get_wiki_page`: distilled, cross-linked pages over a knowledge base.

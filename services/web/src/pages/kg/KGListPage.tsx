@@ -497,9 +497,16 @@ export function KGListPage() {
     }
   }
 
+  // Expert mode lists ONE folder at a time straight from the server (`folderId`
+  // filter, limit 500). The old client-side filter ran over the 20 newest graphs
+  // of the whole account, so a folder holding older graphs opened empty while
+  // its card (counted server-side) said "7 graphs". Easy mode keeps a flat list.
+  const folderParam = isExpert ? (currentFolderId ?? 'root') : null
   const { data, isLoading, error } = useApiQuery<CompilationsResponse>(
-    ['kg', 'compilations'],
-    '/kg/compilations'
+    ['kg', 'compilations', folderParam ?? 'all'],
+    folderParam
+      ? `/kg/compilations?folderId=${encodeURIComponent(folderParam)}&limit=500`
+      : '/kg/compilations?limit=500'
   )
   const compilations = data?.compilations ?? []
 
@@ -758,7 +765,15 @@ export function KGListPage() {
                     list is only the 20 newest, and it shrinks as you type in the
                     search box — a folder's size must not depend on a text filter. */}
                 <p className="text-xs text-slate-600">
-                  {folder.totalCompilationCount ?? 0} graphs
+                  {(() => {
+                    // Say what the folder WILL show when opened (direct graphs)
+                    // and, separately, what its subfolders hold — a card that
+                    // read "12 graphs" and opened onto nothing was a lie.
+                    const direct = folder.compilationCount ?? 0
+                    const nested = Math.max(0, (folder.totalCompilationCount ?? 0) - direct)
+                    const label = `${direct} ${direct === 1 ? 'graph' : 'graphs'}`
+                    return nested > 0 ? `${label} · ${nested} in subfolders` : label
+                  })()}
                 </p>
               </div>
               <ChevronRight size={14} className="text-slate-700 opacity-0 group-hover:opacity-100 transition-opacity" />

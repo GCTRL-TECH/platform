@@ -18,6 +18,9 @@ struct UpdateRoleBody { role: String, clearance: Option<String> }
 struct UpdateTokensBody { tokens_balance: i32 }
 
 #[derive(Deserialize)]
+struct UpdateActiveBody { active: bool }
+
+#[derive(Deserialize)]
 struct UpdateTierBody { tier: String }
 
 #[derive(Deserialize)]
@@ -32,6 +35,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/stats",               get(stats))
         .route("/users",               get(list_users))
         .route("/users/:id/role",      put(update_role))
+        .route("/users/:id/active",    put(update_active))
         .route("/users/:id/tokens",    put(update_tokens))
         .route("/users/:id/tier",      put(update_tier))
         .route("/users/:id/licenses",  get(user_licenses))
@@ -81,7 +85,7 @@ async fn list_users(
     let rows = sqlx::query_as::<_, (
         uuid::Uuid, String, Option<String>, String, String,
         Option<String>, i32, bool, chrono::DateTime<chrono::Utc>,
-        Option<i32>, Option<i32>
+        Option<i32>, Option<i32>, bool, i64, i64
     )>(
         "SELECT u.id, u.email, u.name,
                 u.role::TEXT AS role,
@@ -90,7 +94,10 @@ async fn list_users(
                 u.tokens_balance,
                 u.email_verified, u.created_at,
                 l.credits_allocated,
-                l.credits_used
+                l.credits_used,
+                u.is_active,
+                (SELECT COUNT(*) FROM api_keys k WHERE k.user_id = u.id AND (k.expires_at IS NULL OR k.expires_at > NOW())) AS api_keys,
+                (SELECT COUNT(*) FROM compilations c WHERE c.user_id = u.id AND COALESCE(c.is_system, false) = false) AS graphs
          FROM users u
          LEFT JOIN LATERAL (
              SELECT credits_allocated, credits_used
@@ -102,7 +109,7 @@ async fn list_users(
          ORDER BY u.created_at DESC"
     ).fetch_all(&state.db).await?;
 
-    let users: Vec<Value> = rows.into_iter().map(|(id, email, name, role, clearance, tier, bal, verified, created, lic_alloc, lic_used)| {
+    let users: Vec<Value> = rows.into_iter().map(|(id, email, name, role, clearance, tier, bal, verified, created, lic_alloc, lic_used, is_active, api_keys, graphs)| {
         let has_license = lic_alloc.is_some();
         json!({
             "id": id,
@@ -117,6 +124,9 @@ async fn list_users(
             "creditsUsed": lic_used,
             "emailVerified": verified,
             "createdAt": created,
+            "isActive": is_active,
+            "apiKeys": api_keys,
+            "graphs": graphs,
         })
     }).collect();
 
@@ -144,6 +154,30 @@ async fn update_role(
     .bind(user_id)
     .execute(&state.db).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Activate / deactivate an account from the product (before this only SCIM
+/// could flip `users.is_active`, which login, every request and API-key auth
+/// already enforce). An admin cannot lock themselves out.
+async fn update_active(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(user_id): Path<uuid::Uuid>,
+    Json(body): Json<UpdateActiveBody>,
+) -> Result<Json<Value>> {
+    require_role(&claims, "admin")?;
+    if user_id == claims.sub && !body.active {
+        return Err(crate::error::AppError::BadRequest("you cannot deactivate your own account".into()));
+    }
+    let updated = sqlx::query(
+        "UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2"
+    ).bind(body.active).bind(user_id).execute(&state.db).await?;
+    if updated.rows_affected() == 0 { return Err(crate::error::AppError::NotFound); }
+    crate::services::audit::log_access(
+        &state.db, &claims, if body.active { "admin.user.activate" } else { "admin.user.deactivate" },
+        "user", &user_id.to_string(), 0, None, true, None,
+    ).await;
+    Ok(Json(json!({ "ok": true, "isActive": body.active })))
 }
 
 async fn update_tokens(
