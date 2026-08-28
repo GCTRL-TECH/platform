@@ -992,6 +992,58 @@ pub(crate) fn pull_image(image: &str) -> Result<(), String> {
     }
 }
 
+/// Builds the `/containers/create` body for a recreate from a `/containers/{name}/json`
+/// inspect document.
+///
+/// The whole `Config` and `HostConfig` are carried over verbatim (the same
+/// round-trip Watchtower relies on) instead of a hand-picked field list. The old
+/// list dropped everything it did not name — `Labels` (Traefik routers and the
+/// `com.docker.compose.*` identity, so `docker compose` stopped recognising the
+/// container), `ExtraHosts` (`host.docker.internal` for kex/fuse/api → graphs
+/// without edges), `Healthcheck` (kex/fuse `depends_on` the agent's health, so a
+/// later `compose up` refused to start them) and `HostConfig.Mounts` (named
+/// volumes). Seen live on 2026-08-25: `brain.gctrl.tech` answered 404 after an
+/// update because gctrl-web came back without its Traefik labels.
+///
+/// Two things must NOT be copied: the auto-generated `Hostname` (dockerd sets it
+/// to the old container's short id when compose did not pin one — copying it
+/// would freeze a stale id as the hostname) and the old id's network alias.
+/// Compose service aliases are kept so DNS by service name keeps working.
+fn build_create_config(inspect: &Value) -> Value {
+    let old_id = inspect["Id"].as_str().unwrap_or("");
+    let short_id: String = old_id.chars().take(12).collect();
+
+    let mut config = inspect["Config"].clone();
+    if config["Hostname"].as_str() == Some(short_id.as_str()) {
+        config.as_object_mut().map(|m| m.remove("Hostname"));
+    }
+
+    let mut host_config = inspect["HostConfig"].clone();
+    if host_config["NetworkMode"].as_str().map_or(true, str::is_empty) {
+        host_config["NetworkMode"] = json!("bridge");
+    }
+
+    let mut endpoints = serde_json::Map::new();
+    if let Some(nets) = inspect["NetworkSettings"]["Networks"].as_object() {
+        for (net, ep) in nets {
+            let aliases: Vec<Value> = ep["Aliases"]
+                .as_array()
+                .map(|a| a.iter().filter(|v| v.as_str() != Some(short_id.as_str())).cloned().collect())
+                .unwrap_or_default();
+            if !aliases.is_empty() {
+                endpoints.insert(net.clone(), json!({ "Aliases": aliases }));
+            }
+        }
+    }
+
+    let mut body = config;
+    body["HostConfig"] = host_config;
+    if !endpoints.is_empty() {
+        body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
+    }
+    body
+}
+
 /// Recreates `name` from its (already-pulled) image, preserving its runtime config.
 /// Returns `Ok(true)` when recreated, `Ok(false)` when the container simply isn't
 /// deployed on this install (404 on inspect) — that's a normal skip, not a failure.
@@ -1006,24 +1058,7 @@ fn recreate_container(name: &str) -> Result<bool, String> {
     }
     let inspect = json_from_body(&body);
 
-    let network_mode = inspect["HostConfig"]["NetworkMode"]
-        .as_str()
-        .unwrap_or("bridge")
-        .to_string();
-
-    let create_cfg = json!({
-        "Image":        inspect["Config"]["Image"],
-        "Cmd":          inspect["Config"]["Cmd"],
-        "Env":          inspect["Config"]["Env"],
-        "ExposedPorts": inspect["Config"]["ExposedPorts"],
-        "HostConfig": {
-            "Binds":         inspect["HostConfig"]["Binds"],
-            "PortBindings":  inspect["HostConfig"]["PortBindings"],
-            "RestartPolicy": inspect["HostConfig"]["RestartPolicy"],
-            "NetworkMode":   network_mode,
-        }
-    })
-    .to_string();
+    let create_cfg = build_create_config(&inspect).to_string();
 
     // Remove old container (force-stop + delete)
     docker_http("DELETE", &format!("/containers/{name}?force=true"), None, 30)?;
@@ -1262,6 +1297,74 @@ pub(crate) fn prune_superseded_images() -> PruneReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── build_create_config ────────────────────────────────────────────────────
+
+    fn sample_inspect() -> Value {
+        json!({
+            "Id": "abcdef123456789",
+            "Config": {
+                "Hostname": "abcdef123456",
+                "Image": "ghcr.io/gctrl-tech/web:latest",
+                "Env": ["A=1"],
+                "Labels": {
+                    "traefik.enable": "true",
+                    "com.docker.compose.project": "gctrl"
+                },
+                "Healthcheck": { "Test": ["CMD", "wget", "-q", "http://127.0.0.1/health"] }
+            },
+            "HostConfig": {
+                "Binds": ["/root/gctrl/nginx.conf:/etc/nginx/conf.d/default.conf:ro"],
+                "Mounts": [{ "Type": "volume", "Source": "gctrl_pgdata", "Target": "/data" }],
+                "ExtraHosts": ["host.docker.internal:host-gateway"],
+                "NetworkMode": "gctrl_gctrl",
+                "RestartPolicy": { "Name": "unless-stopped" }
+            },
+            "NetworkSettings": {
+                "Networks": {
+                    "gctrl_gctrl": { "Aliases": ["gctrl-web", "abcdef123456"], "IPAddress": "172.16.24.9" }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn build_create_config_preserves_labels_extra_hosts_healthcheck_and_mounts() {
+        let cfg = build_create_config(&sample_inspect());
+        assert_eq!(cfg["Labels"]["traefik.enable"], "true");
+        assert_eq!(cfg["Labels"]["com.docker.compose.project"], "gctrl");
+        assert_eq!(cfg["Healthcheck"]["Test"][0], "CMD");
+        assert_eq!(cfg["HostConfig"]["ExtraHosts"][0], "host.docker.internal:host-gateway");
+        assert_eq!(cfg["HostConfig"]["Mounts"][0]["Source"], "gctrl_pgdata");
+        assert!(cfg["HostConfig"]["Binds"][0].as_str().is_some_and(|b| !b.is_empty()));
+        assert_eq!(cfg["HostConfig"]["NetworkMode"], "gctrl_gctrl");
+        assert_eq!(cfg["Image"], "ghcr.io/gctrl-tech/web:latest");
+    }
+
+    #[test]
+    fn build_create_config_drops_auto_hostname_but_keeps_pinned_one() {
+        let cfg = build_create_config(&sample_inspect());
+        assert!(cfg.get("Hostname").is_none(), "old container id must not become the hostname");
+
+        let mut pinned = sample_inspect();
+        pinned["Config"]["Hostname"] = json!("brain");
+        assert_eq!(build_create_config(&pinned)["Hostname"], "brain");
+    }
+
+    #[test]
+    fn build_create_config_keeps_service_alias_not_old_id_and_no_ip_pin() {
+        let cfg = build_create_config(&sample_inspect());
+        let ep = &cfg["NetworkingConfig"]["EndpointsConfig"]["gctrl_gctrl"];
+        assert_eq!(ep["Aliases"], json!(["gctrl-web"]));
+        assert!(ep.get("IPAddress").is_none());
+    }
+
+    #[test]
+    fn build_create_config_defaults_missing_network_mode_to_bridge() {
+        let mut i = sample_inspect();
+        i["HostConfig"]["NetworkMode"] = json!("");
+        assert_eq!(build_create_config(&i)["HostConfig"]["NetworkMode"], "bridge");
+    }
 
     // ── version_gt / parse_version (pre-existing behavior, unchanged) ─────────
 
