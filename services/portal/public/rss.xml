@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>How to Fill Time Gaps Irregular Timestamps Pandas Guide</title>
+      <link>https://gctrl.tech/blog/how-to-fill-gaps-in-irregular-time-series-data</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/how-to-fill-gaps-in-irregular-time-series-data</guid>
+      <description>Learn how to fill time gaps irregular timestamps pandas workflows using resample, reindex, and interpolation to standardize your time series data.</description>
+      <pubDate>Thu, 03 Sep 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>How to Improve Basic FAISS RAG Pipeline Performance</title>
       <link>https://gctrl.tech/blog/beyond-basic-faiss-optimizing-your-rag-retrieval-pipeline</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/beyond-basic-faiss-optimizing-your-rag-retrieval-pipeline</guid>

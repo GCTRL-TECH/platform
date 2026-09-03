@@ -45,6 +45,7 @@ Agent skill: https://gctrl.tech/skill.md
 
 ## Articles
 
+- [How to Fill Time Gaps Irregular Timestamps Pandas Guide](https://gctrl.tech/blog/how-to-fill-gaps-in-irregular-time-series-data): Learn how to fill time gaps irregular timestamps pandas workflows using resample, reindex, and interpolation to standardize your time series data.
 - [How to Improve Basic FAISS RAG Pipeline Performance](https://gctrl.tech/blog/beyond-basic-faiss-optimizing-your-rag-retrieval-pipeline): Learn how to improve basic faiss rag pipeline results using recursive chunking, retrieval gates, and RAGAS evaluations to stop hallucinations.
 - [Best Tools for LLM Product Analytics: Evals and Monitoring](https://gctrl.tech/blog/llm-product-analytics-the-stack-for-evals-and-monitoring): Discover the best tools for llm product analytics. Learn how to use Confident AI, DeepEval, and Langfuse for pre-production evals and production monitoring.
 - [Entity Resolution Duplicate Names: Improving RAG Accuracy](https://gctrl.tech/blog/entity-resolution-for-rag-merging-duplicate-identities-in-knowle): Learn how entity resolution duplicate names prevents retrieval fragmentation and hallucinations in RAG systems by merging records into a golden record.
