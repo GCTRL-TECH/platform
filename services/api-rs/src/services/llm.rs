@@ -667,6 +667,25 @@ pub async fn resolve_for_user(
         .flatten(),
     };
 
+    // A bare local-Ollama row (no key, no base, no model — what the Ollama
+    // override UI / onboarding leaves behind) carries no information beyond
+    // "use local Ollama", so it must not shadow an operator-configured global
+    // runtime. Measured on Asgard (2026-09-04): with the global runtime on oMLX,
+    // every KEX/FUSE/RAG call of the admin still went to Ollama (`model not
+    // found`) because of such a placeholder row from July. An explicitly
+    // requested provider is still honoured above; only the implicit
+    // "most recent active row" pick is subject to this rule.
+    let row = match row {
+        Some((ref provider, ref api_key, ref base_url, ref default_model))
+            if requested.is_none()
+                && placeholder_ollama_row(provider, api_key.as_deref(), base_url.as_deref(), default_model.as_deref())
+                && active_runtime_config(db).await.is_some() =>
+        {
+            None
+        }
+        other => other,
+    };
+
     match row {
         Some((provider, api_key, base_url, default_model)) => {
             let model = requested_model
@@ -690,6 +709,19 @@ pub async fn resolve_for_user(
             choose_fallback_target(global, requested_model)
         }
     }
+}
+
+/// True for a `user_llm_providers` row that says nothing but "local Ollama":
+/// provider `ollama` with no key, no base URL and no default model. Such a row
+/// must not shadow a configured global runtime (see `resolve_for_user`).
+pub fn placeholder_ollama_row(
+    provider: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    default_model: Option<&str>,
+) -> bool {
+    let empty = |o: Option<&str>| o.map(str::trim).filter(|s| !s.is_empty()).is_none();
+    provider == "ollama" && empty(api_key) && empty(base_url) && empty(default_model)
 }
 
 /// Resolve the owner's runtime-configured Ollama base URL (Settings →
@@ -2069,5 +2101,15 @@ mod tests {
         assert_eq!(key_for_base(None, key(), Some("http://mac:8020")), None);
         assert_eq!(key_for_base(Some("http://mac:8020"), key(), None), None);
         assert_eq!(key_for_base(Some("http://mac:8020"), None, Some("http://mac:8020")), None);
+    }
+
+    #[test]
+    fn placeholder_ollama_row_detection() {
+        assert!(placeholder_ollama_row("ollama", None, None, None));
+        assert!(placeholder_ollama_row("ollama", Some(" "), Some(""), None));
+        assert!(!placeholder_ollama_row("ollama", Some("k"), None, None));
+        assert!(!placeholder_ollama_row("ollama", None, Some("http://host.docker.internal:11434"), None));
+        assert!(!placeholder_ollama_row("ollama", None, None, Some("qwen2.5:7b")));
+        assert!(!placeholder_ollama_row("openai_compatible", None, None, None));
     }
 }

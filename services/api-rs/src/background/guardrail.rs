@@ -138,6 +138,13 @@ async fn run_tick(state: &AppState) {
 
     match probe(&target).await {
         Ok(()) => {
+            // Stamp the healthy probe too: `last_probe_at` frozen at the last
+            // failure made a working guardrail look asleep (Asgard, 2026-09-04).
+            let _ = sqlx::query(
+                "UPDATE guardrail_state SET last_probe_at = now(), last_error = NULL WHERE id = 1",
+            )
+            .execute(&state.db)
+            .await;
             reset_failures(state).await;
             dismiss_unhealthy_events(state).await;
         }
