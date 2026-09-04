@@ -9,7 +9,7 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 80718f8 -->
+<!-- baseline-sha: bad4f84 -->
 
 ## v0.9.4 - Apple-Silicon inference as a first-class runtime, and a guardrail that tells busy from broken
 
