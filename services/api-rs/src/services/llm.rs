@@ -161,6 +161,23 @@ pub async fn stored_runtime_key(db: &sqlx::PgPool) -> Option<String> {
     stored_runtime_base_and_key(db).await.1
 }
 
+/// Pure half of [`stored_key_for_base`]: the stored key is returned ONLY when
+/// `base` is the same server the key was entered for. An operator who changes the
+/// base URL without supplying a key must not have the old credential presented
+/// to the new host (credential misdirection, flagged by the push security review).
+pub fn key_for_base(stored_base: Option<&str>, stored_key: Option<String>, base: Option<&str>) -> Option<String> {
+    match (stored_base, base) {
+        (Some(sb), Some(nb)) if same_openai_root(sb, nb) => stored_key,
+        _ => None,
+    }
+}
+
+/// The stored runtime key, but only for a probe/request against the stored base.
+pub async fn stored_key_for_base(db: &sqlx::PgPool, base: Option<&str>) -> Option<String> {
+    let (stored_base, stored_key) = stored_runtime_base_and_key(db).await;
+    key_for_base(stored_base.as_deref(), stored_key, base)
+}
+
 /// `(base_url, decrypted api_key)` of the global runtime, each `None` when
 /// unset/empty. One query for the callers that must decide whether a key belongs
 /// to a given base (credential route, model listing, worker overrides).
@@ -2041,5 +2058,16 @@ mod tests {
             "pinned",
         );
         assert!(result.is_some(), "trailing slash should still match bundled llamacpp");
+    }
+
+    #[test]
+    fn key_for_base_only_for_same_server() {
+        let key = || Some("k".to_string());
+        assert_eq!(key_for_base(Some("http://mac:8020/v1"), key(), Some("http://mac:8020")), key());
+        assert_eq!(key_for_base(Some("http://mac:8020"), key(), Some("http://MAC:8020/v1/")), key());
+        assert_eq!(key_for_base(Some("http://mac:8020"), key(), Some("http://other:8020")), None);
+        assert_eq!(key_for_base(None, key(), Some("http://mac:8020")), None);
+        assert_eq!(key_for_base(Some("http://mac:8020"), key(), None), None);
+        assert_eq!(key_for_base(Some("http://mac:8020"), None, Some("http://mac:8020")), None);
     }
 }

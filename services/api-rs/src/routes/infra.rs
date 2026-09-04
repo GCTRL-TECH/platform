@@ -114,7 +114,9 @@ pub fn resolve_model_arg(model_id: &str, runtime: &str) -> Option<String> {
 // ── Shared persist_runtime helper ─────────────────────────────────────────────
 
 /// Shared helper: UPSERT `runtime_config` row (id=1).
-/// Seals `api_key` when provided; COALESCE preserves existing key otherwise.
+/// Seals `api_key` when provided; otherwise the existing key is kept ONLY while the
+/// base URL is unchanged (a model-only edit). A base change without a fresh key
+/// clears it, so a stored credential is never carried to a different server.
 /// `runtime_id` is the catalog entry applied (always written — a switch to
 /// `ollama` must clear a stale `mlx`); `max_concurrency` is COALESCEd so a
 /// caller that doesn't know it (agent tool, bundled arms) keeps the operator's
@@ -145,7 +147,9 @@ pub(crate) async fn persist_runtime(
              provider        = $1,
              base_url        = $2,
              model           = $3,
-             api_key         = COALESCE($4, runtime_config.api_key),
+             api_key         = CASE WHEN $4 IS NOT NULL THEN $4
+                                    WHEN runtime_config.base_url IS NOT DISTINCT FROM $2 THEN runtime_config.api_key
+                                    ELSE NULL END,
              runtime_id      = $5,
              max_concurrency = COALESCE($6, runtime_config.max_concurrency),
              updated_at      = now()",
@@ -1241,7 +1245,7 @@ async fn set_runtime(
     // server 401s an anonymous probe and would report "unhealthy" while working.
     let probe_key = match api_key_opt {
         Some(k) => Some(k.to_string()),
-        None => crate::services::llm::stored_runtime_key(&state.db).await,
+        None => crate::services::llm::stored_key_for_base(&state.db, validated_base.as_deref()).await,
     };
     let health_client = reqwest::Client::new();
     let target = crate::services::llm::LlmTarget {
@@ -1686,7 +1690,7 @@ async fn switch_external_like(
     let api_key_opt = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let probe_key = match api_key_opt {
         Some(k) => Some(k.to_string()),
-        None => crate::services::llm::stored_runtime_key(db).await,
+        None => crate::services::llm::stored_key_for_base(db, Some(&base_url)).await,
     };
     let health_client = reqwest::Client::new();
     let target = crate::services::llm::LlmTarget {

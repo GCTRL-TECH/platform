@@ -1955,7 +1955,7 @@ async fn execute_tool_inner(
                     // 401s an anonymous /v1/models and would read as unhealthy.
                     let probe_key = match api_key_arg.clone() {
                         Some(k) => Some(k),
-                        None => crate::services::llm::stored_runtime_key(&state.db).await,
+                        None => crate::services::llm::stored_key_for_base(&state.db, Some(&base_url)).await,
                     };
                     let health_client = reqwest::Client::new();
                     let target = crate::services::llm::LlmTarget {
