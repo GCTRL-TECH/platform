@@ -117,6 +117,9 @@ services:
       - PG_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL
       - PORT=4010
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}
+      # Worker credential fetch for keyed OpenAI-compatible runtimes (D7 in
+      # docs/superpowers/specs/2026-09-04-mlx-runtime-and-backpressure-design.md).
+      - GCTRL_INTERNAL_API_URL=http://api:4000
       - KEX_ENTITY_VERIFY=${KEX_ENTITY_VERIFY:-false}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
       - PHOENIX_SERVICE_NAME=gctrl-kex
@@ -155,6 +158,8 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_COLLECTION=GCTRL_chunks
       - OLLAMA_BASE=http://ollama:11434
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}
+      - GCTRL_INTERNAL_API_URL=http://api:4000
       - GCTRL_DISTILL_PROVIDER=${GCTRL_DISTILL_PROVIDER:-ollama}
       - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}

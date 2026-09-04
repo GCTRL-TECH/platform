@@ -358,8 +358,12 @@ def _build_timeline(facts: list[dict]) -> list[dict]:
 
 # ── Summary synthesis (REUSES the distiller's local-Ollama per-entity pass) ─────
 
-def _build_summary(entity: dict, conn=None) -> str:
-    """One concise paragraph from the distiller's Ollama synthesis. Falls back to
+def _build_summary(
+    entity: dict, conn=None,
+    model=None, ollama_base=None, kind="ollama", api_key=None, max_concurrency=None,
+) -> str:
+    """One concise paragraph from the distiller's synthesis on the job's generation
+    runtime (model/base/kind/api_key/max_concurrency; Ollama by default). Falls back to
     a deterministic fact list if the LLM is unavailable (graceful, still grounded).
     """
     # P2a: prefer the precise entity_uris-based lookup (no name-substring false
@@ -402,7 +406,7 @@ def _build_summary(entity: dict, conn=None) -> str:
         f"Source snippets:\n{snippet_lines}\n"
     )
     try:
-        summary = distiller._llm_complete(prompt).strip()
+        summary = distiller._llm_complete(prompt, model=model, ollama_base=ollama_base, kind=kind, api_key=api_key, max_concurrency=max_concurrency).strip()
         # Strip any stray heading the model emitted.
         summary = re.sub(r"^#+\s.*$", "", summary, flags=re.MULTILINE).strip()
         if summary:
@@ -469,14 +473,17 @@ def _upsert_dossier(
 
 # ── Public: compile one dossier ─────────────────────────────────────────────────
 
-def _compile_one(driver, conn, user_id: str, entity_name: str) -> Optional[dict]:
+def _compile_one(
+    driver, conn, user_id: str, entity_name: str,
+    model=None, ollama_base=None, kind="ollama", api_key=None, max_concurrency=None,
+) -> Optional[dict]:
     entity = _fetch_entity_facts(driver, user_id, entity_name)
     if entity is None:
         return None
 
     origin_files = _resolve_origin_files(conn, user_id, entity["source_jobs"])
     timeline = _build_timeline(entity["facts"])
-    summary = _build_summary(entity, conn)
+    summary = _build_summary(entity, conn, model=model, ollama_base=ollama_base, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
     uri = _entity_uri(entity)
 
     with conn:
@@ -497,7 +504,10 @@ def _compile_one(driver, conn, user_id: str, entity_name: str) -> Optional[dict]
     }
 
 
-def build_dossier_for_name(user_id: str, entity_name: str) -> Optional[dict]:
+def build_dossier_for_name(
+    user_id: str, entity_name: str,
+    model=None, ollama_base=None, kind="ollama", api_key=None, max_concurrency=None,
+) -> Optional[dict]:
     """On-demand: build/refresh the dossier for a single named entity. Returns the
     compiled dossier dict, or None if the user owns no node with that name."""
     logger.info(f"[dossier] on-demand build '{entity_name}' for user {user_id}")
@@ -505,7 +515,7 @@ def build_dossier_for_name(user_id: str, entity_name: str) -> Optional[dict]:
     conn = _pg_connect()
     try:
         with telemetry.span("fuse.dossier", "CHAIN", {"input.value": entity_name, "user_id": user_id}):
-            return _compile_one(driver, conn, user_id, entity_name)
+            return _compile_one(driver, conn, user_id, entity_name, model=model, ollama_base=ollama_base, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
     finally:
         driver.close()
         conn.close()
@@ -538,7 +548,8 @@ def _resolve_origin_files_scoped(conn, source_jobs: list[str], granted_jobs: set
 
 
 def build_dossier_for_name_scoped(
-    user_id: str, entity_name: str, source_job_ids: list[str]
+    user_id: str, entity_name: str, source_job_ids: list[str],
+    model=None, ollama_base=None, kind="ollama", api_key=None, max_concurrency=None,
 ) -> Optional[dict]:
     """On-demand KB-SCOPED build: compile the dossier for `entity_name` confined to
     the caller's granted `source_job_ids`, and store it under `user_id` (the scoped
@@ -565,7 +576,7 @@ def build_dossier_for_name_scoped(
             return None
         origin_files = _resolve_origin_files_scoped(conn, entity["source_jobs"], granted)
         timeline = _build_timeline(entity["facts"])
-        summary = _build_summary(entity, conn)
+        summary = _build_summary(entity, conn, model=model, ollama_base=ollama_base, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
         uri = _entity_uri(entity)
         with conn:
             action = _upsert_dossier(
@@ -589,7 +600,8 @@ def build_dossier_for_name_scoped(
 
 
 def build_top_dossiers(
-    compilation_id: str, user_id: str, source_job_ids: list[str], top_n: int = 10
+    compilation_id: str, user_id: str, source_job_ids: list[str], top_n: int = 10,
+    model=None, ollama_base=None, kind="ollama", api_key=None, max_concurrency=None,
 ) -> dict:
     """Build/refresh dossiers for the top-degree ('god node') entities of a
     compilation. Called from the distill job. Returns a summary."""
@@ -605,7 +617,7 @@ def build_top_dossiers(
         names = _fetch_top_entity_names(driver, source_job_ids, top_n)
         for nm in names:
             try:
-                res = _compile_one(driver, conn, user_id, nm)
+                res = _compile_one(driver, conn, user_id, nm, model=model, ollama_base=ollama_base, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
             except Exception as exc:
                 logger.warning(f"[dossier] failed to compile '{nm}': {exc}")
                 continue

@@ -119,18 +119,18 @@ Return ONLY a JSON array, one object per candidate, in this exact shape:
 JSON array:"""
 
 
-def verify_entities(entities, text, model, base, kind, api_key=None, min_score=0.0):
+def verify_entities(entities, text, model, base, kind, api_key=None, min_score=0.0, max_concurrency=None):
     """Verify/retype GLiNER candidates via the configured generation LLM.
 
     Args:
         entities: list of NER entity dicts (ner.py shape: start, end, text,
             type, coarse_type, score, gliner_label, label, ...).
         text: the full source text (used to derive context snippets).
-        model/base/kind/api_key: the SAME generation runtime params the job
-            already resolved for relex (relex_base, relex_model,
-            generation_kind, generation_api_key) — this tier rides whatever
-            runtime is configured (Ollama 7b/14b, or an OpenAI-compatible
-            GPU endpoint), it never hardcodes its own model.
+        model/base/kind/api_key/max_concurrency: the SAME generation runtime
+            params the job already resolved for relex (relex_base, relex_model,
+            generation_kind, generation_api_key, generation_max_concurrency) —
+            this tier rides whatever runtime is configured (Ollama 7b/14b, or an
+            OpenAI-compatible GPU endpoint), it never hardcodes its own model.
         min_score: entities scoring below this are never sent to the LLM and
             pass through untouched (never a recall cost). Default 0.0 = every
             entity is a verify candidate.
@@ -206,6 +206,7 @@ def verify_entities(entities, text, model, base, kind, api_key=None, min_score=0
                 options={"temperature": 0.0},
                 think=config.ENTITY_VERIFY_THINK,
                 timeout=180,
+                max_concurrency=max_concurrency,
             )
             report["llm_calls"] += 1
             parsed = parser._parse_json_array(raw)

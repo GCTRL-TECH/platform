@@ -62,6 +62,11 @@ function humanizeAgentError(raw: string): string {
   ) {
     return 'This model failed to run on your machine (the local Ollama runner crashed). Pick a different model from the selector (top-right) — a cloud model usually works.'
   }
+  // Transient backpressure from the model server (oMLX 507 "memory pressure" /
+  // 409 "model busy", vLLM 429/503). The API already retried with backoff.
+  if (r.includes('llm error') && /\b(409|429|503|507)\b/.test(r)) {
+    return 'The model server is busy or under memory pressure right now — the request was retried and still failed. Try again in a moment or lower "Max parallel requests" in Settings → Infrastructure.'
+  }
   return raw
 }
 

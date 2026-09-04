@@ -204,7 +204,7 @@ export function PurposeCard({
       <p className="mb-3 text-xs text-slate-500">{blurb}</p>
 
       {onSetRuntime && (
-        <RuntimeOverrideRow provider={runtimeProvider} baseUrl={runtimeBaseUrl} model={selected} onSet={onSetRuntime} />
+        <RuntimeOverrideRow provider={runtimeProvider} baseUrl={runtimeBaseUrl} model={selected} onSet={onSetRuntime} activeRuntime={activeRuntime} />
       )}
 
       {runtimeId && (
@@ -349,22 +349,31 @@ export function PurposeCard({
 const OLLAMA_HOST = 'http://host.docker.internal:11434'
 
 /** Per-purpose Runtime + Model (P2). Choose which INSTANCE this purpose runs on —
- *  inherit the global runtime, bundled Ollama (CPU), native Ollama (GPU on this
- *  host), or a custom /v1 endpoint (local vLLM, LM Studio, Ollama cloud) — and
- *  then pick a model from THAT instance's installed models. So e.g. KEX embedding
- *  can run on native GPU Ollama while chat rides a cloud endpoint. Keyless local
- *  endpoints only for the batch workers (KEX/FUSE). */
+ *  inherit the global runtime, the global runtime's own server (with a
+ *  different model), bundled Ollama (CPU), native Ollama (GPU on this host), or
+ *  a custom /v1 endpoint (local vLLM, LM Studio, Ollama cloud) — and then pick a
+ *  model from THAT instance's installed models. So e.g. KEX embedding can run on
+ *  native GPU Ollama while chat rides a cloud endpoint. Endpoints on the global
+ *  runtime's server reuse its stored API key (workers fetch it via the internal
+ *  credential route); other keyed endpoints still need a keyless proxy. */
 function RuntimeOverrideRow({
-  provider, baseUrl, model, onSet,
+  provider, baseUrl, model, onSet, activeRuntime,
 }: {
   provider?: string | null
   baseUrl?: string | null
   model?: string
   onSet: (provider: string, baseUrl: string, model?: string) => Promise<void>
+  activeRuntime?: ActiveRuntime | null
 }) {
+  // "Same server as the global runtime" only makes sense for a non-Ollama
+  // global runtime with a concrete base (external / mlx / llama.cpp / vLLM).
+  const globalBase = activeRuntime && activeRuntime.provider !== 'ollama' && activeRuntime.base_url
+    ? activeRuntime.base_url
+    : null
   const derived = !provider ? 'inherit'
     : (provider === 'ollama' && baseUrl === OLLAMA_HOST) ? 'native'
     : (provider === 'ollama') ? 'bundled'
+    : (globalBase && provider === 'openai_compatible' && baseUrl === globalBase) ? 'global'
     : 'custom'
   const [mode, setMode] = useState(derived)
   const [customUrl, setCustomUrl] = useState(provider === 'ollama' ? '' : (baseUrl ?? ''))
@@ -381,6 +390,7 @@ function RuntimeOverrideRow({
     if (m === 'inherit') return null
     if (m === 'bundled') return { provider: 'ollama', base: '' }
     if (m === 'native') return { provider: 'ollama', base: OLLAMA_HOST }
+    if (m === 'global') return globalBase ? { provider: 'openai_compatible', base: globalBase } : null
     return { provider: 'openai_compatible', base: customUrl.trim() }
   }
 
@@ -391,7 +401,11 @@ function RuntimeOverrideRow({
         `/llm/instance-models?provider=${encodeURIComponent(t.provider)}&base=${encodeURIComponent(t.base)}`
       )
       setInstModels(data.models ?? [])
-      if (!data.reachable) setInstErr('Instance not reachable — is it running?')
+      if (!data.reachable) {
+        setInstErr(t.provider === 'openai_compatible'
+          ? 'Could not list models — the server may be down or require its API key. You can still type the model name.'
+          : 'Instance not reachable — is it running?')
+      }
     } catch { setInstErr('Could not load models') } finally { setInstLoading(false) }
   }
 
@@ -424,6 +438,7 @@ function RuntimeOverrideRow({
           className="flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[12px] text-slate-200 focus:border-indigo-500 focus:outline-none disabled:opacity-50"
         >
           <option value="inherit">Inherit global runtime</option>
+          {globalBase && <option value="global">Same server as the global runtime</option>}
           <option value="bundled">Ollama — bundled (CPU)</option>
           <option value="native">Ollama — native (this host, GPU)</option>
           <option value="custom">Custom /v1 endpoint…</option>
@@ -445,6 +460,15 @@ function RuntimeOverrideRow({
           <span className="shrink-0 text-[11px] font-medium text-slate-400">Model</span>
           {instLoading ? (
             <span className="flex items-center gap-1 text-[11px] text-slate-500"><Loader2 size={11} className="animate-spin" /> Loading models…</span>
+          ) : instModels.length === 0 ? (
+            // Nothing listed (server down, or a keyed /v1 server that rejects the
+            // unauthenticated list call) — fall back to typing the model name.
+            <input
+              value={pickModel}
+              onChange={(e) => setPickModel(e.target.value)}
+              placeholder="Model name as the server expects it"
+              className="flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 font-mono text-[11px] text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+            />
           ) : (
             <select
               value={pickModel}
@@ -452,7 +476,7 @@ function RuntimeOverrideRow({
               style={{ colorScheme: 'dark' }}
               className="flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[12px] text-slate-200 focus:border-indigo-500 focus:outline-none"
             >
-              <option value="">{instModels.length ? 'Select a model…' : 'No models on this instance'}</option>
+              <option value="">Select a model…</option>
               {instModels.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           )}
@@ -470,7 +494,7 @@ function RuntimeOverrideRow({
       <p className="text-[10px] text-slate-500">
         {mode === 'inherit'
           ? 'Follows the global runtime. Pick a specific instance to run this purpose there — e.g. native Ollama for GPU.'
-          : 'Model list = what that instance has installed. Keyless local endpoints only for the batch workers (KEX/FUSE).'}
+          : 'Model list = what that instance has installed. Endpoints on the global runtime\'s server reuse its API key automatically; other keyed endpoints need a keyless proxy.'}
       </p>
     </div>
   )

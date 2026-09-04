@@ -11,6 +11,17 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 80718f8 -->
 
+## v0.9.4 - Apple-Silicon inference as a first-class runtime, and a guardrail that tells busy from broken
+
+*4 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **MLX / oMLX is now a selectable runtime.** Settings → Infrastructure lists "MLX / oMLX (Apple Silicon, this host)" next to Ollama, llama.cpp and vLLM: point it at the server on your Mac (the default is `http://host.docker.internal:8020`), paste the server's API key, and every purpose that inherits the global runtime - chat, Talk to Graph, relation extraction, wiki distillation, dossiers and the user profile - runs on it. Batch workers authenticate against a keyed server through an internal credential lookup; the key never enters the job queue.
+- **A busy model server no longer looks like a dead one.** Under memory pressure an inference server answers with "busy, retry later" style codes (409, 429, 503, 507). GCTRL used to count three of those as three failures and silently switch the whole platform back to bundled Ollama, where the configured model does not even exist, and left an alarm banner up for a day. Those responses are now retried with backoff on every path (API, extraction, fusion), never count toward the auto-revert, and the guardrail only ever reverts when bundled Ollama is proven able to take over. Re-applying a runtime clears stale banners.
+- **The health probe finally sends your API key** and accepts a base URL with or without a trailing `/v1` - the same root the chat call uses, so "unhealthy" now means unreachable, not "the probe forgot the key". The Infrastructure card shows the actual reason when a runtime is unhealthy.
+- **Thinking is switched off for extraction on OpenAI-compatible runtimes** (`enable_thinking: false`, overridable with `GCTRL_LLM_THINK` / `KEX_THINK` / `FUSE_THINK`), and the relation-extraction token budget (`RELEX_NUM_PREDICT`) now reaches `/v1` servers as `max_tokens`. A reasoning model such as Qwen 3.6 answers structured extraction calls in seconds instead of thinking for a minute first.
+- **Max parallel requests per runtime.** A new per-runtime limit (default 4) caps how many generation requests GCTRL opens at once against a local server, so a batch ingest cannot push a 48 GB machine into memory pressure on its own.
+- **Three more call sites follow the configured runtime**: the fact log during ingest, entity dossiers and the user-profile distillation were hard-wired to Ollama; they now use the same runtime as everything else. Entity-resolution embeddings in FUSE deliberately stay on Ollama `nomic-embed-text` - the licensed tuning profile is calibrated on those vectors.
+
 ## v0.9.3 - An update keeps your containers the way you configured them
 
 *28 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

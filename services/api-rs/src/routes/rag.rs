@@ -611,7 +611,11 @@ async fn query(
     // using the conversation so search finds the right entity. First turn (no
     // history) → unchanged, so no extra cost. Used for chunk search + dossier/entity
     // resolution; the ORIGINAL message stays the question shown to the model.
-    let search_query = contextualize_query(&client, &target, &history, &req.message).await;
+    let search_query = {
+        // Spec D2: every generation call against a /v1 runtime takes a slot.
+        let _slot = crate::services::llm::acquire_slot(&state, &target).await;
+        contextualize_query(&client, &target, &history, &req.message).await
+    };
     if search_query != req.message {
         tracing::info!("rag: contextualized follow-up '{}' → '{}'", req.message, search_query);
     }
@@ -1379,12 +1383,15 @@ async fn query(
     // Thread the conversation: prior turns first, then the grounded question.
     let mut chat_msgs: Vec<Value> = history.clone();
     chat_msgs.push(json!({ "role": "user", "content": user_content }));
-    let answer = crate::services::llm::chat_messages_once(
-        &client,
-        &target,
-        &crate::services::llm::ChatMessages { system: system_prompt, messages: chat_msgs },
-    )
-    .await
+    let answer = {
+        let _slot = crate::services::llm::acquire_slot(&state, &target).await;
+        crate::services::llm::chat_messages_once(
+            &client,
+            &target,
+            &crate::services::llm::ChatMessages { system: system_prompt, messages: chat_msgs },
+        )
+        .await
+    }
     .map_err(AppError::Internal)?;
 
     // De-cloak the answer before it's persisted/returned — the cloak map never
@@ -1599,7 +1606,10 @@ async fn deep_query(
     // WORKING MEMORY: contextualize the question against the running conversation so
     // dossier/entity resolution (and the agent's own framing) follow a follow-up's
     // referent. The original message stays the user turn; this only steers retrieval.
-    let search_query = contextualize_query(&client, &target, history, &req.message).await;
+    let search_query = {
+        let _slot = llm::acquire_slot(state, &target).await;
+        contextualize_query(&client, &target, history, &req.message).await
+    };
 
     // GCTRL base + the caller's enabled skills, plus a deep-mode preamble nudging
     // the model to gather evidence via tools before answering with citations.
@@ -1703,9 +1713,11 @@ async fn deep_query(
         };
 
         let cm = ChatMessages { system: &turn_system, messages: messages.clone() };
-        let reply = llm::chat_messages_once(&client, &target, &cm)
-            .await
-            .map_err(AppError::Internal)?;
+        let reply = {
+            let _slot = llm::acquire_slot(state, &target).await;
+            llm::chat_messages_once(&client, &target, &cm).await
+        }
+        .map_err(AppError::Internal)?;
         let trimmed = reply.trim().to_string();
 
         // Detect a tool call (same protocol as agent::chat). find_tool_json parses
@@ -1760,8 +1772,10 @@ async fn deep_query(
                     "content": format!("Question: {}\n\nEvidence:\n{evidence}", req.message),
                 })],
             };
-            final_answer = llm::chat_messages_once(&client, &target, &synth)
-                .await
+            final_answer = {
+                let _slot = llm::acquire_slot(state, &target).await;
+                llm::chat_messages_once(&client, &target, &synth).await
+            }
                 .unwrap_or_else(|_| {
                     if sources.is_empty() {
                         "I could not retrieve enough evidence to answer.".to_string()

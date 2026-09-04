@@ -154,7 +154,7 @@ A Rust control plane orchestrates Python extraction/fusion workers, a React UI, 
 - **Workers:** Python (KEX extraction, FUSE fusion)
 - **Frontend:** React + Vite (dashboard + license portal)
 - **Stores:** Neo4j (graph) · Qdrant (vectors) · PostgreSQL · Redis
-- **Inference:** local Ollama (multi-provider configurable)
+- **Inference:** local Ollama by default; switchable to llama.cpp, vLLM, MLX / oMLX (Apple Silicon) or any OpenAI-compatible `/v1` endpoint
 - **Packaging:** Docker Compose, one-line installer
 
 ---

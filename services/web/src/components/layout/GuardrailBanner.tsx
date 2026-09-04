@@ -27,7 +27,12 @@ function describeEvent(e: GuardrailEvent): string {
     const reason = typeof e.detail.reason === 'string' ? e.detail.reason : 'repeated failures'
     const from = e.detail.from as { provider?: string; model?: string } | undefined
     const src = from?.provider ? ` (was ${from.provider}${from.model ? ` / ${from.model}` : ''})` : ''
-    return `LLM runtime reverted to bundled Ollama after 3 consecutive failures: ${reason}${src}.`
+    return `LLM runtime reverted to bundled Ollama after repeated failures: ${reason}${src}.`
+  }
+  if (e.kind === 'runtime_unhealthy') {
+    const reason = typeof e.detail.reason === 'string' ? e.detail.reason : 'repeated failures'
+    const fallback = typeof e.detail.fallback_error === 'string' ? e.detail.fallback_error : 'fallback unavailable'
+    return `Active LLM runtime is failing (${reason}) and bundled Ollama cannot take over (${fallback}). Fix the runtime in the Cookbook.`
   }
   if (e.kind === 'degraded_jobs') {
     const count = typeof e.detail.count === 'number' ? e.detail.count : 'Several'
@@ -38,7 +43,8 @@ function describeEvent(e: GuardrailEvent): string {
 
 /**
  * Global amber banner surfacing guardrail events (auto-reverted runtime,
- * degraded-job spikes) — polls GET /infra/guardrail every 60s. Mounted once in
+ * runtime unhealthy with no usable fallback, degraded-job spikes) — polls
+ * GET /infra/guardrail every 60s. Mounted once in
  * the app shell so it's visible from anywhere. Dismissible per-event.
  */
 export function GuardrailBanner() {

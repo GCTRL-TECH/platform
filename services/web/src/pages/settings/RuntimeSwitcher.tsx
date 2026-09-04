@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useId } from 'react'
 import { Check, Wifi, WifiOff, Loader2, AlertTriangle, Eye, EyeOff, ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
@@ -14,6 +14,13 @@ export interface ActiveRuntime {
   embedding_mode: string | null
   configured: boolean
   healthy: boolean
+  /** Catalog id that was applied (ollama | llamacpp | vllm | external | mlx).
+   *  Null for rows written before migration 082 — fall back to URL heuristics. */
+  runtime_id?: string | null
+  /** Per-runtime concurrency gate (1..64). */
+  max_concurrency?: number
+  /** Last probe error when `healthy` is false. */
+  health_error?: string | null
 }
 
 export interface RuntimeCatalogEntry {
@@ -22,6 +29,22 @@ export interface RuntimeCatalogEntry {
   kind: string
   needs_base_url: boolean
   needs_gpu?: boolean
+  needs_api_key?: boolean
+  default_base_url?: string
+  description?: string
+}
+
+const DEFAULT_MAX_CONCURRENCY = 4
+
+/** Map an active runtime back to the catalog id the switcher form should show. */
+function catalogIdFor(rt: ActiveRuntime): string {
+  if (rt.runtime_id) return rt.runtime_id
+  return rt.provider === 'openai_compatible' ? 'external' : rt.provider
+}
+
+function clampConcurrency(n: number): number {
+  if (!Number.isFinite(n)) return DEFAULT_MAX_CONCURRENCY
+  return Math.min(64, Math.max(1, Math.round(n)))
 }
 
 interface Props {
@@ -51,6 +74,14 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
+  const [maxConcurrency, setMaxConcurrency] = useState<number>(DEFAULT_MAX_CONCURRENCY)
+
+  // Models the selected openai_compatible instance (external / mlx) actually
+  // serves — best-effort datalist behind the free-text model field. There is no
+  // /infra/models catalog for these runtimes.
+  const [instanceModels, setInstanceModels] = useState<string[]>([])
+  const [instanceLoading, setInstanceLoading] = useState(false)
+  const instanceListId = useId()
 
   // SSE stream state
   const [streamPhase, setStreamPhase] = useState<StreamPhase>('idle')
@@ -84,9 +115,10 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
   // Pre-fill form from active runtime
   useEffect(() => {
     if (activeRuntime && !selectedKind) {
-      setSelectedKind(activeRuntime.provider)
+      setSelectedKind(catalogIdFor(activeRuntime))
       setSelectedModel(activeRuntime.model ?? '')
       setBaseUrl(activeRuntime.base_url ?? '')
+      if (activeRuntime.max_concurrency != null) setMaxConcurrency(clampConcurrency(activeRuntime.max_concurrency))
     }
   }, [activeRuntime, selectedKind])
 
@@ -95,6 +127,43 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
   const needsBaseUrl = selectedEntry?.needs_base_url ?? false
   const needsGpu = selectedEntry?.needs_gpu ?? false
   const gpuAvailable = hardware?.nvidia_toolkit ?? false
+  const needsApiKey = !!selectedEntry && (selectedEntry.needs_api_key === true || selectedEntry.id === 'external')
+  // external / mlx: an arbitrary OpenAI-compatible server — no bundled model
+  // catalog exists, so the model is free text (with the instance's own list as hints).
+  const isOpenAiCompatible = !!selectedEntry && selectedEntry.kind === 'openai_compatible'
+  const showConcurrency = !!selectedKind && selectedKind !== 'ollama'
+
+  const loadInstanceModels = useCallback(async (base: string) => {
+    const b = base.trim()
+    if (!b) { setInstanceModels([]); return }
+    setInstanceLoading(true)
+    try {
+      const { data } = await api.get<{ reachable: boolean; models: string[] }>(
+        `/llm/instance-models?provider=openai_compatible&base=${encodeURIComponent(b)}`,
+      )
+      setInstanceModels(data.models ?? [])
+    } catch {
+      setInstanceModels([])
+    } finally {
+      setInstanceLoading(false)
+    }
+  }, [])
+
+  // Refresh the instance model hints when an openai_compatible runtime is picked
+  // (the base URL may have been prefilled from the catalog or the active runtime).
+  useEffect(() => {
+    if (isOpenAiCompatible) void loadInstanceModels(baseUrl)
+    else setInstanceModels([])
+    // Re-run on runtime change only; the base URL input refreshes on blur.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpenAiCompatible, selectedKind])
+
+  function selectRuntime(id: string) {
+    setSelectedKind(id)
+    setSelectedModel('')
+    const entry = catalog.find((e) => e.id === id)
+    if (entry?.default_base_url && !baseUrl.trim()) setBaseUrl(entry.default_base_url)
+  }
 
   async function handleSwitch() {
     if (!selectedKind) return
@@ -106,10 +175,14 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
 
     try {
       const token = getToken()
-      const body: Record<string, string | undefined> = { runtime: selectedKind }
-      if (selectedModel) body.model = selectedModel
+      const body: Record<string, string | number | undefined> = {
+        runtime: selectedKind,
+        runtime_id: selectedKind,
+      }
+      if (selectedModel.trim()) body.model = selectedModel.trim()
       if (baseUrl.trim()) body.base_url = baseUrl.trim()
       if (apiKey.trim()) body.api_key = apiKey.trim()
+      if (showConcurrency) body.max_concurrency = clampConcurrency(maxConcurrency)
 
       const resp = await fetch('/api/infra/switch-runtime', {
         method: 'POST',
@@ -265,10 +338,7 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                 ) : (
                   <select
                     value={selectedKind}
-                    onChange={(e) => {
-                      setSelectedKind(e.target.value)
-                      setSelectedModel('')
-                    }}
+                    onChange={(e) => selectRuntime(e.target.value)}
                     style={{ colorScheme: 'dark' }}
                     className="w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
                   >
@@ -295,9 +365,12 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                 {needsGpu && gpuAvailable && (
                   <p className="mt-1 text-[11px] text-emerald-400/80">NVIDIA GPU detected — vLLM can use it.</p>
                 )}
+                {selectedEntry?.description && (
+                  <p className="mt-1 text-[11px] text-slate-500">{selectedEntry.description}</p>
+                )}
               </div>
 
-              {/* Base URL (for external / llamacpp / vllm) */}
+              {/* Base URL (for external / mlx / llamacpp / vllm) */}
               {needsBaseUrl && (
                 <div>
                   <label className="mb-1.5 block text-[11px] font-medium text-slate-400">
@@ -306,17 +379,18 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                   <input
                     value={baseUrl}
                     onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder="http://host:port/v1"
+                    onBlur={() => { if (isOpenAiCompatible) void loadInstanceModels(baseUrl) }}
+                    placeholder={selectedEntry?.default_base_url || 'http://host:port/v1'}
                     className="w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
                   />
                 </div>
               )}
 
-              {/* API key (external only) */}
-              {selectedEntry && selectedEntry.id === 'external' && (
+              {/* API key (external: optional; mlx and other keyed catalog entries: needs_api_key) */}
+              {needsApiKey && (
                 <div>
                   <label className="mb-1.5 block text-[11px] font-medium text-slate-400">
-                    API Key <span className="text-slate-600">(optional)</span>
+                    API Key{selectedEntry?.id === 'external' && <span className="text-slate-600"> (optional)</span>}
                   </label>
                   <div className="relative">
                     <input
@@ -334,6 +408,36 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                       {showApiKey ? <EyeOff size={13} /> : <Eye size={13} />}
                     </button>
                   </div>
+                  {selectedEntry?.id !== 'external' && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Required when the server was started with an API key (oMLX <code className="font-mono">--api-key</code>, LM Studio auth…).
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Per-runtime concurrency gate — not for Ollama (it queues internally) */}
+              {showConcurrency && (
+                <div>
+                  <label className="mb-1.5 block text-[11px] font-medium text-slate-400">
+                    Max parallel requests
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={64}
+                    step={1}
+                    value={maxConcurrency}
+                    onChange={(e) => {
+                      const n = Number(e.target.value)
+                      setMaxConcurrency(Number.isFinite(n) ? n : DEFAULT_MAX_CONCURRENCY)
+                    }}
+                    onBlur={() => setMaxConcurrency((v) => clampConcurrency(v))}
+                    className="w-28 rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                  />
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    How many chat requests GCTRL sends to this server at once (1–64). Lower it if the server answers busy / memory-pressure errors.
+                  </p>
                 </div>
               )}
 
@@ -350,8 +454,34 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                 </div>
               )}
 
-              {/* For external/vllm where user sets base_url, also allow picking a model */}
-              {selectedKind && needsBaseUrl && (
+              {/* external / mlx: free-text model with the instance's own list as hints */}
+              {selectedKind && needsBaseUrl && isOpenAiCompatible && (
+                <div>
+                  <label className="mb-1.5 block text-[11px] font-medium text-slate-400">
+                    Model <span className="text-slate-600">(as the server names it)</span>
+                  </label>
+                  <input
+                    list={instanceListId}
+                    value={selectedModel}
+                    onChange={(e) => setSelectedModel(e.target.value)}
+                    placeholder="e.g. qwen3.6-35b-a3b"
+                    className="w-full rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 font-mono text-sm text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none"
+                  />
+                  <datalist id={instanceListId}>
+                    {instanceModels.map((m) => <option key={m} value={m} />)}
+                  </datalist>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {instanceLoading
+                      ? 'Checking which models the server lists…'
+                      : instanceModels.length > 0
+                        ? `${instanceModels.length} model(s) listed by the server — pick one or type a name.`
+                        : 'Type the model name the server expects. Keyed servers may not list models until the key is saved.'}
+                  </p>
+                </div>
+              )}
+
+              {/* llama.cpp / vLLM where user sets base_url: pick from the bundled catalog */}
+              {selectedKind && needsBaseUrl && !isOpenAiCompatible && (
                 <div>
                   <label className="mb-1.5 block text-[11px] font-medium text-slate-400">
                     Model <span className="text-slate-600">(from base URL)</span>

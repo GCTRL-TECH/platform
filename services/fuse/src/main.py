@@ -264,6 +264,8 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         generation_kind = payload.get("generation_kind") or "ollama"
         generation_base = payload.get("generation_base")
         generation_api_key = payload.get("generation_api_key")
+        # Per-runtime generation gate (spec D2); None -> llm_client env default.
+        generation_max_concurrency = payload.get("generation_max_concurrency")
         logger.info(f"Worker: received distill job for {compilation_id}")
 
         if job_id != "unknown":
@@ -276,6 +278,7 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
             compilation_id, user_id, limit=limit,
             model=distill_model, ollama_base=distill_base,
             kind=generation_kind, api_key=generation_api_key,
+            max_concurrency=generation_max_concurrency,
         )
 
         if job_id != "unknown":
@@ -472,6 +475,31 @@ class DistillRequest(BaseModel):
     generation_kind: str = "ollama"
     generation_base: Optional[str] = None
     generation_api_key: Optional[str] = None
+    generation_max_concurrency: Optional[int] = None
+
+
+class GenerationRuntimeMixin(BaseModel):
+    """Per-request generation runtime for the dossier / user-profile builders (D8,
+    2026-09-04). These used to be hard-wired to Ollama `/api/generate`; api-rs now
+    sends the resolved `distill` purpose here over the internal HTTP hop (the key
+    may travel on this hop, it never enters Redis). All optional: omitted ->
+    env defaults, exactly as before."""
+    distill_model: Optional[str] = None
+    ollama_base: Optional[str] = None
+    generation_kind: str = "ollama"
+    generation_base: Optional[str] = None
+    generation_api_key: Optional[str] = None
+    generation_max_concurrency: Optional[int] = None
+
+    def generation_kwargs(self):
+        base = self.generation_base if self.generation_base else self.ollama_base
+        return {
+            "model": self.distill_model,
+            "ollama_base": base,
+            "kind": self.generation_kind or "ollama",
+            "api_key": self.generation_api_key,
+            "max_concurrency": self.generation_max_concurrency,
+        }
 
 
 class MergeResponse(BaseModel):
@@ -524,6 +552,7 @@ async def distill_endpoint(req: DistillRequest):
             req.compilation_id, req.user_id, limit=req.limit,
             model=req.distill_model, ollama_base=distill_base,
             kind=req.generation_kind, api_key=req.generation_api_key,
+            max_concurrency=req.generation_max_concurrency,
         )
     except ValueError as exc:
         # Bad request: not a WIKI comp / missing source / unknown comp.
@@ -533,7 +562,7 @@ async def distill_endpoint(req: DistillRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-class DossierRequest(BaseModel):
+class DossierRequest(GenerationRuntimeMixin):
     user_id: str
     # Single-entity on-demand build (the api-rs GET /dossier?name=X path).
     entity_name: Optional[str] = None
@@ -560,6 +589,7 @@ async def dossier_build_endpoint(req: DossierRequest):
         if req.entity_name and req.source_job_ids:
             result = dossier.build_dossier_for_name_scoped(
                 req.user_id, req.entity_name, req.source_job_ids,
+                **req.generation_kwargs(),
             )
             if result is None:
                 raise HTTPException(
@@ -568,7 +598,9 @@ async def dossier_build_endpoint(req: DossierRequest):
                 )
             return result
         if req.entity_name:
-            result = dossier.build_dossier_for_name(req.user_id, req.entity_name)
+            result = dossier.build_dossier_for_name(
+                req.user_id, req.entity_name, **req.generation_kwargs(),
+            )
             if result is None:
                 raise HTTPException(
                     status_code=404,
@@ -579,6 +611,7 @@ async def dossier_build_endpoint(req: DossierRequest):
             return dossier.build_top_dossiers(
                 req.compilation_id, req.user_id,
                 req.source_job_ids or [], top_n=req.top_n,
+                **req.generation_kwargs(),
             )
         raise HTTPException(
             status_code=400,
@@ -591,7 +624,7 @@ async def dossier_build_endpoint(req: DossierRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-class ProfileBuildRequest(BaseModel):
+class ProfileBuildRequest(GenerationRuntimeMixin):
     user_id: str
 
 
@@ -603,7 +636,7 @@ async def profile_build_endpoint(req: ProfileBuildRequest):
     Incognito content is never persisted, so it can never be a source here.
     """
     try:
-        return user_profile.build_profile(req.user_id)
+        return user_profile.build_profile(req.user_id, **req.generation_kwargs())
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except Exception as exc:

@@ -170,7 +170,10 @@ def _upsert_profile(conn, user_id: str, facts: list[dict], summary: str) -> None
     conn.commit()
 
 
-def build_profile(user_id: str) -> dict:
+def build_profile(
+    user_id: str,
+    model=None, ollama_base=None, kind="ollama", api_key=None, max_concurrency=None,
+) -> dict:
     """Distil + persist the user's profile from STANDARD-mode history.
 
     Returns {facts, summary, message_count, action}. Raises PermissionError if the
@@ -191,7 +194,7 @@ def build_profile(user_id: str) -> dict:
         transcript = _build_transcript(rows)
         prompt = _distill_prompt(transcript)
         try:
-            raw = distiller._llm_complete(prompt)
+            raw = distiller._llm_complete(prompt, model=model, ollama_base=ollama_base, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
         except Exception as exc:
             logger.error(f"[user_profile] LLM distill failed for {user_id}: {exc}")
             raise

@@ -191,6 +191,12 @@ export function RuntimeCard({ hardware, recommendation, activeRuntime, isAdmin, 
         {activeRuntime?.model && (
           <p className="mt-0.5 text-[11px] text-slate-500">Model: <span className="font-mono text-slate-400">{activeRuntime.model}</span></p>
         )}
+        {activeRuntime && !activeRuntime.healthy && activeRuntime.health_error && (
+          <p className="mt-1 flex items-start gap-1 text-[11px] text-amber-400">
+            <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+            <span>Unreachable: {activeRuntime.health_error}</span>
+          </p>
+        )}
       </div>
 
       {/* Fallback: the onboard CPU Ollama always backs the primary — the runtime
@@ -301,7 +307,7 @@ export function RuntimeCard({ hardware, recommendation, activeRuntime, isAdmin, 
       {/* Runtime kind switch — reuse RuntimeSwitcher, don't rebuild it. */}
       <div className="space-y-2 border-t border-slate-800 pt-3">
         <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
-          Change runtime (Ollama / llama.cpp / vLLM / custom endpoint)
+          Change runtime (Ollama / llama.cpp / vLLM / MLX / custom endpoint)
         </p>
         <RuntimeSwitcher
           hardware={hardware}

@@ -1365,25 +1365,18 @@ async fn distill(
     }
 
     let limit = req.limit.unwrap_or(15).clamp(1, 100);
-    // Per-user distill model + Ollama base (Settings → AI Models / Infra). Unset →
-    // FUSE uses its env defaults, so existing installs are untouched.
-    let (distill_model, ollama_base) =
-        crate::services::llm::resolve_distill_overrides(&state.db, claims.sub).await;
-    let gen_target =
-        crate::services::llm::resolve_distill_generation_overrides(&state.db, claims.sub).await;
+    // Per-user distill model + Ollama base + generation_* (Settings → AI Models /
+    // Infra). Unset → FUSE uses its env defaults, so existing installs are
+    // untouched. Internal HTTP hop to FUSE, so the runtime key may travel (D8).
     let fuse_url = format!("{}/distill", state.cfg.fuse_url);
     let client = reqwest::Client::new();
     let mut distill_payload = serde_json::json!({
         "compilation_id": id.to_string(),
         "user_id": claims.sub.to_string(),
         "limit": limit,
-        "distill_model": distill_model,
-        "ollama_base": ollama_base,
     });
-    if let Some(ref gen) = gen_target {
-        if let Some(map) = distill_payload.as_object_mut() {
-            crate::services::llm::apply_generation_overrides(gen, map);
-        }
+    if let Some(map) = distill_payload.as_object_mut() {
+        map.extend(crate::services::llm::distill_payload_fields(&state.db, claims.sub, true).await);
     }
     let resp = client
         .post(&fuse_url)
@@ -2702,7 +2695,7 @@ pub(crate) async fn build_dossier_via_fuse(
     let url = format!("{}/dossier/build", state.cfg.fuse_url);
     let resp = reqwest::Client::new()
         .post(&url)
-        .json(&json!({ "user_id": user_id.to_string(), "entity_name": name }))
+        .json(&dossier_build_body(state, user_id, json!({ "user_id": user_id.to_string(), "entity_name": name })).await)
         .timeout(std::time::Duration::from_secs(180))
         .send()
         .await
@@ -2716,6 +2709,24 @@ pub(crate) async fn build_dossier_via_fuse(
         return Err(AppError::Internal(format!("FUSE dossier build failed ({st}): {body}")));
     }
     Ok(Some(()))
+}
+
+/// Add the DISTILL purpose's generation runtime to a FUSE `/dossier/build` body
+/// (spec D8): `distill_model` always, plus `generation_kind/base/model/
+/// max_concurrency/api_key` when that runtime is openai_compatible. The key may
+/// travel here because this is a direct internal HTTP hop to FUSE, never Redis.
+async fn dossier_build_body(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    mut body: Value,
+) -> Value {
+    let (distill, gen) =
+        crate::services::llm::worker_generation_overrides(&state.db, user_id, "distill", true).await;
+    if let Some(map) = body.as_object_mut() {
+        map.insert("distill_model".into(), json!(distill.model));
+        map.extend(gen);
+    }
+    body
 }
 
 /// KB-SCOPED on-demand dossier build for a colleague token. Asks FUSE to compile the
@@ -2738,11 +2749,11 @@ pub(crate) async fn build_dossier_via_fuse_scoped(
     let url = format!("{}/dossier/build", state.cfg.fuse_url);
     let resp = reqwest::Client::new()
         .post(&url)
-        .json(&json!({
+        .json(&dossier_build_body(state, user_id, json!({
             "user_id": user_id.to_string(),
             "entity_name": name,
             "source_job_ids": source_jobs,
-        }))
+        })).await)
         .timeout(std::time::Duration::from_secs(180))
         .send()
         .await

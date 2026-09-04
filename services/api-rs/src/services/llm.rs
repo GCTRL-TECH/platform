@@ -91,28 +91,259 @@ pub fn choose_fallback_target(
     }
 }
 
-/// Check whether a resolved `LlmTarget` is currently reachable.
+/// Canonical root of an OpenAI-compatible server: trailing `/` trimmed and ONE
+/// trailing `/v1` stripped. Operators paste both `http://host:8020` and
+/// `http://host:8020/v1` (oMLX prints the latter); every caller appends its own
+/// `/v1/...` path. Before this helper only `ChatMessages::build` stripped, so a
+/// `/v1` base chatted fine but probed `/v1/v1/models` (measured on Asgard, spec
+/// D4). The Python workers mirror this as `_v1_root()`.
+pub fn openai_compat_root(base: &str) -> String {
+    let b = base.trim().trim_end_matches('/');
+    let b = b.strip_suffix("/v1").unwrap_or(b);
+    b.trim_end_matches('/').to_string()
+}
+
+/// True when two bases name the same OpenAI-compatible server after
+/// canonicalisation (`/v1`, trailing slash, and the in-container loopback
+/// rewrite all folded). Used to decide whether the STORED runtime key belongs to
+/// a target (workers only ever get the key for the runtime it was entered for).
+pub fn same_openai_root(a: &str, b: &str) -> bool {
+    let ca = openai_compat_root(&containerize_ollama_base(a));
+    let cb = openai_compat_root(&containerize_ollama_base(b));
+    !ca.is_empty() && ca.eq_ignore_ascii_case(&cb)
+}
+
+/// Reachability probe with the REASON, so the UI/agent can say "401: api key
+/// missing or wrong" instead of a bare `healthy:false` (Asgard failure #1: the
+/// probe omitted the stored key and reported a working oMLX as dead).
 ///
-/// - `openai_compatible` → `GET {base}/v1/models`
+/// - `openai_compatible` → `GET {root}/v1/models`, `Authorization: Bearer` when
+///   the target carries a key
 /// - all others (ollama) → `GET {base}/api/tags`
 ///
-/// 3-second timeout; returns `true` on any 2xx response.
-pub async fn runtime_health(client: &reqwest::Client, target: &LlmTarget) -> bool {
+/// 3-second timeout. Errors: `unreachable: <e>`, `401 unauthorized (api key
+/// missing or wrong)`, `HTTP <code>`.
+pub async fn runtime_health_detail(client: &reqwest::Client, target: &LlmTarget) -> Result<(), String> {
     let base = target.base();
-    let url = if target.provider == "openai_compatible" {
-        format!("{}/v1/models", base.trim_end_matches('/'))
+    let is_openai = target.provider == "openai_compatible";
+    let url = if is_openai {
+        format!("{}/v1/models", openai_compat_root(&base))
     } else {
         format!("{}/api/tags", base.trim_end_matches('/'))
     };
-    match client
-        .get(&url)
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-    {
-        Ok(r) => r.status().is_success(),
-        Err(_) => false,
+    let mut req = client.get(&url).timeout(Duration::from_secs(3));
+    if is_openai {
+        if let Some(k) = target.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
     }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) if r.status().as_u16() == 401 => {
+            Err("401 unauthorized (api key missing or wrong)".to_string())
+        }
+        Ok(r) => Err(format!("HTTP {}", r.status().as_u16())),
+        Err(e) => Err(format!("unreachable: {e}")),
+    }
+}
+
+/// Boolean wrapper over [`runtime_health_detail`] for callers that only need
+/// up/down.
+pub async fn runtime_health(client: &reqwest::Client, target: &LlmTarget) -> bool {
+    runtime_health_detail(client, target).await.is_ok()
+}
+
+/// The decrypted API key stored on the global runtime (`runtime_config.api_key`),
+/// `None` when unset/empty. Every probe target must carry this instead of
+/// `api_key: None` — a keyed runtime (oMLX) answers 401 to an anonymous
+/// `/v1/models` even though chat (which sends the key) works.
+pub async fn stored_runtime_key(db: &sqlx::PgPool) -> Option<String> {
+    stored_runtime_base_and_key(db).await.1
+}
+
+/// `(base_url, decrypted api_key)` of the global runtime, each `None` when
+/// unset/empty. One query for the callers that must decide whether a key belongs
+/// to a given base (credential route, model listing, worker overrides).
+pub async fn stored_runtime_base_and_key(db: &sqlx::PgPool) -> (Option<String>, Option<String>) {
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT base_url, api_key FROM runtime_config WHERE id = 1")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let (base, key) = row.unwrap_or((None, None));
+    let nz = |s: String| {
+        let s = s.trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    };
+    (
+        base.and_then(nz),
+        key.map(|k| crate::services::crypto::open(&k)).and_then(nz),
+    )
+}
+
+/// `runtime_config.max_concurrency` (migration 082), default 4 when the row is
+/// missing. Read per call — one indexed singleton-row SELECT is cheaper than a
+/// cache-invalidation story and lets an operator change it without a restart.
+pub async fn runtime_max_concurrency(db: &sqlx::PgPool) -> i64 {
+    let v: Option<i32> = sqlx::query_scalar("SELECT max_concurrency FROM runtime_config WHERE id = 1")
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    v.map(i64::from).filter(|n| *n >= 1).unwrap_or(4)
+}
+
+// ── Transient-error contract (spec D1) ────────────────────────────────────────
+
+/// Statuses a local inference server returns while it is alive but cannot take
+/// the request RIGHT NOW: oMLX answers `507` under memory pressure and `409`
+/// ("model busy; unload pending") while swapping, vLLM/llama.cpp `503` while
+/// loading, proxies `502/504`, everything `429`. These must be retried, not
+/// treated as a dead runtime (the guardrail reverted Asgard to bundled Ollama
+/// after three of them). Non-transient statuses (400/401/403/404/422/500…) fail
+/// immediately as before.
+pub fn is_transient_status(code: u16) -> bool {
+    matches!(code, 408 | 409 | 425 | 429 | 502 | 503 | 504 | 507)
+}
+
+/// Retry ladder knobs. Defaults give `1, 2, 4, 8, 16 s` (5 retries).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub base_ms: u64,
+}
+
+/// Pure: parse the two env knobs (`GCTRL_LLM_RETRY_MAX`, `GCTRL_LLM_RETRY_BASE_MS`).
+/// Unparseable or absent → defaults; `max` is capped at 10 so a typo cannot
+/// turn one request into minutes of sleeping.
+pub fn retry_policy(max: Option<&str>, base_ms: Option<&str>) -> RetryPolicy {
+    let max_retries = max
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(5)
+        .min(10);
+    let base_ms = base_ms
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1000);
+    RetryPolicy { max_retries, base_ms }
+}
+
+impl RetryPolicy {
+    pub fn from_env() -> Self {
+        retry_policy(
+            std::env::var("GCTRL_LLM_RETRY_MAX").ok().as_deref(),
+            std::env::var("GCTRL_LLM_RETRY_BASE_MS").ok().as_deref(),
+        )
+    }
+}
+
+/// Hard cap on a single retry sleep. A server's `Retry-After: 3600` must not
+/// park an interactive chat for an hour.
+const RETRY_SLEEP_CAP_MS: u64 = 30_000;
+
+/// Pure: how long to sleep before retry number `attempt` (0-based). A
+/// `Retry-After` (seconds) from the server wins over the exponential ladder;
+/// either way the sleep is capped at 30 s.
+pub fn retry_delay(attempt: u32, base_ms: u64, retry_after_secs: Option<u64>) -> Duration {
+    let ms = match retry_after_secs {
+        Some(s) => s.saturating_mul(1000),
+        None => base_ms.saturating_mul(1u64 << attempt.min(20)),
+    };
+    Duration::from_millis(ms.min(RETRY_SLEEP_CAP_MS))
+}
+
+/// `Retry-After` as integer seconds; the HTTP-date form is ignored (no local
+/// server sends it, and a wrong parse would only shorten the sleep).
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// A send error worth retrying: the connection never got established (refused,
+/// reset during handshake). A TIMEOUT on a started request is NOT retried — the
+/// model is genuinely slow/stuck and a retry would just double the wait.
+fn is_transient_send_error(e: &reqwest::Error) -> bool {
+    if e.is_timeout() {
+        return false;
+    }
+    if e.is_connect() {
+        return true;
+    }
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("connection reset") || msg.contains("broken pipe")
+}
+
+/// POST `body` to `url`, retrying transient failures per [`RetryPolicy`]. Returns
+/// the successful response, or the usual `LLM error {code}: …` /
+/// `LLM unreachable: …` string once retries are exhausted or the failure is
+/// non-transient. Shared by the one-shot and streaming chat paths.
+async fn send_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+    body: &Value,
+    timeout: Duration,
+) -> Result<reqwest::Response, String> {
+    let policy = RetryPolicy::from_env();
+    let mut attempt = 0u32;
+    loop {
+        let res = apply_headers(client.post(url), headers)
+            .json(body)
+            .timeout(timeout)
+            .send()
+            .await;
+        let (msg, retry_after, transient) = match res {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) => {
+                let code = resp.status();
+                let retry_after = parse_retry_after(resp.headers());
+                let text = resp.text().await.unwrap_or_default();
+                let msg = format!("LLM error {code}: {}", text.chars().take(300).collect::<String>());
+                (msg, retry_after, is_transient_status(code.as_u16()))
+            }
+            Err(e) => (format!("LLM unreachable: {e}"), None, is_transient_send_error(&e)),
+        };
+        if !transient || attempt >= policy.max_retries {
+            return Err(msg);
+        }
+        let delay = retry_delay(attempt, policy.base_ms, retry_after);
+        tracing::info!(
+            "llm: transient failure, retry {}/{} in {:?}: {}",
+            attempt + 1, policy.max_retries, delay, msg.chars().take(160).collect::<String>()
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
+
+// ── Per-runtime concurrency gate (spec D2) ────────────────────────────────────
+
+/// Take one of `runtime_config.max_concurrency` generation slots against the
+/// active `openai_compatible` runtime. Returns `None` (no gating) for every
+/// other provider: Ollama queues internally and cloud APIs have no local memory
+/// pressure; the gate exists to stop THIS process from fanning N windows into a
+/// 21 GB model on a 48 GB box. The semaphore is rebuilt when the configured size
+/// changes, so an operator edit applies to the next request without a restart.
+/// Hold the returned permit across the LLM call; dropping it frees the slot.
+pub async fn acquire_slot(
+    state: &crate::models::AppState,
+    target: &LlmTarget,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if target.provider != "openai_compatible" {
+        return None;
+    }
+    let want = runtime_max_concurrency(&state.db).await.clamp(1, 64) as usize;
+    let sem = {
+        let mut gate = state.llm_gate.lock().await;
+        if gate.0 != want {
+            *gate = (want, std::sync::Arc::new(tokio::sync::Semaphore::new(want)));
+        }
+        gate.1.clone()
+    };
+    sem.acquire_owned().await.ok()
 }
 
 /// A fully-resolved chat target: which provider/model to hit, where, and with
@@ -300,7 +531,7 @@ impl LlmTarget {
     /// validation, cloud providers are forced back to their official host and an
     /// invalid Ollama base falls back to the default — so the server never
     /// performs an attacker-chosen fetch for cloud providers.
-    fn base(&self) -> String {
+    pub fn base(&self) -> String {
         let candidate = self
             .base_url
             .clone()
@@ -478,25 +709,81 @@ pub async fn resolve_ollama_base_for_user(
 ///
 /// Injects ONLY when `target.provider == "openai_compatible"`:
 ///   - generation_kind = "openai_compatible"
-///   - generation_base = target.base() (canonical, no /v1)
+///   - generation_base = openai_compat_root(target.base()) (canonical, no /v1)
 ///   - generation_model = target.model
+///   - generation_max_concurrency = `max_concurrency` (spec D2: the worker sizes
+///     its per-base semaphore from this)
 ///
-/// `generation_api_key` is intentionally NOT injected. Worker-side generation
-/// against an external authenticated endpoint is intentionally not supported
-/// (no plaintext secret in Redis). Local/bundled runtimes are keyless; the
-/// interactive chat/agent/RAG path runs in-process and still supports authed
-/// external endpoints.
+/// `generation_api_key` is intentionally NOT injected: the payload goes through
+/// Redis and no plaintext secret belongs there. Workers that need a key fetch it
+/// over the internal HTTP hop (`GET /api/internal/generation-credential`, spec
+/// D7) instead.
 ///
 /// For all other providers (ollama, cloud, anthropic) — does nothing, so
 /// generation stays on Ollama as today (backward compatible).
-pub fn apply_generation_overrides(target: &LlmTarget, map: &mut serde_json::Map<String, Value>) {
+pub fn apply_generation_overrides(
+    target: &LlmTarget,
+    max_concurrency: i64,
+    map: &mut serde_json::Map<String, Value>,
+) {
     if target.provider != "openai_compatible" {
         return;
     }
     map.insert("generation_kind".into(), json!("openai_compatible"));
-    map.insert("generation_base".into(), json!(target.base()));
+    map.insert("generation_base".into(), json!(openai_compat_root(&target.base())));
     map.insert("generation_model".into(), json!(target.model));
+    map.insert("generation_max_concurrency".into(), json!(max_concurrency.max(1)));
     // generation_api_key is NOT inserted — no plaintext secret in Redis.
+}
+
+/// Pure: which key a worker may present to `target`. The stored GLOBAL runtime
+/// key belongs to the global runtime's server only — it is handed out when the
+/// target resolves to that same server (after `/v1` + loopback canonicalisation);
+/// a per-purpose override pointing elsewhere gets its own key (usually none).
+pub fn pick_worker_key(
+    target_base: &str,
+    target_key: Option<&str>,
+    runtime_base: Option<&str>,
+    runtime_key: Option<&str>,
+) -> Option<String> {
+    let nz = |k: Option<&str>| k.map(str::trim).filter(|k| !k.is_empty()).map(str::to_string);
+    match runtime_base {
+        Some(rb) if same_openai_root(rb, target_base) => nz(runtime_key).or_else(|| nz(target_key)),
+        _ => nz(target_key),
+    }
+}
+
+/// Resolve `purpose`'s generation runtime and build the `generation_*` payload
+/// fields the KEX/FUSE workers understand (empty map for non-openai_compatible
+/// targets). `include_key: false` for anything that travels through Redis;
+/// `include_key: true` ONLY for a direct internal HTTP hop to a worker (the
+/// dossier/profile builds, spec D8). Returns the resolved target too, since the
+/// Ollama path still needs its `model` for the worker's own model field.
+pub async fn worker_generation_overrides(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    purpose: &str,
+    include_key: bool,
+) -> (LlmTarget, serde_json::Map<String, Value>) {
+    let target = resolve_purpose(db, user_id, purpose).await;
+    let mut map = serde_json::Map::new();
+    if target.provider != "openai_compatible" {
+        return (target, map);
+    }
+    let max_concurrency = runtime_max_concurrency(db).await;
+    apply_generation_overrides(&target, max_concurrency, &mut map);
+    if include_key {
+        let (runtime_base, runtime_key) = stored_runtime_base_and_key(db).await;
+        if let Some(k) = pick_worker_key(
+            &target.base(),
+            target.api_key.as_deref(),
+            runtime_base.as_deref(),
+            runtime_key.as_deref(),
+        ) {
+            map.insert("generation_api_key".into(), json!(k));
+        }
+    }
+    (target, map)
 }
 
 /// P2 per-purpose runtime resolver. A purpose can override its own
@@ -659,9 +946,9 @@ pub async fn inject_ollama_overrides(
         // the resolved model as relex_model (fixes the old mismatch where a vLLM
         // runtime still received an Ollama relex tag); inject generation_* when
         // that runtime is openai_compatible.
-        let rel = resolve_purpose(db, user_id, "relation").await;
+        let (rel, gen) = worker_generation_overrides(db, user_id, "relation", false).await;
         map.insert("relex_model".into(), json!(rel.model));
-        apply_generation_overrides(&rel, map);
+        map.extend(gen);
 
         // ── Part 6.1: Pinned embedding override ───────────────────────────────
         // When the active runtime is the bundled llama.cpp (gctrl-llamacpp:8080)
@@ -732,41 +1019,24 @@ pub async fn resolve_purpose_model(
         .filter(|s| !s.is_empty())
 }
 
-/// Resolve the wiki-distillation overrides for a user: the chosen distill model
-/// (Settings → AI Models → Models, `user_model_prefs.distill_model`) and the
-/// runtime Ollama base. Either is `None` when unset, so the FUSE distiller falls
-/// back to its env defaults (`GCTRL_DISTILL_MODEL` / `OLLAMA_BASE`) and existing
-/// installs are untouched.
-pub async fn resolve_distill_overrides(
+/// Build the FUSE distill payload fields for a user: `distill_model` (the DISTILL
+/// purpose's resolved model — an explicit per-purpose model, else the inherited
+/// runtime's; bundled-Ollama-unset resolves to "llama3.2", identical to the old
+/// env default), `ollama_base` (the user's runtime Ollama override, `None` when
+/// unset so FUSE keeps `OLLAMA_BASE`), plus the `generation_*` fields when the
+/// distill runtime is openai_compatible. `include_key` follows
+/// [`worker_generation_overrides`]: false for Redis, true only for a direct
+/// internal HTTP hop.
+pub async fn distill_payload_fields(
     db: &sqlx::PgPool,
     user_id: uuid::Uuid,
-) -> (Option<String>, Option<String>) {
-    // P2: distill resolves its own per-purpose runtime. Use the resolved model so
-    // a purpose inheriting a non-ollama runtime adopts that runtime's model
-    // (mismatch fix) while an explicit per-purpose distill model is still honored.
-    // Bundled-ollama-unset resolves to "llama3.2" — identical to the old env default.
-    let target = resolve_purpose(db, user_id, "distill").await;
+    include_key: bool,
+) -> serde_json::Map<String, Value> {
     let ollama_base = resolve_ollama_base_for_user(db, user_id).await;
-    (Some(target.model), ollama_base)
-}
-
-/// Resolve the generation-runtime overrides for FUSE distill jobs.
-///
-/// Returns `Some(target)` ONLY when the active runtime is `openai_compatible`
-/// (the only non-Ollama provider supported for worker generation today).
-/// Returns `None` for all other runtimes so callers add nothing and generation
-/// stays on Ollama (backward compatible).
-pub async fn resolve_distill_generation_overrides(
-    db: &sqlx::PgPool,
-    user_id: uuid::Uuid,
-) -> Option<LlmTarget> {
-    // P2: follow the DISTILL purpose's own runtime, not just the global one.
-    let gen = resolve_purpose(db, user_id, "distill").await;
-    if gen.provider == "openai_compatible" {
-        Some(gen)
-    } else {
-        None
-    }
+    let (target, mut map) = worker_generation_overrides(db, user_id, "distill", include_key).await;
+    map.insert("distill_model".into(), json!(target.model));
+    map.insert("ollama_base".into(), json!(ollama_base));
+    map
 }
 
 // ── Request building ──────────────────────────────────────────────────────────
@@ -780,9 +1050,35 @@ pub struct ChatMessages<'a> {
     pub messages: Vec<Value>,
 }
 
+/// Pure: the truthy spelling shared by every GCTRL boolean env knob
+/// (`1|true|yes|on`, case-insensitive).
+pub fn env_truthy(v: Option<&str>) -> bool {
+    v.map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Whether `/v1` runtimes may reason before answering. OFF unless
+/// `GCTRL_LLM_THINK` is truthy (spec D3): qwen3.6 on oMLX spends 1-4k thinking
+/// tokens (30-60 s) per call otherwise, which is the whole latency budget of an
+/// extraction window. Mirrors `KEX_THINK` / `FUSE_THINK` on the workers.
+fn think_enabled() -> bool {
+    env_truthy(std::env::var("GCTRL_LLM_THINK").ok().as_deref())
+}
+
 impl<'a> ChatMessages<'a> {
     /// Build the request URL, headers, and JSON body for `target`, with `stream`.
     fn build(&self, target: &LlmTarget, stream: bool) -> (String, Vec<(String, String)>, Value) {
+        self.build_with_think(target, stream, think_enabled())
+    }
+
+    /// [`build`](Self::build) with the thinking switch passed explicitly, so the
+    /// request shape can be unit-tested without touching process env.
+    fn build_with_think(
+        &self,
+        target: &LlmTarget,
+        stream: bool,
+        think: bool,
+    ) -> (String, Vec<(String, String)>, Value) {
         let base = target.base();
         let key = target.api_key.clone().unwrap_or_default();
         match target.provider.as_str() {
@@ -832,19 +1128,21 @@ impl<'a> ChatMessages<'a> {
             // local servers (llama.cpp, vLLM, LM Studio, LocalAI) need no key.
             //
             // Users commonly supply base_url with a trailing `/v1` (e.g.
-            // `http://localhost:8080/v1`). Strip it before appending the path so
-            // both `http://host:port` and `http://host:port/v1` produce the same
-            // canonical URL `http://host:port/v1/chat/completions`.
+            // `http://localhost:8080/v1`); `openai_compat_root` folds it so both
+            // spellings produce `http://host:port/v1/chat/completions`.
+            //
+            // `chat_template_kwargs.enable_thinking` is the vLLM/SGLang/oMLX/
+            // mlx-lm convention for the Qwen3 thinking switch; servers that don't
+            // know it ignore the extra field.
             "openai_compatible" => {
-                let canonical = base.trim_end_matches('/');
-                let canonical = canonical.strip_suffix("/v1").unwrap_or(canonical);
-                let url = format!("{}/v1/chat/completions", canonical);
+                let url = format!("{}/v1/chat/completions", openai_compat_root(&base));
                 let mut messages = vec![json!({ "role": "system", "content": self.system })];
                 messages.extend(self.messages.iter().cloned());
                 let body = json!({
                     "model": target.model,
                     "messages": messages,
                     "stream": stream,
+                    "chat_template_kwargs": { "enable_thinking": think },
                 });
                 // Only send Bearer when a key is actually configured.
                 let headers = match target.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
@@ -914,16 +1212,10 @@ pub async fn chat_messages_once(
 ) -> Result<String, String> {
     let (url, headers, body) = messages.build(target, false);
 
-    let req = apply_headers(client.post(&url), &headers)
-        .json(&body)
-        .timeout(Duration::from_secs(120));
-
-    let resp = req.send().await.map_err(|e| format!("LLM unreachable: {e}"))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("LLM error {code}: {}", text.chars().take(300).collect::<String>()));
-    }
+    // Transient statuses / connect failures are retried here (spec D1); a
+    // non-transient failure or an exhausted ladder surfaces as the usual
+    // `LLM error {code}: …` / `LLM unreachable: …` string.
+    let resp = send_with_retry(client, &url, &headers, &body, Duration::from_secs(120)).await?;
     let v: Value = resp.json().await.map_err(|e| format!("LLM parse error: {e}"))?;
 
     let answer = match target.provider.as_str() {
@@ -960,23 +1252,15 @@ pub async fn chat_stream(
     let (url, headers, body) = messages.build(target, true);
     let provider = target.provider.clone();
 
-    let resp_result = apply_headers(client.post(&url), &headers)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await;
+    // Only the INITIAL send is retried (spec D1): once bytes are flowing a
+    // mid-stream failure cannot be replayed without duplicating tokens.
+    let resp_result = send_with_retry(client, &url, &headers, &body, Duration::from_secs(120)).await;
 
     async_stream::stream! {
         let resp = match resp_result {
             Ok(r) => r,
-            Err(e) => { yield Err(format!("LLM unreachable: {e}")); return; }
+            Err(e) => { yield Err(e); return; }
         };
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            yield Err(format!("LLM error {code}: {}", text.chars().take(300).collect::<String>()));
-            return;
-        }
 
         let mut bytes = resp.bytes_stream();
         // Buffer across chunk boundaries: provider lines can split mid-line.
@@ -1442,45 +1726,157 @@ mod tests {
         );
     }
 
-    // ── runtime_health URL selection ─────────────────────────────────────────
+    // ── openai_compat_root / same_openai_root (spec D4) ───────────────────────
 
-    /// For `openai_compatible` the health probe must use `/v1/models`.
+    /// The probe, chat and worker URLs are all built from this root, so both
+    /// operator spellings must fold to the same value (Asgard: `…:8020/v1`
+    /// probed `/v1/v1/models`).
     #[test]
-    fn runtime_health_url_openai_compatible() {
-        // We can't make a real request in unit tests, but we can verify the URL
-        // that *would* be used by inspecting the path chosen for the provider.
-        // We do this by checking the provider-branch logic directly.
-        let t = LlmTarget {
-            provider: "openai_compatible".into(),
-            model: "m".into(),
-            base_url: Some("http://localhost:8080".into()),
-            api_key: None,
-        };
-        let base = t.base();
-        let url = if t.provider == "openai_compatible" {
-            format!("{}/v1/models", base.trim_end_matches('/'))
-        } else {
-            format!("{}/api/tags", base.trim_end_matches('/'))
-        };
-        assert_eq!(url, "http://localhost:8080/v1/models");
+    fn openai_compat_root_folds_v1_and_trailing_slash() {
+        assert_eq!(openai_compat_root("http://x:8020"), "http://x:8020");
+        assert_eq!(openai_compat_root("http://x:8020/"), "http://x:8020");
+        assert_eq!(openai_compat_root("http://x:8020/v1"), "http://x:8020");
+        assert_eq!(openai_compat_root("http://x:8020/v1/"), "http://x:8020");
+        assert_eq!(openai_compat_root("  http://x:8020/v1  "), "http://x:8020");
     }
 
-    /// For `ollama` the health probe must use `/api/tags`.
+    /// Exactly ONE `/v1` is stripped: a deliberately nested prefix survives.
     #[test]
-    fn runtime_health_url_ollama() {
-        let t = LlmTarget {
-            provider: "ollama".into(),
-            model: "llama3.2".into(),
-            base_url: Some("http://ollama:11434".into()),
-            api_key: None,
-        };
-        let base = t.base();
-        let url = if t.provider == "openai_compatible" {
-            format!("{}/v1/models", base.trim_end_matches('/'))
-        } else {
-            format!("{}/api/tags", base.trim_end_matches('/'))
-        };
-        assert_eq!(url, "http://ollama:11434/api/tags");
+    fn openai_compat_root_strips_only_one_v1() {
+        assert_eq!(openai_compat_root("http://x/v1/v1"), "http://x/v1");
+        assert_eq!(openai_compat_root("http://x/api/v1"), "http://x/api");
+        // `/v10` is not `/v1`.
+        assert_eq!(openai_compat_root("http://x/v10"), "http://x/v10");
+    }
+
+    #[test]
+    fn same_openai_root_matches_across_spellings() {
+        assert!(same_openai_root("http://mac:8020", "http://mac:8020/v1"));
+        assert!(same_openai_root("http://mac:8020/v1/", "http://MAC:8020"));
+        assert!(!same_openai_root("http://mac:8020", "http://mac:8021"));
+        assert!(!same_openai_root("http://mac:8020", "http://other:8020/v1"));
+        assert!(!same_openai_root("", ""));
+    }
+
+    // ── transient contract (spec D1) ─────────────────────────────────────────
+
+    #[test]
+    fn transient_statuses_are_the_spec_set() {
+        for c in [408u16, 409, 425, 429, 502, 503, 504, 507] {
+            assert!(is_transient_status(c), "{c} must be transient");
+        }
+        for c in [200u16, 400, 401, 403, 404, 422, 500, 501] {
+            assert!(!is_transient_status(c), "{c} must NOT be transient");
+        }
+    }
+
+    #[test]
+    fn retry_policy_defaults_and_parsing() {
+        assert_eq!(retry_policy(None, None), RetryPolicy { max_retries: 5, base_ms: 1000 });
+        assert_eq!(retry_policy(Some("3"), Some("250")), RetryPolicy { max_retries: 3, base_ms: 250 });
+        // Garbage / zero → defaults; a huge max is capped at 10.
+        assert_eq!(retry_policy(Some("x"), Some("0")), RetryPolicy { max_retries: 5, base_ms: 1000 });
+        assert_eq!(retry_policy(Some("99"), None).max_retries, 10);
+        assert_eq!(retry_policy(Some("0"), None).max_retries, 0);
+    }
+
+    /// Ladder `1, 2, 4, 8, 16 s`, `Retry-After` wins, everything capped at 30 s.
+    #[test]
+    fn retry_delay_ladder_retry_after_and_cap() {
+        let secs: Vec<u64> = (0..5).map(|a| retry_delay(a, 1000, None).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 16]);
+        assert_eq!(retry_delay(0, 1000, Some(7)).as_secs(), 7);
+        assert_eq!(retry_delay(9, 1000, None).as_secs(), 30, "ladder capped at 30 s");
+        assert_eq!(retry_delay(0, 1000, Some(3600)).as_secs(), 30, "Retry-After capped at 30 s");
+        assert_eq!(retry_delay(0, 250, None).as_millis(), 250);
+        // No overflow on absurd attempt counts.
+        assert_eq!(retry_delay(u32::MAX, 1000, None).as_secs(), 30);
+    }
+
+    // ── thinking switch (spec D3) ────────────────────────────────────────────
+
+    #[test]
+    fn env_truthy_spellings() {
+        for v in ["1", "true", "TRUE", "yes", " on "] {
+            assert!(env_truthy(Some(v)), "{v:?} must be truthy");
+        }
+        for v in ["0", "false", "", "no", "off", "maybe"] {
+            assert!(!env_truthy(Some(v)), "{v:?} must be falsy");
+        }
+        assert!(!env_truthy(None));
+    }
+
+    fn compat_target() -> LlmTarget {
+        LlmTarget {
+            provider: "openai_compatible".into(),
+            model: "qwen3.6-35b-a3b".into(),
+            base_url: Some("http://mac:8020/v1".into()),
+            api_key: Some("k".into()),
+        }
+    }
+
+    #[test]
+    fn openai_compatible_body_disables_thinking_by_default() {
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        let (url, _, body) = cm.build_with_think(&compat_target(), false, false);
+        assert_eq!(url, "http://mac:8020/v1/chat/completions");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(false));
+    }
+
+    #[test]
+    fn openai_compatible_body_enables_thinking_when_asked() {
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        let (_, _, body) = cm.build_with_think(&compat_target(), true, true);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+        assert_eq!(body["stream"], true);
+    }
+
+    /// Only the `/v1` dialect carries the kwarg — Ollama has its own `think`
+    /// field and cloud APIs reject unknown top-level keys.
+    #[test]
+    fn thinking_kwarg_is_openai_compatible_only() {
+        let cm = ChatMessages { system: "s", messages: vec![] };
+        for provider in ["ollama", "openai", "anthropic", "openrouter"] {
+            let t = LlmTarget { provider: provider.into(), model: "m".into(), base_url: None, api_key: Some("k".into()) };
+            let (_, _, body) = cm.build_with_think(&t, false, false);
+            assert!(body.get("chat_template_kwargs").is_none(), "{provider} must not carry chat_template_kwargs");
+        }
+    }
+
+    // ── worker key selection (spec D7/D8) ────────────────────────────────────
+
+    #[test]
+    fn pick_worker_key_prefers_runtime_key_on_same_server() {
+        let k = pick_worker_key("http://mac:8020", None, Some("http://mac:8020/v1"), Some("rt-key"));
+        assert_eq!(k.as_deref(), Some("rt-key"));
+        // Same server but the target has its own key and the runtime none → target's.
+        let k = pick_worker_key("http://mac:8020", Some("own"), Some("http://mac:8020"), None);
+        assert_eq!(k.as_deref(), Some("own"));
+    }
+
+    #[test]
+    fn pick_worker_key_never_leaks_runtime_key_to_another_server() {
+        let k = pick_worker_key("http://other:9000", None, Some("http://mac:8020"), Some("rt-key"));
+        assert!(k.is_none(), "runtime key must not travel to a different server; got {k:?}");
+        let k = pick_worker_key("http://other:9000", Some(" "), None, Some("rt-key"));
+        assert!(k.is_none());
+        let k = pick_worker_key("http://other:9000", Some("own"), Some("http://mac:8020"), Some("rt-key"));
+        assert_eq!(k.as_deref(), Some("own"));
+    }
+
+    /// `generation_base` is the canonical root and `generation_max_concurrency`
+    /// rides along (spec D2) — the key still never does.
+    #[test]
+    fn apply_gen_overrides_canonical_base_and_max_concurrency() {
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&compat_target(), 2, &mut map);
+        assert_eq!(map["generation_base"], json!("http://mac:8020"));
+        assert_eq!(map["generation_max_concurrency"], json!(2));
+        assert!(!map.contains_key("generation_api_key"));
+        // A nonsensical value is floored at 1 so a worker never builds a 0-slot semaphore.
+        let mut map = serde_json::Map::new();
+        apply_generation_overrides(&compat_target(), 0, &mut map);
+        assert_eq!(map["generation_max_concurrency"], json!(1));
     }
 
     // ── apply_generation_overrides (pure, no DB) ─────────────────────────────
@@ -1496,7 +1892,7 @@ mod tests {
             api_key: Some("mykey".into()),
         };
         let mut map = serde_json::Map::new();
-        apply_generation_overrides(&t, &mut map);
+        apply_generation_overrides(&t, 4, &mut map);
         assert_eq!(map["generation_kind"], json!("openai_compatible"));
         assert_eq!(map["generation_model"], json!("qwen2.5:7b"));
         assert!(map.contains_key("generation_base"), "generation_base must be set");
@@ -1518,7 +1914,7 @@ mod tests {
         };
         let mut map = serde_json::Map::new();
         map.insert("ollama_base".into(), json!("http://ollama:11434"));
-        apply_generation_overrides(&t, &mut map);
+        apply_generation_overrides(&t, 4, &mut map);
         assert!(!map.contains_key("generation_kind"), "ollama must not inject generation_kind");
         assert!(!map.contains_key("generation_base"));
         assert!(!map.contains_key("generation_model"));
@@ -1537,7 +1933,7 @@ mod tests {
             api_key: Some("sk-x".into()),
         };
         let mut map = serde_json::Map::new();
-        apply_generation_overrides(&t, &mut map);
+        apply_generation_overrides(&t, 4, &mut map);
         assert!(!map.contains_key("generation_kind"));
     }
 
@@ -1551,7 +1947,7 @@ mod tests {
             api_key: Some("k".into()),
         };
         let mut map = serde_json::Map::new();
-        apply_generation_overrides(&t, &mut map);
+        apply_generation_overrides(&t, 4, &mut map);
         assert!(!map.contains_key("generation_kind"));
     }
 
@@ -1566,7 +1962,7 @@ mod tests {
             api_key: Some("real-key".into()),
         };
         let mut map = serde_json::Map::new();
-        apply_generation_overrides(&t, &mut map);
+        apply_generation_overrides(&t, 4, &mut map);
         assert!(
             !map.contains_key("generation_api_key"),
             "generation_api_key must NEVER enter the Redis payload; got: {:?}", map.get("generation_api_key")
@@ -1587,7 +1983,7 @@ mod tests {
             api_key: None,
         };
         let mut map = serde_json::Map::new();
-        apply_generation_overrides(&t, &mut map);
+        apply_generation_overrides(&t, 4, &mut map);
         assert!(!map.contains_key("generation_api_key"));
     }
 

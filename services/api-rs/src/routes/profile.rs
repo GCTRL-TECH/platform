@@ -162,10 +162,19 @@ async fn build_profile(
         ));
     }
 
+    // Spec D8: the profile distillation follows the DISTILL purpose's runtime
+    // instead of FUSE's hard-wired Ollama. Key allowed: internal HTTP hop, not Redis.
+    let (distill, gen) =
+        crate::services::llm::worker_generation_overrides(&state.db, claims.sub, "distill", true).await;
+    let mut body = json!({ "user_id": claims.sub.to_string(), "distill_model": distill.model });
+    if let Some(map) = body.as_object_mut() {
+        map.extend(gen);
+    }
+
     let url = format!("{}/profile/build", state.cfg.fuse_url);
     let resp = reqwest::Client::new()
         .post(&url)
-        .json(&json!({ "user_id": claims.sub.to_string() }))
+        .json(&body)
         .timeout(std::time::Duration::from_secs(180))
         .send()
         .await

@@ -6,6 +6,19 @@
 //! model that doesn't fit) never leaves the agent/RAG/KEX permanently broken
 //! with no operator around to notice.
 //!
+//! Two things it deliberately does NOT count (spec 2026-09-04, D5):
+//!
+//! - **Transient backpressure.** A live server saying "not right now" (`507`
+//!   under memory pressure, `409` "model busy; unload pending", `429`, `503`
+//!   while loading …) is logged and recorded on `guardrail_state.last_error`
+//!   with the suffix ` (transient, not counted)` but never increments the
+//!   counter. Three of those reverted Asgard's oMLX runtime to a bundled Ollama
+//!   where the model did not even exist.
+//! - **A revert onto a fallback that cannot serve.** Before reverting, bundled
+//!   Ollama must answer `/api/tags` with at least one model. If it cannot, the
+//!   counter is HELD at the threshold, one undismissed `runtime_unhealthy` event
+//!   tells the operator, and the revert waits until the fallback is proven usable.
+//!
 //! This is a SEPARATE loop from `background::run_watchdog`, which stays
 //! observe-only by design (see its doc comment) — this module is the one place
 //! allowed to ACT (revert `runtime_config`). It NEVER touches
@@ -20,7 +33,7 @@
 //! the runtime now wouldn't undo it; this NEVER drives a revert.
 
 use std::sync::Arc;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 
 use crate::models::AppState;
@@ -30,8 +43,14 @@ const CONSECUTIVE_FAILURE_THRESHOLD: i32 = 3;
 /// Completed-degraded KEX jobs in the last hour that triggers a notify-only event.
 const DEGRADED_JOB_THRESHOLD: i64 = 5;
 /// Hard cap on the probe call, enforced via `tokio::time::timeout` (see NOTE
-/// below on why this wraps rather than threads through `chat_once`).
-const PROBE_TIMEOUT_SECS: u64 = 20;
+/// below on why this wraps rather than threads through `chat_once`). 60 s, not
+/// 20: the chat layer now retries transient statuses with a `1+2+4+8+16 s`
+/// ladder (31 s worst case, spec D1) BEFORE returning — a shorter cap would turn
+/// a memory-pressure burst into a "timeout" and count it as fatal, which is the
+/// exact misclassification this revision removes.
+const PROBE_TIMEOUT_SECS: u64 = 60;
+/// Fallback reachability check (bundled Ollama `/api/tags`).
+const FALLBACK_PROBE_SECS: u64 = 3;
 
 fn probe_interval_secs() -> u64 {
     std::env::var("GUARDRAIL_PROBE_SECS")
@@ -118,9 +137,25 @@ async fn run_tick(state: &AppState) {
     };
 
     match probe(&target).await {
-        Ok(()) => reset_failures(state).await,
-        Err(reason) => {
-            let new_count = failures + 1;
+        Ok(()) => {
+            reset_failures(state).await;
+            dismiss_unhealthy_events(state).await;
+        }
+        Err(ProbeFailure::Transient(reason)) => {
+            // Alive but busy: record, never count. The chat layer already
+            // retried the ladder before this surfaced.
+            let _ = sqlx::query(
+                "UPDATE guardrail_state SET last_probe_at = now(), last_error = $1 WHERE id = 1",
+            )
+            .bind(format!("{reason} (transient, not counted)"))
+            .execute(&state.db)
+            .await;
+            tracing::info!("guardrail: runtime under transient backpressure, not counted: {reason}");
+        }
+        Err(ProbeFailure::Fatal(reason)) => {
+            // Held at the threshold: once there, every tick re-checks the
+            // fallback instead of growing a meaningless count.
+            let new_count = (failures + 1).min(CONSECUTIVE_FAILURE_THRESHOLD);
             let _ = sqlx::query(
                 "UPDATE guardrail_state
                     SET consecutive_failures = $1, last_probe_at = now(), last_error = $2
@@ -135,7 +170,14 @@ async fn run_tick(state: &AppState) {
             );
 
             if new_count >= CONSECUTIVE_FAILURE_THRESHOLD {
-                revert_runtime(state, &provider, base_url.as_deref(), model.as_deref(), &reason).await;
+                match fallback_usable().await {
+                    Ok(()) => {
+                        revert_runtime(state, &provider, base_url.as_deref(), model.as_deref(), &reason).await
+                    }
+                    Err(fallback_error) => {
+                        mark_unhealthy(state, &reason, &fallback_error, &provider, base_url.as_deref(), model.as_deref()).await
+                    }
+                }
             }
         }
     }
@@ -154,8 +196,8 @@ async fn run_tick(state: &AppState) {
 /// exercises the full request/response/parse path (so unreachable / 5xx /
 /// OOM-crash / context-length errors are all caught) without touching shared
 /// request-building code. A "ping" completion is small enough on every
-/// reasonable model that the 20s cap is not a practical constraint.
-async fn probe(target: &crate::services::llm::LlmTarget) -> Result<(), String> {
+/// reasonable model that the cap is not a practical constraint.
+async fn probe(target: &crate::services::llm::LlmTarget) -> Result<(), ProbeFailure> {
     let client = reqwest::Client::new();
     let fut = crate::services::llm::chat_once(
         &client,
@@ -166,24 +208,58 @@ async fn probe(target: &crate::services::llm::LlmTarget) -> Result<(), String> {
     match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), fut).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(classify_error(&e)),
-        Err(_) => Err(format!("timeout after {PROBE_TIMEOUT_SECS}s")),
+        Err(_) => Err(ProbeFailure::Fatal(format!("timeout after {PROBE_TIMEOUT_SECS}s"))),
     }
 }
 
-/// Classify a raw chat error string into a short, stable reason. Matching is
-/// case-insensitive (mirrors `(?i)out of memory|CUDA|context length`) via a
+/// How a failed probe is treated: `Transient` is recorded but never counted,
+/// `Fatal` counts towards the revert threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeFailure {
+    Transient(String),
+    Fatal(String),
+}
+
+/// Numeric status out of the chat layer's `LLM error <code> <text>: …` string
+/// (`StatusCode` displays as `507 Insufficient Storage`).
+fn llm_error_status(low: &str) -> Option<u16> {
+    let rest = low.split("llm error ").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Classify a raw chat error string. Matching is case-insensitive via a
 /// lowercased `contains` check — no regex dependency needed for this shape.
-fn classify_error(raw: &str) -> String {
+///
+/// Transient (spec D1/D5): an `LLM error <status>` with a transient status
+/// (`is_transient_status`), or backpressure wording from the server body —
+/// "busy", "unload is pending" / "unload pending", "memory pressure".
+/// Fatal: unreachable, OOM / CUDA / context-length, any other 5xx, and every
+/// remaining error (401/403/404 …). OOM is checked BEFORE the wording rule so a
+/// genuine "out of memory … please retry" from a crashed backend still counts.
+pub fn classify_error(raw: &str) -> ProbeFailure {
     let low = raw.to_lowercase();
-    if low.contains("unreachable") {
-        "unreachable".to_string()
-    } else if low.contains("out of memory") || low.contains("cuda") || low.contains("context length") {
-        format!("out of memory / CUDA / context-length error: {}", raw.chars().take(200).collect::<String>())
-    } else if low.contains("llm error 5") {
-        format!("server error (5xx): {}", raw.chars().take(200).collect::<String>())
-    } else {
-        raw.chars().take(200).collect()
+    let short: String = raw.chars().take(200).collect();
+
+    if let Some(code) = llm_error_status(&low) {
+        if crate::services::llm::is_transient_status(code) {
+            return ProbeFailure::Transient(format!("transient HTTP {code}: {short}"));
+        }
     }
+    if low.contains("unreachable") {
+        return ProbeFailure::Fatal("unreachable".to_string());
+    }
+    if low.contains("out of memory") || low.contains("cuda") || low.contains("context length") {
+        return ProbeFailure::Fatal(format!("out of memory / CUDA / context-length error: {short}"));
+    }
+    const BACKPRESSURE: &[&str] = &["busy", "unload is pending", "unload pending", "memory pressure"];
+    if BACKPRESSURE.iter().any(|k| low.contains(k)) {
+        return ProbeFailure::Transient(format!("transient backpressure: {short}"));
+    }
+    if low.contains("llm error 5") {
+        return ProbeFailure::Fatal(format!("server error (5xx): {short}"));
+    }
+    ProbeFailure::Fatal(short)
 }
 
 async fn reset_failures(state: &AppState) {
@@ -192,6 +268,76 @@ async fn reset_failures(state: &AppState) {
     )
     .execute(&state.db)
     .await;
+}
+
+/// A healthy probe means any "cannot revert, fallback unusable" alert is stale.
+async fn dismiss_unhealthy_events(state: &AppState) {
+    let _ = sqlx::query(
+        "UPDATE guardrail_events SET dismissed = true WHERE kind = 'runtime_unhealthy' AND dismissed = false",
+    )
+    .execute(&state.db)
+    .await;
+}
+
+/// Is the bundled Ollama (`ollama_default_base()`) able to serve as the revert
+/// target? `GET /api/tags` must answer 2xx AND list ≥1 model — reverting onto an
+/// Ollama with nothing pulled just moves the outage (Asgard: the guardrail
+/// reverted to an Ollama where the model did not exist).
+async fn fallback_usable() -> Result<(), String> {
+    let base = crate::services::llm::ollama_default_base();
+    let url = format!("{}/api/tags", base.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(FALLBACK_PROBE_SECS))
+        .send()
+        .await
+        .map_err(|e| format!("bundled Ollama unreachable at {base}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("bundled Ollama at {base} answered HTTP {}", resp.status().as_u16()));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bundled Ollama /api/tags unparseable: {e}"))?;
+    let n = v["models"].as_array().map(|a| a.len()).unwrap_or(0);
+    if n == 0 {
+        return Err(format!("bundled Ollama at {base} has no models pulled"));
+    }
+    Ok(())
+}
+
+/// The runtime is failing AND the fallback cannot serve: do not revert, tell the
+/// operator once. Idempotent — a second tick with an open `runtime_unhealthy`
+/// event inserts nothing (the banner would otherwise stack).
+async fn mark_unhealthy(
+    state: &AppState,
+    reason: &str,
+    fallback_error: &str,
+    provider: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) {
+    tracing::warn!(
+        "guardrail: runtime failing ({reason}) but NOT reverting — fallback unusable: {fallback_error}"
+    );
+    let existing: Option<bool> = sqlx::query_scalar(
+        "SELECT true FROM guardrail_events WHERE kind = 'runtime_unhealthy' AND dismissed = false LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    if existing.is_some() {
+        return;
+    }
+    let _ = sqlx::query("INSERT INTO guardrail_events (kind, detail) VALUES ('runtime_unhealthy', $1)")
+        .bind(json!({
+            "reason": reason,
+            "fallback_error": fallback_error,
+            "target": { "provider": provider, "base_url": base_url, "model": model },
+        }))
+        .execute(&state.db)
+        .await;
 }
 
 /// Revert `runtime_config` to the bundled Ollama default, record the snapshot +
@@ -216,7 +362,7 @@ async fn revert_runtime(
 
     let steps: Result<(), sqlx::Error> = async {
         sqlx::query(
-            "UPDATE runtime_config SET provider = 'ollama', base_url = NULL, model = NULL, updated_at = now() WHERE id = 1",
+            "UPDATE runtime_config SET provider = 'ollama', base_url = NULL, model = NULL, runtime_id = 'ollama', updated_at = now() WHERE id = 1",
         )
         .execute(&mut *tx)
         .await?;
@@ -234,6 +380,13 @@ async fn revert_runtime(
             .bind(json!({ "reason": reason, "from": snapshot }))
             .execute(&mut *tx)
             .await?;
+
+        // The "cannot revert" alert (if any) is superseded by the revert itself.
+        sqlx::query(
+            "UPDATE guardrail_events SET dismissed = true WHERE kind = 'runtime_unhealthy' AND dismissed = false",
+        )
+        .execute(&mut *tx)
+        .await?;
 
         Ok(())
     }
@@ -293,4 +446,83 @@ async fn check_degraded_jobs(state: &AppState) {
         .await;
 
     tracing::warn!("guardrail: {count} KEX job(s) completed degraded in the last hour (notify-only)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_error, ProbeFailure};
+
+    fn transient(s: &str) -> bool { matches!(classify_error(s), ProbeFailure::Transient(_)) }
+    fn fatal(s: &str) -> bool { matches!(classify_error(s), ProbeFailure::Fatal(_)) }
+
+    /// The exact strings oMLX produced on Asgard (spec "Why" #4) — these must
+    /// never count towards a revert.
+    #[test]
+    fn omlx_backpressure_is_transient() {
+        assert!(transient("LLM error 507 Insufficient Storage: {\"error\":\"retry after memory pressure drops\"}"));
+        assert!(transient("LLM error 409 Conflict: {\"error\":\"model busy; unload pending\"}"));
+    }
+
+    #[test]
+    fn transient_status_codes_are_transient() {
+        for code in ["408", "409", "425", "429", "502", "503", "504", "507"] {
+            let s = format!("LLM error {code} Whatever: nothing useful in the body");
+            assert!(transient(&s), "{code} must be transient");
+        }
+    }
+
+    /// Backpressure WORDING is transient even on an otherwise fatal status.
+    #[test]
+    fn backpressure_wording_is_transient_case_insensitive() {
+        assert!(transient("LLM error 500 Internal Server Error: Model BUSY"));
+        assert!(transient("LLM error 500 Internal Server Error: unload is pending"));
+        assert!(transient("LLM error 500 Internal Server Error: Unload Pending"));
+        assert!(transient("LLM error 500 Internal Server Error: memory pressure"));
+    }
+
+    #[test]
+    fn dead_runtime_classes_are_fatal() {
+        assert!(fatal("LLM unreachable: error sending request for url (http://mac:8020/v1/chat/completions)"));
+        assert!(fatal("LLM error 401 Unauthorized: invalid api key"));
+        assert!(fatal("LLM error 404 Not Found: model 'x' not found"));
+        assert!(fatal("LLM error 500 Internal Server Error: boom"));
+        assert!(fatal("LLM error 403 Forbidden: "));
+        assert!(fatal("timeout after 60s"));
+        assert!(fatal("LLM parse error: expected value"));
+    }
+
+    /// The existing reason strings are preserved (the banner and logs key on them).
+    #[test]
+    fn fatal_reasons_keep_their_existing_shape() {
+        assert_eq!(classify_error("LLM unreachable: x"), ProbeFailure::Fatal("unreachable".into()));
+        match classify_error("LLM error 500 Internal Server Error: CUDA out of memory") {
+            ProbeFailure::Fatal(r) => assert!(r.starts_with("out of memory / CUDA / context-length error:"), "got {r}"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        match classify_error("LLM error 500 Internal Server Error: boom") {
+            ProbeFailure::Fatal(r) => assert!(r.starts_with("server error (5xx):"), "got {r}"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    /// OOM wins over the wording rule: a crashed backend asking to "retry" is
+    /// still a crash.
+    #[test]
+    fn oom_beats_backpressure_wording() {
+        assert!(fatal("LLM error 500 Internal Server Error: CUDA out of memory, please retry"));
+    }
+
+    /// An "unreachable" that happens to contain a keyword stays fatal.
+    #[test]
+    fn unreachable_beats_backpressure_wording() {
+        assert!(fatal("LLM unreachable: connection reset by peer, retry"));
+    }
+
+    #[test]
+    fn transient_reason_carries_the_status() {
+        match classify_error("LLM error 429 Too Many Requests: slow down") {
+            ProbeFailure::Transient(r) => assert!(r.contains("429"), "got {r}"),
+            other => panic!("expected Transient, got {other:?}"),
+        }
+    }
 }

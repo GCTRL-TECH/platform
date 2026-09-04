@@ -115,12 +115,23 @@ pub fn resolve_model_arg(model_id: &str, runtime: &str) -> Option<String> {
 
 /// Shared helper: UPSERT `runtime_config` row (id=1).
 /// Seals `api_key` when provided; COALESCE preserves existing key otherwise.
+/// `runtime_id` is the catalog entry applied (always written — a switch to
+/// `ollama` must clear a stale `mlx`); `max_concurrency` is COALESCEd so a
+/// caller that doesn't know it (agent tool, bundled arms) keeps the operator's
+/// value.
+///
+/// Re-applying a runtime is the operator's acknowledgement (spec D5): the
+/// guardrail failure counter is reset and any open `runtime_reverted` /
+/// `runtime_unhealthy` alert is dismissed, so the banner does not outlive the
+/// fix by a day as it did on Asgard.
 pub(crate) async fn persist_runtime(
     db: &sqlx::PgPool,
     provider: &str,
     base_url: Option<&str>,
     model: Option<&str>,
     api_key: Option<&str>,
+    runtime_id: Option<&str>,
+    max_concurrency: Option<i32>,
 ) -> crate::error::Result<()> {
     let sealed_key: Option<String> = api_key
         .map(|k| k.trim())
@@ -128,22 +139,114 @@ pub(crate) async fn persist_runtime(
         .map(crate::services::crypto::seal);
 
     sqlx::query(
-        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, updated_at)
-         VALUES (1, $1, $2, $3, $4, now())
+        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, runtime_id, max_concurrency, updated_at)
+         VALUES (1, $1, $2, $3, $4, $5, COALESCE($6, 4), now())
          ON CONFLICT (id) DO UPDATE SET
-             provider   = $1,
-             base_url   = $2,
-             model      = $3,
-             api_key    = COALESCE($4, runtime_config.api_key),
-             updated_at = now()",
+             provider        = $1,
+             base_url        = $2,
+             model           = $3,
+             api_key         = COALESCE($4, runtime_config.api_key),
+             runtime_id      = $5,
+             max_concurrency = COALESCE($6, runtime_config.max_concurrency),
+             updated_at      = now()",
     )
     .bind(provider)
     .bind(base_url)
     .bind(model)
     .bind(sealed_key)
+    .bind(runtime_id)
+    .bind(max_concurrency)
     .execute(db)
     .await?;
+
+    // Re-arm: operator acknowledged by re-applying. Best-effort — the runtime
+    // row is already saved; a failure here only leaves a stale banner.
+    let _ = sqlx::query("UPDATE guardrail_state SET consecutive_failures = 0 WHERE id = 1")
+        .execute(db)
+        .await;
+    let _ = sqlx::query(
+        "UPDATE guardrail_events SET dismissed = true
+          WHERE kind IN ('runtime_reverted', 'runtime_unhealthy') AND dismissed = false",
+    )
+    .execute(db)
+    .await;
     Ok(())
+}
+
+/// Catalog ids accepted by `switch-runtime`, `POST /runtime` and the agent tool.
+pub const RUNTIME_IDS: &[&str] = &["ollama", "llamacpp", "vllm", "external", "mlx"];
+
+/// Pure: `max_concurrency` from a request body — `None` keeps the stored value,
+/// otherwise it must be within `1..=64` (a 48 GB box saturates long before 64;
+/// the cap just stops a typo from disabling the gate).
+pub fn validate_max_concurrency(v: Option<i32>) -> std::result::Result<Option<i32>, String> {
+    match v {
+        None => Ok(None),
+        Some(n) if (1..=64).contains(&n) => Ok(Some(n)),
+        Some(n) => Err(format!("max_concurrency must be between 1 and 64 (got {n})")),
+    }
+}
+
+/// Pure: an optional `runtime_id` from a request body must be a catalog id.
+pub fn validate_runtime_id(v: Option<&str>) -> std::result::Result<Option<String>, String> {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(id) if RUNTIME_IDS.contains(&id) => Ok(Some(id.to_string())),
+        Some(id) => Err(format!("Unknown runtime_id '{id}'. Valid: {}", RUNTIME_IDS.join(", "))),
+    }
+}
+
+/// Pure: does the worker's `base` query name the stored runtime server? Folds
+/// `/v1`, trailing slash and the in-container loopback rewrite. A missing stored
+/// base never matches (no key can belong to "nothing").
+pub fn credential_base_matches(stored_base: Option<&str>, query_base: &str) -> bool {
+    match stored_base.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sb) => crate::services::llm::same_openai_root(sb, query_base),
+        None => false,
+    }
+}
+
+/// Routes that must NOT sit behind user auth. Registered with FULL paths and
+/// merged in `main.rs` (the `routes::update::public_router` pattern — a second
+/// `.nest("/api/infra", …)` beside the protected nest would collide).
+///
+/// `GET /api/internal/generation-credential?base=<url>` (spec D7): the KEX/FUSE
+/// workers fetch the active runtime's API key over this internal hop instead of
+/// receiving it through Redis. Guarded by `X-Internal-Secret == INTERNAL_API_SECRET`
+/// (401 when the header is wrong OR no secret is configured — an unconfigured
+/// secret must not turn into an open credential endpoint); 404 when `base` is not
+/// the stored runtime's server. The key is never logged.
+pub fn public_router() -> Router<Arc<crate::models::AppState>> {
+    Router::new().route("/api/internal/generation-credential", get(generation_credential))
+}
+
+#[derive(Deserialize)]
+struct CredentialQuery {
+    base: Option<String>,
+}
+
+async fn generation_credential(
+    State(state): State<Arc<crate::models::AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<CredentialQuery>,
+) -> Result<Json<Value>> {
+    let expected = state.cfg.internal_secret.trim();
+    let presented = headers
+        .get("x-internal-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if expected.is_empty() || presented.is_empty() || presented != expected {
+        return Err(AppError::Unauthorized);
+    }
+    let Some(base) = q.base.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(AppError::BadRequest("base is required".into()));
+    };
+    let (stored_base, key) = crate::services::llm::stored_runtime_base_and_key(&state.db).await;
+    if !credential_base_matches(stored_base.as_deref(), base) {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "api_key": key })))
 }
 
 /// The bundled (onboard) default endpoint for a swappable service — what GCTRL
@@ -1064,93 +1167,28 @@ pub fn validate_runtime_input(
 
 // ── GET /api/infra/active-runtime ────────────────────────────────────────────
 
-/// Return the current global runtime — provider, endpoint, model, and a live
-/// health probe result. The `api_key` is NEVER returned; `configured` is true
-/// when a provider row exists and the provider field is non-empty.
+/// Return the current global runtime — provider, endpoint, model, `runtime_id`,
+/// `max_concurrency`, and a live health probe (`healthy` + `health_error`). The
+/// `api_key` is NEVER returned; `configured` is true when a provider row exists
+/// and the provider field is non-empty. Same shape as the agent tool
+/// (`active_runtime_json`) so the two can never drift.
 async fn get_active_runtime(
     Extension(_claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
     // Any authenticated user may read (not admin-only — the UI shows this in
     // the Settings summary for all users to understand the active backend).
-    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT provider, base_url, model, embedding_mode
-             FROM runtime_config WHERE id = 1",
-        )
-        .fetch_optional(&state.db)
-        .await?;
-
-    let (provider, base_url, model, embedding_mode, configured) = match row {
-        Some((Some(p), b, m, em)) if !p.trim().is_empty() => {
-            (p.trim().to_string(), b, m, em, true)
-        }
-        Some((_, b, m, em)) => ("ollama".to_string(), b, m, em, false),
-        None => ("ollama".to_string(), None, None, None, false),
-    };
-
-    // Build a temporary target for the health probe — no key needed for probing.
-    let health_client = reqwest::Client::new();
-    let target = crate::services::llm::LlmTarget {
-        provider: provider.clone(),
-        model: model.clone().unwrap_or_else(|| "llama3.2".to_string()),
-        base_url: base_url.clone(),
-        api_key: None,
-    };
-    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
-
-    Ok(Json(json!({
-        "provider":       provider,
-        "base_url":       base_url,
-        "model":          model,
-        "embedding_mode": embedding_mode.unwrap_or_else(|| "pinned".to_string()),
-        "configured":     configured,
-        "healthy":        healthy,
-    })))
+    Ok(Json(active_runtime_json(&state.db).await))
 }
 
 // ── GET /api/infra/runtimes ───────────────────────────────────────────────────
 
-/// Return the static catalog of selectable runtime kinds for the UI.
+/// Return the static catalog of selectable runtime kinds for the UI (the same
+/// `runtimes_catalog_json` the agent tool serves).
 async fn list_runtimes(
     Extension(_claims): Extension<JwtClaims>,
 ) -> Result<Json<Value>> {
-    Ok(Json(json!({
-        "runtimes": [
-            {
-                "id":           "ollama",
-                "label":        "Bundled Ollama",
-                "kind":         "ollama",
-                "needs_base_url": false,
-                "needs_gpu":    false,
-                "description":  "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
-            },
-            {
-                "id":           "llamacpp",
-                "label":        "llama.cpp (bundled)",
-                "kind":         "openai_compatible",
-                "needs_base_url": false,
-                "needs_gpu":    false,
-                "description":  "Bundled llama.cpp server. Faster than Ollama on CPU; CUDA-offloads on NVIDIA GPUs with 6–16 GB VRAM.",
-            },
-            {
-                "id":           "vllm",
-                "label":        "vLLM (GPU, bundled)",
-                "kind":         "openai_compatible",
-                "needs_base_url": false,
-                "needs_gpu":    true,
-                "description":  "Bundled vLLM engine. Maximum throughput for NVIDIA GPUs with ≥8 GB VRAM (nvidia-container-toolkit required).",
-            },
-            {
-                "id":           "external",
-                "label":        "OpenAI-compatible endpoint",
-                "kind":         "openai_compatible",
-                "needs_base_url": true,
-                "needs_gpu":    false,
-                "description":  "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API.",
-            },
-        ]
-    })))
+    Ok(Json(runtimes_catalog_json()))
 }
 
 // ── POST /api/infra/runtime ───────────────────────────────────────────────────
@@ -1161,15 +1199,24 @@ struct SetRuntimeReq {
     base_url: Option<String>,
     api_key:  Option<String>,
     model:    Option<String>,
+    /// Catalog id applied (`ollama|llamacpp|vllm|external|mlx`); the UI label
+    /// prefers it over the bare provider. Defaults to `ollama` for the Ollama
+    /// provider, else stays NULL (legacy callers).
+    runtime_id: Option<String>,
+    /// Spec D2 — `1..=64`; omitted keeps the stored value.
+    max_concurrency: Option<i32>,
 }
 
 /// Set (UPSERT) the global active runtime. Admin-only.
 ///
 /// Steps:
-///   1. Validate provider and base_url (SSRF guard via validate_runtime_input).
-///   2. Build a temporary LlmTarget and probe health — still saves even if unhealthy.
-///   3. UPSERT the singleton row; seal api_key when provided; preserve existing
-///      key when omitted (mirrors routes/llm.rs preserve-on-omit behaviour).
+///   1. Validate provider, base_url (SSRF guard via validate_runtime_input),
+///      runtime_id and max_concurrency.
+///   2. Build a temporary LlmTarget and probe health WITH the request key (or
+///      the stored one) — still saves even if unhealthy.
+///   3. UPSERT the singleton row via `persist_runtime`; seal api_key when
+///      provided; preserve existing key when omitted (mirrors routes/llm.rs
+///      preserve-on-omit behaviour).
 async fn set_runtime(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -1180,47 +1227,44 @@ async fn set_runtime(
     let provider = req.provider.trim().to_string();
     let base_url_raw = req.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let model = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let api_key_opt = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    // (a)+(b) Validate provider + base_url with SSRF guard.
+    // (a)+(b) Validate provider + base_url with SSRF guard, plus the new knobs.
     let validated_base: Option<String> = validate_runtime_input(&provider, base_url_raw)
-        .map_err(|e| AppError::BadRequest(e))?;
+        .map_err(AppError::BadRequest)?;
+    let max_concurrency = validate_max_concurrency(req.max_concurrency).map_err(AppError::BadRequest)?;
+    let runtime_id = validate_runtime_id(req.runtime_id.as_deref())
+        .map_err(AppError::BadRequest)?
+        .or_else(|| (provider == "ollama").then(|| "ollama".to_string()));
 
-    // (c) Health probe — save regardless of result but signal the caller.
+    // (c) Health probe WITH a key: the request's, else the stored one — a keyed
+    // server 401s an anonymous probe and would report "unhealthy" while working.
+    let probe_key = match api_key_opt {
+        Some(k) => Some(k.to_string()),
+        None => crate::services::llm::stored_runtime_key(&state.db).await,
+    };
     let health_client = reqwest::Client::new();
     let target = crate::services::llm::LlmTarget {
         provider: provider.clone(),
         model: model.clone().unwrap_or_else(|| "llama3.2".to_string()),
         base_url: validated_base.clone(),
-        api_key: None, // health probe doesn't need the key
+        api_key: probe_key,
     };
-    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+    let health = crate::services::llm::runtime_health_detail(&health_client, &target).await;
+    let healthy = health.is_ok();
 
-    // (d) Seal the api_key when provided.
-    let sealed_key: Option<String> = req
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(crate::services::crypto::seal);
-
-    // UPSERT singleton row (id=1). When api_key is omitted (NULL), COALESCE
-    // preserves the existing stored key so the operator doesn't need to re-enter
-    // it on every model/URL change — matching routes/llm.rs upsert behaviour.
-    sqlx::query(
-        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, updated_at)
-         VALUES (1, $1, $2, $3, $4, now())
-         ON CONFLICT (id) DO UPDATE SET
-             provider   = $1,
-             base_url   = $2,
-             model      = $3,
-             api_key    = COALESCE($4, runtime_config.api_key),
-             updated_at = now()",
+    // (d) UPSERT singleton row (id=1). When api_key is omitted, persist_runtime's
+    // COALESCE preserves the stored key so the operator doesn't re-enter it on
+    // every model/URL change.
+    persist_runtime(
+        &state.db,
+        &provider,
+        validated_base.as_deref(),
+        model.as_deref(),
+        api_key_opt,
+        runtime_id.as_deref(),
+        max_concurrency,
     )
-    .bind(&provider)
-    .bind(&validated_base)
-    .bind(&model)
-    .bind(&sealed_key)
-    .execute(&state.db)
     .await?;
 
     crate::services::audit::log_access(
@@ -1228,7 +1272,7 @@ async fn set_runtime(
         0, None, true, None,
     ).await;
 
-    let mut resp = json!({ "saved": true, "healthy": healthy });
+    let mut resp = json!({ "saved": true, "healthy": healthy, "health_error": health.err() });
     if !healthy {
         resp["warning"] = json!(
             "Runtime saved but health probe failed. The server may not be running yet — \
@@ -1270,6 +1314,10 @@ struct SwitchRuntimeReq {
     model:    Option<String>,
     base_url: Option<String>,
     api_key:  Option<String>,
+    /// Optional explicit catalog id; normally derived from `runtime`.
+    runtime_id: Option<String>,
+    /// Spec D2 — `1..=64`; omitted keeps the stored value.
+    max_concurrency: Option<i32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1303,8 +1351,8 @@ pub fn validate_reindex_request(
 }
 
 /// `POST /api/infra/switch-runtime` — SSE stream, admin-only.
-/// Body: `{ runtime, model?, base_url?, api_key? }`
-/// runtime ∈ "ollama" | "llamacpp" | "external"
+/// Body: `{ runtime, model?, base_url?, api_key?, runtime_id?, max_concurrency? }`
+/// runtime ∈ "ollama" | "llamacpp" | "vllm" | "external" | "mlx"
 async fn switch_runtime(
     Extension(claims): Extension<crate::middleware::auth::JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -1346,54 +1394,27 @@ async fn run_switch_runtime(
 
     let runtime = req.runtime.trim().to_string();
 
+    // Request-level knobs shared by every arm; a bad value fails before any
+    // container work starts.
+    let max_concurrency = match validate_max_concurrency(req.max_concurrency) {
+        Ok(v) => v,
+        Err(e) => {
+            send("error", json!({ "message": e }));
+            return;
+        }
+    };
+
     match runtime.as_str() {
-        "external" => {
-            // Validate base_url and health-probe before saving.
-            send("progress", json!({ "step": "validating", "message": "Validating external endpoint…" }));
-
-            let base_url = match req.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(b) => b.to_string(),
-                None => {
-                    send("error", json!({ "message": "base_url is required for external runtime" }));
-                    return;
-                }
-            };
-
-            if let Err(e) = crate::services::llm::validate_llm_base("openai_compatible", Some(&base_url)) {
-                send("error", json!({ "message": format!("Invalid base_url: {e}") }));
-                return;
-            }
-
-            let model_str = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
-                .unwrap_or("llama3.2").to_string();
-
-            let health_client = reqwest::Client::new();
-            let target = crate::services::llm::LlmTarget {
-                provider: "openai_compatible".into(),
-                model: model_str.clone(),
-                base_url: Some(base_url.clone()),
-                api_key: None,
-            };
-            let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
-            if !healthy {
-                send("progress", json!({ "step": "validating", "message": "Health probe returned unhealthy — saving anyway (server may still be starting)." }));
-            }
-
-            send("progress", json!({ "step": "saving", "message": "Saving runtime config…" }));
-
-            let api_key_opt = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
-            if let Err(e) = persist_runtime(&db, "openai_compatible", Some(&base_url), Some(&model_str), api_key_opt).await {
-                send("error", json!({ "message": format!("DB save failed: {e}") }));
-                return;
-            }
-
-            send("done", json!({ "provider": "openai_compatible", "base_url": base_url, "model": model_str, "healthy": healthy }));
+        // Both are "a /v1 server somewhere else"; only the catalog id differs
+        // (the UI label + whether a model must be named).
+        "external" | "mlx" => {
+            switch_external_like(&tx, &db, &req, &runtime, max_concurrency).await;
         }
 
         "ollama" => {
             send("progress", json!({ "step": "saving", "message": "Switching back to bundled Ollama…" }));
 
-            if let Err(e) = persist_runtime(&db, "ollama", None, None, None).await {
+            if let Err(e) = persist_runtime(&db, "ollama", None, None, None, Some("ollama"), max_concurrency).await {
                 send("error", json!({ "message": format!("DB save failed: {e}") }));
                 return;
             }
@@ -1486,6 +1507,8 @@ async fn run_switch_runtime(
                 Some("http://gctrl-llamacpp:8080"),
                 Some(&model_id_owned),
                 None,
+                Some("llamacpp"),
+                max_concurrency,
             ).await {
                 send("error", json!({ "message": format!("DB save failed: {e}") }));
                 return;
@@ -1588,6 +1611,8 @@ async fn run_switch_runtime(
                 Some("http://gctrl-vllm:8000"),
                 Some(&model_id_owned),
                 None,
+                Some("vllm"),
+                max_concurrency,
             ).await {
                 send("error", json!({ "message": format!("DB save failed: {e}") }));
                 return;
@@ -1611,9 +1636,96 @@ async fn run_switch_runtime(
         }
 
         other => {
-            send("error", json!({ "message": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, vllm, external") }));
+            send("error", json!({ "message": format!("Unknown runtime '{other}'. Valid: {}", RUNTIME_IDS.join(", ")) }));
         }
     }
+}
+
+/// Shared `external` / `mlx` arm of `run_switch_runtime`: validate the base,
+/// probe WITH the request key (else the stored one — a keyed oMLX 401s an
+/// anonymous `/v1/models`), then persist as provider `openai_compatible` under
+/// `runtime_id`. `mlx` requires an explicit model: an MLX server serves whatever
+/// the operator loaded and a silent `llama3.2` default would 404 on every call;
+/// `external` keeps its historical default for backward compatibility.
+async fn switch_external_like(
+    tx: &mpsc::UnboundedSender<std::result::Result<Event, Infallible>>,
+    db: &sqlx::PgPool,
+    req: &SwitchRuntimeReq,
+    runtime_id: &str,
+    max_concurrency: Option<i32>,
+) {
+    let send = |event: &str, data: serde_json::Value| {
+        let _ = tx.send(Ok(Event::default().event(event).data(data.to_string())));
+    };
+    let label = if runtime_id == "mlx" { "MLX endpoint" } else { "external endpoint" };
+
+    send("progress", json!({ "step": "validating", "message": format!("Validating {label}…") }));
+
+    let base_url = match req.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => b.to_string(),
+        None => {
+            send("error", json!({ "message": format!("base_url is required for the {runtime_id} runtime") }));
+            return;
+        }
+    };
+
+    if let Err(e) = crate::services::llm::validate_llm_base("openai_compatible", Some(&base_url)) {
+        send("error", json!({ "message": format!("Invalid base_url: {e}") }));
+        return;
+    }
+
+    let model_str = match req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(m) => m.to_string(),
+        None if runtime_id == "mlx" => {
+            send("error", json!({ "message": "model is required for the mlx runtime" }));
+            return;
+        }
+        None => "llama3.2".to_string(),
+    };
+
+    let api_key_opt = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let probe_key = match api_key_opt {
+        Some(k) => Some(k.to_string()),
+        None => crate::services::llm::stored_runtime_key(db).await,
+    };
+    let health_client = reqwest::Client::new();
+    let target = crate::services::llm::LlmTarget {
+        provider: "openai_compatible".into(),
+        model: model_str.clone(),
+        base_url: Some(base_url.clone()),
+        api_key: probe_key,
+    };
+    let health = crate::services::llm::runtime_health_detail(&health_client, &target).await;
+    let healthy = health.is_ok();
+    if let Err(ref e) = health {
+        send("progress", json!({ "step": "validating", "message": format!("Health probe failed ({e}) — saving anyway (server may still be starting).") }));
+    }
+
+    send("progress", json!({ "step": "saving", "message": "Saving runtime config…" }));
+
+    if let Err(e) = persist_runtime(
+        db,
+        "openai_compatible",
+        Some(&base_url),
+        Some(&model_str),
+        api_key_opt,
+        Some(runtime_id),
+        max_concurrency,
+    )
+    .await
+    {
+        send("error", json!({ "message": format!("DB save failed: {e}") }));
+        return;
+    }
+
+    send("done", json!({
+        "provider": "openai_compatible",
+        "runtime_id": runtime_id,
+        "base_url": base_url,
+        "model": model_str,
+        "healthy": healthy,
+        "health_error": health.err(),
+    }));
 }
 
 /// Poll gctrl-llamacpp's health endpoint until it responds or times out.
@@ -1877,41 +1989,62 @@ pub fn recommend_json() -> Value {
     })
 }
 
-/// Return the static runtime catalog as JSON (same data as GET /runtimes).
+/// The runtime catalog — ONE source for `GET /runtimes` and the agent
+/// `list_runtimes` tool (they used to be two copies that disagreed on the
+/// external entry's id). Ids are `RUNTIME_IDS`; `needs_api_key` tells the UI to
+/// show the key field, `default_base_url` prefills the base.
 pub fn runtimes_catalog_json() -> Value {
     json!({
         "runtimes": [
             {
-                "id":             "ollama",
-                "label":          "Bundled Ollama",
-                "kind":           "ollama",
-                "needs_base_url": false,
-                "needs_gpu":      false,
-                "description":    "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
+                "id":               "ollama",
+                "label":            "Bundled Ollama",
+                "kind":             "ollama",
+                "needs_base_url":   false,
+                "needs_api_key":    false,
+                "needs_gpu":        false,
+                "default_base_url": "",
+                "description":      "Local Ollama bundled with GCTRL. No key required. Default when nothing is configured.",
             },
             {
-                "id":             "llamacpp",
-                "label":          "llama.cpp (bundled)",
-                "kind":           "openai_compatible",
-                "needs_base_url": false,
-                "needs_gpu":      false,
-                "description":    "Bundled llama.cpp server. Faster than Ollama on CPU; CUDA-offloads on NVIDIA GPUs with 6–16 GB VRAM.",
+                "id":               "llamacpp",
+                "label":            "llama.cpp (bundled)",
+                "kind":             "openai_compatible",
+                "needs_base_url":   false,
+                "needs_api_key":    false,
+                "needs_gpu":        false,
+                "default_base_url": "",
+                "description":      "Bundled llama.cpp server. Faster than Ollama on CPU; CUDA-offloads on NVIDIA GPUs with 6–16 GB VRAM.",
             },
             {
-                "id":             "vllm",
-                "label":          "vLLM (GPU, bundled)",
-                "kind":           "openai_compatible",
-                "needs_base_url": false,
-                "needs_gpu":      true,
-                "description":    "Bundled vLLM engine. Maximum throughput for NVIDIA GPUs with ≥8 GB VRAM (nvidia-container-toolkit required).",
+                "id":               "vllm",
+                "label":            "vLLM (GPU, bundled)",
+                "kind":             "openai_compatible",
+                "needs_base_url":   false,
+                "needs_api_key":    false,
+                "needs_gpu":        true,
+                "default_base_url": "",
+                "description":      "Bundled vLLM engine. Maximum throughput for NVIDIA GPUs with ≥8 GB VRAM (nvidia-container-toolkit required).",
             },
             {
-                "id":             "openai_compatible",
-                "label":          "OpenAI-compatible endpoint",
-                "kind":           "openai_compatible",
-                "needs_base_url": true,
-                "needs_gpu":      false,
-                "description":    "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API.",
+                "id":               "external",
+                "label":            "OpenAI-compatible endpoint",
+                "kind":             "openai_compatible",
+                "needs_base_url":   true,
+                "needs_api_key":    true,
+                "needs_gpu":        false,
+                "default_base_url": "",
+                "description":      "Any /v1-compatible server: LM Studio, llama.cpp, vLLM, LocalAI, or a hosted API. API key optional.",
+            },
+            {
+                "id":               "mlx",
+                "label":            "MLX / oMLX (Apple Silicon, this host)",
+                "kind":             "openai_compatible",
+                "needs_base_url":   true,
+                "needs_api_key":    true,
+                "needs_gpu":        false,
+                "default_base_url": "http://host.docker.internal:8020",
+                "description":      "Native Apple-Silicon inference on this Mac (oMLX, mlx-lm server, LM Studio MLX). OpenAI-compatible; paste the server's API key if it has one. Thinking is switched off for extraction speed.",
             },
         ]
     })
@@ -1934,43 +2067,56 @@ pub fn models_for_runtime_json(runtime: &str) -> Value {
     json!({ "runtime": runtime, "models": models })
 }
 
-/// Return the active runtime status as JSON. Never leaks api_key.
-/// Falls back gracefully when the DB is unreachable.
+/// Return the active runtime status as JSON. Never leaks api_key — but the
+/// probe DOES use it (spec D4): a keyed runtime answers 401 to an anonymous
+/// `/v1/models`, which is how a working oMLX showed as dead. `health_error`
+/// carries the probe's reason (`null` when healthy). Falls back gracefully when
+/// the DB is unreachable.
 pub async fn active_runtime_json(db: &sqlx::PgPool) -> Value {
-    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i32>)> =
         sqlx::query_as(
-            "SELECT provider, base_url, model, embedding_mode FROM runtime_config WHERE id = 1",
+            "SELECT provider, base_url, model, embedding_mode, api_key, runtime_id, max_concurrency
+             FROM runtime_config WHERE id = 1",
         )
         .fetch_optional(db)
         .await
         .ok()
         .flatten();
 
-    let (provider, base_url, model, embedding_mode, configured) = match row {
-        Some((Some(p), b, m, em)) if !p.trim().is_empty() => {
-            (p.trim().to_string(), b, m, em, true)
+    let (provider, base_url, model, embedding_mode, api_key, runtime_id, max_concurrency, configured) = match row {
+        Some((Some(p), b, m, em, k, rid, mc)) if !p.trim().is_empty() => {
+            (p.trim().to_string(), b, m, em, k, rid, mc, true)
         }
-        Some((_, b, m, em)) => ("ollama".to_string(), b, m, em, false),
-        None => ("ollama".to_string(), None, None, None, false),
+        Some((_, b, m, em, k, rid, mc)) => ("ollama".to_string(), b, m, em, k, rid, mc, false),
+        None => ("ollama".to_string(), None, None, None, None, None, None, false),
     };
+    let runtime_id = runtime_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| (provider == "ollama").then(|| "ollama".to_string()));
 
-    // Light health probe — no key needed.
     let health_client = reqwest::Client::new();
     let target = crate::services::llm::LlmTarget {
         provider: provider.clone(),
         model: model.clone().unwrap_or_else(|| "llama3.2".to_string()),
         base_url: base_url.clone(),
-        api_key: None,
+        api_key: api_key
+            .map(|k| crate::services::crypto::open(&k))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     };
-    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+    let health = crate::services::llm::runtime_health_detail(&health_client, &target).await;
 
     json!({
-        "provider":       provider,
-        "base_url":       base_url,
-        "model":          model,
-        "embedding_mode": embedding_mode.unwrap_or_else(|| "pinned".to_string()),
-        "configured":     configured,
-        "healthy":        healthy,
+        "provider":        provider,
+        "base_url":        base_url,
+        "model":           model,
+        "runtime_id":      runtime_id,
+        "max_concurrency": max_concurrency.unwrap_or(4),
+        "embedding_mode":  embedding_mode.unwrap_or_else(|| "pinned".to_string()),
+        "configured":      configured,
+        "healthy":         health.is_ok(),
+        "health_error":    health.err(),
     })
 }
 
@@ -2209,6 +2355,8 @@ pub fn spawn_llamacpp_startup(db: sqlx::PgPool, model_id: String) {
             "openai_compatible",
             Some("http://gctrl-llamacpp:8080"),
             Some(&model_id),
+            None,
+            Some("llamacpp"),
             None,
         )
         .await
@@ -2451,19 +2599,56 @@ mod switch_runtime_tests {
 
     #[test]
     fn valid_runtimes() {
-        // These are the four valid runtime strings for switch-runtime
-        for rt in &["ollama", "llamacpp", "vllm", "external"] {
-            assert!(matches!(*rt, "ollama" | "llamacpp" | "vllm" | "external"),
-                "runtime '{rt}' should be valid");
+        // The five catalog ids accepted by switch-runtime / POST /runtime / the agent tool.
+        for rt in &["ollama", "llamacpp", "vllm", "external", "mlx"] {
+            assert!(super::RUNTIME_IDS.contains(rt), "runtime '{rt}' should be valid");
+            assert_eq!(super::validate_runtime_id(Some(rt)).unwrap().as_deref(), Some(*rt));
         }
     }
 
     #[test]
     fn invalid_runtimes_not_in_set() {
-        for rt in &["tgi", "openai", "lmstudio", ""] {
-            assert!(!matches!(*rt, "ollama" | "llamacpp" | "vllm" | "external"),
-                "runtime '{rt}' should be invalid");
+        for rt in &["tgi", "openai", "lmstudio", "openai_compatible"] {
+            assert!(!super::RUNTIME_IDS.contains(rt), "runtime '{rt}' should be invalid");
+            assert!(super::validate_runtime_id(Some(rt)).is_err(), "'{rt}' must be rejected");
         }
+        // Absent / blank → "not specified", not an error.
+        assert_eq!(super::validate_runtime_id(None).unwrap(), None);
+        assert_eq!(super::validate_runtime_id(Some("  ")).unwrap(), None);
+    }
+
+    // ── max_concurrency (spec D2) ────────────────────────────────────────────
+
+    #[test]
+    fn max_concurrency_bounds() {
+        use super::validate_max_concurrency as v;
+        assert_eq!(v(None).unwrap(), None, "omitted keeps the stored value");
+        assert_eq!(v(Some(1)).unwrap(), Some(1));
+        assert_eq!(v(Some(2)).unwrap(), Some(2));
+        assert_eq!(v(Some(64)).unwrap(), Some(64));
+        for bad in [0, -1, 65, 1000] {
+            let err = v(Some(bad)).unwrap_err();
+            assert!(err.contains("between 1 and 64"), "{bad}: {err}");
+        }
+    }
+
+    // ── internal credential route base matching (spec D7) ────────────────────
+
+    #[test]
+    fn credential_base_matches_folds_v1_and_slash() {
+        use super::credential_base_matches as m;
+        assert!(m(Some("http://mac:8020"), "http://mac:8020/v1"));
+        assert!(m(Some("http://mac:8020/v1/"), "http://mac:8020"));
+        assert!(m(Some(" http://mac:8020 "), "http://MAC:8020/"));
+    }
+
+    #[test]
+    fn credential_base_rejects_other_servers_and_missing_base() {
+        use super::credential_base_matches as m;
+        assert!(!m(Some("http://mac:8020"), "http://mac:8021"));
+        assert!(!m(Some("http://mac:8020"), "http://evil:8020"));
+        assert!(!m(None, "http://mac:8020"), "no stored base → no key for anyone");
+        assert!(!m(Some(""), "http://mac:8020"));
     }
 }
 
@@ -2544,14 +2729,55 @@ mod agent_tool_tests {
         );
     }
 
+    /// The external entry's id is `external` — the id the switch arms and the
+    /// agent tool switch on (the old agent copy said `openai_compatible`, which
+    /// no arm accepted).
     #[test]
-    fn runtimes_catalog_contains_openai_compatible() {
+    fn runtimes_catalog_contains_external_not_openai_compatible_id() {
         let cat = runtimes_catalog_json();
         let rts = cat["runtimes"].as_array().unwrap();
-        assert!(
-            rts.iter().any(|r| r["id"].as_str() == Some("openai_compatible")),
-            "runtimes catalog must contain 'openai_compatible'"
-        );
+        assert!(rts.iter().any(|r| r["id"].as_str() == Some("external")));
+        assert!(!rts.iter().any(|r| r["id"].as_str() == Some("openai_compatible")));
+    }
+
+    /// Catalog ids and `RUNTIME_IDS` are the same set, in the same order.
+    #[test]
+    fn runtimes_catalog_ids_match_runtime_ids() {
+        let cat = runtimes_catalog_json();
+        let ids: Vec<&str> = cat["runtimes"].as_array().unwrap()
+            .iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids, super::RUNTIME_IDS.to_vec());
+    }
+
+    /// Spec D6: the `mlx` entry, exactly as the UI relies on it.
+    #[test]
+    fn runtimes_catalog_mlx_entry() {
+        let cat = runtimes_catalog_json();
+        let rts = cat["runtimes"].as_array().unwrap();
+        let mlx = rts.iter().find(|r| r["id"].as_str() == Some("mlx")).expect("mlx entry");
+        assert_eq!(mlx["label"].as_str(), Some("MLX / oMLX (Apple Silicon, this host)"));
+        assert_eq!(mlx["kind"].as_str(), Some("openai_compatible"));
+        assert_eq!(mlx["needs_base_url"].as_bool(), Some(true));
+        assert_eq!(mlx["needs_api_key"].as_bool(), Some(true));
+        assert_eq!(mlx["needs_gpu"].as_bool(), Some(false));
+        assert_eq!(mlx["default_base_url"].as_str(), Some("http://host.docker.internal:8020"));
+        assert!(mlx["description"].as_str().unwrap().contains("Thinking is switched off"));
+    }
+
+    /// Every entry carries the two new UI fields; bundled runtimes never ask for a key.
+    #[test]
+    fn runtimes_catalog_entries_have_key_and_default_base_fields() {
+        let cat = runtimes_catalog_json();
+        for r in cat["runtimes"].as_array().unwrap() {
+            let id = r["id"].as_str().unwrap();
+            assert!(r["needs_api_key"].is_boolean(), "{id}: needs_api_key");
+            assert!(r["default_base_url"].is_string(), "{id}: default_base_url");
+            let bundled = matches!(id, "ollama" | "llamacpp" | "vllm");
+            assert_eq!(r["needs_api_key"].as_bool(), Some(!bundled), "{id}: needs_api_key");
+        }
+        let ext = cat["runtimes"].as_array().unwrap().iter()
+            .find(|r| r["id"].as_str() == Some("external")).unwrap();
+        assert_eq!(ext["default_base_url"].as_str(), Some(""));
     }
 
     #[test]

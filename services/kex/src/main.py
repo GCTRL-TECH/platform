@@ -181,6 +181,7 @@ def _run_pipeline_impl(
     generation_kind: str = "ollama",
     generation_base: str | None = None,
     generation_api_key: str | None = None,
+    generation_max_concurrency: int | None = None,
 ) -> dict:
     """
     Full extraction pipeline: NER -> RelEx -> KG Builder -> Chunking -> Embedding -> Vector Store.
@@ -251,6 +252,7 @@ def _run_pipeline_impl(
                 model=relex_model,
                 kind=generation_kind,
                 api_key=generation_api_key,
+                max_concurrency=generation_max_concurrency,
             )
         # extract_relations returns (relations, report) tuple.
         if isinstance(relex_result, tuple) and len(relex_result) == 2:
@@ -287,6 +289,7 @@ def _run_pipeline_impl(
                 base=relex_base,
                 kind=generation_kind,
                 api_key=generation_api_key,
+                max_concurrency=generation_max_concurrency,
             )
             logger.info(f"[{job_id}] Entity verify: {entity_verify_report}")
         except Exception as exc:
@@ -412,7 +415,16 @@ def _run_pipeline_impl(
     # retrievable instead of losing the top-k race to bulk prose.
     try:
         from .fact_log import extract_facts, fact_chunks
-        facts = extract_facts(text)
+        # Same resolved generation runtime as relex / entity-verify (D8): on
+        # Ollama the fact-log model stays; on a /v1 runtime the relex model is used.
+        facts = extract_facts(
+            text,
+            ollama_base=generation_base if generation_base else ollama_base,
+            model=relex_model,
+            kind=generation_kind,
+            api_key=generation_api_key,
+            max_concurrency=generation_max_concurrency,
+        )
         if facts:
             f_chunks = fact_chunks(text, facts)
             f_embeddings = embedder.embed_batch([c.get("embed_text", c["content"]) for c in f_chunks])
@@ -535,6 +547,13 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
             generation_kind = payload.get("generation_kind") or "ollama"
             generation_api_key = payload.get("generation_api_key")
             generation_base = payload.get("generation_base")
+            # Per-runtime parallel-request budget (runtime_config.max_concurrency,
+            # injected by apply_generation_overrides). Absent/invalid → llm_client's
+            # env default (GENERATION_MAX_CONCURRENCY, 4).
+            try:
+                generation_max_concurrency = int(payload.get("generation_max_concurrency") or 0) or None
+            except (TypeError, ValueError):
+                generation_max_concurrency = None
             # P2b document identity, resolved by the API from (user, path):
             # the source_documents row id + the full source path + the
             # source-side modified time (when known). All optional — absent
@@ -679,6 +698,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 generation_kind=generation_kind,
                 generation_base=generation_base,
                 generation_api_key=generation_api_key,
+                generation_max_concurrency=generation_max_concurrency,
             )
             # Record crawl provenance on the result for the dashboard.
             if crawled_urls:

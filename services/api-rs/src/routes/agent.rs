@@ -393,10 +393,10 @@ pub(crate) fn tool_schema() -> Value {
             // ── Runtime configuration tools ───────────────────────────────────────
             { "name": "get_hardware",       "description": "Read the host hardware profile (CPU cores, RAM, GPU, VRAM, OS/arch) detected at install time. Read-only, any caller", "args": {} },
             { "name": "recommend_runtime",  "description": "Recommend the best runtime and model for the current hardware (pure local logic — no IO). Returns { runtime, model, rationale, speedup_estimate }. Read-only, any caller", "args": {} },
-            { "name": "list_runtimes",      "description": "List the available runtime kinds (ollama, openai_compatible) with metadata. Read-only, any caller", "args": {} },
+            { "name": "list_runtimes",      "description": "List the available runtime catalog entries (ollama, llamacpp, vllm, external, mlx — the last three are openai_compatible /v1 servers; mlx is native Apple-Silicon inference on this host) with metadata: needs_base_url, needs_api_key, default_base_url. Read-only, any caller", "args": {} },
             { "name": "get_active_runtime", "description": "Read the current active LLM generation runtime: provider, base_url, model, embedding_mode, configured, healthy. Never leaks api_key. Read-only, any caller", "args": {} },
             { "name": "list_models",        "description": "List the built-in model catalog for a given runtime kind. Args: { runtime } where runtime ∈ 'ollama' | 'llamacpp' | 'vllm'. Read-only, any caller", "args": { "runtime": "string" } },
-            { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'external', model?: string, base_url?: string, api_key?: string }. ollama/external: synchronous validate+persist. llamacpp: async (spawns pull+create in background, returns immediately with status='starting')", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?" } },
+            { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'vllm'|'external'|'mlx', model?: string, base_url?: string, api_key?: string, max_concurrency?: number }. ollama/external/mlx: synchronous validate+persist (external/mlx need base_url; mlx also needs model; api_key optional). llamacpp: async (spawns pull+create in background, returns immediately with status='starting'). vllm: use the Cookbook UI (container launch). max_concurrency (1-64) caps parallel generation requests against a /v1 runtime", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?", "max_concurrency": "number?" } },
             { "name": "set_model",          "description": "Update the model for the active runtime without changing the provider (admin only). Validates against the built-in catalog for known runtimes; accepts any string for ollama/external. Args: { model: string }", "args": { "model": "string" } },
             { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } },
             // ── File-asset index + connector ops ─────────────────────────────────
@@ -1916,10 +1916,16 @@ async fn execute_tool_inner(
             let model_arg = args["model"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
             let base_url_arg = args["base_url"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
             let api_key_arg = args["api_key"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let max_concurrency = match crate::routes::infra::validate_max_concurrency(
+                args["max_concurrency"].as_i64().and_then(|n| i32::try_from(n).ok()),
+            ) {
+                Ok(v) => v,
+                Err(e) => return json!({ "error": e }),
+            };
 
             match runtime.as_str() {
                 "ollama" => {
-                    if let Err(e) = crate::routes::infra::persist_runtime(&state.db, "ollama", None, None, None).await {
+                    if let Err(e) = crate::routes::infra::persist_runtime(&state.db, "ollama", None, None, None, Some("ollama"), max_concurrency).await {
                         return json!({ "error": format!("DB save failed: {e}") });
                     }
                     // Best-effort: stop llamacpp if running
@@ -1929,29 +1935,47 @@ async fn execute_tool_inner(
                     let healthy = crate::routes::infra::active_runtime_json(&state.db).await["healthy"].as_bool().unwrap_or(false);
                     json!({ "ok": true, "provider": "ollama", "healthy": healthy })
                 }
-                "external" => {
+                // Same behaviour: a /v1 server elsewhere, provider openai_compatible;
+                // only the recorded catalog id differs. mlx must name its model (an
+                // MLX server serves whatever was loaded — a llama3.2 default 404s).
+                rt @ ("external" | "mlx") => {
                     let base_url = match base_url_arg {
                         Some(b) => b,
-                        None => return json!({ "error": "base_url is required for external runtime" }),
+                        None => return json!({ "error": format!("base_url is required for the {rt} runtime") }),
                     };
                     if let Err(e) = crate::services::llm::validate_llm_base("openai_compatible", Some(&base_url)) {
                         return json!({ "error": format!("Invalid base_url: {e}") });
                     }
-                    let model_str = model_arg.unwrap_or_else(|| "llama3.2".to_string());
+                    let model_str = match model_arg {
+                        Some(m) => m,
+                        None if rt == "mlx" => return json!({ "error": "model is required for the mlx runtime" }),
+                        None => "llama3.2".to_string(),
+                    };
+                    // Probe WITH the key (request's, else stored): a keyed server
+                    // 401s an anonymous /v1/models and would read as unhealthy.
+                    let probe_key = match api_key_arg.clone() {
+                        Some(k) => Some(k),
+                        None => crate::services::llm::stored_runtime_key(&state.db).await,
+                    };
                     let health_client = reqwest::Client::new();
                     let target = crate::services::llm::LlmTarget {
                         provider: "openai_compatible".into(),
                         model: model_str.clone(),
                         base_url: Some(base_url.clone()),
-                        api_key: None,
+                        api_key: probe_key,
                     };
-                    let healthy = crate::services::llm::runtime_health(&health_client, &target).await;
+                    let health = crate::services::llm::runtime_health_detail(&health_client, &target).await;
                     if let Err(e) = crate::routes::infra::persist_runtime(
                         &state.db, "openai_compatible", Some(&base_url), Some(&model_str), api_key_arg.as_deref(),
+                        Some(rt), max_concurrency,
                     ).await {
                         return json!({ "error": format!("DB save failed: {e}") });
                     }
-                    json!({ "ok": true, "provider": "openai_compatible", "base_url": base_url, "model": model_str, "healthy": healthy })
+                    json!({
+                        "ok": true, "provider": "openai_compatible", "runtime_id": rt,
+                        "base_url": base_url, "model": model_str,
+                        "healthy": health.is_ok(), "health_error": health.err(),
+                    })
                 }
                 "llamacpp" => {
                     let model_id = model_arg.as_deref().unwrap_or("qwen2.5-3b").to_string();
@@ -1971,7 +1995,7 @@ async fn execute_tool_inner(
                         "note": "llama.cpp is downloading the model in the background; check get_active_runtime for healthy=true"
                     })
                 }
-                other => json!({ "error": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, external") }),
+                other => json!({ "error": format!("Unknown runtime '{other}'. Valid: ollama, llamacpp, external, mlx (vllm: use the Cookbook UI)") }),
             }
         }
 
@@ -2228,6 +2252,9 @@ async fn chat(
             let mut decided = false;
             let mut suppress = false;
             {
+                // Spec D2: one generation slot for the whole stream (released at
+                // the end of this block). No-op for Ollama/cloud targets.
+                let _slot = llm::acquire_slot(&state_clone, &target).await;
                 let stream = llm::chat_stream(&client, &target, &turn).await;
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
@@ -2357,6 +2384,7 @@ async fn chat(
                 convo.push(json!({"role": "user", "content":
                     "You have reached the tool-call limit. Now give your final answer in plain text, no tool calls."}));
                 let turn = ChatMessages { system: &system_prompt, messages: convo.clone() };
+                let _slot = llm::acquire_slot(&state_clone, &target).await;
                 let stream = llm::chat_stream(&client, &target, &turn).await;
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
@@ -2795,6 +2823,27 @@ mod agent_tool_registration_tests {
             .expect("switch_runtime must be in tool_schema");
         assert!(tool["args"].get("runtime").is_some(),
             "switch_runtime descriptor must declare a 'runtime' arg");
+    }
+
+    /// Spec D6: the descriptor must advertise every catalog id (the model reads
+    /// this text to know `mlx` exists) and the new concurrency knob.
+    #[test]
+    fn switch_runtime_descriptor_lists_all_catalog_ids() {
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"].as_str() == Some("switch_runtime")).unwrap();
+        let desc = tool["description"].as_str().unwrap();
+        assert!(desc.contains("'ollama'|'llamacpp'|'vllm'|'external'|'mlx'"), "got: {desc}");
+        assert!(tool["args"].get("max_concurrency").is_some(),
+            "switch_runtime descriptor must declare 'max_concurrency'");
+    }
+
+    #[test]
+    fn list_runtimes_descriptor_mentions_mlx() {
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"].as_str() == Some("list_runtimes")).unwrap();
+        assert!(tool["description"].as_str().unwrap().contains("mlx"));
     }
 
     // ── Codebase KB read tools registered (P1a) ───────────────────────────────

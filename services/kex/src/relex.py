@@ -392,6 +392,7 @@ class RelationExtractor:
         model: Optional[str] = None,
         kind: str = "ollama",
         api_key: Optional[str] = None,
+        max_concurrency: Optional[int] = None,
     ) -> tuple:
         """
         Extract relations from text given a list of entity dicts.
@@ -527,7 +528,8 @@ class RelationExtractor:
             prompt = _build_prompt(win_text, entity_lines)
 
             raw_response = self._call_ollama(
-                prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key
+                prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key,
+                max_concurrency=max_concurrency,
             )
             if raw_response is None:
                 # _call_ollama already recorded the reason on self.last_degraded_*.
@@ -590,6 +592,7 @@ class RelationExtractor:
                 new_rels = self._gap_fill(
                     win_text, entities, prompt_entities_gf, relations,
                     ollama_base, model, kind, api_key,
+                    max_concurrency=max_concurrency,
                 )
                 # Merge any new gap-fill triples into `relations`.
                 existing_keys = {(r["head"].lower(), r["type"], r["tail"].lower()) for r in relations}
@@ -644,6 +647,7 @@ class RelationExtractor:
         model: Optional[str],
         kind: str = "ollama",
         api_key: Optional[str] = None,
+        max_concurrency: Optional[int] = None,
     ) -> list[dict]:
         """Up to RELEX_GAPFILL_MAX_PASSES focused re-extractions targeting entities
         that appear in the text but ended up in NO relation. Each pass adds only
@@ -673,7 +677,8 @@ class RelationExtractor:
 
             gap_prompt = _build_gapfill_prompt(text, entity_lines, isolated_names)
             raw = self._call_ollama(
-                gap_prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key
+                gap_prompt, ollama_base=ollama_base, model=model, kind=kind, api_key=api_key,
+                max_concurrency=max_concurrency,
             )
             if raw is None:
                 break  # LLM degraded mid-cycle — keep what we have, never fail
@@ -740,6 +745,7 @@ class RelationExtractor:
         model: Optional[str] = None,
         kind: str = "ollama",
         api_key: Optional[str] = None,
+        max_concurrency: Optional[int] = None,
     ) -> Optional[str]:
         """Call the LLM with SELF-HEALING model provisioning (Ollama) or direct
         passthrough (OpenAI-compatible).
@@ -784,7 +790,9 @@ class RelationExtractor:
                 if not self._pull_model(base, m):
                     _relex_dead_primaries.add(m)
                     continue
-            status, text = self._generate_once(base, m, prompt, kind=kind, api_key=api_key)
+            status, text = self._generate_once(
+                base, m, prompt, kind=kind, api_key=api_key, max_concurrency=max_concurrency
+            )
             if status == "ok":
                 if idx > 0:
                     logger.warning(f"RelEx fell back to '{m}' (primary '{primary}' unavailable)")
@@ -794,7 +802,7 @@ class RelationExtractor:
                     # Model isn't installed — provision it once, then retry the same model.
                     if self._pull_model(base, m):
                         status2, text2 = self._generate_once(
-                            base, m, prompt, kind=kind, api_key=api_key
+                            base, m, prompt, kind=kind, api_key=api_key, max_concurrency=max_concurrency
                         )
                         if status2 == "ok":
                             if idx > 0:
@@ -833,6 +841,7 @@ class RelationExtractor:
         prompt: str,
         kind: str = "ollama",
         api_key: Optional[str] = None,
+        max_concurrency: Optional[int] = None,
     ) -> tuple[str, Optional[str]]:
         """One LLM call via llm_client. Returns (status, text) where status is
         'ok' | 'not_found' | 'server_error' | 'unreachable'.
@@ -840,6 +849,11 @@ class RelationExtractor:
         For kind=="ollama" the Ollama-specific 404 (model not found) is detected
         via the HTTP 404 response and returned as "not_found" so the caller can
         trigger auto-pull. For other kinds, 404 is treated as a server error.
+
+        Transient backpressure (503/507/409/429 …, connection resets) is absorbed
+        INSIDE llm_client's retry ladder, so only a genuinely exhausted ladder
+        surfaces here as an HTTPError — a busy runtime never marks the primary
+        model dead.
         """
         try:
             num_predict = getattr(config, "RELEX_NUM_PREDICT", 2048)
@@ -852,6 +866,7 @@ class RelationExtractor:
                 options={"temperature": 0.0, "num_predict": num_predict},
                 think=getattr(config, "RELEX_THINK", False),
                 timeout=getattr(config, "RELEX_TIMEOUT", 180),
+                max_concurrency=max_concurrency,
             )
             return ("ok", text)
         except requests.exceptions.HTTPError as exc:

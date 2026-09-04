@@ -41,7 +41,15 @@ async fn main() {
     let neo   = services::neo4j::connect(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password).await;
     let redis = services::redis::connect(&cfg.redis_url).await;
 
-    let state = Arc::new(models::AppState { cfg: cfg.clone(), db, neo, redis });
+    let state = Arc::new(models::AppState {
+        cfg: cfg.clone(),
+        db,
+        neo,
+        redis,
+        // Sized from runtime_config.max_concurrency lazily on first use (see
+        // llm::acquire_slot); 4 only seeds the tuple so the first compare resizes.
+        llm_gate: Arc::new(tokio::sync::Mutex::new((4, Arc::new(tokio::sync::Semaphore::new(4))))),
+    });
 
     background::spawn_all(state.clone());
 
@@ -167,6 +175,9 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/setup",  routes::setup::router())
         .nest("/api/public", routes::kg::public_router())
         .merge(routes::connectors::public_router())
+        // GET /api/internal/generation-credential — worker-to-api hop guarded by
+        // X-Internal-Secret, not a user session (see routes::infra::public_router).
+        .merge(routes::infra::public_router())
         // Cloaking LLM gateway: OpenAI-compatible POST /v1/chat/completions. Mounted
         // OUTSIDE the auth middleware — it does its own auth so it can accept a gctrl
         // token sent as either `ApiKey <t>` or `Bearer <t>` (some OpenAI clients force

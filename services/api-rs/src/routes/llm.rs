@@ -104,14 +104,28 @@ async fn instance_models(
 
     let is_openai = matches!(provider.as_str(), "openai_compatible" | "openai" | "openrouter");
     let url = if is_openai {
-        format!("{}/v1/models", base.trim_end_matches('/'))
+        // Fold a pasted `/v1` so this never probes `/v1/v1/models` (spec D4).
+        format!("{}/v1/models", crate::services::llm::openai_compat_root(&base))
     } else {
         format!("{}/api/tags", base.trim_end_matches('/'))
     };
 
+    // A keyed server (oMLX) 401s an anonymous `/v1/models`. The stored runtime
+    // key is attached ONLY when the asked-for base is the runtime's own server;
+    // it must never be presented to some other endpoint the user typed in.
+    let mut req = client.get(&url).timeout(Duration::from_secs(5));
+    if provider == "openai_compatible" {
+        let (rt_base, rt_key) = crate::services::llm::stored_runtime_base_and_key(&state.db).await;
+        if let (Some(rb), Some(k)) = (rt_base, rt_key) {
+            if crate::services::llm::same_openai_root(&rb, &base) {
+                req = req.header("authorization", format!("Bearer {k}"));
+            }
+        }
+    }
+
     let mut models: Vec<String> = Vec::new();
     let mut reachable = false;
-    if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(5)).send().await {
+    if let Ok(resp) = req.send().await {
         if resp.status().is_success() {
             reachable = true;
             if let Ok(j) = resp.json::<Value>().await {

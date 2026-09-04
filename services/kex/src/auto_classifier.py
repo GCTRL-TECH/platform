@@ -22,6 +22,7 @@ async def auto_classify(
     kind: str = "ollama",
     api_key=None,
     base=None,
+    max_concurrency=None,
 ) -> str:
     """Return the ISO 27001 classification label for the given text.
     Falls back to 'INTERNAL' on any error.
@@ -30,6 +31,8 @@ async def auto_classify(
     `api_key` is forwarded to llm_client for OpenAI-compatible providers.
     `base` overrides the endpoint URL; when falsy falls back to OLLAMA_BASE so
     default kind="ollama" behaviour is preserved unchanged.
+    `max_concurrency` is the per-runtime parallel-request budget (payload
+    `generation_max_concurrency`); None → llm_client's env default.
     Default kind="ollama" preserves existing behaviour.
     """
     resolved_base = (base or "").strip() or OLLAMA_BASE
@@ -43,6 +46,7 @@ async def auto_classify(
             api_key=api_key,
             think=config.AUTO_CLASSIFY_THINK,
             timeout=30.0,
+            max_concurrency=max_concurrency,
         )
         result = result.strip().upper()
         valid = {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "STRICTLY_CONFIDENTIAL"}

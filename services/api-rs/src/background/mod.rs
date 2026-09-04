@@ -493,23 +493,16 @@ async fn enqueue_one_distill(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Per-user distill model + Ollama base (Settings → AI Models / Infra). Unset →
-    // FUSE uses its env defaults, so scheduled distills match the sync HTTP path.
-    let (distill_model, ollama_base) =
-        crate::services::llm::resolve_distill_overrides(&state.db, user_id).await;
-    let gen_target =
-        crate::services::llm::resolve_distill_generation_overrides(&state.db, user_id).await;
+    // Per-user distill model + Ollama base + generation_* (Settings → AI Models /
+    // Infra). Unset → FUSE uses its env defaults, so scheduled distills match the
+    // sync HTTP path. No key: this payload goes through Redis.
     let mut distill_payload = json!({
         "job_id": job_id.to_string(),
         "compilation_id": compilation_id.to_string(),
         "user_id": user_id.to_string(),
-        "distill_model": distill_model,
-        "ollama_base": ollama_base,
     });
-    if let Some(ref gen) = gen_target {
-        if let Some(map) = distill_payload.as_object_mut() {
-            crate::services::llm::apply_generation_overrides(gen, map);
-        }
+    if let Some(map) = distill_payload.as_object_mut() {
+        map.extend(crate::services::llm::distill_payload_fields(&state.db, user_id, false).await);
     }
     crate::services::redis::lpush(
         &state.redis,

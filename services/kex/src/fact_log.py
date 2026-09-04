@@ -8,9 +8,10 @@ self-contained facts and stores them as their OWN small chunks (under the same
 job): short + dense text embeds cleanly, ranks high, and carries explicit
 update/denial/date phrasing that answer generation can rely on.
 
-Runs FULLY LOCAL against Ollama (same privacy story as NER/RelEx — no cloud
-call, no key material in the worker). Fails soft: any error simply yields no
-fact chunks; the normal pipeline output is untouched.
+Runs on the job's resolved GENERATION runtime via llm_client (Ollama by default;
+an OpenAI-compatible local server such as oMLX/vLLM when the job says so — the
+same base/kind/key/concurrency relex uses). Fails soft: any error simply yields
+no fact chunks; the normal pipeline output is untouched.
 """
 import json
 import logging
@@ -19,7 +20,7 @@ import re
 
 import requests
 
-from . import config
+from . import config, llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -54,33 +55,59 @@ def _parse_facts(raw: str) -> list[str]:
     return facts
 
 
-def _generate(base: str, model: str, prompt: str, timeout: int = 90) -> str | None:
+def _generate(
+    base: str, model: str, prompt: str, timeout: int = 90,
+    kind: str = "ollama", api_key=None, max_concurrency=None,
+) -> str | None:
+    """One completion on the job's generation runtime. None on any failure —
+    including Ollama's 404 "model not installed" (so the caller can try the
+    lighter fallback tag). Transient backpressure is retried inside llm_client."""
     try:
-        resp = requests.post(
-            f"{base}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False,
-                  "options": {"temperature": 0.1},
-                  "think": config.FACT_LOG_THINK},
+        return llm_client.complete(
+            prompt, model, base, kind,
+            api_key=api_key,
+            options={"temperature": 0.1},
+            think=config.FACT_LOG_THINK,
             timeout=timeout,
+            max_concurrency=max_concurrency,
         )
-        if resp.status_code == 404:
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        if kind == "ollama" and status == 404:
             return None  # model not installed
-        resp.raise_for_status()
-        return resp.json().get("response", "")
+        logger.warning(f"fact_log generate failed on {model}: {exc}")
+        return None
     except Exception as exc:  # noqa: BLE001 — fact log must never break ingest
         logger.warning(f"fact_log generate failed on {model}: {exc}")
         return None
 
 
-def extract_facts(text: str, ollama_base: str | None = None) -> list[str]:
-    """Distill `text` into atomic facts. Empty list on any failure (fail-soft)."""
+def extract_facts(
+    text: str,
+    ollama_base: str | None = None,
+    model: str | None = None,
+    kind: str = "ollama",
+    api_key=None,
+    max_concurrency=None,
+) -> list[str]:
+    """Distill `text` into atomic facts. Empty list on any failure (fail-soft).
+
+    `ollama_base/kind/api_key/max_concurrency` are the job's resolved generation
+    runtime (what relex uses). On Ollama the dedicated fact-log model
+    (KEX_FACT_LOG_MODEL, with KEX_FACT_LOG_FALLBACK on 404) is kept; on any other
+    runtime `model` (the job's relation model) is used instead — an Ollama-only
+    tag would 404 on a /v1 server — and no fallback tag is attempted."""
     if not FACT_LOG_ENABLED or len(text) < 200:
         return []
     base = (ollama_base or config.OLLAMA_BASE).rstrip("/")
     prompt = PROMPT.format(text=text[:9000])
-    raw = _generate(base, FACT_LOG_MODEL, prompt)
-    if raw is None and FACT_LOG_FALLBACK and FACT_LOG_FALLBACK != FACT_LOG_MODEL:
-        raw = _generate(base, FACT_LOG_FALLBACK, prompt)
+    if kind == "ollama":
+        primary, fallback = FACT_LOG_MODEL, FACT_LOG_FALLBACK
+    else:
+        primary, fallback = ((model or "").strip() or FACT_LOG_MODEL), ""
+    raw = _generate(base, primary, prompt, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
+    if raw is None and fallback and fallback != primary:
+        raw = _generate(base, fallback, prompt, kind=kind, api_key=api_key, max_concurrency=max_concurrency)
     if not raw:
         return []
     facts = _parse_facts(raw)

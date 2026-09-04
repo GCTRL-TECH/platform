@@ -25,18 +25,39 @@ export function describeRuntime(
     if (ollamaOverrideUrl === undefined) return 'Ollama'
     return ollamaOverrideUrl ? `Native Ollama (${ollamaOverrideUrl})` : 'Bundled Ollama (container)'
   }
-  if (activeRuntime.base_url === LLAMACPP_BUNDLED_URL) return 'llama.cpp (bundled)'
-  if (activeRuntime.base_url === VLLM_BUNDLED_URL) return 'vLLM (GPU)'
-  return activeRuntime.base_url ? `Custom endpoint (${activeRuntime.base_url})` : 'Custom endpoint'
+  switch (resolveRuntimeId(activeRuntime)) {
+    case 'llamacpp': return 'llama.cpp (bundled)'
+    case 'vllm': return 'vLLM (GPU)'
+    case 'mlx': return 'MLX / oMLX (this host)'
+    default:
+      return activeRuntime.base_url ? `Custom endpoint (${activeRuntime.base_url})` : 'Custom endpoint'
+  }
 }
 
 /** Short chip label (no URL) — for compact per-purpose "runs on" chips. */
 export function describeRuntimeShort(activeRuntime: ActiveRuntime | null): string {
   if (!activeRuntime) return 'Unknown'
   if (activeRuntime.provider === 'ollama') return 'Ollama'
-  if (activeRuntime.base_url === LLAMACPP_BUNDLED_URL) return 'llama.cpp'
-  if (activeRuntime.base_url === VLLM_BUNDLED_URL) return 'vLLM'
-  return 'Custom endpoint'
+  switch (resolveRuntimeId(activeRuntime)) {
+    case 'llamacpp': return 'llama.cpp'
+    case 'vllm': return 'vLLM'
+    case 'mlx': return 'MLX'
+    default: return 'Custom endpoint'
+  }
+}
+
+/**
+ * Catalog id of the active runtime. Prefers the persisted `runtime_id`
+ * (migration 082); rows written before it carry null, so fall back to the
+ * bundled-URL heuristics. Returns null when nothing can be inferred (a plain
+ * custom endpoint written pre-082).
+ */
+function resolveRuntimeId(activeRuntime: ActiveRuntime): string | null {
+  if (activeRuntime.runtime_id) return activeRuntime.runtime_id
+  if (activeRuntime.provider === 'ollama') return 'ollama'
+  if (activeRuntime.base_url === LLAMACPP_BUNDLED_URL) return 'llamacpp'
+  if (activeRuntime.base_url === VLLM_BUNDLED_URL) return 'vllm'
+  return null
 }
 
 /**
@@ -49,7 +70,8 @@ export function describeRuntimeShort(activeRuntime: ActiveRuntime | null): strin
  */
 export function bundledGenerationRuntimeId(activeRuntime: ActiveRuntime | null): 'llamacpp' | 'vllm' | null {
   if (!activeRuntime || activeRuntime.provider === 'ollama') return null
-  if (activeRuntime.base_url === LLAMACPP_BUNDLED_URL) return 'llamacpp'
-  if (activeRuntime.base_url === VLLM_BUNDLED_URL) return 'vllm'
-  return null
+  // `mlx` and `external` are deliberately NOT bundled: no /infra/models catalog
+  // exists for them, so callers fall through to the free-text / instance path.
+  const id = resolveRuntimeId(activeRuntime)
+  return id === 'llamacpp' || id === 'vllm' ? id : null
 }

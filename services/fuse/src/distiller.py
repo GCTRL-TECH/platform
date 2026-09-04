@@ -358,6 +358,7 @@ def _llm_complete(
     ollama_base: Optional[str] = None,
     kind: str = "ollama",
     api_key=None,
+    max_concurrency=None,
 ) -> str:
     """Single completion routed through the runtime-aware llm_client.
 
@@ -367,7 +368,8 @@ def _llm_complete(
     `model` / `ollama_base` are optional per-job overrides (the owner's
     Settings → AI Models distill model + Settings → Infrastructure Ollama base);
     empty/None falls back to the env defaults so the default install is unchanged.
-    `api_key` is forwarded to llm_client for OpenAI-compatible providers.
+    `api_key` is forwarded to llm_client for OpenAI-compatible providers;
+    `max_concurrency` is the per-runtime generation gate (spec D2, 2026-09-04).
     """
     distill_model = (model or "").strip() or DISTILL_MODEL
     base = (ollama_base or "").strip() or OLLAMA_BASE
@@ -378,6 +380,7 @@ def _llm_complete(
         kind,
         api_key=api_key,
         timeout=_LLM_TIMEOUT,
+        max_concurrency=max_concurrency,
     ).strip()
 
 
@@ -547,6 +550,7 @@ def distill(
     ollama_base: Optional[str] = None,
     kind: str = "ollama",
     api_key=None,
+    max_concurrency=None,
 ) -> dict:
     """Traced wrapper around ``_distill_impl`` — one CHAIN span per wiki
     distillation run (llm.complete child spans nest under it). No-op unless
@@ -558,6 +562,7 @@ def distill(
         return _distill_impl(
             compilation_id, user_id, limit=limit, model=model,
             ollama_base=ollama_base, kind=kind, api_key=api_key,
+            max_concurrency=max_concurrency,
         )
 
 
@@ -569,6 +574,7 @@ def _distill_impl(
     ollama_base: Optional[str] = None,
     kind: str = "ollama",
     api_key=None,
+    max_concurrency=None,
 ) -> dict:
     """Distil a WIKI compilation into a faithful living wiki.
 
@@ -656,6 +662,7 @@ def _distill_impl(
                         ollama_base=ollama_base,
                         kind=kind,
                         api_key=api_key,
+                        max_concurrency=max_concurrency,
                     )
                 except Exception as exc:
                     logger.warning(f"[distill {compilation_id}] LLM failed for '{ent['name']}': {exc}")
