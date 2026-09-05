@@ -127,6 +127,7 @@ _SHARED_RELATION_RULES = "\n".join([
     "- A product belongs to its maker via develops(maker, product) — do NOT use part_of between a product and its company.",
     '- Do NOT emit uses or part_of for a technology that only appears in a requirements/tooling list (e.g. "requires PostgreSQL, Ubuntu 22.04") unless the sentence explicitly states the org or person actually uses/depends on it — a bare requirement or prerequisite is not a stated usage fact.',
     "- speaks is ONLY for a human speaking a natural language. A product's supported languages are NOT speaks. Programming languages are has_skill, never speaks.",
+    "- located_in is ONLY where an organization is headquartered / has an office, or where a person lives or was born. Markets served, customer regions, sales territories, or countries merely mentioned in a list (e.g. \"active in EMEA, France and the Nordics\") are NOT located_in — skip them.",
 ])
 
 

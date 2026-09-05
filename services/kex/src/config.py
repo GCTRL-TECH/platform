@@ -172,7 +172,7 @@ FORMAT_NER_ENABLED: bool = os.environ.get("KEX_FORMAT_NER", "true").lower() in (
 # Kept for backward compat - unused with GLiNER
 NER_MODEL: str = os.environ.get("NER_MODEL", "dslim/bert-base-NER")
 
-# Default entity types for GLiNER zero-shot NER (403 encyclopedic types).
+# Default entity types for GLiNER zero-shot NER (407 encyclopedic types).
 # These are sent as labels to GLiNER at inference time.
 # Users can override/extend these per extraction request.
 # Sweet-spot size: GLiNER batches at 20 labels per call -> 21 batches per chunk
@@ -188,8 +188,13 @@ DEFAULT_ENTITY_TYPES: list[str] = [
     "chef", "nurse", "dentist", "veterinarian", "pilot", "astronaut",
     "soldier", "monarch", "president", "prime minister", "senator",
     "mayor", "diplomat", "spy", "criminal",
-    # ---- Organizations (40) ----
+    # ---- Organizations (44) ----
+    # "department" / "business unit" / "division" / "subsidiary" added 2026-09-05:
+    # org-chart units ("Produktentwicklung", "Vertrieb & Partnermanagement") were
+    # the only systematic NER misses left on the 32-doc gold, and every
+    # heads(person, unit) relation depends on them. Labels only ever grow.
     "company", "organization", "government agency", "political party",
+    "department", "business unit", "division", "subsidiary",
     "university", "research institute", "nonprofit", "sports team",
     "military organization", "religious organization",
     "bank", "hospital", "school", "public library", "museum", "theater",
@@ -668,6 +673,10 @@ WIKIDATA_TYPE_MAP: dict[str, dict[str, str]] = {
     "venture capital firm": {"qid": "Q925242",    "label": "venture capital"},
     "private equity firm":  {"qid": "Q827810",    "label": "private equity"},
     "startup":              {"qid": "Q3553344",   "label": "startup company"},
+    "department":           {"qid": "Q2366457",   "label": "department"},
+    "business unit":        {"qid": "Q2366457",   "label": "department"},
+    "division":             {"qid": "Q334453",    "label": "division"},
+    "subsidiary":           {"qid": "Q658255",    "label": "subsidiary"},
     "corporation":          {"qid": "Q167037",    "label": "corporation"},
     "llc":                  {"qid": "Q207320",    "label": "limited liability company"},
     "partnership":          {"qid": "Q380767",    "label": "partnership"},
@@ -887,6 +896,7 @@ _coarse_register("organization", [
     "sole proprietorship", "startup", "startup company",
     "venture capital firm", "venture capital", "private equity firm",
     "private equity", "hedge fund", "team",
+    "department", "business unit", "division", "subsidiary",
 ])
 
 # location — places + geography + structures regarded as places
