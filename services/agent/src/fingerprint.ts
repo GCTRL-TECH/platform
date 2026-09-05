@@ -1,7 +1,25 @@
 import si from 'systeminformation';
 import { createHash } from 'crypto';
 
-export async function computeFingerprint(): Promise<string> {
+// Memoized for the process lifetime: systeminformation reports the CURRENT cpu
+// speed (frequency scaling) and an unstable disk enumeration on some hosts (CI
+// runners included), so two calls seconds apart could hash differently and flip
+// the license seat binding mid-run. A machine's fingerprint must not change
+// while the agent is running; the formula itself is left untouched so existing
+// installs keep the fingerprint they were activated with.
+let cached: Promise<string> | null = null;
+
+export function computeFingerprint(): Promise<string> {
+  if (!cached) {
+    cached = computeFingerprintUncached().catch((err) => {
+      cached = null; // never cache a failure
+      throw err;
+    });
+  }
+  return cached;
+}
+
+async function computeFingerprintUncached(): Promise<string> {
   const [cpu, disk, net] = await Promise.all([
     si.cpu(),
     si.diskLayout(),
