@@ -3611,6 +3611,13 @@ interface MemoryHealth {
   }
   heat: { hot: number; warm: number; cold: number }
   trust: { high: number; mid: number; low: number }
+  /** Hebbian association layer (v0.9.6+): co-activation pairs and how
+   *  consolidated the knowledge in use is (average half-life in days). */
+  hebb?: {
+    pairs: number
+    strongPairs: number
+    avgHalfLifeDays: { chunks: number; dossiers: number }
+  }
   lastRun: {
     startedAt: string
     finishedAt: string | null
@@ -3623,6 +3630,8 @@ interface MemoryHealth {
       promoted?: number
       evicted_dossiers?: number
       evicted_chunks?: number
+      decayed_pairs?: number
+      pruned_pairs?: number
     }
   } | null
 }
@@ -3689,7 +3698,8 @@ function MemoryTab() {
       setLastResult(
         `Cycle complete in ${s.durationMs ?? 0}ms — decayed ${(s.decayedDossiers ?? 0) + (s.decayedChunks ?? 0)}, ` +
         `deduped ${s.dedupedChunks ?? 0}, promoted ${s.promoted ?? 0}, ` +
-        `evicted ${(s.evictedDossiers ?? 0) + (s.evictedChunks ?? 0)}.`
+        `evicted ${(s.evictedDossiers ?? 0) + (s.evictedChunks ?? 0)}, ` +
+        `pairs decayed ${s.decayedPairs ?? 0} / pruned ${s.prunedPairs ?? 0}.`
       )
       await load()
     } catch {
@@ -3732,6 +3742,8 @@ function MemoryTab() {
         <p className="mb-4 text-xs text-slate-500">
           The memory-governance cycle (decay → dedup → promote → evict → refresh) runs automatically every
           10 minutes and keeps your knowledge base self-maintaining — fully local, no data leaves the machine.
+          Memory learns from use: every read reinforces what it returned and lengthens its half-life, passages
+          retrieved together become associated, and what stays unused for weeks fades out.
         </p>
         {lastResult && (
           <div className="mb-4 rounded-lg border border-emerald-900/40 bg-emerald-950/10 px-4 py-2 text-sm text-emerald-400 flex items-center gap-2">
@@ -3776,6 +3788,38 @@ function MemoryTab() {
           ]} />
         </div>
       </section>
+
+      {/* ── Association layer (Hebbian) ──────────────────────────────── */}
+      {health.hebb && (
+        <section>
+          <SectionHeader>Association &amp; consolidation</SectionHeader>
+          <p className="mb-3 text-xs text-slate-500">
+            Passages that fire together wire together: pairs returned in the same retrieval gain weight on every
+            joint hit and fade with a 30-day half-life; strong pairs (≥0.5) are pulled into later searches. The
+            half-life tells how consolidated the knowledge in use is — 7 days for fresh items, up to 180 for
+            knowledge that keeps being used.
+          </p>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <MetricTile label="Co-activation pairs" value={health.hebb.pairs} sub="linked passage pairs" />
+            <MetricTile
+              label="Strong pairs"
+              value={health.hebb.strongPairs}
+              sub="weight ≥ 0.5 · pulled into search"
+              accent={health.hebb.strongPairs > 0 ? 'text-emerald-400' : 'text-slate-100'}
+            />
+            <MetricTile
+              label="Chunk half-life"
+              value={`${health.hebb.avgHalfLifeDays.chunks.toFixed(1)} d`}
+              sub="avg over passages in use"
+            />
+            <MetricTile
+              label="Dossier half-life"
+              value={`${health.hebb.avgHalfLifeDays.dossiers.toFixed(1)} d`}
+              sub="avg over live dossiers"
+            />
+          </div>
+        </section>
+      )}
 
       {/* ── Store sizes ──────────────────────────────────────────────── */}
       <section>
@@ -3823,6 +3867,8 @@ function MemoryTab() {
                 ['Promoted', lastRun.summary.promoted],
                 ['Evicted dossiers', lastRun.summary.evicted_dossiers],
                 ['Evicted chunks', lastRun.summary.evicted_chunks],
+                ['Decayed pairs', lastRun.summary.decayed_pairs ?? 0],
+                ['Pruned pairs', lastRun.summary.pruned_pairs ?? 0],
               ].map(([label, value]) => (
                 <div key={label as string} className="flex items-center justify-between">
                   <span className="text-slate-500">{label}</span>

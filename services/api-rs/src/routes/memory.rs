@@ -201,6 +201,8 @@ async fn run_maintenance(
             "promoted":        summary.promoted,
             "evictedDossiers": summary.evicted_dossiers,
             "evictedChunks":   summary.evicted_chunks,
+            "decayedPairs":    summary.decayed_pairs,
+            "prunedPairs":     summary.pruned_pairs,
             "durationMs":      summary.duration_ms,
             "trigger":         summary.trigger,
         }
