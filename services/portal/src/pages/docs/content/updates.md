@@ -9,7 +9,7 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: cbeb46b -->
+<!-- baseline-sha: de84352 -->
 
 ## v0.9.5 - Memory that learns from use
 
@@ -21,6 +21,15 @@ keep improving - so here it is, release by release.
 - **Heat finally reaches ranking.** Search gives reinforced passages a bounded rank bonus on top of dense + lexical fusion and the cross-encoder rerank: one previous use lifts a passage about three positions, ten uses about twelve, and the bonus caps at fifteen - a prior on what has proven useful, never an override of relevance. Every returned passage reports its `hebb_bonus`; a pulled-in neighbour is marked `via: coactivation`.
 - **The memory snapshot shows the new layer.** `memory_health` reports the number of co-activation pairs, how many are strong, and the average half-life of the knowledge in use, next to the heat and trust distributions it already had.
 - **Folder counts say what the folder shows, and users are managed from Settings.** A folder card counted every knowledge base of the account regardless of clearance caps, token grants, KB scope and the Codebase-access switch, while opening the folder listed only the twenty newest graphs of the whole account. Counts now use the same visibility rule as the list, the card separates "graphs here" from "in subfolders", the list takes `folderId` (`root` for unfiled graphs) and defaults to 100 rows. `list_graphs` on the agent gateway now carries `type`, `folderId`, `folderPath` and live counts so an agent picks its knowledge base by placement, not by guessing from names. A new Users tab (administrators only) lists every account and adds the switch that was missing: activate or deactivate an account (`PUT /api/admin/users/:id/active`).
+
+## v0.9.5 - Entity recognition tuned on a real Apple-Silicon box: recall 0.94 -> 0.99
+
+Measured on the 6-document quick gold set on a Mac Studio running Qwen 3.6 on MLX; two repeat runs each, no memory pressure, embeddings untouched.
+
+- **Organizational units are entities now.** Departments, business units, divisions and subsidiaries ("Produktentwicklung", "Vertrieb & Partnermanagement") were the only systematic misses left on the gold set, and every "who heads what" relation depends on them. The label set only ever grows; the bi-encoder NER stays label-count independent, so this costs no time.
+- **The entity-verify tier runs before relation extraction.** It used to run after, so the relation prompt still saw every junk candidate. Verify-first hands the relation model a curated list. On a strong local model (Qwen 3.6, thinking off) the tier costs no recall any more (0.940 -> 0.941 before, 0.976 with verify-first) and lifts entity F1 from 0.70 to 0.76-0.77. Still opt-in (`KEX_ENTITY_VERIFY=true`); with a slightly lower detection threshold (`NER_THRESHOLD=0.40`) the same set reaches detection-recall 0.988 and F1 0.771 at ~26 s per document.
+- **Markets served are no longer "located in".** The largest true relation false-positive class was located_in(org, region) for sales territories ("active in EMEA, France and the Nordics"). located_in is now reserved for headquarters, offices and residence.
+- **Measured, not applied:** turning off the per-document fact log saves ~4.5 s per document but removes the atomic-fact chunks retrieval relies on; the format pre-pass (dates, money, quantities) stays on - switching it off did not improve quality.
 
 ## v0.9.4 - Apple-Silicon inference as a first-class runtime, and a guardrail that tells busy from broken
 
