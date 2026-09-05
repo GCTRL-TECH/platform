@@ -17,8 +17,6 @@ fusion and the cross-encoder rerank:
 Fail-safe by design: any error, no Postgres, no user → the input order is kept.
 """
 
-from __future__ import annotations
-
 import logging
 import math
 from typing import Callable, Optional
@@ -35,8 +33,9 @@ NEIGHBOUR_FETCH = 50       # pairs read per query (strongest first)
 NEIGHBOUR_CONFIDENCE = 0.35  # `score` a pulled-in chunk reports (lexical floor)
 
 
-def heat_bonus(heat: float) -> float:
-    """Bounded rank bonus for a chunk's heat."""
+def heat_bonus(heat) -> float:
+    """Bounded rank bonus for a chunk's heat. `heat` may be None (untyped on purpose:
+    the Cython prod build enforces annotations as hard types)."""
     return min(PRIOR_CAP, PRIOR_SCALE * math.log1p(max(0.0, float(heat or 0.0))))
 
 
@@ -110,7 +109,7 @@ def _mention_names(mentions) -> list[str]:
     return names
 
 
-def _normalize(rid: str, content: str, mentions, job_id, comp_id) -> dict:
+def _normalize(rid, content, mentions, job_id, comp_id) -> dict:
     """Same chunk shape the dense/lexical channels produce (rag.rs deserializes it)."""
     return {
         "text": content or "",
