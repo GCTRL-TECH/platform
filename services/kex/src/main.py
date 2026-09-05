@@ -233,6 +233,35 @@ def _run_pipeline_impl(
         _sp.set_attribute("kex.entities", len(entities))
     logger.info(f"[{job_id}] NER: {len(entities)} entities")
 
+    # 1b. Entity Verify/Retype (opt-in precision tier, config.ENTITY_VERIFY_ENABLED).
+    # Runs BETWEEN NER and RelEx (moved 2026-09-05; it used to run after RelEx):
+    # RelEx is prompted with the entity list, so a verified list means fewer junk
+    # candidates in the prompt, better relation precision and a shorter prompt.
+    # Measured on Asgard (qwen3.6, thinking off): the tier costs no recall
+    # (0.9401 -> 0.9405) while NER-F1 rose 0.70 -> 0.76; with a lower GLiNER
+    # threshold (0.35) recall reached 0.976 but RelEx precision fell because the
+    # unverified list doubled - hence verify-first. Reuses the SAME resolved
+    # generation runtime as relex (base/model/kind/key). GLiNER remains the only
+    # span producer: this tier can only drop or retype a candidate, never invent
+    # one. Failure-safe - any error leaves `entities` unchanged.
+    entity_verify_report = None
+    if config.ENTITY_VERIFY_ENABLED:
+        try:
+            verify_base = generation_base if generation_base else ollama_base
+            verify_model = config.ENTITY_VERIFY_MODEL or relex_model or config.RELEX_MODEL
+            with telemetry.span("kex.entity_verify", "LLM", {"llm.model_name": verify_model, "llm.provider": generation_kind}):
+                entities, entity_verify_report = verify_entities(
+                    entities, text,
+                    model=verify_model,
+                    base=verify_base,
+                    kind=generation_kind,
+                    api_key=generation_api_key,
+                    max_concurrency=generation_max_concurrency,
+                )
+            logger.info(f"[{job_id}] Entity verify: {entity_verify_report}")
+        except Exception as exc:
+            logger.warning(f"[{job_id}] Entity verify failed (non-fatal, entities unchanged): {exc}")
+
     # 2. Relation Extraction (Ollama HTTP — can run in parallel)
     # Resilient: a failure of the LLM (Ollama down / crash / timeout / 5xx) MUST
     # NOT fail the whole job. We keep the entities already extracted by NER and
@@ -271,29 +300,6 @@ def _run_pipeline_impl(
             "Ollama in Settings → Infrastructure to enable relation extraction."
         )
     logger.info(f"[{job_id}] RelEx: {len(relations)} relations")
-
-    # 2b. Entity Verify/Retype (opt-in precision tier, config.ENTITY_VERIFY_ENABLED).
-    # Runs AFTER NER+RelEx (reuses the SAME resolved generation runtime as relex —
-    # relex_base/relex_model/generation_kind/generation_api_key) and BEFORE the
-    # KG builder / chunk mapping, so a dropped-junk or retyped entity is reflected
-    # everywhere downstream. GLiNER remains the only span producer: this tier can
-    # only drop or retype a candidate, never invent one. Failure-safe — any error
-    # leaves `entities` unchanged.
-    entity_verify_report = None
-    if config.ENTITY_VERIFY_ENABLED:
-        try:
-            verify_model = config.ENTITY_VERIFY_MODEL or relex_model or config.RELEX_MODEL
-            entities, entity_verify_report = verify_entities(
-                entities, text,
-                model=verify_model,
-                base=relex_base,
-                kind=generation_kind,
-                api_key=generation_api_key,
-                max_concurrency=generation_max_concurrency,
-            )
-            logger.info(f"[{job_id}] Entity verify: {entity_verify_report}")
-        except Exception as exc:
-            logger.warning(f"[{job_id}] Entity verify failed (non-fatal, entities unchanged): {exc}")
 
     # 3. Write to Knowledge Graph
     # Origin provenance for A2 dossiers: prefer the caller-supplied source (file
