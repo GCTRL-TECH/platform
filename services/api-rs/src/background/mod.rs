@@ -1326,6 +1326,15 @@ const MEM_PROMOTE_SCAN: i64 = 25;
 const MEM_PROMOTE_BUILD_CAP: usize = 3;   // bound the per-tick dossier builds (LLM)
 const MEM_PROMOTE_MIN_DEGREE: i64 = 2;    // A4 refinement: real node must have degree ≥ this
 const MEM_EVICT_FLOOR: f64 = 0.5;         // heat below this (and idle) → archive
+// Eviction is a LONG-idle decision, decoupled from the decay tick. With decay
+// alone (×0.95 per 600s tick once idle ≥ 1h) a dossier seeded at heat 5 fell
+// below the floor after ~8h and a chunk used once (heat 1) after ~3.5h — so an
+// office that stops at 17:00 found its whole HOT tier archived by 09:00, every
+// `get_dossier` failed once and rebuilt via LLM, and every chunk that had ever
+// grounded an answer vanished from lexical retrieval (archived = false filters).
+// Heat still ranks; archiving now needs 7 idle days (dossier) / 30 (chunk).
+const MEM_EVICT_IDLE_DOSSIER_SECS: i64 = 7 * 86_400;
+const MEM_EVICT_IDLE_CHUNK_SECS: i64 = 30 * 86_400;
 const MEM_DEDUP_TAU: f64 = 0.92;          // cosine threshold for near-dup chunks
 
 /// Structured summary of one governance cycle — persisted to memory_cycle_runs and
@@ -1602,12 +1611,12 @@ async fn promote_hot_entities(state: &AppState) -> i64 {
 async fn evict_cold_dossiers(state: &AppState) -> i64 {
     sqlx::query(
         "UPDATE entity_dossiers \
-            SET archived = true, updated_at = NOW() \
+            SET archived = true, archived_reason = 'evict', updated_at = NOW() \
           WHERE archived = false AND pinned = false AND heat < $1 \
-            AND (last_accessed IS NULL OR last_accessed < NOW() - ($2 || ' seconds')::interval)"
+            AND COALESCE(last_accessed, updated_at) < NOW() - ($2 || ' seconds')::interval"
     )
     .bind(MEM_EVICT_FLOOR)
-    .bind(MEM_IDLE_SECS.to_string())
+    .bind(MEM_EVICT_IDLE_DOSSIER_SECS.to_string())
     .execute(&state.db)
     .await
     .map(|r| r.rows_affected() as i64)
@@ -1622,13 +1631,13 @@ async fn evict_cold_dossiers(state: &AppState) -> i64 {
 async fn evict_cold_chunks(state: &AppState) -> i64 {
     sqlx::query(
         "UPDATE text_chunks \
-            SET archived = true \
+            SET archived = true, archived_reason = 'evict' \
           WHERE archived = false AND heat < $1 \
             AND last_accessed IS NOT NULL \
             AND last_accessed < NOW() - ($2 || ' seconds')::interval"
     )
     .bind(MEM_EVICT_FLOOR)
-    .bind(MEM_IDLE_SECS.to_string())
+    .bind(MEM_EVICT_IDLE_CHUNK_SECS.to_string())
     .execute(&state.db)
     .await
     .map(|r| r.rows_affected() as i64)

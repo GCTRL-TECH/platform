@@ -35,6 +35,7 @@ import {
   ExternalLink,
   Webhook,
   Sparkles,
+  Users,
   Trash2,
   Plus,
   AlertTriangle,
@@ -56,6 +57,7 @@ import { api, apiGet } from '@/lib/api'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 import ObsidianVaultManager from '@/components/connectors/ObsidianVaultManager'
 import SSOPage from './SSOPage'
+import AdminPanel from '../admin/AdminPanel'
 import WebhooksPage from './WebhooksPage'
 import { NativeOllamaGuide } from './NativeOllamaGuide'
 import { HardwareCard, type HardwareInfo, type Recommendation } from './HardwareCard'
@@ -68,7 +70,7 @@ import { AdvancedEmbeddingModal } from './AdvancedEmbeddingModal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type TabId = 'license' | 'models' | 'integrations' | 'agent' | 'connect-agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso'
+type TabId = 'license' | 'models' | 'integrations' | 'agent' | 'connect-agent' | 'mcp' | 'n8n' | 'webhooks' | 'account' | 'infrastructure' | 'memory' | 'profile' | 'sso' | 'users'
 
 type AgentSubTabId = 'harness' | 'skills'
 
@@ -78,6 +80,8 @@ interface Tab {
   icon: typeof Brain
   /** Only shown in Expert mode's nav (Easy mode hides these tabs). */
   expert?: boolean
+  /** Only shown to admins (the tab renders admin-only API data). */
+  admin?: boolean
 }
 
 interface ApiKeyField {
@@ -119,6 +123,7 @@ const TABS: Tab[] = [
   { id: 'memory', label: 'Memory', icon: Brain, expert: true },
   { id: 'profile', label: 'Personal Memory', icon: Sparkles, expert: true },
   { id: 'sso', label: 'SSO / SCIM', icon: KeyRound, expert: true },
+  { id: 'users', label: 'Users', icon: Users, admin: true },
   { id: 'account', label: 'Account', icon: User },
 ]
 
@@ -4447,6 +4452,8 @@ curl -fsSL ${apiBase}/agent/skill.md -o .cursor/rules/gctrl.mdc`}
 
 export function SettingsPage() {
   const { isExpert } = useUiMode()
+  const { user: currentUser } = useAuth()
+  const currentIsAdmin = currentUser?.role === 'admin'
   // Deep-linkable via `?tab=<id>` (e.g. /settings?tab=models). Defaults to
   // 'models' when the param is missing or unknown — non-breaking.
   const [activeTab, setActiveTab] = useState<TabId>(() => {
@@ -4469,7 +4476,7 @@ export function SettingsPage() {
   // stale nav state) can still land on one — keep it in the rendered list so
   // the active-tab highlight isn't orphaned. Tab content itself is untouched;
   // this only affects which buttons are shown in the sidebar.
-  const visibleTabs = TABS.filter((t) => isExpert || !t.expert)
+  const visibleTabs = TABS.filter((t) => (isExpert || !t.expert) && (!t.admin || currentIsAdmin))
   const navTabs = visibleTabs.some((t) => t.id === activeTab)
     ? visibleTabs
     : [...visibleTabs, currentTab]
@@ -4530,6 +4537,7 @@ export function SettingsPage() {
         {activeTab === 'memory' && <MemoryTab />}
         {activeTab === 'profile' && <PersonalMemoryTab />}
         {activeTab === 'sso' && <SSOPage />}
+        {activeTab === 'users' && <AdminPanel embedded initialTab="users" />}
         {activeTab === 'account' && <AccountTab />}
       </main>
     </div>

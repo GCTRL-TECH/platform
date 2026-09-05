@@ -475,7 +475,7 @@ registerToolWithAlias<Record<string, never>>(
   'List all knowledge graph compilations available in Ground Control. Shows name, entity count, relation count, and classification level.',
   {},
   async () => {
-    const result = await apiCall('GET', '/kg/compilations') as {
+    const result = await apiCall('GET', '/kg/compilations?limit=200') as {
       compilations: Array<{
         id: string;
         name: string;
