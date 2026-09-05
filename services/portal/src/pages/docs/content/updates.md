@@ -11,7 +11,7 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: de84352 -->
 
-## v0.9.5 - Memory that learns from use
+## v0.9.6 - Memory that learns from use
 
 *5 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
 
@@ -50,7 +50,7 @@ Measured on the 6-document quick gold set on a Mac Studio running Qwen 3.6 on ML
 - **Updating from inside the app no longer strips your deployment configuration.** The in-app updater recreated every service container from a short list of settings and silently dropped the rest: the reverse-proxy labels that put GCTRL behind your own domain (the site answered 404 after every update), the identity that lets `docker compose` recognise the containers, the host entry that points the extraction engine at an Ollama running on your machine (extractions finished with entities and no relations), the health check that the extraction and fusion services wait for, and named volumes. The updater now carries a container's complete configuration across, exactly as it was created, and only leaves out what must be fresh - the auto-generated hostname and the old container's network alias. Custom labels, extra hosts, health checks and volumes survive the update, in the published stack and in any override file you maintain next to it.
 - **If an earlier update already took your labels with it:** remove the affected service containers and bring them back with `docker compose up -d` once; from this version on they stay intact.
 
-## v0.9.3 - Memory that survives the night, numbers you can trust
+## v0.9.2.1 - Memory that survives the night, numbers you can trust
 
 *26 August 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
 
