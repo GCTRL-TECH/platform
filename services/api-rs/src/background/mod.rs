@@ -160,8 +160,7 @@ pub fn spawn_all(state: Arc<AppState>) {
     tokio::spawn(async move {
         // Initial delay so migrations + pool + seed are settled before the first pass.
         sleep(Duration::from_secs(120)).await;
-        let period = std::env::var("GCTRL_MEMORY_TICK_SECS")
-            .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(600);
+        let period = memory_tick_secs();
         loop {
             let _ = run_memory_cycle(&s, "scheduled").await;
             sleep(Duration::from_secs(period)).await;
@@ -1294,8 +1293,11 @@ async fn sweep_orphaned_graph(state: &AppState) {
 // POST /api/memory/maintenance/run. Every run is idempotent, loudly logged, and
 // recorded as a structured summary in `memory_cycle_runs`:
 //
-//   1. DECAY    heat *= DECAY (0.95) on dossiers + chunks NOT accessed within
-//               IDLE_SECS (1h). Floored at 0. Recently-touched items are skipped
+//   1. DECAY    heat *= 0.5^(tick / half_life_secs) on dossiers + chunks NOT
+//               accessed within IDLE_SECS (1h) — a per-item half-life that every
+//               use lengthens (services/hebb.rs: 7 d initial, ×1.5 per use, cap
+//               180 d). Co-activation pairs decay the same way (30 d half-life)
+//               and faded pairs are pruned. Recently-touched items are skipped
 //               so a hot item isn't decayed the same tick it was used.
 //   2. DEDUP    (A5) near-duplicate chunks (embedding cosine > τ 0.92) are merged
 //               into one canonical chunk — union provenance, most-restrictive
@@ -1312,11 +1314,18 @@ async fn sweep_orphaned_graph(state: &AppState) {
 //   5. REFRESH  count of promotions doubles as the dossier-refresh signal (new
 //               dossiers are freshly built); reported in the run summary.
 //
-// Tunables: DECAY 0.95, IDLE_SECS 3600, PROMOTE_HEAT 5.0, PROMOTE_MIN_DEGREE 2,
-// PROMOTE_BUILD_CAP 3 (bounded LLM work), EVICT_FLOOR 0.5, DEDUP_TAU 0.92.
+// Tunables: IDLE_SECS 3600, PROMOTE_HEAT 5.0, PROMOTE_MIN_DEGREE 2,
+// PROMOTE_BUILD_CAP 3 (bounded LLM work), EVICT_FLOOR 0.5, DEDUP_TAU 0.92; the
+// half-life / reinforcement constants live in services/hebb.rs.
 
-const MEM_DECAY: f64 = 0.95;
 const MEM_IDLE_SECS: i64 = 3600;          // only decay/evict items idle ≥ 1h
+
+/// Cadence of the governance cycle (env GCTRL_MEMORY_TICK_SECS, default 600 s).
+/// Also the elapsed time the half-life decay assumes per run.
+pub(crate) fn memory_tick_secs() -> u64 {
+    std::env::var("GCTRL_MEMORY_TICK_SECS")
+        .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(600)
+}
 const MEM_PROMOTE_HEAT: f64 = 5.0;        // chunk-heat-around-entity threshold
 // We SCAN up to this many hot candidate names per tick but only BUILD up to
 // MEM_PROMOTE_BUILD_CAP of them — most candidates are noisy entity_mentions that
@@ -1347,6 +1356,9 @@ pub struct MemoryCycleSummary {
     pub promoted:         i64,
     pub evicted_dossiers: i64,
     pub evicted_chunks:   i64,
+    /// Co-activation pairs decayed / pruned this run (Hebbian association layer).
+    pub decayed_pairs:    i64,
+    pub pruned_pairs:     i64,
     pub duration_ms:      i64,
     pub trigger:          String,
 }
@@ -1358,8 +1370,11 @@ pub struct MemoryCycleSummary {
 pub async fn run_memory_cycle(state: &AppState, trigger: &str) -> MemoryCycleSummary {
     let started = std::time::Instant::now();
 
-    let decayed_d = decay_dossiers(state).await;
-    let decayed_c = decay_chunks(state).await;
+    let tick_secs = memory_tick_secs() as f64;
+    let decayed_d = decay_dossiers(state, tick_secs).await;
+    let decayed_c = decay_chunks(state, tick_secs).await;
+    let (decayed_p, pruned_p) =
+        crate::services::hebb::decay_coactivation(&state.db, tick_secs, MEM_IDLE_SECS).await;
     let deduped   = dedup_chunks(state).await;          // A5
     let promoted  = promote_hot_entities(state).await;  // A4-refined (degree gate)
     let evicted_d = evict_cold_dossiers(state).await;
@@ -1372,14 +1387,16 @@ pub async fn run_memory_cycle(state: &AppState, trigger: &str) -> MemoryCycleSum
         promoted,
         evicted_dossiers: evicted_d,
         evicted_chunks:   evicted_c,
+        decayed_pairs:    decayed_p,
+        pruned_pairs:     pruned_p,
         duration_ms:      started.elapsed().as_millis() as i64,
         trigger:          trigger.to_string(),
     };
 
-    if decayed_d + decayed_c + deduped + promoted + evicted_d + evicted_c > 0 {
+    if decayed_d + decayed_c + deduped + promoted + evicted_d + evicted_c + pruned_p > 0 {
         tracing::info!(
-            "memory-cycle [{trigger}]: decayed {decayed_d} dossier(s)/{decayed_c} chunk(s), \
-             deduped {deduped} chunk(s), promoted {promoted} entity→dossier, \
+            "memory-cycle [{trigger}]: decayed {decayed_d} dossier(s)/{decayed_c} chunk(s)/{decayed_p} pair(s), \
+             pruned {pruned_p} pair(s), deduped {deduped} chunk(s), promoted {promoted} entity→dossier, \
              evicted {evicted_d} dossier(s)/{evicted_c} chunk(s) in {}ms",
             summary.duration_ms
         );
@@ -1487,15 +1504,19 @@ async fn entity_has_degree(state: &AppState, user_id: Uuid, name: &str) -> bool 
     }
 }
 
-/// Decay heat on dossiers idle ≥ MEM_IDLE_SECS. Returns rows touched.
-async fn decay_dossiers(state: &AppState) -> i64 {
+/// Decay heat on dossiers idle ≥ MEM_IDLE_SECS by one tick of their own
+/// half-life: heat *= 0.5^(tick / half_life_secs). Heat that falls under 0.01 is
+/// snapped to 0 so a faded row stops counting as "decayed" every run. Returns
+/// rows touched.
+async fn decay_dossiers(state: &AppState, tick_secs: f64) -> i64 {
     sqlx::query(
         "UPDATE entity_dossiers \
-            SET heat = GREATEST(0, heat * $1) \
+            SET heat = CASE WHEN heat * power(0.5, $1::float8 / GREATEST(half_life_secs, 1)) < 0.01 \
+                            THEN 0 ELSE heat * power(0.5, $1::float8 / GREATEST(half_life_secs, 1)) END \
           WHERE archived = false AND heat > 0 \
             AND (last_accessed IS NULL OR last_accessed < NOW() - ($2 || ' seconds')::interval)"
     )
-    .bind(MEM_DECAY)
+    .bind(tick_secs)
     .bind(MEM_IDLE_SECS.to_string())
     .execute(&state.db)
     .await
@@ -1503,15 +1524,17 @@ async fn decay_dossiers(state: &AppState) -> i64 {
     .unwrap_or(0)
 }
 
-/// Decay heat on chunks idle ≥ MEM_IDLE_SECS. Returns rows touched.
-async fn decay_chunks(state: &AppState) -> i64 {
+/// Decay heat on chunks idle ≥ MEM_IDLE_SECS by one tick of their own half-life
+/// (same rule as dossiers). Returns rows touched.
+async fn decay_chunks(state: &AppState, tick_secs: f64) -> i64 {
     sqlx::query(
         "UPDATE text_chunks \
-            SET heat = GREATEST(0, heat * $1) \
+            SET heat = CASE WHEN heat * power(0.5, $1::float8 / GREATEST(half_life_secs, 1)) < 0.01 \
+                            THEN 0 ELSE heat * power(0.5, $1::float8 / GREATEST(half_life_secs, 1)) END \
           WHERE archived = false AND heat > 0 \
             AND (last_accessed IS NULL OR last_accessed < NOW() - ($2 || ' seconds')::interval)"
     )
-    .bind(MEM_DECAY)
+    .bind(tick_secs)
     .bind(MEM_IDLE_SECS.to_string())
     .execute(&state.db)
     .await
@@ -1607,13 +1630,16 @@ async fn promote_hot_entities(state: &AppState) -> i64 {
     built
 }
 
-/// EVICT cold, non-pinned dossiers (soft-archive). Pinned never evicted.
+/// EVICT cold, non-pinned dossiers (soft-archive). Pinned never evicted, and —
+/// mirroring the chunk guard — neither is a dossier that was never read: what
+/// never had the chance to be used cannot be "forgotten for disuse".
 async fn evict_cold_dossiers(state: &AppState) -> i64 {
     sqlx::query(
         "UPDATE entity_dossiers \
             SET archived = true, archived_reason = 'evict', updated_at = NOW() \
           WHERE archived = false AND pinned = false AND heat < $1 \
-            AND COALESCE(last_accessed, updated_at) < NOW() - ($2 || ' seconds')::interval"
+            AND last_accessed IS NOT NULL \
+            AND last_accessed < NOW() - ($2 || ' seconds')::interval"
     )
     .bind(MEM_EVICT_FLOOR)
     .bind(MEM_EVICT_IDLE_DOSSIER_SECS.to_string())

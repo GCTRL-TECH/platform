@@ -46,22 +46,14 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/models",            get(list_models))
 }
 
-/// A4 — HEAT on chunks. Bump heat / access_count / last_accessed on the chunks
-/// that were actually returned by retrieval and used to ground an answer. One
-/// batch UPDATE by id; owner-scoped so a chunk id can't bump another user's row.
-/// Best-effort — a DB hiccup never fails the query. Mirrors `bump_dossier_heat`.
+/// A4 — HEAT on chunks. The chunks that were actually returned by retrieval and
+/// used to ground an answer are reinforced (rank-weighted, `Signal::Answer`) and
+/// wired together as co-activated (services/hebb.rs). `chunk_ids` must be in
+/// rank order. Best-effort — a DB hiccup never fails the query.
 pub(crate) async fn bump_chunk_heat(db: &sqlx::PgPool, user_id: Uuid, chunk_ids: &[Uuid]) {
     if chunk_ids.is_empty() { return; }
-    let _ = sqlx::query(
-        "UPDATE text_chunks \
-            SET heat = heat + 1.0, access_count = access_count + 1, \
-                last_accessed = NOW(), archived = false \
-          WHERE id = ANY($1) AND user_id = $2"
-    )
-    .bind(chunk_ids)
-    .bind(user_id)
-    .execute(db)
-    .await;
+    crate::services::hebb::reinforce_chunks(db, user_id, chunk_ids, crate::services::hebb::Signal::Answer).await;
+    crate::services::hebb::record_coactivation(db, user_id, chunk_ids).await;
 }
 
 /// A4 — TRUST feedback. `POST /api/rag/feedback`.
@@ -156,6 +148,13 @@ async fn feedback(
             let _ = sqlx::query(
                 "UPDATE entity_dossiers SET trust = $1, updated_at = NOW() WHERE id = $2"
             ).bind(new_trust).bind(d.id).execute(&state.db).await;
+            // Hebbian: a vote is the strongest signal — up consolidates the dossier,
+            // down drops it out of the hot set (same as the agent gateway).
+            if vote == "down" {
+                crate::services::hebb::forget_dossier(&state.db, d.id).await;
+            } else {
+                crate::services::hebb::reinforce_dossier(&state.db, d.id, crate::services::hebb::Signal::Feedback).await;
+            }
             trust_after = Some(new_trust);
             entity_name_out = Some(d.entity_name.clone());
             crate::services::audit::log_access(&state.db, &claims, "rag.feedback",

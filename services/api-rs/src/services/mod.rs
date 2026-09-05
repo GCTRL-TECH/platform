@@ -2,6 +2,7 @@ pub mod audit;
 pub mod classify_resolver;
 pub mod cron;
 pub mod crypto;
+pub mod hebb;
 pub mod llm;
 pub mod neo4j;
 pub mod obsidian;

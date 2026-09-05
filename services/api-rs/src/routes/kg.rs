@@ -2852,12 +2852,8 @@ pub(crate) async fn dossier_required_rank_scoped(
 pub(crate) async fn bump_dossier_heat(db: &sqlx::PgPool, dossier_id: Uuid) {
     // A4: a fresh access also REVIVES a soft-archived dossier (archived → false),
     // so eviction is reversible the moment a cold entity becomes relevant again.
-    let _ = sqlx::query(
-        "UPDATE entity_dossiers \
-            SET heat = heat + 1.0, access_count = access_count + 1, \
-                last_accessed = NOW(), archived = false \
-          WHERE id = $1"
-    ).bind(dossier_id).execute(db).await;
+    // Reinforcement + half-life consolidation live in services/hebb.rs.
+    crate::services::hebb::reinforce_dossier(db, dossier_id, crate::services::hebb::Signal::Answer).await;
 }
 
 /// A soft-archived (evicted) dossier is still the compiled truth - bring it back

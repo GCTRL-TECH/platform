@@ -49,6 +49,7 @@ from .ner import get_ner_pipeline
 from .pii_detector import detect_pii, redact_pii
 from .relex import get_extractor
 from . import reranker
+from . import hebb
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
@@ -1845,6 +1846,15 @@ async def search_endpoint(req: SearchReq, request: Request):
     # best passages bubble to the top before rag.rs cuts to its final few. Degrades to
     # a no-op (RRF order) if the model is unavailable.
     reranked = reranker.rerank(query, fused, top_k=max(1, req.limit))
+
+    # Hebbian prior (src/hebb.py): chunks that keep being used get a bounded rank
+    # bonus, and a strongly co-activated neighbour of the hits is pulled in. Applied
+    # last so relevance ranking stays the base; fail-safe (keeps the order above).
+    reranked = hebb.rerank_with_memory(
+        reranked, user_id=req.user_id, limit=max(1, req.limit),
+        max_rank=req.max_rank, compilation_id=req.compilation_id,
+        conn_factory=get_search_pg,
+    )
 
     logger.info(
         "/search hybrid: dense=%d lexical=%d fused=%d reranked=%d (comp=%s)",

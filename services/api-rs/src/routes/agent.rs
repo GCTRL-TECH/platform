@@ -867,6 +867,11 @@ async fn execute_tool_inner(
                     });
                 }
             }
+            // Hebbian: resolving an entity is use of its dossier (if one exists) —
+            // own rows only, so a scoped token can never warm the owner's dossier.
+            if result.get("error").is_none() {
+                crate::services::hebb::reinforce_dossier_by_name(&state.db, claims.sub, &name, crate::services::hebb::Signal::Search).await;
+            }
             crate::services::audit::log_access(&state.db, claims, "agent.get_entity", "entity", &name, rank, None, true, None).await;
             result
         }
@@ -983,6 +988,13 @@ async fn execute_tool_inner(
                     *arr = drop_code_chunks(std::mem::take(arr), &code_comps, &code_jobs);
                 }
             }
+            // Hebbian: what an agent retrieves counts as use (`Signal::Search`) and
+            // the returned chunks are wired together, exactly like the chat path —
+            // before this, agent reads left no trace and the memory could not learn
+            // what its agents actually use.
+            let used = crate::services::hebb::chunk_ids_from_search(&chunks);
+            crate::services::hebb::reinforce_chunks(&state.db, claims.sub, &used, crate::services::hebb::Signal::Search).await;
+            crate::services::hebb::record_coactivation(&state.db, claims.sub, &used).await;
             crate::services::audit::log_access(&state.db, claims, "agent.search_chunks", "chunks", "*", rank as i32, None, true, None).await;
             chunks
         }
@@ -1866,6 +1878,13 @@ async fn execute_tool_inner(
                     let new_trust: f32 = if vote == "down" { 0.0 } else { (d.trust + 0.1).clamp(0.8, 1.0) };
                     let _ = sqlx::query("UPDATE entity_dossiers SET trust=$1, updated_at=NOW() WHERE id=$2")
                         .bind(new_trust).bind(d.id).execute(&state.db).await;
+                    // Hebbian: an explicit vote is the strongest signal there is — up
+                    // consolidates the dossier, down drops it out of the hot set.
+                    if vote == "down" {
+                        crate::services::hebb::forget_dossier(&state.db, d.id).await;
+                    } else {
+                        crate::services::hebb::reinforce_dossier(&state.db, d.id, crate::services::hebb::Signal::Feedback).await;
+                    }
                     trust_after = json!(new_trust);
                     name_out = json!(d.entity_name);
                 }

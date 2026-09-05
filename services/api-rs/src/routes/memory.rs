@@ -125,6 +125,20 @@ pub(crate) async fn health_json(
          FROM entity_dossiers WHERE user_id = $1 AND archived = false"
     ).bind(uid).fetch_one(&state.db).await.unwrap_or((0, 0, 0));
 
+    // ── Hebbian association layer: co-activation pairs + consolidation ──
+    let (pairs, strong_pairs): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE weight >= 0.5) \
+         FROM memory_coactivation WHERE user_id = $1"
+    ).bind(uid).fetch_one(&state.db).await.unwrap_or((0, 0));
+    let chunk_half_life_days: f64 = sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT AVG(half_life_secs)::float8 / 86400.0 FROM text_chunks \
+         WHERE user_id = $1 AND archived = false AND access_count > 0"
+    ).bind(uid).fetch_one(&state.db).await.ok().flatten().unwrap_or(0.0);
+    let dossier_half_life_days: f64 = sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT AVG(half_life_secs)::float8 / 86400.0 FROM entity_dossiers \
+         WHERE user_id = $1 AND archived = false"
+    ).bind(uid).fetch_one(&state.db).await.ok().flatten().unwrap_or(0.0);
+
     // ── Last governance-cycle summary (global; the cycle is corpus-wide) ─
     let last_run: Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, i64, String, Value)> =
         sqlx::query_as(
@@ -153,6 +167,16 @@ pub(crate) async fn health_json(
         },
         "heat":  { "hot": hot, "warm": warm, "cold": cold },
         "trust": { "high": trust_high, "mid": trust_mid, "low": trust_low },
+        // Hebbian layer: how much association the memory has built and how
+        // consolidated the used knowledge is (avg half-life of accessed items).
+        "hebb": {
+            "pairs": pairs,
+            "strongPairs": strong_pairs,
+            "avgHalfLifeDays": {
+                "chunks":   (chunk_half_life_days * 10.0).round() / 10.0,
+                "dossiers": (dossier_half_life_days * 10.0).round() / 10.0,
+            },
+        },
         "lastRun": last_run_json,
     })
 }
