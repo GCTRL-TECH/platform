@@ -342,7 +342,12 @@ pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Vec<Ent
 /// (never persisted as a session — the durable registry is `cloak_maps`).
 #[derive(Debug, Clone, Default)]
 pub struct CloakSession {
-    /// pseudonym -> canonical original text (exact casing as first seen).
+    /// pseudonym -> the ORIGINAL text as it stood in the request (exact surface form of the
+    /// first occurrence). Not the graph's canonical spelling: the cloud model echoes pseudonyms
+    /// back inside file paths, identifiers and quotes, and de-cloaking to a canonical
+    /// `AI_lab_TEAM` turned `/Users/ai_lab_team/…` into a path that does not exist
+    /// (observed live 2026-09-06: every project-chat tool call failed, the agent fell back to
+    /// `find /` and hung for 12 minutes). Whatever the request said is what comes back.
     pub map: HashMap<String, String>,
 }
 
@@ -428,14 +433,45 @@ fn find_pii(text: &str) -> Vec<(String, &'static str)> {
 /// and a chat request cloaks many messages against the same dictionary.
 type PreparedCandidate = (String, Option<String>, String);
 
+/// PURE: does this candidate name look like an IDENTIFIER rather than a name of a person,
+/// organisation or place? Machine names, file names, hosts, env vars, slugs: `ai_lab_team`,
+/// `anvil.local`, `asgard_prod`, `SKILL.md`, `multiversum-brand-v2`. The knowledge graph
+/// collects these as entities (KEX types them "data center", "tool", …), but cloaking them
+/// hides no personal data and breaks every path and command the cloud model has to reproduce
+/// verbatim. Rule: any of the glue characters `_ - . / \ :` inside the name, or a single
+/// token of only lowercase letters/digits (a slug), is an identifier. PII regex hits never
+/// pass through here (they enter in `collect_prepared`), so e-mails stay cloaked.
+fn is_identifier_like(name: &str) -> bool {
+    let t = name.trim();
+    // Anything with whitespace is a NAME ("Anna Schmidt-Weber", "12,5 Mio. EUR", "Anvil Prod").
+    if t.contains(char::is_whitespace) {
+        return false;
+    }
+    // Machine glue that never appears inside a person/org/place name.
+    if t.chars().any(|c| matches!(c, '_' | '/' | '\\' | ':' | '.')) {
+        return true;
+    }
+    let has_upper = t.chars().any(|c| c.is_uppercase());
+    // kebab-case slug ("multiversum-brand-v2") vs. a hyphenated surname ("Schmidt-Weber").
+    if t.contains('-') {
+        return !has_upper;
+    }
+    // A bare lowercase/digit token ("gctrl", "prod", "omlx") is a slug, not a name.
+    !has_upper && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
 /// PURE: fold a candidate dictionary into match keys once, dropping entries too
-/// short to be worth hiding (they would match noise).
+/// short to be worth hiding (they would match noise) and identifier-shaped names
+/// (see [`is_identifier_like`]).
 fn prepare_candidates(candidates: &[EntityCandidate]) -> Vec<PreparedCandidate> {
     let mut out = Vec::with_capacity(candidates.len());
     for c in candidates {
         let trimmed = c.name.trim();
         let key = lower_key(trimmed);
         if key.chars().count() < 2 {
+            continue;
+        }
+        if is_identifier_like(trimmed) {
             continue;
         }
         out.push((key, c.kind.clone(), trimmed.to_string()));
@@ -531,6 +567,27 @@ fn collect_candidates(
 /// already-resolved `lower_key -> pseudonym` map. Non-candidate text is copied
 /// through unchanged (byte-for-byte via the original `chars`).
 pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) -> String {
+    let mut surfaces = HashMap::new();
+    apply_pseudonyms_recording(text, key_to_pseudonym, &mut surfaces)
+}
+
+/// Glue characters that bind two alphanumeric runs into ONE identifier: path separators,
+/// snake/kebab case, dots in file and host names, `key=value`, `user@host`, `host:port`, `~`.
+/// A key that ends or starts at such a char while the char's other side is alphanumeric is
+/// INSIDE an identifier and must not be cloaked (`/asgard_prod/anvil/skills` keeps `anvil`).
+/// The same char with a non-alphanumeric other side is ordinary punctuation and stays a
+/// boundary (`Fabio Chiaramonte.` at a sentence end still cloaks).
+fn is_identifier_glue(c: char) -> bool {
+    matches!(c, '/' | '\\' | '_' | '-' | '.' | ':' | '@' | '~' | '=')
+}
+
+/// Like [`apply_pseudonyms`], additionally recording, per pseudonym, the exact text it
+/// replaced (first occurrence wins) — what [`decloak`] must put back.
+pub fn apply_pseudonyms_recording(
+    text: &str,
+    key_to_pseudonym: &HashMap<String, String>,
+    surfaces: &mut HashMap<String, String>,
+) -> String {
     if key_to_pseudonym.is_empty() {
         return text.to_string();
     }
@@ -572,9 +629,22 @@ pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) 
                 // of "Euro" → "[AMOUNT-156]o" — garbling the text the cloud model has
                 // to reason over AND leaking word-shape structure. (Both observed
                 // live in the mock-cloud gateway proof.)
-                let before_ok = i == 0 || !chars[i - 1].is_alphanumeric();
-                let after_ok = i + klen >= chars.len() || !chars[i + klen].is_alphanumeric();
+                // IDENTIFIER guard (2026-09-06): the boundary check alone let a graph entity
+                // match a path segment — `/Users/ai_lab_team/asgard_prod/anvil/…` came back from
+                // the cloud model as `/Users/AI_lab_TEAM/asgard_Prod/Anvil/…` and every tool
+                // call in the project chat failed. A glue char whose far side is alphanumeric
+                // means the match sits inside a path, slug, host or env var: skip it.
+                let before_ok = i == 0
+                    || !(chars[i - 1].is_alphanumeric()
+                        || (is_identifier_glue(chars[i - 1]) && i >= 2 && chars[i - 2].is_alphanumeric()));
+                let end = i + klen;
+                let after_ok = end >= chars.len()
+                    || !(chars[end].is_alphanumeric()
+                        || (is_identifier_glue(chars[end]) && end + 1 < chars.len() && chars[end + 1].is_alphanumeric()));
                 if before_ok && after_ok {
+                    surfaces
+                        .entry(pseudonym.to_string())
+                        .or_insert_with(|| chars[i..end].iter().collect::<String>());
                     out.push_str(pseudonym);
                     i += klen;
                     continue 'outer;
@@ -825,13 +895,19 @@ pub async fn cloak_batch(
             let (prefix, bracketed) = bucket_template(kind.as_deref());
             next_pseudonym(db, primary, key, prefix, bracketed).await
         };
+        // Provisional: the canonical spelling, replaced below by the surface form the request
+        // actually used (a key narrowed to this request always matches at least once).
         session.map.insert(pseudonym.clone(), canonical.clone());
         key_to_pseudonym.insert(key.clone(), pseudonym);
     }
+    let mut surfaces: HashMap<String, String> = HashMap::with_capacity(key_to_pseudonym.len());
     let cloaked = texts
         .iter()
-        .map(|t| apply_pseudonyms(t, &key_to_pseudonym))
+        .map(|t| apply_pseudonyms_recording(t, &key_to_pseudonym, &mut surfaces))
         .collect();
+    for (pseudonym, surface) in surfaces {
+        session.map.insert(pseudonym, surface);
+    }
     (cloaked, session)
 }
 
@@ -977,6 +1053,76 @@ mod tests {
 
     // ── candidate collection / bucket stability ──────────────────────────
 
+    // ── identifier safety (2026-09-06) ────────────────────────────────────
+
+    #[test]
+    fn a_path_keeps_its_segments_even_when_they_are_graph_entities() {
+        // `anvil`, `prod`, `Users`, `skills` are all plausible graph entities; none may touch the path.
+        let mut map = HashMap::new();
+        for (k, p) in [("anvil", "Term-1"), ("prod", "Term-2"), ("Users", "Term-3"), ("skills", "Term-4"), ("Multiversum", "Org-5")] {
+            map.insert(lower_key(k), p.to_string());
+        }
+        let path = "Lies /Users/ai_lab_team/asgard_prod/anvil/skills/multiversum-brand-v2/SKILL.md und cd ~/asgard_prod/anvil";
+        assert_eq!(apply_pseudonyms(path, &map), path, "identifier-internal matches must never be cloaked");
+        // …while the same words as prose are still cloaked.
+        assert_eq!(apply_pseudonyms("Anvil läuft auf prod bei Multiversum.", &map), "Term-1 läuft auf Term-2 bei Org-5.");
+    }
+
+    #[test]
+    fn sentence_punctuation_is_still_a_boundary() {
+        let mut map = HashMap::new();
+        map.insert(lower_key("Fabio Chiaramonte"), "Person-1".to_string());
+        assert_eq!(apply_pseudonyms("Das war Fabio Chiaramonte.", &map), "Das war Person-1.");
+        assert_eq!(apply_pseudonyms("(Fabio Chiaramonte) - Fabio Chiaramonte: ja", &map), "(Person-1) - Person-1: ja");
+        assert_eq!(apply_pseudonyms("Fabio Chiaramonte, Hamburg", &map), "Person-1, Hamburg");
+    }
+
+    #[test]
+    fn identifier_like_candidates_are_never_prepared() {
+        let candidates = vec![
+            cand("ai_lab_team", Some("data center")),
+            cand("anvil.local", Some("data center")),
+            cand("asgard_prod", None),
+            cand("SKILL.md", Some("tool")),
+            cand("multiversum-brand-v2", Some("tool")),
+            cand("gctrl", Some("tool")),
+            cand("Fabio Chiaramonte", Some("person")),
+            cand("Multiversum GmbH", Some("organization")),
+            cand("Anvil", Some("search engine")),
+        ];
+        let prepared = prepare_candidates(&candidates);
+        let names: Vec<&str> = prepared.iter().map(|(_, _, c)| c.as_str()).collect();
+        assert_eq!(names, vec!["Fabio Chiaramonte", "Multiversum GmbH", "Anvil"]);
+        assert!(is_identifier_like("ai_lab_team") && is_identifier_like("SKILL.md") && is_identifier_like("gctrl"));
+        assert!(!is_identifier_like("Anvil") && !is_identifier_like("Fabio Chiaramonte"));
+        assert!(is_identifier_like("multiversum-brand-v2") && is_identifier_like("anvil.local") && is_identifier_like("host:8020"));
+        // Hyphenated surnames and amounts are names, not machine identifiers.
+        assert!(!is_identifier_like("Schmidt-Weber") && !is_identifier_like("Anna Schmidt-Weber") && !is_identifier_like("12,5 Mio. EUR"));
+    }
+
+    #[test]
+    fn email_hits_survive_the_identifier_filter_via_the_pii_path() {
+        let seen = collect_candidates(&[], "Schreib an f.chiaramonte@multiversum.consulting bitte.");
+        assert!(seen.contains_key(&lower_key("f.chiaramonte@multiversum.consulting")));
+        let mut map = HashMap::new();
+        map.insert(lower_key("f.chiaramonte@multiversum.consulting"), "[EMAIL-1]".to_string());
+        assert_eq!(apply_pseudonyms("Schreib an f.chiaramonte@multiversum.consulting bitte.", &map), "Schreib an [EMAIL-1] bitte.");
+    }
+
+    #[test]
+    fn decloak_restores_the_surface_form_of_the_request_not_the_canonical() {
+        let mut map = HashMap::new();
+        map.insert(lower_key("Fabio Chiaramonte"), "Person-1".to_string());
+        let mut surfaces = HashMap::new();
+        let cloaked = apply_pseudonyms_recording("FABIO CHIARAMONTE rief an; Fabio Chiaramonte auch.", &map, &mut surfaces);
+        assert_eq!(cloaked, "Person-1 rief an; Person-1 auch.");
+        // First occurrence wins — and it is the request's spelling, not the dictionary's.
+        assert_eq!(surfaces.get("Person-1").map(String::as_str), Some("FABIO CHIARAMONTE"));
+        let mut session = CloakSession::empty();
+        session.map.extend(surfaces);
+        assert_eq!(decloak(&session, &cloaked), "FABIO CHIARAMONTE rief an; FABIO CHIARAMONTE auch.");
+    }
+
     #[test]
     fn same_entity_different_casing_collapses_to_one_key() {
         let candidates = vec![cand("Fabio", Some("person")), cand("FABIO", Some("person")), cand("fabio", Some("person"))];
@@ -1050,16 +1196,18 @@ mod tests {
         // The pre-filter must be EXACT, not a heuristic: for a corpus of tricky
         // keys and texts, "survives the filter" must agree with "actually
         // substitutes" on every pair — otherwise an entity leaks in plaintext.
+        // (Identifier-shaped names like "x9" are dropped by POLICY in prepare_candidates, not
+        // by the pre-filter — see is_identifier_like — so the corpus uses "X9".)
         let names = [
             "LAN", "Anna Schmidt", "Anna Schmidt-Weber", "12,5 Mio. EUR", "Ground Control",
-            "GCTRL", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.", "x9",
+            "GCTRL", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.", "X9",
         ];
         let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, None)).collect();
         let texts = [
             "Das LAN ist offline.", "Die Anlage plant mehr.", "Anna Schmidt-Weber rief an.",
             "Anna Schmidt rief an.", "Budget 12,5 Mio. EUR heute.", "12,5 Mio. USD heute.",
             "GROUND CONTROL steuert das.", "gctrl/anvil läuft.", "Björn Öztürk kam.",
-            "ACME & Co. liefert.", "ACME liefert.", "Wert x9 gesetzt.", "Wert x99 gesetzt.",
+            "ACME & Co. liefert.", "ACME liefert.", "Wert X9 gesetzt.", "Wert X99 gesetzt.",
             "Nichts davon hier.", "",
         ];
         for text in texts {
