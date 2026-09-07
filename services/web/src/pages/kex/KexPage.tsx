@@ -86,6 +86,14 @@ const ACCEPTED_TYPES: Record<string, string[]> = {
   'application/vnd.oasis.opendocument.text': ['.odt'],
   'application/vnd.oasis.opendocument.presentation': ['.odp'],
   'application/vnd.oasis.opendocument.spreadsheet': ['.ods'],
+  // Images: transcribed by the vision model when the runtime can see,
+  // Tesseract OCR otherwise (screenshots, whiteboard photos, Miro exports).
+  'image/png': ['.png'],
+  'image/jpeg': ['.jpg', '.jpeg'],
+  'image/webp': ['.webp'],
+  'image/tiff': ['.tif', '.tiff'],
+  'image/bmp': ['.bmp'],
+  'image/gif': ['.gif'],
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────

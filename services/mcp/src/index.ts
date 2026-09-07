@@ -1121,14 +1121,14 @@ registerTool<Record<string, never>>(
 const MAX_INGEST_FILE_BYTES = 25 * 1024 * 1024; // 25MB, mirrors the API's decoded-size cap
 
 const ingestFileSchema = {
-  path: z.string().describe('Absolute (or cwd-relative) path to the local file to ingest, e.g. a PDF or DOCX'),
+  path: z.string().describe('Absolute (or cwd-relative) path to the local file to ingest, e.g. a PDF, DOCX or an image (PNG/JPG/WEBP: screenshot, whiteboard photo, Miro export)'),
   compilationId: z.string().optional().describe('Optional: target knowledge graph compilation ID. Omit to fall back to your default knowledge base.'),
   ontologyId: z.string().optional().describe('Optional ontology ID to guide entity type extraction'),
 };
 
 registerTool<{ path: string; compilationId?: string; ontologyId?: string }>(
   'gctrl_ingest_file',
-  'Ingest a PDF, DOCX, or other binary file into the knowledge graph. Use this whenever the user drops, mentions, or references a file (not raw text) that should become knowledge — reads the file from local disk, uploads it, and starts extraction. For plain text, use gctrl_extract/gctrl_store instead.',
+  'Ingest a PDF, DOCX, PPTX, image (PNG/JPG/WEBP/TIFF/BMP/GIF — transcribed by the vision model when the runtime can see, OCR otherwise), scanned PDF, or other binary file into the knowledge graph. Use this whenever the user drops, mentions, or references a file (not raw text) that should become knowledge — reads the file from local disk, uploads it, and starts extraction. For plain text, use gctrl_extract/gctrl_store instead.',
   ingestFileSchema,
   async ({ path: filePath, compilationId, ontologyId }) => {
     let bytes: Buffer;

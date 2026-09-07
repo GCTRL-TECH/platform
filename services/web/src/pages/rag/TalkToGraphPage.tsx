@@ -1548,7 +1548,7 @@ export function TalkToGraphPage() {
   function handleFileButtonClick() {
     const input = document.createElement('input')
     input.type = 'file'
-    input.accept = '.pdf,.docx,.txt,.csv'
+    input.accept = '.pdf,.docx,.pptx,.xlsx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp,.gif'
     input.onchange = (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]
       if (file) {

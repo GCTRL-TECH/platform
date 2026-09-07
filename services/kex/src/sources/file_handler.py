@@ -30,6 +30,12 @@ def _ext_of(filename: str) -> str:
     return "." + filename.rsplit(".", 1)[-1].lower()
 
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".gif")
+
+# Tesseract language packs shipped in both prod images (build/Dockerfile.prod*).
+OCR_LANGS = "eng+spa+deu+fra"
+
+
 def _route_by_extension(ext: str, file_bytes: bytes) -> "Optional[str]":
     """Route a file to the right pure-python parser by lowercase extension.
 
@@ -71,6 +77,10 @@ def _route_by_extension(ext: str, file_bytes: bytes) -> "Optional[str]":
         return _extract_eml(file_bytes)
     if ext == ".msg":
         return _extract_msg(file_bytes)
+    if ext in IMAGE_EXTENSIONS:
+        # Belt and braces: callers with a generic/wrong MIME (SharePoint, the
+        # raw KEX /upload) still reach OCR for an image by its extension.
+        return _extract_image_ocr(file_bytes)
     return None
 
 
@@ -929,8 +939,22 @@ def _extract_image_ocr(data: bytes) -> str:
     except ImportError:
         raise ValueError("Pillow and pytesseract are required for OCR. Install: pip install Pillow pytesseract")
 
+    from PIL import ImageOps  # type: ignore
+
     img = Image.open(io.BytesIO(data))
-    text = pytesseract.image_to_string(img)
+    # Phone photos carry an EXIF orientation; Tesseract reads the raw pixels.
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001 - orientation is best-effort
+        pass
+    # GIF/TIFF first frame, palette/alpha images -> RGB on white so Tesseract sees
+    # dark text on a light ground instead of transparent pixels.
+    if img.mode not in ("RGB", "L"):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, "white")
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
+    text = pytesseract.image_to_string(img, lang=OCR_LANGS)
 
     if not text.strip():
         raise ValueError("Image contained no extractable text (OCR found nothing)")

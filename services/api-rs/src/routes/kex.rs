@@ -682,6 +682,48 @@ async fn upload(
     Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
 }
 
+/// MIME type KEX should route a file by, from its extension. KEX's
+/// `file_handler.extract_text` routes first by extension and then by MIME; a type
+/// it does not recognise ends in "Unsupported mimetype". Until v0.9.7 every
+/// extension not listed here was enqueued as `application/octet-stream`, so an
+/// image, a PPTX or an .eml uploaded through the API or an agent's `ingest_file`
+/// failed even though KEX can read them (OCR/vision for images, python-pptx, ...).
+/// Keep the strings in sync with `services/kex/src/sources/file_handler.py`.
+pub(crate) fn mime_for_filename(file_name: &str) -> &'static str {
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "pdf"  => "application/pdf",
+        "txt" | "text" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "csv"  => "text/csv",
+        "json" => "application/json",
+        "xml"  => "application/xml",
+        "yaml" | "yml" => "application/x-yaml",
+        "toml" => "application/toml",
+        "rtf"  => "application/rtf",
+        "epub" => "application/epub+zip",
+        "eml"  => "message/rfc822",
+        "msg"  => "application/vnd.ms-outlook",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xlsm" => "application/vnd.ms-excel.sheet.macroEnabled.12",
+        "odt"  => "application/vnd.oasis.opendocument.text",
+        "odp"  => "application/vnd.oasis.opendocument.presentation",
+        "ods"  => "application/vnd.oasis.opendocument.spreadsheet",
+        // Images: KEX transcribes them with the vision model when the runtime
+        // can see, and falls back to Tesseract OCR otherwise.
+        "png"  => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "tif" | "tiff" => "image/tiff",
+        "bmp"  => "image/bmp",
+        "gif"  => "image/gif",
+        _      => "application/octet-stream",
+    }
+}
+
 /// Core of file ingestion: given raw bytes + a filename, resolves the mimetype
 /// from the extension, spends tokens, creates the `kex_upload` job, links it
 /// into a compilation (explicit choice, else the user's default so nothing is
@@ -701,16 +743,7 @@ pub(crate) async fn submit_upload(
     enforce_classification_ceiling(&state.db, claims, classification_level_id).await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
 
-    let mimetype = match file_name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
-        "pdf"  => "application/pdf",
-        "txt"  => "text/plain",
-        "md"   => "text/markdown",
-        "html" | "htm" => "text/html",
-        "csv"  => "text/csv",
-        "json" => "application/json",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        _      => "application/octet-stream",
-    };
+    let mimetype = mime_for_filename(file_name);
 
     let job_id = Uuid::new_v4();
     sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
@@ -1391,5 +1424,27 @@ mod code_ingest_tests {
         assert!(c.contains("coarse_type: 'code'"));
         assert!(c.contains(&crate::services::neo4j::job_scope("n", "jobs")));
         assert!(c.contains("n.sha256"));
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::mime_for_filename;
+
+    #[test]
+    fn images_and_office_types_are_routed_by_extension() {
+        assert_eq!(mime_for_filename("board.png"), "image/png");
+        assert_eq!(mime_for_filename("PHOTO.JPG"), "image/jpeg");
+        assert_eq!(mime_for_filename("scan.tif"), "image/tiff");
+        assert_eq!(mime_for_filename("deck.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+        assert_eq!(mime_for_filename("mail.eml"), "message/rfc822");
+        assert_eq!(mime_for_filename("notes.markdown"), "text/markdown");
+    }
+
+    #[test]
+    fn unknown_or_missing_extension_stays_octet_stream() {
+        assert_eq!(mime_for_filename("blob.dwg"), "application/octet-stream");
+        assert_eq!(mime_for_filename("noext"), "application/octet-stream");
+        assert_eq!(mime_for_filename("report.pdf"), "application/pdf");
     }
 }
