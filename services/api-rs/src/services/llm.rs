@@ -211,6 +211,132 @@ pub async fn runtime_max_concurrency(db: &sqlx::PgPool) -> i64 {
     v.map(i64::from).filter(|n| *n >= 1).unwrap_or(4)
 }
 
+// ── Vision capability (v0.9.7) ────────────────────────────────────────────────
+
+/// 1x1 transparent PNG — the smallest image a vision endpoint accepts.
+pub const VISION_PROBE_PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/// Pure: the operator switch over the probe result. `on`/`off` force, `auto`
+/// trusts a positive probe only — unknown (never probed, server was busy) means
+/// "no vision" so KEX keeps using OCR instead of sending images into the void.
+pub fn effective_vision(mode: &str, detected: Option<bool>) -> bool {
+    match mode.trim() {
+        "on" => true,
+        "off" => false,
+        _ => detected == Some(true),
+    }
+}
+
+/// Pure: Ollama `/api/show` reports `capabilities: ["completion","vision",…]`.
+pub fn ollama_show_has_vision(show: &Value) -> bool {
+    show.get("capabilities")
+        .and_then(|c| c.as_array())
+        .map(|a| a.iter().any(|v| v.as_str() == Some("vision")))
+        .unwrap_or(false)
+}
+
+/// Does the runtime accept image input for its model? One request that cannot
+/// be misread: an OpenAI-compatible server gets a chat completion with an
+/// `image_url` part and `max_tokens` 5 — a vision-language model answers 2xx
+/// (Qwen3.6 on oMLX: ~2 s), a text-only server rejects the part with
+/// 400/415/422. Ollama is asked `/api/show`. Anything else (busy 409/507,
+/// 5xx, unreachable) is an error, i.e. NOT a verdict — the stored value stays
+/// unknown and the next run retries.
+pub async fn probe_vision(client: &reqwest::Client, target: &LlmTarget) -> Result<bool, String> {
+    let base = target.base();
+    if target.provider == "openai_compatible" {
+        let url = format!("{}/v1/chat/completions", openai_compat_root(&base));
+        let body = json!({
+            "model": target.model,
+            "stream": false,
+            "max_tokens": 5,
+            "chat_template_kwargs": { "enable_thinking": false },
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "Reply OK" },
+                { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{VISION_PROBE_PNG_BASE64}") } }
+            ]}]
+        });
+        let mut req = client.post(&url).timeout(Duration::from_secs(15)).json(&body);
+        if let Some(k) = target.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        return match req.send().await {
+            Ok(r) if r.status().is_success() => Ok(true),
+            Ok(r) if matches!(r.status().as_u16(), 400 | 415 | 422) => Ok(false),
+            Ok(r) => Err(format!("HTTP {}", r.status().as_u16())),
+            Err(e) => Err(format!("unreachable: {e}")),
+        };
+    }
+    let url = format!("{}/api/show", base.trim_end_matches('/'));
+    match client.post(&url).timeout(Duration::from_secs(5)).json(&json!({ "model": target.model })).send().await {
+        Ok(r) if r.status().is_success() => {
+            let v: Value = r.json().await.map_err(|e| format!("bad /api/show json: {e}"))?;
+            Ok(ollama_show_has_vision(&v))
+        }
+        Ok(r) => Err(format!("HTTP {}", r.status().as_u16())),
+        Err(e) => Err(format!("unreachable: {e}")),
+    }
+}
+
+/// `runtime_config.vision` + `vision_detected` (migration 084); `('auto', None)`
+/// when the row is missing.
+pub async fn runtime_vision(db: &sqlx::PgPool) -> (String, Option<bool>) {
+    let row: Option<(Option<String>, Option<bool>)> =
+        sqlx::query_as("SELECT vision, vision_detected FROM runtime_config WHERE id = 1")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    match row {
+        Some((m, d)) => (m.unwrap_or_else(|| "auto".into()), d),
+        None => ("auto".into(), None),
+    }
+}
+
+/// The global runtime as an [`LlmTarget`] with its key opened, or None when no
+/// runtime row is configured.
+pub async fn global_runtime_target(db: &sqlx::PgPool) -> Option<LlmTarget> {
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT provider, base_url, model, api_key FROM runtime_config WHERE id = 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let (provider, base_url, model, key) = row?;
+    let provider = provider.map(|p| p.trim().to_string()).filter(|p| !p.is_empty())?;
+    Some(LlmTarget {
+        provider,
+        model: model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).unwrap_or_else(|| "llama3.2".into()),
+        base_url,
+        api_key: key.map(|k| crate::services::crypto::open(&k)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+    })
+}
+
+/// Probe the global runtime once and store the verdict (`vision_detected`,
+/// `vision_probed_at`). Inconclusive probes leave the row untouched. Best effort.
+pub async fn refresh_runtime_vision(db: &sqlx::PgPool) -> Option<bool> {
+    let target = global_runtime_target(db).await?;
+    let client = reqwest::Client::new();
+    match probe_vision(&client, &target).await {
+        Ok(v) => {
+            let _ = sqlx::query(
+                "UPDATE runtime_config SET vision_detected = $1, vision_probed_at = now() WHERE id = 1",
+            )
+            .bind(v)
+            .execute(db)
+            .await;
+            tracing::info!("vision probe: {} on {} → {}", target.model, target.base(), if v { "images accepted" } else { "text only" });
+            Some(v)
+        }
+        Err(e) => {
+            tracing::info!("vision probe inconclusive for {}: {e}", target.model);
+            None
+        }
+    }
+}
+
 // ── Transient-error contract (spec D1) ────────────────────────────────────────
 
 /// Statuses a local inference server returns while it is alive but cannot take
@@ -998,6 +1124,32 @@ pub async fn inject_ollama_overrides(
         let (rel, gen) = worker_generation_overrides(db, user_id, "relation", false).await;
         map.insert("relex_model".into(), json!(rel.model));
         map.extend(gen);
+
+        // ── Vision (v0.9.7): may KEX send images to the relation runtime? ─────
+        // Only when the runtime says it can see AND the relation target IS the
+        // globally loaded model on the same server — the whole point is to use
+        // the one model that is already in memory, never to load a second one.
+        let vision_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>, Option<bool>)> =
+            sqlx::query_as(
+                "SELECT provider, base_url, model, vision, vision_detected FROM runtime_config WHERE id = 1",
+            )
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+        let generation_vision = match vision_row {
+            Some((Some(rt_provider), rt_base, Some(rt_model), mode, detected)) => {
+                let same_model = rel.model.trim().eq_ignore_ascii_case(rt_model.trim());
+                let same_provider = rel.provider == rt_provider;
+                let same_server = match rt_base.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                    Some(b) => same_openai_root(&rel.base(), b),
+                    None => true,
+                };
+                effective_vision(mode.as_deref().unwrap_or("auto"), detected) && same_model && same_provider && same_server
+            }
+            _ => false,
+        };
+        map.insert("generation_vision".into(), json!(generation_vision));
 
         // ── Part 6.1: Pinned embedding override ───────────────────────────────
         // When the active runtime is the bundled llama.cpp (gctrl-llamacpp:8080)
@@ -2111,5 +2263,30 @@ mod tests {
         assert!(!placeholder_ollama_row("ollama", None, Some("http://host.docker.internal:11434"), None));
         assert!(!placeholder_ollama_row("ollama", None, None, Some("qwen2.5:7b")));
         assert!(!placeholder_ollama_row("openai_compatible", None, None, None));
+    }
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::{effective_vision, ollama_show_has_vision};
+    use serde_json::json;
+
+    #[test]
+    fn effective_vision_switch_semantics() {
+        assert!(effective_vision("on", None));
+        assert!(effective_vision("on", Some(false)));
+        assert!(!effective_vision("off", Some(true)));
+        assert!(effective_vision("auto", Some(true)));
+        assert!(!effective_vision("auto", Some(false)));
+        assert!(!effective_vision("auto", None), "unknown must never send images");
+        assert!(!effective_vision("garbage", None));
+    }
+
+    #[test]
+    fn ollama_show_capabilities_parse() {
+        assert!(ollama_show_has_vision(&json!({ "capabilities": ["completion", "vision", "thinking"] })));
+        assert!(!ollama_show_has_vision(&json!({ "capabilities": ["completion"] })));
+        assert!(!ollama_show_has_vision(&json!({})));
+        assert!(!ollama_show_has_vision(&json!({ "capabilities": "vision" })));
     }
 }

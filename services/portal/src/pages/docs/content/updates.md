@@ -11,6 +11,14 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: de84352 -->
 
+## v0.9.7 - Images become knowledge
+
+*7 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Image uploads no longer die as `application/octet-stream`.** Every extension outside pdf/txt/md/html/csv/json/docx was enqueued with a generic type, so a PNG, a PPTX, an XLSX or an .eml uploaded through the API or an agent's `ingest_file` failed in KEX with "Unsupported mimetype" - although KEX could read all of them. One extension-to-type map now covers images (PNG/JPG/WEBP/TIFF/BMP/GIF), the Office, OpenDocument, mail and markup types, the web dropzones accept images, and KEX routes image files by extension as well. OCR reads English, German, French and Spanish, orients phone photos by their EXIF tag and flattens transparent images before Tesseract sees them.
+- **Images are transcribed by the model you already run - never by a second one.** When the active runtime understands images, KEX hands each image (and the first pages of a scanned PDF) to it and stores a structured transcript: title, type, every legible word in reading order, the structure of a board as groups, items and `A -> B` connections, the entities on it, a short summary. Tesseract's text is appended so exact strings stay findable, and it remains the fallback whenever vision is off, unknown, busy or empty. The image goes to the model only when the relation runtime *is* the globally loaded model on the same server - on a box that shares its RAM between GCTRL and other agents, nothing ever loads a second model for a picture.
+- **The runtime knows whether it can see.** Settings → Infrastructure gains an *Image understanding* switch (Auto / On / Off). In Auto, GCTRL probes the model once with a 1×1 image - a vision-language model such as Qwen3.6 on oMLX answers, a text-only server rejects the part - and shows the result as a *Vision* or *Text only* badge next to the health pill; an inconclusive probe (busy server) is retried in the background and never counts as a verdict. `get_active_runtime` reports `vision`, `vision_mode` and `vision_detected`; `switch_runtime` takes `vision`.
+
 ## v0.9.6 - Memory that learns from use
 
 *5 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

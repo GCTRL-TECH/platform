@@ -21,7 +21,13 @@ export interface ActiveRuntime {
   max_concurrency?: number
   /** Last probe error when `healthy` is false. */
   health_error?: string | null
+  /** Image understanding (migration 084): operator switch, probe result, effective value. */
+  vision_mode?: 'auto' | 'on' | 'off'
+  vision_detected?: boolean | null
+  vision?: boolean
 }
+
+type VisionMode = 'auto' | 'on' | 'off'
 
 export interface RuntimeCatalogEntry {
   id: string
@@ -75,6 +81,7 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
   const [apiKey, setApiKey] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
   const [maxConcurrency, setMaxConcurrency] = useState<number>(DEFAULT_MAX_CONCURRENCY)
+  const [visionMode, setVisionMode] = useState<VisionMode>('auto')
 
   // Models the selected openai_compatible instance (external / mlx) actually
   // serves — best-effort datalist behind the free-text model field. There is no
@@ -119,6 +126,7 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
       setSelectedModel(activeRuntime.model ?? '')
       setBaseUrl(activeRuntime.base_url ?? '')
       if (activeRuntime.max_concurrency != null) setMaxConcurrency(clampConcurrency(activeRuntime.max_concurrency))
+      if (activeRuntime.vision_mode) setVisionMode(activeRuntime.vision_mode)
     }
   }, [activeRuntime, selectedKind])
 
@@ -183,6 +191,7 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
       if (baseUrl.trim()) body.base_url = baseUrl.trim()
       if (apiKey.trim()) body.api_key = apiKey.trim()
       if (showConcurrency) body.max_concurrency = clampConcurrency(maxConcurrency)
+      body.vision = visionMode
 
       const resp = await fetch('/api/infra/switch-runtime', {
         method: 'POST',
@@ -440,6 +449,27 @@ export function RuntimeSwitcher({ hardware, isAdmin, activeRuntime, onSwitched }
                   </p>
                 </div>
               )}
+
+              {/* Image understanding — KEX transcribes images with THIS model when it can see */}
+              <div>
+                <label className="mb-1.5 block text-[11px] font-medium text-slate-400">
+                  Image understanding
+                </label>
+                <select
+                  value={visionMode}
+                  onChange={(e) => setVisionMode(e.target.value as VisionMode)}
+                  className="w-56 rounded border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-sm text-slate-200 focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="auto">
+                    Auto — detected: {activeRuntime?.vision_detected === true ? 'yes' : activeRuntime?.vision_detected === false ? 'no' : 'unknown'}
+                  </option>
+                  <option value="on">On — always send images</option>
+                  <option value="off">Off — OCR only</option>
+                </select>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Uploaded images and scanned PDFs are transcribed by the loaded model when it accepts image input (a one-time probe with a 1×1 image decides); otherwise Tesseract OCR. Never loads a second model.
+                </p>
+              </div>
 
               {/* Model picker — shown for runtimes that need a model selection */}
               {selectedKind && !needsBaseUrl && (

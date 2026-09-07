@@ -395,9 +395,9 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "get_hardware",       "description": "Read the host hardware profile (CPU cores, RAM, GPU, VRAM, OS/arch) detected at install time. Read-only, any caller", "args": {} },
             { "name": "recommend_runtime",  "description": "Recommend the best runtime and model for the current hardware (pure local logic — no IO). Returns { runtime, model, rationale, speedup_estimate }. Read-only, any caller", "args": {} },
             { "name": "list_runtimes",      "description": "List the available runtime catalog entries (ollama, llamacpp, vllm, external, mlx — the last three are openai_compatible /v1 servers; mlx is native Apple-Silicon inference on this host) with metadata: needs_base_url, needs_api_key, default_base_url. Read-only, any caller", "args": {} },
-            { "name": "get_active_runtime", "description": "Read the current active LLM generation runtime: provider, base_url, model, embedding_mode, configured, healthy. Never leaks api_key. Read-only, any caller", "args": {} },
+            { "name": "get_active_runtime", "description": "Read the current active LLM generation runtime: provider, base_url, model, embedding_mode, configured, healthy, and whether it understands images (vision: effective, vision_mode: auto|on|off, vision_detected: probe result). Never leaks api_key. Read-only, any caller", "args": {} },
             { "name": "list_models",        "description": "List the built-in model catalog for a given runtime kind. Args: { runtime } where runtime ∈ 'ollama' | 'llamacpp' | 'vllm'. Read-only, any caller", "args": { "runtime": "string" } },
-            { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'vllm'|'external'|'mlx', model?: string, base_url?: string, api_key?: string, max_concurrency?: number }. ollama/external/mlx: synchronous validate+persist (external/mlx need base_url; mlx also needs model; api_key optional). llamacpp: async (spawns pull+create in background, returns immediately with status='starting'). vllm: use the Cookbook UI (container launch). max_concurrency (1-64) caps parallel generation requests against a /v1 runtime", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?", "max_concurrency": "number?" } },
+            { "name": "switch_runtime",     "description": "Switch the active generation runtime (admin only). Args: { runtime: 'ollama'|'llamacpp'|'vllm'|'external'|'mlx', model?: string, base_url?: string, api_key?: string, max_concurrency?: number }. ollama/external/mlx: synchronous validate+persist (external/mlx need base_url; mlx also needs model; api_key optional). llamacpp: async (spawns pull+create in background, returns immediately with status='starting'). vllm: use the Cookbook UI (container launch). max_concurrency (1-64) caps parallel generation requests against a /v1 runtime. vision: 'auto' (probe the model with a tiny image, default) | 'on' | 'off' — whether KEX may transcribe images with this runtime instead of OCR", "args": { "runtime": "string", "model": "string?", "base_url": "string?", "api_key": "string?", "max_concurrency": "number?", "vision": "string?" } },
             { "name": "set_model",          "description": "Update the model for the active runtime without changing the provider (admin only). Validates against the built-in catalog for known runtimes; accepts any string for ollama/external. Args: { model: string }", "args": { "model": "string" } },
             { "name": "set_embedding_mode", "description": "Set the embedding mode flag (admin only). Valid values: 'pinned' (default, fast exact lookup) or 'advanced' (richer multi-pass). Does not trigger re-indexing — that is scheduled separately. Args: { mode: 'pinned'|'advanced' }", "args": { "mode": "string" } },
             // ── File-asset index + connector ops ─────────────────────────────────
@@ -1963,10 +1963,14 @@ async fn execute_tool_inner(
                 Ok(v) => v,
                 Err(e) => return json!({ "error": e }),
             };
+            let vision_mode = match crate::routes::infra::validate_vision_mode(args["vision"].as_str()) {
+                Ok(v) => v,
+                Err(e) => return json!({ "error": e }),
+            };
 
             match runtime.as_str() {
                 "ollama" => {
-                    if let Err(e) = crate::routes::infra::persist_runtime(&state.db, "ollama", None, None, None, Some("ollama"), max_concurrency).await {
+                    if let Err(e) = crate::routes::infra::persist_runtime(&state.db, "ollama", None, None, None, Some("ollama"), max_concurrency, vision_mode.as_deref()).await {
                         return json!({ "error": format!("DB save failed: {e}") });
                     }
                     // Best-effort: stop llamacpp if running
@@ -2008,7 +2012,7 @@ async fn execute_tool_inner(
                     let health = crate::services::llm::runtime_health_detail(&health_client, &target).await;
                     if let Err(e) = crate::routes::infra::persist_runtime(
                         &state.db, "openai_compatible", Some(&base_url), Some(&model_str), api_key_arg.as_deref(),
-                        Some(rt), max_concurrency,
+                        Some(rt), max_concurrency, vision_mode.as_deref(),
                     ).await {
                         return json!({ "error": format!("DB save failed: {e}") });
                     }

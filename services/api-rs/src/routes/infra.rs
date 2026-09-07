@@ -134,6 +134,7 @@ pub(crate) async fn persist_runtime(
     api_key: Option<&str>,
     runtime_id: Option<&str>,
     max_concurrency: Option<i32>,
+    vision: Option<&str>,
 ) -> crate::error::Result<()> {
     let sealed_key: Option<String> = api_key
         .map(|k| k.trim())
@@ -141,8 +142,8 @@ pub(crate) async fn persist_runtime(
         .map(crate::services::crypto::seal);
 
     sqlx::query(
-        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, runtime_id, max_concurrency, updated_at)
-         VALUES (1, $1, $2, $3, $4, $5, COALESCE($6, 4), now())
+        "INSERT INTO runtime_config (id, provider, base_url, model, api_key, runtime_id, max_concurrency, vision, updated_at)
+         VALUES (1, $1, $2, $3, $4, $5, COALESCE($6, 4), COALESCE($7, 'auto'), now())
          ON CONFLICT (id) DO UPDATE SET
              provider        = $1,
              base_url        = $2,
@@ -152,6 +153,16 @@ pub(crate) async fn persist_runtime(
                                     ELSE NULL END,
              runtime_id      = $5,
              max_concurrency = COALESCE($6, runtime_config.max_concurrency),
+             vision          = COALESCE($7, runtime_config.vision),
+             -- a probe result belongs to one (server, model): a change clears it
+             vision_detected = CASE WHEN runtime_config.provider = $1
+                                     AND runtime_config.base_url IS NOT DISTINCT FROM $2
+                                     AND runtime_config.model IS NOT DISTINCT FROM $3
+                                    THEN runtime_config.vision_detected ELSE NULL END,
+             vision_probed_at = CASE WHEN runtime_config.provider = $1
+                                      AND runtime_config.base_url IS NOT DISTINCT FROM $2
+                                      AND runtime_config.model IS NOT DISTINCT FROM $3
+                                     THEN runtime_config.vision_probed_at ELSE NULL END,
              updated_at      = now()",
     )
     .bind(provider)
@@ -160,6 +171,7 @@ pub(crate) async fn persist_runtime(
     .bind(sealed_key)
     .bind(runtime_id)
     .bind(max_concurrency)
+    .bind(vision)
     .execute(db)
     .await?;
 
@@ -188,6 +200,16 @@ pub fn validate_max_concurrency(v: Option<i32>) -> std::result::Result<Option<i3
         None => Ok(None),
         Some(n) if (1..=64).contains(&n) => Ok(Some(n)),
         Some(n) => Err(format!("max_concurrency must be between 1 and 64 (got {n})")),
+    }
+}
+
+/// Pure: `vision` from a request body — `None` keeps the stored value, else one
+/// of `auto|on|off` (migration 084).
+pub fn validate_vision_mode(v: Option<&str>) -> std::result::Result<Option<String>, String> {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(m @ ("auto" | "on" | "off")) => Ok(Some(m.to_string())),
+        Some(m) => Err(format!("vision must be one of auto, on, off (got '{m}')")),
     }
 }
 
@@ -1209,6 +1231,8 @@ struct SetRuntimeReq {
     runtime_id: Option<String>,
     /// Spec D2 — `1..=64`; omitted keeps the stored value.
     max_concurrency: Option<i32>,
+    /// Image understanding: `auto` (probe) | `on` | `off`; omitted keeps the stored value.
+    vision: Option<String>,
 }
 
 /// Set (UPSERT) the global active runtime. Admin-only.
@@ -1237,6 +1261,7 @@ async fn set_runtime(
     let validated_base: Option<String> = validate_runtime_input(&provider, base_url_raw)
         .map_err(AppError::BadRequest)?;
     let max_concurrency = validate_max_concurrency(req.max_concurrency).map_err(AppError::BadRequest)?;
+    let vision_mode = validate_vision_mode(req.vision.as_deref()).map_err(AppError::BadRequest)?;
     let runtime_id = validate_runtime_id(req.runtime_id.as_deref())
         .map_err(AppError::BadRequest)?
         .or_else(|| (provider == "ollama").then(|| "ollama".to_string()));
@@ -1268,8 +1293,15 @@ async fn set_runtime(
         api_key_opt,
         runtime_id.as_deref(),
         max_concurrency,
+        vision_mode.as_deref(),
     )
     .await?;
+    // Learn whether the (possibly new) model sees images — detached, the save must
+    // not wait for a busy server; the periodic task retries an inconclusive probe.
+    {
+        let db = state.db.clone();
+        tokio::spawn(async move { crate::services::llm::refresh_runtime_vision(&db).await; });
+    }
 
     crate::services::audit::log_access(
         &state.db, &claims, "infra.runtime.set", "runtime_config", "1",
@@ -1322,6 +1354,8 @@ struct SwitchRuntimeReq {
     runtime_id: Option<String>,
     /// Spec D2 — `1..=64`; omitted keeps the stored value.
     max_concurrency: Option<i32>,
+    /// Image understanding: `auto` | `on` | `off`; omitted keeps the stored value.
+    vision: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1407,18 +1441,25 @@ async fn run_switch_runtime(
             return;
         }
     };
+    let vision_mode = match validate_vision_mode(req.vision.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            send("error", json!({ "message": e }));
+            return;
+        }
+    };
 
     match runtime.as_str() {
         // Both are "a /v1 server somewhere else"; only the catalog id differs
         // (the UI label + whether a model must be named).
         "external" | "mlx" => {
-            switch_external_like(&tx, &db, &req, &runtime, max_concurrency).await;
+            switch_external_like(&tx, &db, &req, &runtime, max_concurrency, vision_mode.as_deref()).await;
         }
 
         "ollama" => {
             send("progress", json!({ "step": "saving", "message": "Switching back to bundled Ollama…" }));
 
-            if let Err(e) = persist_runtime(&db, "ollama", None, None, None, Some("ollama"), max_concurrency).await {
+            if let Err(e) = persist_runtime(&db, "ollama", None, None, None, Some("ollama"), max_concurrency, vision_mode.as_deref()).await {
                 send("error", json!({ "message": format!("DB save failed: {e}") }));
                 return;
             }
@@ -1513,6 +1554,7 @@ async fn run_switch_runtime(
                 None,
                 Some("llamacpp"),
                 max_concurrency,
+                vision_mode.as_deref(),
             ).await {
                 send("error", json!({ "message": format!("DB save failed: {e}") }));
                 return;
@@ -1617,6 +1659,7 @@ async fn run_switch_runtime(
                 None,
                 Some("vllm"),
                 max_concurrency,
+                vision_mode.as_deref(),
             ).await {
                 send("error", json!({ "message": format!("DB save failed: {e}") }));
                 return;
@@ -1657,6 +1700,7 @@ async fn switch_external_like(
     req: &SwitchRuntimeReq,
     runtime_id: &str,
     max_concurrency: Option<i32>,
+    vision_mode: Option<&str>,
 ) {
     let send = |event: &str, data: serde_json::Value| {
         let _ = tx.send(Ok(Event::default().event(event).data(data.to_string())));
@@ -1715,6 +1759,7 @@ async fn switch_external_like(
         api_key_opt,
         Some(runtime_id),
         max_concurrency,
+        vision_mode,
     )
     .await
     {
@@ -2086,6 +2131,7 @@ pub async fn active_runtime_json(db: &sqlx::PgPool) -> Value {
         .await
         .ok()
         .flatten();
+    let (vision_mode, vision_detected) = crate::services::llm::runtime_vision(db).await;
 
     let (provider, base_url, model, embedding_mode, api_key, runtime_id, max_concurrency, configured) = match row {
         Some((Some(p), b, m, em, k, rid, mc)) if !p.trim().is_empty() => {
@@ -2121,6 +2167,11 @@ pub async fn active_runtime_json(db: &sqlx::PgPool) -> Value {
         "configured":      configured,
         "healthy":         health.is_ok(),
         "health_error":    health.err(),
+        // Image understanding (migration 084): the operator switch, the probe
+        // result (null = unknown) and what KEX will actually do.
+        "vision_mode":     vision_mode,
+        "vision_detected": vision_detected,
+        "vision":          crate::services::llm::effective_vision(&vision_mode, vision_detected),
     })
 }
 
@@ -2361,6 +2412,7 @@ pub fn spawn_llamacpp_startup(db: sqlx::PgPool, model_id: String) {
             Some(&model_id),
             None,
             Some("llamacpp"),
+            None,
             None,
         )
         .await
@@ -3111,5 +3163,20 @@ mod reindex_tests {
         let err = validate_reindex_request(true, "REINDEX", "", None, None);
         assert!(err.is_err(), "empty embedding_model must be rejected");
         assert!(err.unwrap_err().contains("embedding_model"), "error must mention embedding_model");
+    }
+}
+
+#[cfg(test)]
+mod vision_mode_tests {
+    use super::validate_vision_mode;
+
+    #[test]
+    fn accepts_the_three_modes_and_keeps_none() {
+        assert_eq!(validate_vision_mode(None), Ok(None));
+        assert_eq!(validate_vision_mode(Some("  ")), Ok(None));
+        assert_eq!(validate_vision_mode(Some("auto")), Ok(Some("auto".into())));
+        assert_eq!(validate_vision_mode(Some(" on ")), Ok(Some("on".into())));
+        assert_eq!(validate_vision_mode(Some("off")), Ok(Some("off".into())));
+        assert!(validate_vision_mode(Some("yes")).is_err());
     }
 }

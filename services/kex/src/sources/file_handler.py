@@ -6,6 +6,7 @@ Supported: PDF, DOCX, CSV, JSON, XML, plain text.
 
 import csv
 import io
+import os
 import json
 import logging
 import re
@@ -36,7 +37,7 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", "
 OCR_LANGS = "eng+spa+deu+fra"
 
 
-def _route_by_extension(ext: str, file_bytes: bytes) -> "Optional[str]":
+def _route_by_extension(ext: str, file_bytes: bytes, page_hook=None, filename="document") -> "Optional[str]":
     """Route a file to the right pure-python parser by lowercase extension.
 
     Returns the extracted text, or None if the extension is not one we route
@@ -44,7 +45,7 @@ def _route_by_extension(ext: str, file_bytes: bytes) -> "Optional[str]":
     self-contained; the per-parser functions already wrap their own errors.
     """
     if ext == ".pdf":
-        return _extract_pdf(file_bytes)
+        return _extract_pdf(file_bytes, page_hook=page_hook, filename=filename)
     if ext == ".docx":
         return _extract_docx(file_bytes)
     if ext == ".pptx":
@@ -84,7 +85,7 @@ def _route_by_extension(ext: str, file_bytes: bytes) -> "Optional[str]":
     return None
 
 
-def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -> str:
+def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document", page_hook=None) -> str:
     """
     Extract textual content from file bytes.
 
@@ -100,6 +101,9 @@ def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -
         file_bytes: Raw file content.
         mimetype:   MIME type string (e.g. "application/pdf").
         filename:   Original filename (used for extension-based detection).
+        page_hook:  optional ``(png_bytes, page_num, filename) -> str`` used for the
+                    pages of a SCANNED pdf before Tesseract (vision transcription,
+                    src/vision.py). None = OCR only.
 
     Returns:
         Extracted text as a single string.
@@ -121,7 +125,7 @@ def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -
     # 1. Route by lowercase extension first — most reliable for uploads.
     if ext:
         try:
-            routed = _route_by_extension(ext, file_bytes)
+            routed = _route_by_extension(ext, file_bytes, page_hook=page_hook, filename=filename)
             if routed is not None:
                 return routed
         except ValueError:
@@ -222,7 +226,7 @@ def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document") -
 # ── format-specific extractors ────────────────────────────────────────
 
 
-def _extract_pdf(data: bytes) -> str:
+def _extract_pdf(data: bytes, page_hook=None, filename="document") -> str:
     """Extract text from all pages of a PDF.
 
     Strategy (best layout fidelity first):
@@ -280,7 +284,7 @@ def _extract_pdf(data: bytes) -> str:
 
     # 3. No text layer → scanned/image PDF. OCR fallback.
     logger.info("PDF has no embedded text — falling back to OCR")
-    return _clean_pdf_text(_ocr_pdf(data))
+    return _clean_pdf_text(_ocr_pdf(data, page_hook=page_hook, filename=filename))
 
 
 # Matches a run of single characters separated by single spaces, e.g.
@@ -324,8 +328,13 @@ def _clean_pdf_text(text: str) -> str:
     return cleaned.strip()
 
 
-def _ocr_pdf(data: bytes) -> str:
-    """OCR a scanned/image PDF by rendering each page and running Tesseract."""
+def _ocr_pdf(data: bytes, page_hook=None, filename="document") -> str:
+    """OCR a scanned/image PDF by rendering each page and running Tesseract.
+
+    With ``page_hook`` (vision transcription, src/vision.py) the first
+    ``KEX_VISION_PDF_MAX_PAGES`` pages go to the loaded model first — one image per
+    call, sequential, so a shared server stays memory-flat; any failure or a page
+    beyond the budget uses Tesseract."""
     try:
         import fitz  # PyMuPDF
         import pytesseract  # type: ignore
@@ -337,11 +346,24 @@ def _ocr_pdf(data: bytes) -> str:
     parts: list[str] = []
     # 2.5x zoom ≈ 180 DPI — enough for Tesseract without huge images.
     matrix = fitz.Matrix(2.5, 2.5)
+    try:
+        vision_pages = int(os.environ.get("KEX_VISION_PDF_MAX_PAGES", "5") or 5)
+    except ValueError:
+        vision_pages = 5
     for page_num in range(doc.page_count):
         try:
             pix = doc.load_page(page_num).get_pixmap(matrix=matrix)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = pytesseract.image_to_string(img, lang="eng+spa+deu+fra")
+            png = pix.tobytes("png")
+            text = ""
+            if page_hook is not None and page_num < vision_pages:
+                try:
+                    text = page_hook(png, page_num, filename) or ""
+                except Exception as exc:  # noqa: BLE001 - vision is best-effort per page
+                    logger.warning(f"vision transcription failed on PDF page {page_num} → OCR: {exc}")
+                    text = ""
+            if not text.strip():
+                img = Image.open(io.BytesIO(png))
+                text = pytesseract.image_to_string(img, lang=OCR_LANGS)
             if text and text.strip():
                 parts.append(text.strip())
         except Exception as exc:

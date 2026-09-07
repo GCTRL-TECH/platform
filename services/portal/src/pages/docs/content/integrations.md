@@ -104,7 +104,7 @@ Whichever transport you pick, the MCP config only gives the agent the *tools*. R
 | Obsidian | Connector |
 | SharePoint | Connector |
 | Website crawler | Connector |
-| PDF / DOCX upload | Upload in the UI, or `ingest_file` from any connected agent |
+| PDF / DOCX / PPTX / images / scanned PDFs | Upload in the UI, or `ingest_file` from any connected agent (images are transcribed by the loaded vision model, OCR otherwise) |
 
 ## See also
 

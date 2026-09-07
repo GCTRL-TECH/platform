@@ -561,6 +561,17 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 generation_max_concurrency = int(payload.get("generation_max_concurrency") or 0) or None
             except (TypeError, ValueError):
                 generation_max_concurrency = None
+            # v0.9.7: may this job send IMAGES to the relation runtime? api-rs sets
+            # it only when the relation model is the globally loaded model on the
+            # same server (no second model, ever). Absent → OCR only.
+            vision_ctx = {
+                "enabled": payload.get("generation_vision") is True,
+                "kind": generation_kind,
+                "base": generation_base or ollama_base or config.OLLAMA_BASE,
+                "model": relex_model or config.RELEX_MODEL,
+                "api_key": generation_api_key,
+                "max_concurrency": generation_max_concurrency,
+            }
             # P2b document identity, resolved by the API from (user, path):
             # the source_documents row id + the full source path + the
             # source-side modified time (when known). All optional — absent
@@ -621,7 +632,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 file_bytes = base64.b64decode(file_data["fileBase64"])
                 mimetype = file_data.get("mimetype", "application/octet-stream")
                 _fname = file_data.get("originalFilename") or file_data.get("fileName") or "document"
-                text = extract_text(file_bytes, mimetype, filename=_fname)
+                text = _extract_job_text(file_bytes, mimetype, _fname, vision_ctx)
                 origin = file_data.get("originalFilename") or file_data.get("fileName")
                 logger.info(f"[{job_id}] Extracted {len(text)} chars from file ({mimetype})")
             elif job_type == "kex_sharepoint":
@@ -633,7 +644,7 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                     drive_id=inp["driveId"],
                     item_id=inp["itemId"],
                 )
-                text = extract_text(file_bytes, mimetype, filename=inp.get("fileName") or "document")
+                text = _extract_job_text(file_bytes, mimetype, inp.get("fileName") or "document", vision_ctx)
                 origin = inp.get("fileName")
                 logger.info(f"[{job_id}] SharePoint: extracted {len(text)} chars from {inp.get('fileName','<unknown>')} ({mimetype})")
             elif job_type == "kex_obsidian":
@@ -737,6 +748,32 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 hb_stop.set()
 
     logger.info(f"KEX worker-{worker_id} stopped")
+
+
+
+def _extract_job_text(file_bytes, mimetype, filename, vision_ctx):
+    """extract_text with the vision layer (src/vision.py) on top.
+
+    Images: transcribed by the loaded model when ``vision_ctx["enabled"]`` (api-rs
+    guarantees it is the same model that is already in memory), Tesseract OCR
+    appended / as fallback. Scanned PDFs: the first pages go through the same model
+    via ``page_hook``. Everything else is unchanged.
+    """
+    from .sources.file_handler import IMAGE_EXTENSIONS, _extract_image_ocr
+
+    ext = os.path.splitext(filename or "")[1].lower()
+    is_image = (mimetype or "").lower().startswith("image/") or ext in IMAGE_EXTENSIONS
+    try:
+        from . import vision
+    except Exception as exc:  # noqa: BLE001 - never let the vision layer break ingest
+        logger.warning(f"vision module unavailable ({exc}) — OCR only")
+        vision = None
+    if is_image:
+        if vision is not None:
+            return vision.extract_image_knowledge(file_bytes, filename, vision_ctx, _extract_image_ocr)
+        return _extract_image_ocr(file_bytes)
+    hook = vision.page_hook_for(vision_ctx) if vision is not None else None
+    return extract_text(file_bytes, mimetype, filename=filename, page_hook=hook)
 
 
 def _start_job_heartbeat(job_id: str) -> threading.Event:

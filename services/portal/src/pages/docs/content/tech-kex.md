@@ -4,7 +4,7 @@ KEX turns unstructured documents into a structured knowledge graph - locally, fa
 
 ## What it does
 
-Point KEX at PDFs, DOCX, plain text, a Google Drive folder, an Obsidian vault, or a code repository, and it extracts **entities and the relationships between them**, chunks and embeds the source text for retrieval, and tags every item with its classification and a pointer back to the exact place it came from. The output is graph-ready: nodes and edges FUSE can merge, and passages Talk-to-Graph can cite.
+Point KEX at PDFs, DOCX, PPTX, plain text, images and scanned documents, a Google Drive folder, an Obsidian vault, or a code repository, and it extracts **entities and the relationships between them**, chunks and embeds the source text for retrieval, and tags every item with its classification and a pointer back to the exact place it came from. The output is graph-ready: nodes and edges FUSE can merge, and passages Talk-to-Graph can cite.
 
 ## Why it matters / USP
 
@@ -19,6 +19,10 @@ KEX is the front door of the pipeline: **Sources → KEX → FUSE → Manage KGs
 ## In practice
 
 A legal team drops three years of contract PDFs into a KEX import. Within the job queue's normal runtime, every contract's parties, dates, and obligations are extracted as entities and relations, tagged with the classification of the source folder, and chunked for search - ready for FUSE to collapse duplicate counterparties into single canonical entities.
+
+## Images and scanned documents
+
+Screenshots, whiteboard photos, Miro board exports (PNG/JPG/WEBP/TIFF/BMP/GIF) and scanned PDFs are documents too. KEX reads them with **the model that is already loaded**: when the active runtime understands images (Settings → Infrastructure shows a *Vision* badge; Qwen3.6 on oMLX or any Ollama model that reports `vision`), each image is transcribed and described - title, type, every legible word in reading order, the structure of a board (groups → items → connections as `A -> B`), the entities on it and a short summary. Tesseract OCR (English, German, French, Spanish) runs as well and is appended so exact strings stay searchable, and it is the fallback whenever the runtime cannot see, is busy, or the transcript comes back empty. Images are downscaled to 1536 px before they are sent; scanned PDFs send their first pages (`KEX_VISION_PDF_MAX_PAGES`, default 5) to the model and OCR the rest. GCTRL never loads a second model for this - the transcription only ever addresses the model the runtime already has in memory, and the RAM-sharing rules of a shared box stay intact.
 
 ## See also
 

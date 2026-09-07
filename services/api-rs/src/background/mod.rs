@@ -199,6 +199,22 @@ pub fn spawn_all(state: Arc<AppState>) {
         }
     });
 
+    // Vision probe (v0.9.7): learn once whether the active runtime's model accepts
+    // images (runtime_config.vision = 'auto' and no verdict yet), retrying while a
+    // busy server answers inconclusively. Cheap: one SELECT per pass, one tiny
+    // request only when unknown.
+    let s = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(90)).await;
+        loop {
+            let (mode, detected) = crate::services::llm::runtime_vision(&s.db).await;
+            if mode == "auto" && detected.is_none() {
+                crate::services::llm::refresh_runtime_vision(&s.db).await;
+            }
+            sleep(Duration::from_secs(300)).await;
+        }
+    });
+
     // Runtime guardrail: a SEPARATE loop (never folds into run_watchdog, which
     // stays observe-only) that probes the active generation runtime and
     // auto-reverts to bundled Ollama after repeated real failures. See

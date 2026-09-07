@@ -208,10 +208,27 @@ def _auth_headers(api_key):
     return headers if headers else None
 
 
-def _v1_body(prompt, model, options, think):
+def _image_parts(images):
+    """`images` = [{"mime": "image/jpeg", "b64": "..."}] → OpenAI image_url parts."""
+    parts = []
+    for im in images or []:
+        if not im:
+            continue
+        b64 = im.get("b64") if isinstance(im, dict) else None
+        if not b64:
+            continue
+        mime = (im.get("mime") if isinstance(im, dict) else None) or "image/jpeg"
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    return parts
+
+
+def _v1_body(prompt, model, options, think, images=None):
+    parts = _image_parts(images)
+    # Byte-parity for every existing caller: a plain string unless images ride along.
+    content = prompt if not parts else [{"type": "text", "text": prompt}] + parts
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": content}],
         "stream": False,
         "temperature": 0,
     }
@@ -225,11 +242,15 @@ def _v1_body(prompt, model, options, think):
     return body
 
 
-def _ollama_body(prompt, model, options, think):
+def _ollama_body(prompt, model, options, think, images=None):
     if options is not None:
         body = {"model": model, "prompt": prompt, "stream": False, "options": options}
     else:
         body = {"model": model, "prompt": prompt, "stream": False}
+    # Ollama's native vision path: raw base64 images next to the prompt.
+    b64s = [im.get("b64") for im in (images or []) if isinstance(im, dict) and im.get("b64")]
+    if b64s:
+        body["images"] = b64s
     # Keep the generation model resident between jobs. Ollama's default keep_alive
     # is 5 min; after any longer idle the NEXT extraction pays the full model load
     # (measured via Phoenix: 9.3 s of a 10.2 s relex on the first call, ~1 s warm).
@@ -318,18 +339,24 @@ def complete(
     think=None,
     timeout=120,
     max_concurrency=None,
+    images=None,
 ) -> str:
     """Traced wrapper around ``_complete_impl`` — one OpenInference LLM span per
     generation call (no-op unless PHOENIX_OTLP_URL is set). Exceptions propagate
-    unchanged so callers' degradation handling behaves exactly as before."""
+    unchanged so callers' degradation handling behaves exactly as before.
+
+    ``images`` (v0.9.7): optional ``[{"mime", "b64"}]`` sent as OpenAI ``image_url``
+    parts on the /v1 branch and as Ollama ``images`` on the native branch. Only the
+    count reaches telemetry — never the bytes."""
     with telemetry.span(
         "llm.complete",
         "LLM",
-        {"llm.model_name": model, "llm.provider": kind, "input.value": telemetry.trunc(prompt)},
+        {"llm.model_name": model, "llm.provider": kind, "input.value": telemetry.trunc(prompt),
+         "llm.images": len(images or [])},
     ) as sp:
         out = _complete_impl(
             prompt, model, base, kind, api_key=api_key, options=options, think=think,
-            timeout=timeout, max_concurrency=max_concurrency,
+            timeout=timeout, max_concurrency=max_concurrency, images=images,
         )
         try:
             sp.set_attribute("output.value", telemetry.trunc(out, 4000))
@@ -348,6 +375,7 @@ def _complete_impl(
     think=None,
     timeout=120,
     max_concurrency=None,
+    images=None,
 ) -> str:
     """Synchronous LLM completion.  Uses `requests`.
 
@@ -379,13 +407,13 @@ def _complete_impl(
     base = base.rstrip("/")
 
     if kind == "ollama":
-        resp = _post_with_retry(f"{base}/api/generate", _ollama_body(prompt, model, options, think), None, timeout)
+        resp = _post_with_retry(f"{base}/api/generate", _ollama_body(prompt, model, options, think, images), None, timeout)
         return resp.json()["response"]
 
     if kind in _OPENAI_KINDS:
         root = _v1_root(base)
         url = f"{root}/v1/chat/completions"
-        body = _v1_body(prompt, model, options, think)
+        body = _v1_body(prompt, model, options, think, images)
         fetch = _credential_fetch_enabled(api_key, kind)
         key = _fetch_generation_credential(root) if fetch else api_key
         with _gate(root, max_concurrency):

@@ -8,8 +8,7 @@ import {
   Cpu,
   Sparkles,
   Server,
-  Box,
-} from 'lucide-react'
+  Box, Image as ImageIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { RuntimeSwitcher, type ActiveRuntime } from './RuntimeSwitcher'
@@ -173,15 +172,28 @@ export function RuntimeCard({ hardware, recommendation, activeRuntime, isAdmin, 
           <span className="text-sm font-medium text-slate-200">Inference Runtime</span>
         </div>
         {activeRuntime && (
-          activeRuntime.healthy ? (
-            <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
-              <Wifi size={9} /> Healthy
-            </span>
-          ) : (
-            <span className="flex items-center gap-1 rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400">
-              <WifiOff size={9} /> Unhealthy
-            </span>
-          )
+          <div className="flex items-center gap-1.5">
+            {activeRuntime.vision !== undefined && (
+              <span
+                title={activeRuntime.vision ? 'Images are transcribed by this model' : 'Images fall back to Tesseract OCR'}
+                className={cn(
+                  'flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium',
+                  activeRuntime.vision ? 'bg-violet-500/10 text-violet-300' : 'bg-slate-800 text-slate-400',
+                )}
+              >
+                <ImageIcon size={9} /> {activeRuntime.vision ? 'Vision' : 'Text only'}
+              </span>
+            )}
+            {activeRuntime.healthy ? (
+              <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
+                <Wifi size={9} /> Healthy
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400">
+                <WifiOff size={9} /> Unhealthy
+              </span>
+            )}
+          </div>
         )}
       </div>
 
