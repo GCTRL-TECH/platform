@@ -3566,9 +3566,15 @@ async fn resolve_fact_conflict(
     .ok_or(AppError::NotFound)?;
     let (owner, comp_id, relation, key_name, key_side, tails, winner_col, _status) = row;
 
-    // Owner or admin only. Non-admin callers must not even learn the row exists.
-    if owner != claims.sub && claims.role != "admin" {
-        return Err(AppError::NotFound);
+    // The owner, within the same visibility rule the conflict queue applies
+    // (clearance cap, grant, Codebase access, KB-scope — see
+    // classification::conflict_access). An admin SESSION may still fix another
+    // user's graph (same policy as the graph mutation endpoints); an admin's
+    // access token may not, as tokens are the limited surface. Anyone else must
+    // not even learn the row exists.
+    let admin_session = claims.role == "admin" && claims.api_key_id.is_none();
+    if !(admin_session && owner != claims.sub) {
+        crate::routes::classification::conflict_access(&state.db, &claims, owner, comp_id).await?;
     }
 
     let tail_values = conflict_tail_values(&tails);

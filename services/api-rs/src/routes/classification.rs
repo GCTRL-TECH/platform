@@ -388,10 +388,132 @@ async fn set_retention(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ─── Conflict visibility ──────────────────────────────────────────────────────
+//
+// A conflict concerns the caller only when the caller may see the compilation
+// it lives in. That is the SAME rule `kg::list` / `kg::list_folders` apply to
+// graphs (clearance cap, per-graph grant, Codebase access, KB-scope of an
+// access token) — before this, the conflict queue was owner-scoped only, so a
+// PUBLIC-capped or KB-scoped colleague token enumerated every conflict of the
+// owner, including element names and competing values from graphs it may not
+// open. The rule is one pure function (`conflict_visible`, unit-tested) used by
+// the list AND by every per-conflict action (suggest / resolve, both kinds).
+
+/// What the request may see, resolved once per request.
+#[derive(Debug, Clone)]
+pub(crate) struct ConflictViewer {
+    /// Effective clearance (already capped by any API-key rank).
+    pub rank: i32,
+    /// True when `rank` is below the owner's own clearance (rank-limited token or
+    /// downgraded agent session) — such a request never sees unclassified graphs.
+    pub capped: bool,
+    /// The token's Codebase-access capability (always true for a session).
+    pub code_access: bool,
+    /// `Some(set)` for a KB-scoped token: only these compilations exist for it.
+    pub scope: Option<std::collections::HashSet<Uuid>>,
+}
+
+impl ConflictViewer {
+    pub(crate) async fn load(db: &sqlx::PgPool, claims: &JwtClaims) -> Self {
+        let (rank, capped) = crate::routes::kg::clearance_rank_with_cap(db, claims).await;
+        let scope = crate::routes::kg::api_key_scope(db, claims).await;
+        ConflictViewer { rank, capped, code_access: claims.code_access, scope }
+    }
+
+    /// A full owner session: not rank-capped, not KB-scoped, Codebase access on.
+    /// Only such a request may see conflicts that are tied to NO compilation.
+    fn is_full_owner(&self) -> bool {
+        !self.capped && self.scope.is_none() && self.code_access
+    }
+}
+
+/// The facts about one compilation the rule needs.
+#[derive(Debug, Clone)]
+pub(crate) struct CompilationFacts {
+    pub id: Uuid,
+    /// Rank of the graph's classification level; None = unclassified.
+    pub level_rank: Option<i32>,
+    pub is_code: bool,
+    /// Per-graph grant of the token used: None = no grant, Some(None) = full
+    /// grant, Some(Some(r)) = grant capped at rank r.
+    pub grant: Option<Option<i32>>,
+}
+
+/// Pure: may this viewer see a conflict living in `comp`? `None` = the conflict
+/// is not attributable to a compilation (fact conflicts from write-time
+/// detection carry `compilation_id = NULL`): visible to a full owner session
+/// only — a limited token cannot be shown data we cannot prove it may see.
+pub(crate) fn conflict_visible(viewer: &ConflictViewer, comp: Option<&CompilationFacts>) -> bool {
+    let Some(c) = comp else { return viewer.is_full_owner(); };
+    if !viewer.code_access && c.is_code { return false; }
+    if let Some(set) = &viewer.scope {
+        if !set.contains(&c.id) { return false; }
+    }
+    let granted = |need: Option<i32>| match (c.grant, need) {
+        (None, _)              => false,
+        (Some(None), _)        => true,   // full grant on this graph
+        (Some(Some(_)), None)  => true,   // any grant reaches an unclassified graph
+        (Some(Some(g)), Some(r)) => g >= r,
+    };
+    match c.level_rank {
+        Some(r) => r <= viewer.rank || granted(Some(r)),
+        None    => !viewer.capped || granted(None),
+    }
+}
+
+/// The caller's compilations with the facts the rule needs, keyed by id. One
+/// query per request; a compilation of another user is simply absent (= not
+/// visible). `api_key_id` is NULL for sessions, so the grant join yields none.
+pub(crate) async fn load_compilation_facts(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> Result<std::collections::HashMap<Uuid, CompilationFacts>> {
+    let rows = sqlx::query_as::<_, (Uuid, Option<i32>, bool, bool, Option<i32>)>(
+        "SELECT c.id, cl.rank, c.type::text = 'CODE', g.id IS NOT NULL, g.granted_rank
+         FROM compilations c
+         LEFT JOIN classification_levels cl ON cl.id = c.classification_level_id
+         LEFT JOIN api_key_grants g ON g.compilation_id = c.id AND g.api_key_id = $2
+         WHERE c.user_id = $1",
+    )
+    .bind(claims.sub)
+    .bind(claims.api_key_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, level_rank, is_code, has_grant, granted_rank)| {
+            let grant = if has_grant { Some(granted_rank) } else { None };
+            (id, CompilationFacts { id, level_rank, is_code, grant })
+        })
+        .collect())
+}
+
+/// Gate for ONE conflict (suggest / resolve, both kinds): the caller must be the
+/// owner AND pass `conflict_visible` for the conflict's compilation. Fails as
+/// NotFound so a caller outside the rule cannot even learn the row exists.
+pub(crate) async fn conflict_access(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+    owner: Uuid,
+    compilation_id: Option<Uuid>,
+) -> Result<()> {
+    if owner != claims.sub { return Err(AppError::NotFound); }
+    let viewer = ConflictViewer::load(db, claims).await;
+    let ok = match compilation_id {
+        None => conflict_visible(&viewer, None),
+        Some(cid) => {
+            let facts = load_compilation_facts(db, claims).await?;
+            facts.get(&cid).is_some_and(|f| conflict_visible(&viewer, Some(f)))
+        }
+    };
+    if ok { Ok(()) } else { Err(AppError::NotFound) }
+}
+
 // ─── Classification conflict handlers ─────────────────────────────────────────
 
 /// GET /api/classification/conflicts
-/// List OPEN conflicts across the caller's compilations — a unified surface:
+/// List OPEN conflicts across the compilations the caller may see (see
+/// "Conflict visibility" above) — a unified surface:
 ///   kind = "classification" — one element carries two different classification
 ///          labels (the pre-P3 rows; response shape unchanged, plus `kind`).
 ///   kind = "fact"           — P3: two sources assert DIFFERENT values for a
@@ -401,6 +523,17 @@ async fn list_conflicts(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
+    let viewer = ConflictViewer::load(&state.db, &claims).await;
+    let facts = load_compilation_facts(&state.db, &claims).await?;
+    let visible = |cid: Option<Uuid>| match cid {
+        None => conflict_visible(&viewer, None),
+        Some(id) => facts.get(&id).is_some_and(|f| conflict_visible(&viewer, Some(f))),
+    };
+    // Owner-scoped in SQL, visibility in Rust (one rule, one function); the
+    // window is wide enough that filtering rarely empties a page, and each
+    // kind is still capped at 200 rows for the UI.
+    const PAGE: usize = 200;
+
     let rows = sqlx::query_as::<_, (
         Uuid, Option<Uuid>, String, String, Value, Option<Value>, String,
         chrono::DateTime<chrono::Utc>,
@@ -410,23 +543,25 @@ async fn list_conflicts(
          FROM classification_conflicts cc
          JOIN compilations c ON c.id = cc.compilation_id
          WHERE c.user_id = $1 AND cc.status = 'open'
-         ORDER BY cc.created_at DESC LIMIT 200",
+         ORDER BY cc.created_at DESC LIMIT 1000",
     )
     .bind(claims.sub)
     .fetch_all(&state.db)
     .await?;
 
-    let mut conflicts: Vec<Value> = rows.into_iter().map(
-        |(id, cid, kind, key, labels, suggestion, status, created)| json!({
+    let mut conflicts: Vec<Value> = rows.into_iter()
+        .filter(|r| visible(r.1))
+        .take(PAGE)
+        .map(|(id, cid, kind, key, labels, suggestion, status, created)| json!({
             "id": id, "kind": "classification",
             "compilationId": cid, "elementKind": kind, "elementKey": key,
             "labels": labels, "suggestion": suggestion, "status": status, "createdAt": created,
-        })
-    ).collect();
+        }))
+        .collect();
 
-    // P3 — fact conflicts (owner-scoped directly by user_id; compilation_id is
-    // NULL for write-time detections, so no compilations join here).
-    let fact_rows = sqlx::query_as::<_, (
+    // P3 — fact conflicts (owner-scoped by user_id; compilation_id is NULL for
+    // write-time detections — those rows are for a full owner session only).
+    let fact_rows_all = sqlx::query_as::<_, (
         Uuid, Option<Uuid>, String, String, String, String, Value, Option<String>,
         String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>,
     )>(
@@ -434,11 +569,12 @@ async fn list_conflicts(
                 tails, authority_winner, status, first_detected_at, last_evaluated_at
          FROM fact_conflicts
          WHERE user_id = $1 AND status = 'open'
-         ORDER BY first_detected_at DESC LIMIT 200",
+         ORDER BY first_detected_at DESC LIMIT 1000",
     )
     .bind(claims.sub)
     .fetch_all(&state.db)
     .await?;
+    let fact_rows: Vec<_> = fact_rows_all.into_iter().filter(|r| visible(r.1)).take(PAGE).collect();
 
     // Enrich tails with a READABLE source-document name. Each tail carries a
     // `sourceDoc` = source_documents.id; the raw card only showed a truncated uuid
@@ -501,15 +637,17 @@ async fn suggest_conflict(
 ) -> Result<Json<Value>> {
     require_editor_or_admin(&state.db, claims.sub).await?;
 
-    let row = sqlx::query_as::<_, (String, Value)>(
-        "SELECT cc.element_key, cc.labels FROM classification_conflicts cc
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, Value)>(
+        "SELECT c.user_id, cc.compilation_id, cc.element_key, cc.labels
+         FROM classification_conflicts cc
          JOIN compilations c ON c.id = cc.compilation_id
-         WHERE cc.id = $1 AND c.user_id = $2",
+         WHERE cc.id = $1",
     )
-    .bind(id).bind(claims.sub)
+    .bind(id)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
-    let (element_key, labels) = row;
+    let (owner, comp_id, element_key, labels) = row;
+    conflict_access(&state.db, &claims, owner, comp_id).await?;
 
     // Readable element name: node key = "name_type_cid", edge key = "head|rel|tail|cid".
     let name = element_key.split(['_', '|']).next().unwrap_or(&element_key).to_string();
@@ -541,16 +679,17 @@ async fn resolve_conflict(
 ) -> Result<Json<Value>> {
     require_admin(&state.db, claims.sub).await?;
 
-    let row = sqlx::query_as::<_, (Option<Uuid>, String, String)>(
-        "SELECT cc.compilation_id, cc.element_kind, cc.element_key
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String)>(
+        "SELECT c.user_id, cc.compilation_id, cc.element_kind, cc.element_key
          FROM classification_conflicts cc
          JOIN compilations c ON c.id = cc.compilation_id
-         WHERE cc.id = $1 AND c.user_id = $2",
+         WHERE cc.id = $1",
     )
-    .bind(id).bind(claims.sub)
+    .bind(id)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
-    let (comp_id, kind, key) = row;
+    let (owner, comp_id, kind, key) = row;
+    conflict_access(&state.db, &claims, owner, comp_id).await?;
 
     let status = match req.action.as_str() {
         "keep" => "resolved",
@@ -646,5 +785,91 @@ async fn require_admin(db: &sqlx::PgPool, user_id: Uuid) -> Result<()> {
     match role.as_deref() {
         Some("admin") => Ok(()),
         _ => Err(AppError::Forbidden("admin role required".into())),
+    }
+}
+
+// ─── Conflict visibility — pure rule tests ───────────────────────────────────
+
+#[cfg(test)]
+mod conflict_visibility_tests {
+    use super::{conflict_visible, CompilationFacts, ConflictViewer};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    fn viewer(rank: i32, capped: bool) -> ConflictViewer {
+        ConflictViewer { rank, capped, code_access: true, scope: None }
+    }
+    fn comp(level_rank: Option<i32>) -> CompilationFacts {
+        CompilationFacts { id: Uuid::new_v4(), level_rank, is_code: false, grant: None }
+    }
+
+    #[test]
+    fn full_owner_session_sees_everything_including_untied_conflicts() {
+        let v = viewer(100, false);
+        assert!(conflict_visible(&v, None), "NULL-compilation fact conflict");
+        assert!(conflict_visible(&v, Some(&comp(None))), "unclassified graph");
+        assert!(conflict_visible(&v, Some(&comp(Some(100)))), "graph at own rank");
+    }
+
+    #[test]
+    fn classified_graph_above_clearance_is_hidden() {
+        let v = viewer(10, true);
+        assert!(conflict_visible(&v, Some(&comp(Some(10)))));
+        assert!(!conflict_visible(&v, Some(&comp(Some(11)))));
+    }
+
+    #[test]
+    fn capped_token_never_sees_unclassified_or_untied_conflicts() {
+        let v = viewer(50, true);
+        assert!(!conflict_visible(&v, Some(&comp(None))), "owner-default content stays hidden");
+        assert!(!conflict_visible(&v, None), "cannot prove the token may see it");
+    }
+
+    #[test]
+    fn a_grant_raises_access_for_that_graph_only() {
+        let v = viewer(0, true);
+        let mut full = comp(Some(80));
+        full.grant = Some(None);
+        assert!(conflict_visible(&v, Some(&full)), "full grant opens a confidential graph");
+
+        let mut partial = comp(Some(80));
+        partial.grant = Some(Some(50));
+        assert!(!conflict_visible(&v, Some(&partial)), "granted_rank below the level");
+        partial.grant = Some(Some(80));
+        assert!(conflict_visible(&v, Some(&partial)), "granted_rank reaches the level");
+
+        let mut unclassified = comp(None);
+        unclassified.grant = Some(Some(1));
+        assert!(conflict_visible(&v, Some(&unclassified)), "any grant reaches an unclassified graph");
+
+        assert!(!conflict_visible(&v, Some(&comp(Some(80)))), "no grant, no access");
+        assert!(!conflict_visible(&v, None), "a grant never reaches an untied conflict");
+    }
+
+    #[test]
+    fn kb_scoped_token_sees_only_its_set() {
+        let inside = comp(None);
+        let outside = comp(None);
+        let mut v = viewer(100, false);
+        v.scope = Some(HashSet::from([inside.id]));
+        assert!(conflict_visible(&v, Some(&inside)));
+        assert!(!conflict_visible(&v, Some(&outside)));
+        assert!(!conflict_visible(&v, None), "scoped token: untied conflicts hidden");
+        v.scope = Some(HashSet::new());
+        assert!(!conflict_visible(&v, Some(&inside)), "empty scope sees nothing");
+    }
+
+    #[test]
+    fn codebase_access_off_hides_code_graphs_and_untied_conflicts() {
+        let mut v = viewer(100, false);
+        v.code_access = false;
+        let mut code = comp(None);
+        code.is_code = true;
+        assert!(!conflict_visible(&v, Some(&code)));
+        assert!(conflict_visible(&v, Some(&comp(None))), "non-code graph unaffected");
+        assert!(!conflict_visible(&v, None));
+        // Even a full grant does not override the capability.
+        code.grant = Some(None);
+        assert!(!conflict_visible(&v, Some(&code)));
     }
 }
