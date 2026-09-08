@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>Enterprise Software Moving Away from SaaS: The Shift Explained</title>
+      <link>https://gctrl.tech/blog/the-enterprise-shift-why-companies-are-leaving-saas</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/the-enterprise-shift-why-companies-are-leaving-saas</guid>
+      <description>Explore why enterprise software moving away from saas is driven by AI agents, seat-based pricing failures, and a shift toward private cloud deployments.</description>
+      <pubDate>Tue, 08 Sep 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>How to Fill Time Gaps Irregular Timestamps Pandas Guide</title>
       <link>https://gctrl.tech/blog/how-to-fill-gaps-in-irregular-time-series-data</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/how-to-fill-gaps-in-irregular-time-series-data</guid>
