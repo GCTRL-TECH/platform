@@ -876,20 +876,41 @@ async fn recover_stale_jobs(state: &AppState) {
     .bind(five_min_ago)
     .execute(&state.db).await;
 
-    // Jobs in 'pending' for >10 min: queue not draining, mark failed so the user sees something.
+    // Jobs in 'pending' for >10 min while the queue is NOT draining: mark failed so
+    // the user sees something.
     // - keyed on updated_at (not created_at): a RESUMED/re-pushed job bumps
     //   updated_at and gets a fresh 10-minute window — the old created_at key
     //   made any retried/held job older than 10 minutes instantly "stalled".
     // - license-held jobs (error='license_hold') are exempt: they wait, visibly,
     //   for the resume watcher — a hold may legitimately outlive any timeout and
     //   customer data must never be failed because of a license state.
+    // - "stalled" means the WORKER is not making progress, not that a job has
+    //   been waiting. A folder import enqueues dozens of documents at once and
+    //   the single KEX worker takes 30-120 s each, so the tail of the queue
+    //   legitimately waits far longer than 10 minutes (Asgard, 2026-09-08: 69
+    //   jobs, 43 of them — every image — marked "Queue stalled" at minute ten
+    //   while the worker was busy completing them; the worker then flipped them
+    //   back to completed one by one, and the UI had already shown failures).
+    //   While any job was picked up or finished within the window the queue is
+    //   alive and pending rows keep waiting. A job pending for more than
+    //   STALL_HARD_LIMIT hours is failed regardless (lost from Redis).
     let ten_min_ago = now - chrono::Duration::minutes(10);
+    let hard_limit = now - chrono::Duration::hours(6);
     let _ = sqlx::query(
         "UPDATE jobs SET status='failed', error='Queue stalled (>10min pending)', completed_at=NOW(), updated_at=NOW()
          WHERE status='pending' AND COALESCE(updated_at, created_at) < $1
-           AND (error IS NULL OR error <> 'license_hold')"
+           AND (error IS NULL OR error <> 'license_hold')
+           AND (
+                COALESCE(updated_at, created_at) < $2
+                OR NOT EXISTS (
+                    SELECT 1 FROM jobs w
+                     WHERE w.status IN ('processing', 'completed')
+                       AND COALESCE(w.updated_at, w.completed_at, w.created_at) >= $1
+                )
+           )"
     )
     .bind(ten_min_ago)
+    .bind(hard_limit)
     .execute(&state.db).await;
 }
 
