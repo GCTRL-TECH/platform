@@ -35,6 +35,7 @@ import { useAuth } from '@/hooks/useAuth'
 import { useUiMode } from '@/hooks/useUiMode'
 import { ExtractionsTable } from './components/ExtractionsTable'
 import { KexEngineBanner } from './components/KexEngineBanner'
+import { ConflictsPanel } from '@/components/conflicts/ConflictsPanel'
 import LocalFolderManager from '@/components/connectors/LocalFolderManager'
 import {
   listLocalVaults,
@@ -66,7 +67,7 @@ interface OntologyOption {
 
 interface OntologiesResponse { ontologies: OntologyOption[] }
 
-type Tab = 'sources' | 'upload' | 'text' | 'url'
+type Tab = 'sources' | 'upload' | 'text' | 'url' | 'conflicts'
 
 // Popular document formats KEX now supports. Keep this list in sync with the
 // `accept` string used by plain <input type="file"> pickers and the helper text.
@@ -559,11 +560,20 @@ export function KexPage() {
     (activeTab === 'sources' && selectedProvider === 'obsidian' && obsidianSelected.size > 0) ||
     (activeTab === 'sources' && selectedProvider !== 'obsidian' && (driveSelected.size > 0 || (selectedProvider === 'google' && currentDriveFolderId !== 'root') || (selectedProvider === 'webcrawler' && !!url.trim())))
 
-  const tabs: { id: Tab; label: string; icon: LucideIcon }[] = [
+  // Open knowledge conflicts (two sources disagree on a fact, or a merge yields
+  // two classifications). They are an ingestion concern - each new source can
+  // create them - so they are reconciled right here, with a live count on the tab.
+  const { data: conflictsData } = useApiQuery<{ conflicts: unknown[] }>(
+    ['classification', 'conflicts'], '/classification/conflicts',
+  )
+  const conflictCount = conflictsData?.conflicts?.length ?? 0
+
+  const tabs: { id: Tab; label: string; icon: LucideIcon; badge?: number }[] = [
     { id: 'sources' as Tab, label: 'Sources', icon: Plug },
     { id: 'upload', label: 'Upload File', icon: Upload },
     { id: 'text', label: 'Paste Text', icon: FileText },
     { id: 'url', label: 'Enter URL', icon: LinkIcon },
+    { id: 'conflicts', label: 'Conflicts', icon: AlertCircle, badge: conflictCount },
   ]
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -600,10 +610,18 @@ export function KexPage() {
               >
                 <Icon size={13} />
                 {tab.label}
+                {tab.badge !== undefined && tab.badge > 0 && (
+                  <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-amber-400">
+                    {tab.badge}
+                  </span>
+                )}
               </button>
             )
           })}
         </div>
+
+        {/* ── Tab: Conflicts (reconcile, no extraction controls) ── */}
+        {activeTab === 'conflicts' && <ConflictsPanel />}
 
         {/* ── Tab: Upload ──────────────────────────────── */}
         {activeTab === 'upload' && (
@@ -942,14 +960,14 @@ export function KexPage() {
         )}
 
         {/* ── Extraction Options (Expert only — easy mode uses server defaults) ── */}
-        {!isExpert && (
+        {activeTab !== 'conflicts' && !isExpert && (
           <div className="mt-4 border-t border-slate-800 pt-3">
             <p className="text-[11px] text-slate-500">
               Everything you add is merged into your knowledge base automatically.
             </p>
           </div>
         )}
-        {isExpert && (
+        {activeTab !== 'conflicts' && isExpert && (
         <div className="mt-4 border-t border-slate-800 pt-3">
           <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Extraction Options</p>
           <div className="space-y-2">
@@ -1082,6 +1100,7 @@ export function KexPage() {
         )}
 
         {/* Submit button (contextual) */}
+        {activeTab !== 'conflicts' && (
         <div className="mt-3 flex justify-end">
           <button onClick={handleSubmit} disabled={!canSubmit || isSubmitting} className="btn-primary">
             {isSubmitting ? (
@@ -1091,6 +1110,7 @@ export function KexPage() {
             )}
           </button>
         </div>
+        )}
       </div>
 
       {/* Extractions table (with batches, infinite scroll, search, threads) */}

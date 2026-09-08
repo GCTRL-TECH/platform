@@ -31,6 +31,7 @@ import { NodeDetailDossier } from '@/components/graph-explorer/NodeDetailDossier
 import { WorkspaceCanvas } from './WorkspaceCanvas'
 import { EmbedShareDialog } from './EmbedShareDialog'
 import { PrivacyDialog, type PrivacyMode } from './PrivacyDialog'
+import { HeaderCorner } from '@/components/layout/HeaderCorner'
 
 interface CompilationSummary {
   id: string
@@ -221,6 +222,8 @@ export function GraphWorkspace() {
           )}
         </span>
         <div className="ml-auto flex items-center gap-1">
+          {/* Version + Report bug: this page hides the AppShell header */}
+          <HeaderCorner className="mr-1 border-r border-slate-800 pr-2" />
           {current && (
             <button onClick={() => setPrivacyOpen(true)} className="btn-ghost text-slate-500 hover:text-slate-300" title="Private Memory — control what cloud models see">
               <ShieldCheck size={16} />
