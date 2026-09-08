@@ -549,13 +549,21 @@ async fn list_conflicts(
     .fetch_all(&state.db)
     .await?;
 
-    let mut conflicts: Vec<Value> = rows.into_iter()
-        .filter(|r| visible(r.1))
-        .take(PAGE)
-        .map(|(id, cid, kind, key, labels, suggestion, status, created)| json!({
+    // Decision memory (migration 086): each conflict carries `history` — the
+    // majority decision for its signature with counters, or null when unseen —
+    // so the queue can show "decided this way 4 of 5 times" without a suggest
+    // round-trip. This is the fact path's only suggestion surface.
+    use crate::services::conflict_memory as memory;
+    let rows: Vec<_> = rows.into_iter().filter(|r| visible(r.1)).take(PAGE).collect();
+    let sigs: Vec<String> = rows.iter().map(|r| memory::classification_signature(&r.2, &r.4)).collect();
+    let class_verdicts = memory::verdicts(&state.db, "classification", &sigs).await;
+
+    let mut conflicts: Vec<Value> = rows.into_iter().zip(sigs)
+        .map(|((id, cid, kind, key, labels, suggestion, status, created), sig)| json!({
             "id": id, "kind": "classification",
             "compilationId": cid, "elementKind": kind, "elementKey": key,
             "labels": labels, "suggestion": suggestion, "status": status, "createdAt": created,
+            "history": memory::verdict_json(class_verdicts.get(&sig)),
         }))
         .collect();
 
@@ -602,9 +610,12 @@ async fn list_conflicts(
         .collect()
     };
 
-    conflicts.extend(fact_rows.into_iter().map(
-        |(id, cid, relation, key_uri, key_name, key_side, mut tails, winner,
-          status, first_detected, last_evaluated)| {
+    let fact_sigs: Vec<String> = fact_rows.iter().map(|r| memory::fact_signature(&r.2, &r.5)).collect();
+    let fact_verdicts = memory::verdicts(&state.db, "fact", &fact_sigs).await;
+
+    conflicts.extend(fact_rows.into_iter().zip(fact_sigs).map(
+        |((id, cid, relation, key_uri, key_name, key_side, mut tails, winner,
+          status, first_detected, last_evaluated), sig)| {
             if let Some(arr) = tails.as_array_mut() {
                 for t in arr.iter_mut() {
                     let name = t.get("sourceDoc").and_then(|v| v.as_str())
@@ -621,6 +632,7 @@ async fn list_conflicts(
                 "keyUri": key_uri, "keyName": key_name, "keySide": key_side,
                 "tails": tails, "authorityWinner": winner, "status": status,
                 "createdAt": first_detected, "lastEvaluatedAt": last_evaluated,
+                "history": memory::verdict_json(fact_verdicts.get(&sig)),
             })
         }
     ));
@@ -629,7 +641,12 @@ async fn list_conflicts(
 }
 
 /// POST /api/classification/conflicts/:id/suggest
-/// Run the resolver (Ollama semantic check) and store a suggested resolution.
+/// Store and return a suggested resolution. The decision memory (migration
+/// 086) is consulted first: when earlier conflicts with the same signature
+/// were decided one way by a strict majority, that decision is the suggestion
+/// (`source: "history"`, with `support` = decisions seen and `confidence` =
+/// majority share); otherwise the resolver (LLM semantic check) answers
+/// (`source: "llm"`, `confidence: null`).
 async fn suggest_conflict(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -637,8 +654,8 @@ async fn suggest_conflict(
 ) -> Result<Json<Value>> {
     require_editor_or_admin(&state.db, claims.sub).await?;
 
-    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, Value)>(
-        "SELECT c.user_id, cc.compilation_id, cc.element_key, cc.labels
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String, Value)>(
+        "SELECT c.user_id, cc.compilation_id, cc.element_kind, cc.element_key, cc.labels
          FROM classification_conflicts cc
          JOIN compilations c ON c.id = cc.compilation_id
          WHERE cc.id = $1",
@@ -646,18 +663,53 @@ async fn suggest_conflict(
     .bind(id)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
-    let (owner, comp_id, element_key, labels) = row;
+    let (owner, comp_id, element_kind, element_key, labels) = row;
     conflict_access(&state.db, &claims, owner, comp_id).await?;
 
-    // Readable element name: node key = "name_type_cid", edge key = "head|rel|tail|cid".
-    let name = element_key.split(['_', '|']).next().unwrap_or(&element_key).to_string();
-    let suggestion = crate::services::classify_resolver::suggest_resolution(&name, &labels).await;
-    let sjson = suggestion.to_json();
+    use crate::services::conflict_memory as memory;
+    let signature = memory::classification_signature(&element_kind, &labels);
+    let verdict = memory::verdicts(&state.db, "classification", std::slice::from_ref(&signature))
+        .await
+        .remove(&signature);
+
+    let (mut sjson, source, support, confidence) = match verdict.as_ref() {
+        Some(v) if v.has_majority() && memory::is_generalizable(&v.chosen) => {
+            let (action, rank) = match v.chosen.as_str() {
+                "keep" => ("keep", None),
+                "dismiss" => ("dismiss", None),
+                c => ("remove_label", memory::remove_label_rank(c)),
+            };
+            let s = json!({
+                "action": action,
+                "rank": rank,
+                "rationale": format!(
+                    "Decision memory: {} of {} conflicts with the same labels were resolved this way.",
+                    v.votes, v.support
+                ),
+                "matchScore": Value::Null,
+            });
+            (s, "history", v.support, Some(v.confidence))
+        }
+        _ => {
+            // Readable element name: node key = "name_type_cid", edge key = "head|rel|tail|cid".
+            let name = element_key.split(['_', '|']).next().unwrap_or(&element_key).to_string();
+            let s = crate::services::classify_resolver::suggest_resolution(&name, &labels).await.to_json();
+            (s, "llm", verdict.as_ref().map(|v| v.support).unwrap_or(0), None)
+        }
+    };
+    if let Some(obj) = sjson.as_object_mut() {
+        obj.insert("source".into(), json!(source));
+    }
 
     sqlx::query("UPDATE classification_conflicts SET suggestion = $1 WHERE id = $2")
         .bind(&sjson).bind(id).execute(&state.db).await?;
 
-    Ok(Json(json!({ "suggestion": sjson })))
+    Ok(Json(json!({
+        "suggestion": sjson,
+        "source": source,
+        "support": support,
+        "confidence": confidence,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -679,8 +731,8 @@ async fn resolve_conflict(
 ) -> Result<Json<Value>> {
     require_admin(&state.db, claims.sub).await?;
 
-    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String)>(
-        "SELECT c.user_id, cc.compilation_id, cc.element_kind, cc.element_key
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String, Value)>(
+        "SELECT c.user_id, cc.compilation_id, cc.element_kind, cc.element_key, cc.labels
          FROM classification_conflicts cc
          JOIN compilations c ON c.id = cc.compilation_id
          WHERE cc.id = $1",
@@ -688,7 +740,7 @@ async fn resolve_conflict(
     .bind(id)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
-    let (owner, comp_id, kind, key) = row;
+    let (owner, comp_id, kind, key, labels) = row;
     conflict_access(&state.db, &claims, owner, comp_id).await?;
 
     let status = match req.action.as_str() {
@@ -706,13 +758,27 @@ async fn resolve_conflict(
         "UPDATE classification_conflicts SET status = $1, resolved_by = $2, resolved_at = NOW() WHERE id = $3"
     ).bind(status).bind(claims.sub).bind(id).execute(&state.db).await?;
 
+    // Learning loop (migration 086): remember how this label combination was
+    // decided, so the next conflict with the same signature gets it suggested
+    // (and, once decided often enough, resolved automatically).
+    use crate::services::conflict_memory as memory;
+    if let Some(chosen) = memory::classification_choice(&req.action, req.rank) {
+        let signature = memory::classification_signature(&kind, &labels);
+        let level_names: Vec<String> = labels.as_array()
+            .map(|a| a.iter().filter_map(|l| l.get("level_name").and_then(|v| v.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        let features = json!({ "elementKind": kind, "levels": level_names, "rank": req.rank });
+        memory::record(&state.db, "classification", &signature, &chosen, features, claims.sub, comp_id).await;
+    }
+
     Ok(Json(json!({ "ok": true, "status": status })))
 }
 
 /// Drop the label of `rank` from a Neo4j node/edge, then recompute `_min_rank`
-/// and `_class_conflict` from the remaining parallel label lists.
-async fn remove_element_label(
-    state: &Arc<crate::models::AppState>,
+/// and `_class_conflict` from the remaining parallel label lists. Shared with
+/// the decision memory's auto-resolution (services/conflict_memory.rs).
+pub(crate) async fn remove_element_label(
+    state: &crate::models::AppState,
     kind: &str,
     key: &str,
     comp_id: Option<Uuid>,

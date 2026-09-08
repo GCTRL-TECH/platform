@@ -3469,7 +3469,7 @@ fn neo4j_rel_type(relation: &str) -> String {
 }
 
 /// Pure: the distinct competing values in a conflict's `tails` JSONB.
-fn conflict_tail_values(tails: &Value) -> Vec<String> {
+pub(crate) fn conflict_tail_values(tails: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(arr) = tails.as_array() {
         for t in arr {
@@ -3587,6 +3587,19 @@ async fn resolve_fact_conflict(
     )
     .map_err(AppError::BadRequest)?;
 
+    // Learning loop (migration 086): remember HOW this kind of conflict was
+    // decided — the signature is relation + key side, the choice its reason
+    // (dismiss / authority winner / most confident / arbitrary pick).
+    let signature = crate::services::conflict_memory::fact_signature(&relation, &key_side);
+    let chosen = crate::services::conflict_memory::fact_choice(
+        decision.as_deref(), winner_col.as_deref(), &tails,
+    );
+    let features = json!({
+        "relation": relation, "keySide": key_side,
+        "tailCount": tail_values.len(),
+        "hadAuthorityWinner": winner_col.as_deref().is_some_and(|w| !w.trim().is_empty()),
+    });
+
     let Some(winner) = decision else {
         sqlx::query(
             "UPDATE fact_conflicts SET status = 'dismissed', last_evaluated_at = now()
@@ -3597,22 +3610,63 @@ async fn resolve_fact_conflict(
         .await?;
         crate::services::audit::log_access(&state.db, &claims, "kg.dismiss_fact_conflict",
             "fact_conflict", &id.to_string(), 0, None, true, None).await;
+        crate::services::conflict_memory::record(
+            &state.db, "fact", &signature, &chosen, features, claims.sub, comp_id,
+        ).await;
         return Ok(Json(json!({ "ok": true, "status": "dismissed" })));
     };
 
-    let rel_type = neo4j_rel_type(&relation);
-    let owner_str = owner.to_string();
     let reason = req.reason.clone().unwrap_or_else(|| {
         format!("fact-conflict resolution: '{winner}' accepted as current for {relation}({key_name})")
     });
+    let (deleted_edges, first_correction) = apply_fact_resolution(
+        &state, id, owner, comp_id, &relation, &key_name, &key_side,
+        &tail_values, &winner, &reason, "resolved",
+    ).await?;
+
+    crate::services::audit::log_access(&state.db, &claims, "kg.resolve_fact_conflict",
+        "fact_conflict", &id.to_string(), 0, None, true, None).await;
+    crate::services::conflict_memory::record(
+        &state.db, "fact", &signature, &chosen, features, claims.sub, comp_id,
+    ).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "status": "resolved",
+        "winner": winner,
+        "deletedEdges": deleted_edges,
+        "remembered": first_correction.is_some(),
+    })))
+}
+
+/// Apply a fact resolution: delete the losing edges (source AND merged graphs),
+/// block them in knowledge_corrections, stamp the winner current and close the
+/// row with `final_status` ('resolved' by a human, 'auto_resolved' by the
+/// decision memory — services/conflict_memory.rs). Returns
+/// (deleted edge count, first knowledge_corrections id).
+pub(crate) async fn apply_fact_resolution(
+    state: &crate::models::AppState,
+    conflict_id: Uuid,
+    owner: Uuid,
+    comp_id: Option<Uuid>,
+    relation: &str,
+    key_name: &str,
+    key_side: &str,
+    tail_values: &[String],
+    winner: &str,
+    reason: &str,
+    final_status: &str,
+) -> Result<(i64, Option<Uuid>)> {
+    let rel_type = neo4j_rel_type(relation);
+    let owner_str = owner.to_string();
 
     // 1+2. Delete each LOSING edge from Neo4j (owner-scoped, matches source AND
     // merged nodes by name) and remember it in knowledge_corrections so
     // re-extraction is blocked. Same delete shape as delete_relationship_core.
     let mut deleted_edges: i64 = 0;
     let mut first_correction: Option<Uuid> = None;
-    for value in tail_values.iter().filter(|v| *v != &winner) {
-        let (head, tail) = conflict_edge_names(&key_side, &key_name, value);
+    for value in tail_values.iter().filter(|v| v.as_str() != winner) {
+        let (head, tail) = conflict_edge_names(key_side, key_name, value);
         let cypher =
             "MATCH (a {name: $head})-[r]->(b {name: $tail}) \
              WHERE type(r) = $rel AND a._owner = $uid \
@@ -3643,9 +3697,9 @@ async fn resolve_fact_conflict(
         .bind(owner)
         .bind(comp_id)
         .bind(&head)
-        .bind(&relation)
+        .bind(relation)
         .bind(&tail)
-        .bind(&reason)
+        .bind(reason)
         .fetch_optional(&state.db)
         .await?;
         if first_correction.is_none() {
@@ -3654,7 +3708,7 @@ async fn resolve_fact_conflict(
     }
 
     // 3. Stamp the winner edge current (and clear any stale superseded marker).
-    let (whead, wtail) = conflict_edge_names(&key_side, &key_name, &winner);
+    let (whead, wtail) = conflict_edge_names(key_side, key_name, winner);
     let _ = state.neo.run(
         neo_query(
             "MATCH (a {name: $head})-[r]->(b {name: $tail}) \
@@ -3670,26 +3724,18 @@ async fn resolve_fact_conflict(
     // 4. Close the conflict row.
     sqlx::query(
         "UPDATE fact_conflicts
-         SET status = 'resolved', authority_winner = $1,
+         SET status = $4, authority_winner = $1,
              resolved_correction_id = $2, last_evaluated_at = now()
          WHERE id = $3",
     )
-    .bind(&winner)
+    .bind(winner)
     .bind(first_correction)
-    .bind(id)
+    .bind(conflict_id)
+    .bind(final_status)
     .execute(&state.db)
     .await?;
 
-    crate::services::audit::log_access(&state.db, &claims, "kg.resolve_fact_conflict",
-        "fact_conflict", &id.to_string(), 0, None, true, None).await;
-
-    Ok(Json(json!({
-        "ok": true,
-        "status": "resolved",
-        "winner": winner,
-        "deletedEdges": deleted_edges,
-        "remembered": first_correction.is_some(),
-    })))
+    Ok((deleted_edges, first_correction))
 }
 
 // ── Data lineage endpoints ────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod classify_resolver;
+pub mod conflict_memory;
 pub mod cron;
 pub mod crypto;
 pub mod hebb;
