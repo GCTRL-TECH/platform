@@ -13,7 +13,7 @@ import ClassificationPage from '@/pages/admin/ClassificationPage'
 
 // ─── Shared types ──────────────────────────────────────────────────────────────
 
-interface Grant { compilationId: string; compilationName: string; grantedRank: number | null }
+interface Grant { compilationId: string; compilationName: string; grantedRank: number | null; readOnly?: boolean }
 interface ApiKey {
   id: string
   name: string
@@ -383,6 +383,7 @@ function TokensSection() {
                       {k.grants.map((g) => (
                         <span key={g.compilationId} className="inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300">
                           {g.compilationName}
+                          {g.readOnly && <span className="rounded bg-slate-700/70 px-1 text-[9px] uppercase tracking-wide text-slate-300" title="Read-only grant: this key can read but not write this graph">ro</span>}
                           <button onClick={() => void toggleGrant(k.id, g.compilationId, true)} className="hover:text-red-300"><X size={9} /></button>
                         </span>
                       ))}

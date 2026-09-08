@@ -86,6 +86,11 @@ fn clearance_name(rank: i32) -> &'static str {
 struct GrantInput {
     #[serde(rename = "compilationId")] compilation_id: Uuid,
     #[serde(rename = "grantedRank")]  granted_rank: Option<i32>,
+    /// Migration 088 — per-grant read-only bit. `true`: the key may read this
+    /// compilation but every mutation targeting it is refused, even though the key
+    /// itself is read-write. Default false keeps the previous "a grant is read-write"
+    /// meaning for every existing client.
+    #[serde(rename = "readOnly", default)] read_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -125,14 +130,14 @@ async fn grants_for_keys(
 ) -> std::collections::HashMap<Uuid, Vec<Value>> {
     let mut map: std::collections::HashMap<Uuid, Vec<Value>> = std::collections::HashMap::new();
     if key_ids.is_empty() { return map; }
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<i32>)>(
-        "SELECT g.api_key_id, g.compilation_id, c.name, g.granted_rank
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<i32>, bool)>(
+        "SELECT g.api_key_id, g.compilation_id, c.name, g.granted_rank, g.read_only
          FROM api_key_grants g JOIN compilations c ON c.id = g.compilation_id
          WHERE g.api_key_id = ANY($1) ORDER BY c.name"
     ).bind(key_ids).fetch_all(db).await.unwrap_or_default();
-    for (kid, cid, name, rank) in rows {
+    for (kid, cid, name, rank, read_only) in rows {
         map.entry(kid).or_default().push(json!({
-            "compilationId": cid, "compilationName": name, "grantedRank": rank,
+            "compilationId": cid, "compilationName": name, "grantedRank": rank, "readOnly": read_only,
         }));
     }
     map
@@ -304,9 +309,9 @@ async fn create_key(
         ).bind(g.compilation_id).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(false);
         if !owns { continue; }
         let _ = sqlx::query(
-            "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank)
-             VALUES ($1, $2, $3) ON CONFLICT (api_key_id, compilation_id) DO NOTHING"
-        ).bind(id).bind(g.compilation_id).bind(g.granted_rank).execute(&state.db).await;
+            "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank, read_only)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (api_key_id, compilation_id) DO NOTHING"
+        ).bind(id).bind(g.compilation_id).bind(g.granted_rank).bind(g.read_only).execute(&state.db).await;
     }
 
     Ok(Json(json!({
@@ -398,11 +403,14 @@ async fn add_grant(
     ).bind(g.compilation_id).bind(claims.sub).fetch_one(&state.db).await?;
     if !owns_comp { return Err(AppError::Forbidden("Not your compilation".into())); }
 
+    // Upsert: re-posting a grant is how a caller flips it between read-only and
+    // read-write (Anvil's personal-key reconcile does exactly that on a role change).
     sqlx::query(
-        "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (api_key_id, compilation_id) DO UPDATE SET granted_rank = EXCLUDED.granted_rank"
-    ).bind(id).bind(g.compilation_id).bind(g.granted_rank).execute(&state.db).await?;
+        "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank, read_only)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (api_key_id, compilation_id)
+         DO UPDATE SET granted_rank = EXCLUDED.granted_rank, read_only = EXCLUDED.read_only"
+    ).bind(id).bind(g.compilation_id).bind(g.granted_rank).bind(g.read_only).execute(&state.db).await?;
 
     Ok(Json(json!({ "ok": true })))
 }

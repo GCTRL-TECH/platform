@@ -137,10 +137,42 @@ pub(crate) async fn api_key_scoped_jobs(
     Some(jobs.into_iter().map(|j| j.to_string()).collect())
 }
 
+/// The compilations this request's API key holds a READ-ONLY grant on (migration
+/// 088, `api_key_grants.read_only`). Empty for JWT sessions and for keys without
+/// such grants. Independent of `kb_scoped`: a read-only grant is honoured on an
+/// unscoped key too, so a caller can never widen a grant by using a full key.
+pub(crate) async fn api_key_read_only_grants(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> std::collections::HashSet<Uuid> {
+    let Some(key_id) = claims.api_key_id else { return Default::default(); };
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT compilation_id FROM api_key_grants WHERE api_key_id = $1 AND read_only"
+    ).bind(key_id).fetch_all(db).await.unwrap_or_default();
+    rows.into_iter().map(|(c,)| c).collect()
+}
+
+/// The knowledge bases this request may WRITE into: `api_key_scope` minus the
+/// read-only grants. Same `None` = unrestricted / `Some(empty)` = nothing contract.
+/// Used where a write has to pick a DEFAULT target (job linking, create_extraction):
+/// a read-only grant must never become the silent default of a store.
+pub(crate) async fn api_key_write_scope(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> Option<std::collections::HashSet<Uuid>> {
+    let mut set = api_key_scope(db, claims).await?;
+    let ro = api_key_read_only_grants(db, claims).await;
+    if !ro.is_empty() { set.retain(|c| !ro.contains(c)); }
+    Some(set)
+}
+
+pub(crate) const READ_ONLY_GRANT_DENIED: &str =
+    "This access token has read-only access to that knowledge base";
+
 /// Write-scope guard: a KB-scoped token may only WRITE into a compilation in its
-/// grant set. JWT callers and unscoped tokens pass through (ownership is enforced
-/// at the SQL/tool layer as before). Returns Forbidden when a scoped token targets
-/// a compilation outside its assigned knowledge base(s).
+/// grant set, and (migration 088) no token may write into a compilation it holds
+/// a READ-ONLY grant on. JWT callers pass through (ownership is enforced at the
+/// SQL/tool layer as before). Returns Forbidden otherwise.
 pub(crate) async fn enforce_kb_write_scope(
     db: &sqlx::PgPool,
     claims: &JwtClaims,
@@ -152,6 +184,9 @@ pub(crate) async fn enforce_kb_write_scope(
                 "This access token is not scoped to that knowledge base".into(),
             ));
         }
+    }
+    if api_key_read_only_grants(db, claims).await.contains(&compilation_id) {
+        return Err(AppError::Forbidden(READ_ONLY_GRANT_DENIED.into()));
     }
     Ok(())
 }

@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: de84352 -->
 
+## v0.9.9 - Read-only grants on access tokens
+
+*8 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A token can now be granted a knowledge base for reading only.** Until now the read/write switch lived on the token as a whole: a colleague's personal, read-write token could not be given a shared knowledge base without also being able to write into it, so integrations such as Anvil minted a second, read-only token per room and member - and the shared room never appeared under the colleague's own token. Each grant carries its own `readOnly` flag (`POST /api/users/api-keys/:id/grants` with `readOnly: true`, also inside the `grants` list when a token is created; re-posting a grant flips it). A read-only grant keeps every read path unchanged - list, query, search, graph tools - and refuses every mutation that targets that knowledge base: `store`, `ingest_file`, node and relationship edits, chunk deletion and superseding, renaming, refreshing, deleting. A token whose grants are all read-only has no default knowledge base either, so `create_extraction` is refused instead of producing an orphaned extraction. Existing grants stay read-write; the token list and the Access Control page show the flag (`ro`).
+
 ## v0.9.8 - Corrections that stick
 
 *8 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

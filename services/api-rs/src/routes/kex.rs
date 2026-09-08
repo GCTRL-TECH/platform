@@ -134,13 +134,16 @@ pub(crate) async fn link_job_to_target_or_default(
     compilation_id: Option<Uuid>,
     job_id: Uuid,
 ) {
-    let scope = crate::routes::kg::api_key_scope(db, claims).await;
+    // WRITE scope (088): a read-only grant is neither a valid explicit target nor a
+    // candidate for the single-grant default — otherwise a viewer's key would link
+    // its extractions straight into the knowledge base it may only read.
+    let scope = crate::routes::kg::api_key_write_scope(db, claims).await;
     let target = match compilation_id {
         Some(cid) => {
             if let Some(set) = &scope {
                 if !set.contains(&cid) {
                     tracing::warn!(%job_id, %cid,
-                        "scoped token tried to link a job outside its granted knowledge bases — job left unlinked");
+                        "scoped token tried to link a job outside its WRITABLE knowledge bases — job left unlinked");
                     return;
                 }
             }
@@ -149,12 +152,12 @@ pub(crate) async fn link_job_to_target_or_default(
         None => match &scope {
             Some(set) if set.len() == 1 => {
                 let cid = set.iter().next().copied();
-                tracing::debug!(%job_id, ?cid, "scoped token: linking job to its single granted knowledge base");
+                tracing::debug!(%job_id, ?cid, "scoped token: linking job to its single writable knowledge base");
                 cid
             }
             Some(_) => {
                 tracing::debug!(%job_id,
-                    "scoped token without explicit compilationId and no single grant — job left unlinked");
+                    "scoped token without explicit compilationId and no single writable grant — job left unlinked");
                 None
             }
             None => resolve_default_compilation(db, claims.sub).await,
@@ -1316,6 +1319,25 @@ async fn ensure_chunk_mutable(
     claims: &JwtClaims,
     id: Uuid,
 ) -> Result<()> {
+    // 088 — read-only grants: a chunk belongs to the knowledge base(s) whose
+    // `compilation_id` or `source_job_ids` carry it; if this key may only READ one
+    // of them, the chunk is not its to delete or supersede. Same join shape as the
+    // code gate below, one query, only when the key holds read-only grants at all.
+    let ro = crate::routes::kg::api_key_read_only_grants(&state.db, claims).await;
+    if !ro.is_empty() {
+        let ro_ids: Vec<Uuid> = ro.into_iter().collect();
+        let in_ro: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM text_chunks tc JOIN compilations c
+                 ON c.user_id = tc.user_id AND c.id = ANY($3)
+                AND (c.id = tc.compilation_id
+                     OR tc.job_id = ANY(COALESCE(c.source_job_ids, '{}'::uuid[])))
+                WHERE tc.id = $1 AND tc.user_id = $2)"
+        ).bind(id).bind(claims.sub).bind(&ro_ids).fetch_one(&state.db).await.unwrap_or(false);
+        if in_ro {
+            return Err(AppError::Forbidden(crate::routes::kg::READ_ONLY_GRANT_DENIED.into()));
+        }
+    }
     if !claims.code_access {
         let is_code: bool = sqlx::query_scalar(
             "SELECT EXISTS (

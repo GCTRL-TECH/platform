@@ -1042,6 +1042,13 @@ async fn execute_tool_inner(
         "create_extraction" => {
             let text = args["text"].as_str().unwrap_or("");
             if text.trim().len() < 10 { return json!({ "error": "text too short (min 10 chars)" }); }
+            // 088 — this tool has no compilationId and lands in the caller's default
+            // knowledge base. A scoped key whose grants are ALL read-only has no such
+            // place; refuse before charging and enqueuing, instead of running an
+            // extraction that could only ever be orphaned.
+            if matches!(crate::routes::kg::api_key_write_scope(&state.db, claims).await, Some(ref s) if s.is_empty()) {
+                return json!({ "error": "this access token has no writable knowledge base — its grants are read-only" });
+            }
             let clf = args["classificationLevelId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
             // A token may not ingest content classified ABOVE its own clearance
             // ceiling — a colleague with INTERNAL clearance can't write CONFIDENTIAL.
