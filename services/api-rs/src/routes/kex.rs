@@ -1104,7 +1104,7 @@ async fn delete_job(
     // Best-effort Qdrant cleanup (after the authoritative PG deletes).
     let mut vectors_deleted = 0usize;
     if !point_ids.is_empty() {
-        let collection = std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "GCTRL_chunks".into());
+        let collection = qdrant_collection(&state).await;
         let url = format!(
             "{}/collections/{}/points/delete?wait=true",
             state.cfg.qdrant_url.trim_end_matches('/'),
@@ -1344,10 +1344,54 @@ pub(crate) fn chunk_point_id(qdrant_point_id: Option<String>, chunk_id: Uuid) ->
         .unwrap_or_else(|| chunk_id.to_string())
 }
 
+const QDRANT_DEFAULT_COLLECTION: &str = "GCTRL_chunks";
+
+/// Pick the collection the vectors actually live in. The env value wins when Qdrant has it;
+/// otherwise the one existing collection whose name matches case-insensitively (Qdrant names
+/// ARE case-sensitive — "gctrl_chunks" vs "GCTRL_chunks" are two collections, one of them
+/// empty); otherwise the default. Pure, so the decision is unit-tested.
+pub(crate) fn pick_qdrant_collection(env: Option<&str>, existing: &[String]) -> String {
+    let wanted = env.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(QDRANT_DEFAULT_COLLECTION);
+    if existing.iter().any(|c| c == wanted) { return wanted.to_string(); }
+    if let Some(c) = existing.iter().find(|c| c.eq_ignore_ascii_case(wanted)) { return c.clone(); }
+    wanted.to_string()
+}
+
+static QDRANT_COLLECTION_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The Qdrant collection that holds the chunk vectors, resolved once against the live server.
+///
+/// KEX owns the collection and reads QDRANT_COLLECTION from ITS container; the API used to
+/// guess the default whenever the variable was not set on its own container. On installs where
+/// KEX had been configured with "gctrl_chunks" every API-side vector delete (delete_chunk,
+/// supersede_chunk, delete_job) posted to a collection that does not exist and silently 404ed —
+/// the row was gone, the vector kept answering searches (Asgard, 2026-09-08). Listing the
+/// collections once and matching case-insensitively removes the guess.
+pub(crate) async fn qdrant_collection(state: &Arc<crate::models::AppState>) -> String {
+    if let Some(c) = QDRANT_COLLECTION_CACHE.get() { return c.clone(); }
+    let env = std::env::var("QDRANT_COLLECTION").ok();
+    let url = format!("{}/collections", state.cfg.qdrant_url.trim_end_matches('/'));
+    let existing: Vec<String> = match reqwest::Client::new().get(&url).send().await {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.ok()
+            .and_then(|v| v["result"]["collections"].as_array().map(|a| {
+                a.iter().filter_map(|c| c["name"].as_str().map(str::to_string)).collect()
+            }))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let picked = pick_qdrant_collection(env.as_deref(), &existing);
+    if env.as_deref().map_or(true, |e| e != picked) {
+        tracing::info!("qdrant: using collection {picked:?} (env {env:?}, existing {existing:?})");
+    }
+    // Only remember a verified answer: with Qdrant unreachable the next call tries again.
+    if existing.iter().any(|c| *c == picked) { let _ = QDRANT_COLLECTION_CACHE.set(picked.clone()); }
+    picked
+}
+
 /// Best-effort removal of one Qdrant point. Failure is logged, never fatal — the
 /// Postgres row is authoritative.
 async fn delete_qdrant_point(state: &Arc<crate::models::AppState>, chunk_id: Uuid, point_id: &str) -> bool {
-    let collection = std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "GCTRL_chunks".into());
+    let collection = qdrant_collection(state).await;
     let url = format!(
         "{}/collections/{}/points/delete?wait=true",
         state.cfg.qdrant_url.trim_end_matches('/'),
@@ -1449,6 +1493,33 @@ pub(crate) async fn supersede_chunk_core(
     crate::services::audit::log_access(&state.db, claims, "chunk.supersede",
         "chunk", &id.to_string(), eff, None, true, None).await;
     Ok(vector_deleted)
+}
+
+#[cfg(test)]
+mod qdrant_collection_tests {
+    use super::pick_qdrant_collection;
+
+    fn ex(names: &[&str]) -> Vec<String> { names.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn env_value_wins_when_qdrant_has_it() {
+        assert_eq!(pick_qdrant_collection(Some("gctrl_chunks"), &ex(&["gctrl_chunks", "other"])), "gctrl_chunks");
+    }
+
+    #[test]
+    fn case_insensitive_match_beats_the_guess() {
+        // The Asgard case: API container without QDRANT_COLLECTION, KEX created "gctrl_chunks".
+        assert_eq!(pick_qdrant_collection(None, &ex(&["gctrl_chunks"])), "gctrl_chunks");
+        // Env set to the default spelling while the server has the lowercase one.
+        assert_eq!(pick_qdrant_collection(Some("GCTRL_chunks"), &ex(&["gctrl_chunks"])), "gctrl_chunks");
+    }
+
+    #[test]
+    fn falls_back_to_the_requested_name_when_nothing_matches() {
+        assert_eq!(pick_qdrant_collection(None, &[]), "GCTRL_chunks");
+        assert_eq!(pick_qdrant_collection(Some("custom"), &ex(&["gctrl_chunks"])), "custom");
+        assert_eq!(pick_qdrant_collection(Some("  "), &ex(&["gctrl_chunks"])), "gctrl_chunks");
+    }
 }
 
 #[cfg(test)]
