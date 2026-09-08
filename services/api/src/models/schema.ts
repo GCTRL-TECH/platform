@@ -133,6 +133,9 @@ export const jobs = pgTable('jobs', {
   error: text('error'),
   batchId: uuid('batch_id').references(() => jobBatches.id, { onDelete: 'set null' }),
   triggerId: uuid('trigger_id').references(() => triggers.id, { onDelete: 'set null' }),
+  // Access token that triggered this job (provenance, migration 081). Null for
+  // web-login (JWT) jobs and background/cron jobs with no calling token.
+  apiKeyId: uuid('api_key_id').references(() => apiKeys.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at', { withTimezone: true })
     .notNull()
     .defaultNow(),

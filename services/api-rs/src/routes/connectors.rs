@@ -1930,6 +1930,7 @@ async fn sync_sharepoint(
             &state.db,
             &state.redis,
             claims.sub,
+            claims.api_key_id,
             req.tenant_config_id,
             &req.site_id,
             &req.drive_id,
@@ -1960,6 +1961,9 @@ async fn enqueue_sharepoint_file(
     db: &sqlx::PgPool,
     redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
     user_id: Uuid,
+    // Access token that triggered this file (provenance). None on the scheduled
+    // trigger + retry paths, where there is no calling token (background/cron).
+    api_key_id: Option<Uuid>,
     tenant_config_id: Uuid,
     site_id: &str,
     drive_id: &str,
@@ -1972,8 +1976,8 @@ async fn enqueue_sharepoint_file(
     let job_id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input)
-         VALUES ($1, $2, 'kex_sharepoint', 'pending', $3)",
+        "INSERT INTO jobs (id, user_id, type, status, input, api_key_id)
+         VALUES ($1, $2, 'kex_sharepoint', 'pending', $3, $4)",
     )
     .bind(job_id)
     .bind(user_id)
@@ -1984,6 +1988,7 @@ async fn enqueue_sharepoint_file(
         "fileId":               file_id,
         "classificationLevelId": classification_level_id,
     }))
+    .bind(api_key_id)
     .execute(db)
     .await?;
 
@@ -2208,6 +2213,8 @@ pub(crate) async fn run_sharepoint_folder_sync(
                 &state.db,
                 &state.redis,
                 user_id,
+                // Scheduled trigger executor — no calling token, so no provenance.
+                None,
                 tenant_config_id,
                 site_id,
                 drive_id,
@@ -2489,8 +2496,8 @@ async fn sync_obsidian(
         let job_id = Uuid::new_v4();
 
         let insert = sqlx::query(
-            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-             VALUES ($1, $2, 'kex_obsidian', 'pending', $3, $4)",
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
+             VALUES ($1, $2, 'kex_obsidian', 'pending', $3, $4, $5)",
         )
         .bind(job_id)
         .bind(claims.sub)
@@ -2503,6 +2510,7 @@ async fn sync_obsidian(
             "discoveryMode": resolved.discovery_mode,
         }))
         .bind(resolved.classification_level_id)
+        .bind(claims.api_key_id)
         .execute(&state.db)
         .await;
 
@@ -2800,8 +2808,8 @@ async fn sync_obsidian_folder(
 
         let job_id = Uuid::new_v4();
         let insert = sqlx::query(
-            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
-             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5)",
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5, $6)",
         )
         .bind(job_id)
         .bind(claims.sub)
@@ -2814,6 +2822,7 @@ async fn sync_obsidian_folder(
         }))
         .bind(resolved.classification_level_id)
         .bind(source_document_id)
+        .bind(claims.api_key_id)
         .execute(&state.db)
         .await;
 
@@ -3077,7 +3086,8 @@ pub(crate) async fn retry_connector_job(
                 .ok_or_else(|| AppError::BadRequest("job input missing fileId".into()))?;
             let clf = classification_level_id.or_else(|| uuid_field("classificationLevelId"));
             enqueue_sharepoint_file(
-                &state.db, &state.redis, user_id, tenant_config_id, site_id, drive_id, file_id, clf, false,
+                // Retry path — no calling token, so no provenance.
+                &state.db, &state.redis, user_id, None, tenant_config_id, site_id, drive_id, file_id, clf, false,
             ).await
         }
         other => Err(AppError::BadRequest(format!(
