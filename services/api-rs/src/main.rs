@@ -52,6 +52,9 @@ async fn main() {
     });
 
     background::spawn_all(state.clone());
+    // Tell the agent which version is running (manual updates never did) —
+    // best-effort, off the boot path. See routes::update::sync_agent_version.
+    tokio::spawn(routes::update::sync_agent_version());
 
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", cfg.port);

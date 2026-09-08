@@ -411,6 +411,7 @@ async fn agent_status(Extension(claims): Extension<Option<JwtClaims>>) -> Json<V
                 let activated = v.get("activated").cloned().unwrap_or(json!(false));
                 return Json(json!({ "reachable": true, "activated": activated }));
             }
+            reconcile_agent_status(&mut v, &current_version());
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("reachable".to_string(), json!(true));
             }
@@ -418,6 +419,26 @@ async fn agent_status(Extension(claims): Extension<Option<JwtClaims>>) -> Json<V
         }
         None => Json(json!({ "reachable": false })),
     }
+}
+
+/// Pure: the agent's `currentVersion` is the instance version it STORED — set
+/// only by `notify_agent_updated` after an in-app update. A manual update
+/// (`curl | bash`, `docker compose pull`) never tells it, so it kept reporting
+/// the pre-update version with `updateAvailable: true` while a newer API was
+/// already running. The running API is the truth about itself: overwrite
+/// `currentVersion` with it and recompute `updateAvailable` against the
+/// agent's `latestVersion` (the agent's value is kept as `agentCurrentVersion`
+/// so the drift stays diagnosable). A missing/unparseable `latestVersion`
+/// yields `false` — `version_gt` is conservative.
+fn reconcile_agent_status(status: &mut Value, running: &str) {
+    let Some(obj) = status.as_object_mut() else { return };
+    let latest = obj.get("latestVersion").and_then(|v| v.as_str()).map(str::to_string);
+    if let Some(prev) = obj.get("currentVersion").cloned() {
+        obj.insert("agentCurrentVersion".to_string(), prev);
+    }
+    obj.insert("currentVersion".to_string(), json!(running));
+    let available = latest.as_deref().is_some_and(|l| version_gt(l, running));
+    obj.insert("updateAvailable".to_string(), json!(available));
 }
 
 /// Fetch the latest version. Tries the configured version channel first, then
@@ -831,6 +852,42 @@ async fn notify_agent_updated() {
             tracing::warn!("notify_agent_updated: POST /version failed: {e}");
         }
     }
+}
+
+/// Startup sync: tell the agent which API version is actually running, so its
+/// stored instance version (and the update banner it drives) reflects MANUAL
+/// updates too — `curl | bash` / `docker compose pull` never call
+/// `notify_agent_updated`. Spawned from `main`, never awaited on the boot
+/// path; entirely best-effort with a few spaced attempts because the agent
+/// container usually comes up alongside the API.
+pub(crate) async fn sync_agent_version() {
+    let version = current_version();
+    let base = std::env::var("GCTRL_AGENT_INTERNAL_URL")
+        .unwrap_or_else(|_| "http://gctrl-agent:7070".to_string());
+    let base = base.trim_end_matches('/').to_string();
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else { return };
+
+    for attempt in 1..=5u32 {
+        tokio::time::sleep(Duration::from_secs(if attempt == 1 { 5 } else { 15 })).await;
+        match client
+            .post(format!("{base}/version"))
+            .json(&json!({ "version": version }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("sync_agent_version: agent current_version set to {version}");
+                return;
+            }
+            Ok(resp) => {
+                tracing::debug!("sync_agent_version: attempt {attempt}: agent returned {}", resp.status());
+            }
+            Err(e) => {
+                tracing::debug!("sync_agent_version: attempt {attempt}: {e}");
+            }
+        }
+    }
+    tracing::info!("sync_agent_version: agent not reachable; /agent-status reconciles the version itself");
 }
 
 // ─── Docker socket helpers ────────────────────────────────────────────────────
@@ -1385,6 +1442,51 @@ mod tests {
     fn version_gt_unparseable_is_conservative() {
         assert!(!version_gt("not-a-version", "1.0.0"));
         assert!(!version_gt("1.0.0", "not-a-version"));
+    }
+
+    // ── reconcile_agent_status (running API overrides the agent's stored version) ─
+
+    /// The Asgard case: manual `docker compose pull` to 0.1.278, agent still
+    /// stores 0.1.267 and advertises an update that is already installed.
+    #[test]
+    fn reconcile_clears_a_stale_update_after_a_manual_update() {
+        let mut s = json!({
+            "activated": true,
+            "currentVersion": "0.1.267",
+            "latestVersion": "0.1.278",
+            "updateAvailable": true,
+        });
+        reconcile_agent_status(&mut s, "0.1.278");
+        assert_eq!(s["currentVersion"], "0.1.278");
+        assert_eq!(s["agentCurrentVersion"], "0.1.267");
+        assert_eq!(s["updateAvailable"], false);
+        assert_eq!(s["activated"], true, "unrelated fields untouched");
+    }
+
+    #[test]
+    fn reconcile_keeps_a_real_update_visible() {
+        let mut s = json!({ "currentVersion": "0.1.270", "latestVersion": "0.1.278", "updateAvailable": false });
+        reconcile_agent_status(&mut s, "0.1.270");
+        assert_eq!(s["updateAvailable"], true, "agent lagging behind must not hide a real update");
+        reconcile_agent_status(&mut s, "v0.1.279");
+        assert_eq!(s["updateAvailable"], false, "running ahead of the channel is not an update");
+    }
+
+    #[test]
+    fn reconcile_without_latest_version_is_conservative() {
+        let mut s = json!({ "currentVersion": "0.1.267", "updateAvailable": true });
+        reconcile_agent_status(&mut s, "0.1.278");
+        assert_eq!(s["updateAvailable"], false);
+        assert_eq!(s["currentVersion"], "0.1.278");
+
+        let mut s = json!({ "latestVersion": "garbage" });
+        reconcile_agent_status(&mut s, "0.1.278");
+        assert_eq!(s["updateAvailable"], false);
+        assert!(s.get("agentCurrentVersion").is_none(), "nothing to preserve");
+
+        let mut not_an_object = json!("unexpected");
+        reconcile_agent_status(&mut not_an_object, "0.1.278");
+        assert_eq!(not_an_object, json!("unexpected"));
     }
 
     // ── short_name_from_image / ghcr_repo_from_image ───────────────────────────
