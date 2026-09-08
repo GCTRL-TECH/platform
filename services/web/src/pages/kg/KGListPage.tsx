@@ -664,9 +664,44 @@ export function KGListPage() {
         )}
       </div>
 
-      {/* Breadcrumb */}
+      {/* Breadcrumb row: Back button pinned top left, then the folder path.
+          The Back button used to be a cell inside the card grid (after the
+          folder cards), so its position depended on how many subfolders the
+          folder had and it vanished entirely on the empty/filtered state.
+          Here it sits outside the grid, independent of sorting, filters and
+          item count. It stays a drop target for moving a graph one level up. */}
       {isExpert && folderPath.length > 0 && (
-        <div className="flex items-center gap-1.5 text-sm">
+        <div className="flex items-center gap-3 text-sm">
+          {currentFolderId && (
+            <button
+              onClick={navigateUp}
+              onDragOver={(e) => {
+                e.preventDefault()
+                e.dataTransfer.dropEffect = 'move'
+                setDragOverFolderId('__parent__')
+              }}
+              onDragLeave={() => setDragOverFolderId(null)}
+              onDrop={(e) => {
+                e.preventDefault()
+                setDragOverFolderId(null)
+                const compilationId = e.dataTransfer.getData('application/x-compilation-id')
+                if (compilationId) {
+                  const parentId = folderPath.length > 1 ? folderPath[folderPath.length - 2]!.id : null
+                  handleMoveToFolder(compilationId, parentId)
+                }
+              }}
+              title="Back to parent folder (drop a graph here to move it up)"
+              className={cn(
+                'flex shrink-0 items-center gap-1.5 rounded-lg border border-dashed px-2.5 py-1.5 text-xs transition-all hover:border-slate-600 hover:text-slate-300',
+                dragOverFolderId === '__parent__'
+                  ? 'border-amber-400/60 bg-amber-400/5 text-amber-300'
+                  : 'border-slate-700/50 text-slate-500'
+              )}
+            >
+              <ChevronLeft size={14} />
+              Back
+            </button>
+          )}
           <button
             onClick={() => navigateToBreadcrumb(-1)}
             className="text-slate-500 hover:text-slate-300 transition-colors"
@@ -705,7 +740,7 @@ export function KGListPage() {
             <p className="mt-0.5 text-xs text-slate-500">Check your connection and try again.</p>
           </div>
         </div>
-      ) : filtered.length === 0 ? (
+      ) : filtered.length === 0 && !(isExpert && foldersInView.length > 0) ? (
         <div className="flex flex-col items-center gap-4 py-24 text-center">
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-800">
             <Database size={24} className="text-slate-600" />
@@ -787,37 +822,6 @@ export function KGListPage() {
               </div>
             </button>
           ))}
-
-          {/* Back button when inside a folder — also a drop target to move card up (Expert only) */}
-          {isExpert && currentFolderId && (
-            <button
-              onClick={navigateUp}
-              onDragOver={(e) => {
-                e.preventDefault()
-                e.dataTransfer.dropEffect = 'move'
-                setDragOverFolderId('__parent__')
-              }}
-              onDragLeave={() => setDragOverFolderId(null)}
-              onDrop={(e) => {
-                e.preventDefault()
-                setDragOverFolderId(null)
-                const compilationId = e.dataTransfer.getData('application/x-compilation-id')
-                if (compilationId) {
-                  const parentId = folderPath.length > 1 ? folderPath[folderPath.length - 2]!.id : null
-                  handleMoveToFolder(compilationId, parentId)
-                }
-              }}
-              className={cn(
-                'flex items-center gap-3 rounded-xl border border-dashed bg-slate-900/50 p-4 text-left transition-all hover:border-slate-600 hover:text-slate-400',
-                dragOverFolderId === '__parent__'
-                  ? 'border-amber-400/60 bg-amber-400/5 text-amber-300'
-                  : 'border-slate-700/50 text-slate-500'
-              )}
-            >
-              <ChevronLeft size={17} />
-              <span className="text-sm">Back</span>
-            </button>
-          )}
 
           {/* Compilation cards */}
           {displayedCompilations.map((compilation) => (
