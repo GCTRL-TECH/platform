@@ -113,7 +113,10 @@ def extract_text(file_bytes: bytes, mimetype: str, filename: str = "document", p
     """
     ext = _ext_of(filename)
 
-    # 0. Legacy binary OLE formats — friendly error, never crash the worker.
+    # 0. Legacy binary OLE formats — friendly error, never crash the worker. Excel 97-2003 is
+    #    the exception: xlrd reads it, and finance exports still arrive that way.
+    if ext == ".xls":
+        return _extract_xls_legacy(file_bytes)
     if ext in _LEGACY_OLE_EXTENSIONS:
         modern = _LEGACY_OLE_EXTENSIONS[ext]
         raise ValueError(
@@ -613,27 +616,77 @@ def _extract_plaintext(data: bytes) -> str:
 # ── XLSX (Excel) ───────────────────────────────────────────────────
 
 
-def _extract_xlsx(data: bytes) -> str:
-    """Extract text from all sheets of an Excel file."""
+def _xlsx_sheet_parts(data: bytes, data_only: bool) -> list:
+    """One text block per non-empty sheet. `data_only=True` reads cached formula RESULTS,
+    `False` the formulas themselves."""
+    from openpyxl import load_workbook  # type: ignore
+
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=data_only)
+    parts = []
     try:
-        from openpyxl import load_workbook  # type: ignore
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append(f"Sheet: {sheet_name}\n" + "\n".join(rows))
+    finally:
+        wb.close()
+    return parts
+
+
+def _extract_xlsx(data: bytes) -> str:
+    """Extract text from all sheets of an Excel file.
+
+    Two passes: cached values first (what a human sees), then the formulas as text. A
+    workbook written by a generator (openpyxl, xlsxwriter, LibreOffice headless without
+    recalculation) carries formulas WITHOUT cached results, so `data_only=True` sees only
+    None — that was the "Excel file contained no data" every financial model produced on
+    Asgard (2026-09-07). Formulas are still knowledge (`=SUM(B2:B13)` tells the model what
+    the sheet computes), so they are ingested with a note instead of failing the upload.
+    """
+    try:
+        import openpyxl  # type: ignore  # noqa: F401
     except ImportError:
         raise ValueError("openpyxl is not installed")
 
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    parts: list[str] = []
+    parts = _xlsx_sheet_parts(data, data_only=True)
+    if not parts:
+        formula_parts = _xlsx_sheet_parts(data, data_only=False)
+        if formula_parts:
+            parts = [
+                "Note: this workbook stores formulas without cached results; the formulas are "
+                "listed instead of computed values."
+            ] + formula_parts
+    if not parts:
+        raise ValueError("Excel file contained no data")
+    return "\n\n".join(parts)
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        rows: list[str] = []
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+
+def _extract_xls_legacy(data: bytes) -> str:
+    """Excel 97-2003 (.xls, binary OLE) via xlrd — the one legacy format worth reading,
+    because finance departments still export it."""
+    try:
+        import xlrd  # type: ignore
+    except ImportError:
+        raise ValueError(
+            "Legacy .xls (Excel 97-2003) needs xlrd, which is not installed. "
+            "Please convert to .xlsx and re-upload."
+        )
+
+    book = xlrd.open_workbook(file_contents=data)
+    parts = []
+    for sheet in book.sheets():
+        rows = []
+        for r in range(sheet.nrows):
+            cells = [str(c).strip() for c in sheet.row_values(r) if c is not None and str(c).strip()]
             if cells:
                 rows.append(" | ".join(cells))
         if rows:
-            parts.append(f"Sheet: {sheet_name}\n" + "\n".join(rows))
-
-    wb.close()
+            parts.append(f"Sheet: {sheet.name}\n" + "\n".join(rows))
     if not parts:
         raise ValueError("Excel file contained no data")
     return "\n\n".join(parts)
