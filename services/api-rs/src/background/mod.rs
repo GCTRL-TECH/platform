@@ -855,6 +855,12 @@ async fn process_job_result(state: &AppState, result: Value) {
                 "userId": uid,
             });
             crate::routes::webhooks::deliver_event(&state.db, uid, "job.completed", &wh_payload).await;
+            // Learning loop (migration 086): a finished KEX/FUSE job may have
+            // written new classification / fact conflicts. Those whose signature
+            // the decision memory knows well enough are resolved the way the
+            // humans did before and marked auto_resolved. Returns at once when
+            // the memory is empty or GCTRL_CONFLICT_AUTO_MIN_SUPPORT < 1.
+            crate::services::conflict_memory::auto_resolve_for_user(state, uid).await;
         }
     }
 }

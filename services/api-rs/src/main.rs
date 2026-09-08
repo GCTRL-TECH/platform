@@ -52,6 +52,9 @@ async fn main() {
     });
 
     background::spawn_all(state.clone());
+    // Tell the agent which version is running (manual updates never did) —
+    // best-effort, off the boot path. See routes::update::sync_agent_version.
+    tokio::spawn(routes::update::sync_agent_version());
 
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -137,7 +140,8 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         .nest("/api/fuse",        routes::fuse::router())
         .nest("/api/kg",          routes::kg::router())
         .nest("/api/billing",     routes::billing::router())
-        .nest("/api/admin",       routes::admin::router())
+        .nest("/api/admin",       routes::admin::router().merge(routes::bugs::admin_router()))
+        .nest("/api/bugs",        routes::bugs::router())
         .nest("/api/update",      routes::update::router())
         .nest("/api/connectors",  routes::connectors::router()
                                         .merge(routes::connector_configs::router()))

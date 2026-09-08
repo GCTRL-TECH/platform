@@ -30,3 +30,4 @@ pub mod webhooks;
 pub mod triggers;
 pub mod memory;
 pub mod profile;
+pub mod bugs;

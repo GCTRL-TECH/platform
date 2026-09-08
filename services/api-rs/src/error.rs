@@ -18,6 +18,11 @@ pub enum AppError {
     Database(#[from] sqlx::Error),
     #[error("Internal error: {0}")]
     Internal(String),
+    /// An upstream the request depends on (the configured LLM runtime) failed
+    /// or answered unusably. 502, not 500: the API itself is fine, and the
+    /// caller must not be handed a partial result.
+    #[error("Bad gateway: {0}")]
+    BadGateway(String),
 }
 
 impl IntoResponse for AppError {
@@ -35,6 +40,10 @@ impl IntoResponse for AppError {
             AppError::Internal(m)    => {
                 tracing::error!("Internal: {m}");
                 (StatusCode::INTERNAL_SERVER_ERROR, m.clone())
+            }
+            AppError::BadGateway(m)  => {
+                tracing::warn!("Upstream: {m}");
+                (StatusCode::BAD_GATEWAY, m.clone())
             }
         };
         (status, Json(json!({ "error": message }))).into_response()
