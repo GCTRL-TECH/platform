@@ -41,6 +41,7 @@ import {
 } from 'lucide-react'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
+import { HeaderCorner } from '@/components/layout/HeaderCorner'
 import { useUiMode } from '@/hooks/useUiMode'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
@@ -1764,6 +1765,9 @@ export function TalkToGraphPage() {
         {...getRootProps()}
       >
         <input {...getInputProps()} />
+
+        {/* Version + Report bug: this page hides the AppShell header */}
+        <HeaderCorner className="absolute right-4 top-3 z-20" />
 
         {/* Drag overlay */}
         {isDragActive && (

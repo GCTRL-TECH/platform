@@ -3,35 +3,11 @@ import { Bell, ArrowUpCircle, CheckCircle2 } from 'lucide-react'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { resolveUpdateState } from '@/lib/version'
-import { ReportBugButton } from '@/components/bugs/ReportBugButton'
+import { HeaderCorner } from './HeaderCorner'
 import { cn } from '@/lib/utils'
 
 interface HeaderProps {
   title: string
-}
-
-/**
- * Always-visible platform version, top right. The text is the API version from
- * `GET /config/public` (the version that is actually running); the tooltip adds
- * the web bundle's build marker and, when known, the license agent's version.
- */
-function VersionBadge({ agentVersion }: { agentVersion?: string }) {
-  const config = usePublicConfig()
-  const webVersion = (import.meta.env as Record<string, string | undefined>).VITE_BUILD_VERSION || 'dev'
-  const platformVersion = config.version || webVersion
-  const tooltip = [
-    `GCTRL platform v${platformVersion}`,
-    `web build ${webVersion}`,
-    agentVersion ? `license agent v${agentVersion}` : null,
-  ].filter(Boolean).join(' · ')
-  return (
-    <span
-      title={tooltip}
-      className="select-none rounded-md border border-slate-800 px-2 py-0.5 font-mono text-[11px] leading-5 text-slate-500"
-    >
-      v{platformVersion}
-    </span>
-  )
 }
 
 /**
@@ -107,10 +83,8 @@ export function Header({ title }: HeaderProps) {
 
       {/* Right section */}
       <div className="flex items-center gap-3">
-        <VersionBadge agentVersion={status?.currentVersion} />
-
-        {/* Bug report: every signed-in user, from any page */}
-        <ReportBugButton />
+        {/* Version badge + Report bug (shared with the immersive pages) */}
+        <HeaderCorner agentVersion={status?.currentVersion} />
 
         {/* Message center */}
         <div className="relative" ref={popoverRef}>
