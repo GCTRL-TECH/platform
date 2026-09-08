@@ -3,6 +3,7 @@ import { Bell, ArrowUpCircle, CheckCircle2 } from 'lucide-react'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { resolveUpdateState } from '@/lib/version'
+import { ReportBugButton } from '@/components/bugs/ReportBugButton'
 import { cn } from '@/lib/utils'
 
 interface HeaderProps {
@@ -107,6 +108,9 @@ export function Header({ title }: HeaderProps) {
       {/* Right section */}
       <div className="flex items-center gap-3">
         <VersionBadge agentVersion={status?.currentVersion} />
+
+        {/* Bug report: every signed-in user, from any page */}
+        <ReportBugButton />
 
         {/* Message center */}
         <div className="relative" ref={popoverRef}>

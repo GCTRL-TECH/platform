@@ -14,8 +14,10 @@ import {
   Pencil,
   Save,
   X,
+  Bug,
 } from 'lucide-react'
 import { api } from '@/lib/api'
+import BugsBoard from './BugsBoard'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
 
@@ -70,7 +72,7 @@ interface AuditEntry {
   createdAt: string
 }
 
-type Tab = 'overview' | 'users' | 'audit'
+type Tab = 'overview' | 'users' | 'audit' | 'bugs'
 
 // Reserved for future role-coloured badges in user list.
 const _ROLE_COLORS: Record<string, string> = {
@@ -379,6 +381,7 @@ export default function AdminPanel({ embedded = false, initialTab = 'overview' }
           { id: 'overview' as Tab, label: 'Overview', icon: BarChart3 },
           { id: 'users'    as Tab, label: 'Users',    icon: Users },
           { id: 'audit'    as Tab, label: 'Audit Log', icon: Clock },
+          { id: 'bugs'     as Tab, label: 'Bugs',      icon: Bug },
         ]).map((t) => (
           <button
             key={t.id}
@@ -583,6 +586,9 @@ export default function AdminPanel({ embedded = false, initialTab = 'overview' }
           </div>
         </div>
       )}
+
+      {/* Bug reports (admin triage board) */}
+      {tab === 'bugs' && <BugsBoard />}
 
       {/* Audit Log */}
       {tab === 'audit' && (
