@@ -292,6 +292,7 @@ remembered so re-extraction never re-introduces it):
 - correct_relationship: Delete a wrong edge and remember it. Args: { compilationId: string, head: string, relType: string, tail: string, reason?: string }
 - delete_node        : Remove an entity and its edges. Args: { compilationId: string, name: string, reason?: string }
 - delete_chunk       : Remove a source text chunk from Postgres + Qdrant. Args: { chunkId: string }
+- supersede_chunk    : A chunk carries a statement the user has corrected, but it comes from a reviewed document — keep the document, take the chunk out of every retrieval path (archived 'superseded', vector removed, remembered). Args: { chunkId: string, reason?: string }
 
 To use a tool, respond with ONLY a JSON object on a single line — exactly ONE tool
 call, no prose, no second object. Wait for its result before the next call:
@@ -391,6 +392,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "correct_relationship","description": "Delete a wrong edge and remember the correction", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string", "reason": "string?" } },
             { "name": "delete_node",        "description": "Remove an entity and its edges (remembered)", "args": { "compilationId": "string", "name": "string", "reason": "string?" } },
             { "name": "delete_chunk",       "description": "Delete a source text chunk from Postgres + Qdrant", "args": { "chunkId": "string" } },
+            { "name": "supersede_chunk",    "description": "Take a chunk out of every retrieval path WITHOUT deleting its source document: archived 'superseded', vector removed, remembered in knowledge_corrections. Use when a user corrects a fact that a reviewed document still states", "args": { "chunkId": "string", "reason": "string?" } },
             // ── Runtime configuration tools ───────────────────────────────────────
             { "name": "get_hardware",       "description": "Read the host hardware profile (CPU cores, RAM, GPU, VRAM, OS/arch) detected at install time. Read-only, any caller", "args": {} },
             { "name": "recommend_runtime",  "description": "Recommend the best runtime and model for the current hardware (pure local logic — no IO). Returns { runtime, model, rationale, speedup_estimate }. Read-only, any caller", "args": {} },
@@ -1709,6 +1711,18 @@ async fn execute_tool_inner(
             }
         }
 
+        // ── Action: supersede a chunk (keep the document, drop it from retrieval) ─
+        "supersede_chunk" => {
+            let Some(chunk_id) = args["chunkId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
+                return json!({ "error": "chunkId is required" });
+            };
+            let reason = args["reason"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            match crate::routes::kex::supersede_chunk_core(state, claims, chunk_id, reason).await {
+                Ok(vector_deleted) => json!({ "ok": true, "superseded": true, "vectorDeleted": vector_deleted }),
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
+
         // ── Read: neighbours of an entity (dependency tracing, code graphs) ───
         "get_neighbors" => {
             let name = args["name"].as_str().unwrap_or("").to_string();
@@ -2660,6 +2674,19 @@ mod agent_tool_registration_tests {
     fn tool_schema_contains_store() {
         assert!(tool_names().contains(&"store".to_string()),
             "tool_schema() must include 'store' (write-back, mirrors stdio gctrl_store)");
+    }
+
+    #[test]
+    fn tool_schema_contains_supersede_chunk_as_a_write_tool() {
+        assert!(tool_names().contains(&"supersede_chunk".to_string()),
+            "tool_schema() must include 'supersede_chunk' (user corrections against reviewed documents)");
+        assert!(!READ_TOOLS.contains(&"supersede_chunk"),
+            "supersede_chunk mutates retrieval state — never a read tool");
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"] == "supersede_chunk").expect("supersede_chunk descriptor");
+        assert!(tool["args"].get("chunkId").is_some());
+        assert!(tool["args"].get("reason").is_some());
     }
 
     // ── File-asset index + connector ops tools ────────────────────────────────

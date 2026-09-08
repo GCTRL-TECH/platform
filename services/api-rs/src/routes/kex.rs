@@ -237,6 +237,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/jobs/retry-failed", post(retry_failed))
         .route("/chunks",          get(list_chunks))
         .route("/chunks/:id",      axum::routing::delete(delete_chunk))
+        .route("/chunks/:id/supersede", post(supersede_chunk))
         .route("/queue",           get(queue_depth))
         .route("/model-status",    get(model_status))
         .route("/threads",         axum::routing::put(set_threads))
@@ -1302,17 +1303,15 @@ async fn delete_chunk(
     Ok(Json(json!({ "ok": true, "vectorDeleted": vector_deleted })))
 }
 
-/// Core: delete a chunk from Postgres + Qdrant (owner-scoped). Shared by the HTTP
-/// handler and the Pi agent tool. Returns whether the Qdrant point was removed.
-pub(crate) async fn delete_chunk_core(
+/// Migration 078 — mutating a chunk that belongs to a CODE knowledge base is a
+/// code-KB mutation. The chunk carries no compilationId of its own in the
+/// request, so the origin is resolved here (own compilation, or the job that
+/// produced it) — one query, only when the capability is off.
+async fn ensure_chunk_mutable(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
     id: Uuid,
-) -> Result<bool> {
-    // Migration 078 — deleting a chunk that belongs to a CODE knowledge base is a
-    // code-KB mutation. The chunk carries no compilationId of its own in the
-    // request, so the origin is resolved here (own compilation, or the job that
-    // produced it) — one query, only when the capability is off.
+) -> Result<()> {
     if !claims.code_access {
         let is_code: bool = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -1328,6 +1327,51 @@ pub(crate) async fn delete_chunk_core(
             ));
         }
     }
+    Ok(())
+}
+
+/// The Qdrant point that carries a chunk's vector. KEX inserts the Postgres row
+/// and the Qdrant point under the SAME fresh UUID (vector_store.py `point_ids`),
+/// and on the `store`/text path it never fills `qdrant_point_id`. Deleting only
+/// when the column was set left ghost points behind: the row was gone, but the
+/// vector search still returned the chunk (its text lives in the payload) —
+/// found on Asgard 2026-09-08, three "deleted" chunks still cited. The chunk id
+/// is therefore the fallback point id.
+pub(crate) fn chunk_point_id(qdrant_point_id: Option<String>, chunk_id: Uuid) -> String {
+    qdrant_point_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| chunk_id.to_string())
+}
+
+/// Best-effort removal of one Qdrant point. Failure is logged, never fatal — the
+/// Postgres row is authoritative.
+async fn delete_qdrant_point(state: &Arc<crate::models::AppState>, chunk_id: Uuid, point_id: &str) -> bool {
+    let collection = std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "GCTRL_chunks".into());
+    let url = format!(
+        "{}/collections/{}/points/delete?wait=true",
+        state.cfg.qdrant_url.trim_end_matches('/'),
+        collection
+    );
+    let res = reqwest::Client::new()
+        .post(&url)
+        .json(&json!({ "points": [point_id] }))
+        .send().await;
+    match res {
+        Ok(r) if r.status().is_success() => true,
+        Ok(r)  => { tracing::warn!("chunk {chunk_id}: Qdrant delete returned {}", r.status()); false }
+        Err(e) => { tracing::warn!("chunk {chunk_id}: Qdrant delete failed: {e}"); false }
+    }
+}
+
+/// Core: delete a chunk from Postgres + Qdrant (owner-scoped). Shared by the HTTP
+/// handler and the Pi agent tool. Returns whether the Qdrant point was removed.
+pub(crate) async fn delete_chunk_core(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    id: Uuid,
+) -> Result<bool> {
+    ensure_chunk_mutable(state, claims, id).await?;
     // Fetch the chunk (owner-scoped) and its Qdrant point id before deleting.
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT qdrant_point_id FROM text_chunks WHERE id = $1 AND user_id = $2"
@@ -1338,30 +1382,94 @@ pub(crate) async fn delete_chunk_core(
     sqlx::query("DELETE FROM text_chunks WHERE id = $1 AND user_id = $2")
         .bind(id).bind(claims.sub).execute(&state.db).await?;
 
-    // Best-effort remove from Qdrant by point id.
-    let mut vector_deleted = false;
-    if let Some(point_id) = qdrant_point_id {
-        let collection = std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "GCTRL_chunks".into());
-        let url = format!(
-            "{}/collections/{}/points/delete?wait=true",
-            state.cfg.qdrant_url.trim_end_matches('/'),
-            collection
-        );
-        let res = reqwest::Client::new()
-            .post(&url)
-            .json(&json!({ "points": [point_id] }))
-            .send().await;
-        match res {
-            Ok(r) if r.status().is_success() => vector_deleted = true,
-            Ok(r)  => tracing::warn!("chunk {id}: Qdrant delete returned {}", r.status()),
-            Err(e) => tracing::warn!("chunk {id}: Qdrant delete failed: {e}"),
-        }
-    }
+    let vector_deleted = delete_qdrant_point(state, id, &chunk_point_id(qdrant_point_id, id)).await;
 
     let eff = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
     crate::services::audit::log_access(&state.db, claims, "chunk.delete",
         "chunk", &id.to_string(), eff, None, true, None).await;
     Ok(vector_deleted)
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct SupersedeReq {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST /api/kex/chunks/:id/supersede  { reason?: string }
+///
+/// A user corrected a fact and this chunk carries the old, wrong statement — but
+/// it comes from a reviewed document, so it must not be deleted. Superseding
+/// keeps the Postgres row (and the source document) and takes the chunk out of
+/// every retrieval path: `archived = true, archived_reason = 'superseded'`
+/// (lexical + Hebb neighbour paths filter on `archived`), and its Qdrant point
+/// is removed (the vector path has no `archived` payload field to filter on —
+/// same reasoning as A5 dedup). Reversible by un-archiving + re-embedding.
+async fn supersede_chunk(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<SupersedeReq>>,
+) -> Result<Json<Value>> {
+    let reason = body.and_then(|Json(b)| b.reason);
+    let vector_deleted = supersede_chunk_core(&state, &claims, id, reason.as_deref()).await?;
+    Ok(Json(json!({ "ok": true, "vectorDeleted": vector_deleted })))
+}
+
+/// Core: mark a chunk superseded (owner-scoped) and drop its vector. Shared by the
+/// HTTP handler and the Pi agent tool. The supersession is remembered in
+/// `knowledge_corrections` (element_kind 'chunk', action 'flag') for the audit
+/// trail. Returns whether the Qdrant point was removed.
+pub(crate) async fn supersede_chunk_core(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    id: Uuid,
+    reason: Option<&str>,
+) -> Result<bool> {
+    ensure_chunk_mutable(state, claims, id).await?;
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "UPDATE text_chunks
+            SET archived = true, archived_reason = 'superseded', heat = 0
+          WHERE id = $1 AND user_id = $2
+          RETURNING qdrant_point_id"
+    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
+    let Some((qdrant_point_id,)) = row else { return Err(AppError::NotFound); };
+
+    let vector_deleted = delete_qdrant_point(state, id, &chunk_point_id(qdrant_point_id, id)).await;
+
+    let _ = sqlx::query(
+        "INSERT INTO knowledge_corrections
+            (user_id, compilation_id, element_kind, head, rel_type, tail, action, reason)
+         VALUES ($1, NULL, 'chunk', $2, NULL, NULL, 'flag', $3)"
+    ).bind(claims.sub).bind(id.to_string()).bind(reason)
+     .execute(&state.db).await
+     .map_err(|e| tracing::warn!("chunk {id}: supersede not remembered: {e}"));
+
+    let eff = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
+    crate::services::audit::log_access(&state.db, claims, "chunk.supersede",
+        "chunk", &id.to_string(), eff, None, true, None).await;
+    Ok(vector_deleted)
+}
+
+#[cfg(test)]
+mod chunk_point_id_tests {
+    use super::chunk_point_id;
+    use uuid::Uuid;
+
+    #[test]
+    fn recorded_point_id_wins() {
+        let id = Uuid::new_v4();
+        assert_eq!(chunk_point_id(Some("abc".into()), id), "abc");
+    }
+
+    #[test]
+    fn missing_or_blank_point_id_falls_back_to_the_chunk_id() {
+        // KEX writes row and point under the same UUID; the column stays NULL on the
+        // text/store path — the Asgard ghost-chunk case.
+        let id = Uuid::new_v4();
+        assert_eq!(chunk_point_id(None, id), id.to_string());
+        assert_eq!(chunk_point_id(Some("  ".into()), id), id.to_string());
+    }
 }
 
 #[cfg(test)]

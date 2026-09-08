@@ -109,8 +109,8 @@ pub async fn reinforce_chunks(db: &sqlx::PgPool, user_id: Uuid, ids_in_rank_orde
                 access_count = tc.access_count + 1, \
                 last_accessed = NOW(), \
                 half_life_secs = LEAST($4, (tc.half_life_secs::float8 * $5)::int), \
-                archived = CASE WHEN tc.archived_reason = 'dedup' THEN tc.archived ELSE false END, \
-                archived_reason = CASE WHEN tc.archived_reason = 'dedup' THEN tc.archived_reason ELSE NULL END \
+                archived = CASE WHEN tc.archived_reason IN ('dedup', 'superseded') THEN tc.archived ELSE false END, \
+                archived_reason = CASE WHEN tc.archived_reason IN ('dedup', 'superseded') THEN tc.archived_reason ELSE NULL END \
            FROM unnest($1::uuid[], $2::real[]) AS u(id, delta) \
           WHERE tc.id = u.id AND tc.user_id = $3"
     )

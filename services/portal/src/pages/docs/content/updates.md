@@ -11,6 +11,13 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: de84352 -->
 
+## v0.9.8 - Corrections that stick
+
+*8 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A deleted chunk no longer haunts the search.** `delete_chunk` removed the Postgres row but only deleted the Qdrant point when the `qdrant_point_id` column was set - and on the `store`/text path it never is. The vector stayed, its payload carries the full text, and the "deleted" passage kept coming back as a cited source. On one instance three chunks a user had just corrected were still quoted after their deletion. The chunk id is now the fallback point id (KEX writes row and point under the same UUID), so a delete is a delete.
+- **`supersede_chunk` retires a statement without deleting its document.** When a user corrects a fact that a reviewed document still states, the document must stay - but the old passage must stop being cited. The new gateway tool and `POST /api/kex/chunks/:id/supersede` archive the chunk with reason `superseded`, remove its vector (the vector path has no `archived` filter) and record the retirement in `knowledge_corrections` (`element_kind` chunk, `action` flag). Reinforcement never revives a superseded chunk, just as it never revives a dedup duplicate.
+
 ## v0.9.7 - Images become knowledge
 
 *7 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

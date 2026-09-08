@@ -4302,12 +4302,15 @@ mod code_capability_source_invariants {
     #[test]
     fn kex_write_paths_gate_code_knowledge_bases() {
         let kex = include_str!("kex.rs");
-        for f in ["extract", "delete_chunk_core", "link_job_to_target_or_default"] {
+        for f in ["extract", "delete_chunk_core", "supersede_chunk_core", "link_job_to_target_or_default"] {
             let b = body(kex, f);
             assert!(
                 b.contains("enforce_code_capability(")
                     || b.contains("compilation_is_code(")
-                    || b.contains("claims.code_access"),
+                    || b.contains("claims.code_access")
+                    // The chunk cores share one gate (delete + supersede resolve the
+                    // chunk's origin the same way); the gate itself reads code_access.
+                    || b.contains("ensure_chunk_mutable("),
                 "routes/kex.rs::{f} writes/deletes knowledge for a named compilation but \
                  no longer checks the Codebase-access capability"
             );
