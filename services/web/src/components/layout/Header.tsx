@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Bell, ArrowUpCircle, CheckCircle2 } from 'lucide-react'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
+import { resolveUpdateState } from '@/lib/version'
 import { cn } from '@/lib/utils'
 
 interface HeaderProps {
@@ -57,8 +58,11 @@ export function Header({ title }: HeaderProps) {
   // LicenseBanner uses). We retired the separate `/api/update/check` header poll.
   const { status } = useLicenseStatus()
 
-  const updateAvailable = status?.updateAvailable === true
-  const updateRequired = status?.updateRequired === true
+  // The agent's `currentVersion` is its own bookkeeping and can lag behind the
+  // platform that is really running (see lib/version.ts). Only prompt when
+  // `latestVersion` is semver-newer than the API version from /config/public.
+  const config = usePublicConfig()
+  const { updateAvailable, updateRequired } = resolveUpdateState(status, config.version)
 
   const notifications = useMemo<Notification[]>(() => {
     const items: Notification[] = []
@@ -67,8 +71,10 @@ export function Header({ title }: HeaderProps) {
         id: 'update',
         type: 'update',
         severity: updateRequired ? 'required' : 'info',
-        title: `New version available — v${status.latestVersion}`,
-        subtitle: status.currentVersion ? `You're on v${status.currentVersion}` : undefined,
+        title: `New version available - v${status.latestVersion}`,
+        subtitle: config.version
+          ? `You're on v${config.version}${status.currentVersion && status.currentVersion !== config.version ? ` (license agent reports v${status.currentVersion})` : ''}`
+          : status.currentVersion ? `License agent reports v${status.currentVersion}` : undefined,
         actionLabel: 'Update now',
         onAction: () => {
           setOpen(false)
@@ -77,7 +83,7 @@ export function Header({ title }: HeaderProps) {
       })
     }
     return items
-  }, [status, updateAvailable, updateRequired])
+  }, [status, updateAvailable, updateRequired, config.version])
 
   const hasActionable = notifications.length > 0
 
@@ -180,8 +186,8 @@ export function Header({ title }: HeaderProps) {
                   <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
                     <CheckCircle2 size={22} className="text-emerald-500/80" />
                     <p className="text-sm text-slate-300">You're all caught up</p>
-                    {status?.currentVersion && (
-                      <p className="text-xs text-slate-500">Running v{status.currentVersion}</p>
+                    {(config.version || status?.currentVersion) && (
+                      <p className="text-xs text-slate-500">Running v{config.version || status?.currentVersion}</p>
                     )}
                   </div>
                 )}

@@ -3,6 +3,8 @@ import { X, RefreshCw, Copy, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getToken } from '@/lib/auth'
 import { apiGet } from '@/lib/api'
+import { usePublicConfig } from '@/hooks/usePublicConfig'
+import { resolveUpdateState } from '@/lib/version'
 
 export interface AgentStatus {
   activated: boolean
@@ -320,13 +322,18 @@ export function LicenseBanner() {
     return () => clearInterval(interval)
   }, [fetchStatus])
 
+  // Same gate as the header bell: the agent's flags only count when its
+  // `latestVersion` is semver-newer than the platform that is really running.
+  const config = usePublicConfig()
+  const { updateAvailable, updateRequired } = resolveUpdateState(status, config.version)
+
   if (!status) return null
 
   return (
     <>
       {showModal && <UpdateModal onClose={() => setShowModal(false)} />}
 
-      {status.updateRequired && (
+      {updateRequired && (
         <div className="flex items-center justify-center gap-3 bg-red-600 px-4 py-2 text-sm text-white">
           <span>
             Required update (v{status.latestVersion}) — operations are blocked until updated.
@@ -342,7 +349,7 @@ export function LicenseBanner() {
         </div>
       )}
 
-      {!status.updateRequired && status.updateAvailable && (
+      {!updateRequired && updateAvailable && (
         <div className="flex items-center justify-center gap-3 bg-yellow-500 px-4 py-2 text-sm text-black">
           <span>Update available — v{status.latestVersion}</span>
           <button
@@ -354,7 +361,7 @@ export function LicenseBanner() {
         </div>
       )}
 
-      {!status.updateRequired && !status.updateAvailable && status.balance <= 0 && status.tier === 'free' && (
+      {!updateRequired && !updateAvailable && status.balance <= 0 && status.tier === 'free' && (
         <div className="flex items-center justify-center gap-2 bg-orange-500 px-4 py-2 text-sm text-white">
           <span>Tokens exhausted.</span>
           <a
