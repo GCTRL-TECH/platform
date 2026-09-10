@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>How to Extract TIF Raster Coordinates in R When rasterToPoints Fa</title>
+      <link>https://gctrl.tech/blog/fixing-r-rastertopoints-extracting-tif-coordinates-when-it-fails</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/fixing-r-rastertopoints-extracting-tif-coordinates-when-it-fails</guid>
+      <description>Learn how to extract tif raster coordinates r using terra::extract() to avoid memory crashes and handle large TIF files more efficiently than rasterToPoints.</description>
+      <pubDate>Thu, 10 Sep 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>Enterprise Software Moving Away from SaaS: The Shift Explained</title>
       <link>https://gctrl.tech/blog/the-enterprise-shift-why-companies-are-leaving-saas</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/the-enterprise-shift-why-companies-are-leaving-saas</guid>

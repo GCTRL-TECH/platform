@@ -45,6 +45,7 @@ Agent skill: https://gctrl.tech/skill.md
 
 ## Articles
 
+- [How to Extract TIF Raster Coordinates in R When rasterToPoints Fa](https://gctrl.tech/blog/fixing-r-rastertopoints-extracting-tif-coordinates-when-it-fails): Learn how to extract tif raster coordinates r using terra::extract() to avoid memory crashes and handle large TIF files more efficiently than rasterToPoints.
 - [Enterprise Software Moving Away from SaaS: The Shift Explained](https://gctrl.tech/blog/the-enterprise-shift-why-companies-are-leaving-saas): Explore why enterprise software moving away from saas is driven by AI agents, seat-based pricing failures, and a shift toward private cloud deployments.
 - [How to Fill Time Gaps Irregular Timestamps Pandas Guide](https://gctrl.tech/blog/how-to-fill-gaps-in-irregular-time-series-data): Learn how to fill time gaps irregular timestamps pandas workflows using resample, reindex, and interpolation to standardize your time series data.
 - [How to Improve Basic FAISS RAG Pipeline Performance](https://gctrl.tech/blog/beyond-basic-faiss-optimizing-your-rag-retrieval-pipeline): Learn how to improve basic faiss rag pipeline results using recursive chunking, retrieval gates, and RAGAS evaluations to stop hallucinations.
