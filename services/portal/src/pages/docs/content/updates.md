@@ -9,7 +9,7 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 2a10fc0 -->
+<!-- baseline-sha: ef264b5 -->
 
 ## v0.9.10 - A trigger that fails once is retried, not retired
 
