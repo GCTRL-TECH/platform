@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 2a10fc0 -->
 
+## v0.9.10 - A trigger that fails once is retried, not retired
+
+*11 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Scheduled triggers recover from transient failures on their own.** Every trigger - the Knowledge Wiki's auto-distill heartbeat, Obsidian, Google Drive and SharePoint syncs - was flipped to `error` on its first failed run, and the executor only ever picked up `active` triggers again. A single database pool timeout during a busy minute was enough to stop a trigger for good; on one instance the auto-distill had been silently idle for four days while its source graphs kept changing, and nothing but a red dot on the Triggers page told the story. An errored trigger is now retried like an active one - only *paused* stops it - after a short back-off of five minutes, so a transient hiccup heals itself and a permanently broken configuration stays visible as `error` with its last error message without re-logging every minute. Existing triggers stuck in `error` pick up again with the update, no manual resume needed.
+
 ## v0.9.9 - Read-only grants on access tokens
 
 *8 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

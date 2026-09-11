@@ -271,7 +271,7 @@ pub async fn run_cron_tick(state: &AppState) -> usize {
     let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>, Value)>(
         "SELECT id, user_id, module::text, type::text, cron_schedule, config
          FROM triggers
-         WHERE status = 'active'
+         WHERE status IN ('active', 'error')
            AND module::text IN ('obsidian', 'google_drive', 'microsoft')
            AND (next_run_at IS NULL OR next_run_at <= NOW())",
     )
@@ -307,9 +307,11 @@ pub async fn run_cron_tick(state: &AppState) -> usize {
             }
             Err(e) => {
                 tracing::warn!("cron trigger {trigger_id} failed: {e}");
-                // Keep it active but record the error + still advance next_run_at
-                // so a permanently-broken vault doesn't get retried every tick.
-                let next = compute_next_run(&kind, cron_schedule.as_deref());
+                // Record the error (status 'error' is a DISPLAY state — the
+                // selects above still pick it up, only 'paused' stops a
+                // trigger) and back off so a permanently-broken vault isn't
+                // retried every tick.
+                let next = compute_next_run_after_error(&kind, cron_schedule.as_deref());
                 let _ = sqlx::query(
                     "UPDATE triggers SET last_run_at = NOW(), next_run_at = $1,
                         last_error = $2, status = 'error', updated_at = NOW()
@@ -340,7 +342,8 @@ pub async fn run_cron_tick(state: &AppState) -> usize {
 // processing `distill_wiki` job for the SAME compilation and skip if one exists —
 // so a slow LLM run never lets distill jobs pile up (mirrors the compilation-
 // refresh debounce intent). next_run_at is advanced every tick regardless, so a
-// misconfigured trigger never busy-loops.
+// misconfigured trigger never busy-loops; a failed run backs off (see
+// `compute_next_run_after_error`) but is retried — 'error' is not a stop state.
 //
 // Returns the number of distill triggers processed (enqueued or debounced-skip).
 
@@ -348,7 +351,7 @@ async fn run_distill_triggers(state: &AppState) -> usize {
     let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, Value)>(
         "SELECT id, user_id, type::text, cron_schedule, config
          FROM triggers
-         WHERE status = 'active'
+         WHERE status IN ('active', 'error')
            AND module = 'distill'
            AND (next_run_at IS NULL OR next_run_at <= NOW())",
     )
@@ -359,9 +362,9 @@ async fn run_distill_triggers(state: &AppState) -> usize {
     let mut executed = 0usize;
     for (trigger_id, user_id, kind, cron_schedule, config) in rows {
         let res = enqueue_one_distill(state, user_id, &kind, &config).await;
-        let next = compute_next_run(&kind, cron_schedule.as_deref());
         match res {
             Ok(enqueued) => {
+                let next = compute_next_run(&kind, cron_schedule.as_deref());
                 let _ = sqlx::query(
                     "UPDATE triggers SET last_run_at = NOW(), next_run_at = $1,
                         run_count = run_count + CASE WHEN $2 THEN 1 ELSE 0 END,
@@ -376,6 +379,12 @@ async fn run_distill_triggers(state: &AppState) -> usize {
             }
             Err(e) => {
                 tracing::warn!("distill trigger {trigger_id} failed: {e}");
+                // Same bookkeeping as the cron executor: 'error' is retried
+                // (with backoff), never a permanent stop. Asgard 2026-09-07:
+                // one transient "pool timed out" flipped both auto-distill
+                // triggers to 'error' and the old `status = 'active'` select
+                // never touched them again — the wiki went stale for days.
+                let next = compute_next_run_after_error(&kind, cron_schedule.as_deref());
                 let _ = sqlx::query(
                     "UPDATE triggers SET last_run_at = NOW(), next_run_at = $1,
                         last_error = $2, status = 'error', updated_at = NOW()
@@ -584,13 +593,76 @@ async fn wiki_has_new_content(
 /// Compute the next run instant. change_detection → always due next tick (now);
 /// cron → parsed from the schedule.
 fn compute_next_run(kind: &str, cron_schedule: Option<&str>) -> chrono::DateTime<chrono::Utc> {
-    let now = chrono::Utc::now();
+    compute_next_run_at(kind, cron_schedule, chrono::Utc::now())
+}
+
+fn compute_next_run_at(
+    kind: &str,
+    cron_schedule: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
     if kind == "change_detection" {
         return now;
     }
     match cron_schedule.filter(|s| !s.is_empty()) {
         Some(c) => crate::services::cron::next_run_from_cron(c, now),
         None => now + chrono::Duration::hours(24),
+    }
+}
+
+/// Minimum gap before a FAILED trigger run is retried. Heartbeats would
+/// otherwise re-fire (and re-log the failure) every executor tick.
+const ERROR_RETRY_BACKOFF: chrono::Duration = chrono::Duration::minutes(5);
+
+/// `next_run_at` after a failed run: the regular schedule, but never sooner
+/// than `ERROR_RETRY_BACKOFF` from now. Transient failures (DB pool timeout,
+/// LLM runtime hiccup) recover on their own; permanent ones (bad config) stay
+/// visible as `status = 'error'` + `last_error` without spamming the log.
+fn compute_next_run_after_error(kind: &str, cron_schedule: Option<&str>) -> chrono::DateTime<chrono::Utc> {
+    compute_next_run_after_error_at(kind, cron_schedule, chrono::Utc::now())
+}
+
+fn compute_next_run_after_error_at(
+    kind: &str,
+    cron_schedule: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let scheduled = compute_next_run_at(kind, cron_schedule, now);
+    scheduled.max(now + ERROR_RETRY_BACKOFF)
+}
+
+#[cfg(test)]
+mod next_run_tests {
+    use super::*;
+
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-07T07:16:00Z").unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn heartbeat_success_refires_next_tick() {
+        assert_eq!(compute_next_run_at("change_detection", None, t0()), t0());
+    }
+
+    #[test]
+    fn heartbeat_failure_backs_off_instead_of_refiring_every_tick() {
+        let next = compute_next_run_after_error_at("change_detection", None, t0());
+        assert_eq!(next, t0() + ERROR_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn cron_failure_keeps_schedule_when_it_is_later_than_the_backoff() {
+        // Hourly schedule → next slot 08:00, well past the 5-minute floor.
+        let next = compute_next_run_after_error_at("cron", Some("0 * * * *"), t0());
+        assert_eq!(next, compute_next_run_at("cron", Some("0 * * * *"), t0()));
+        assert!(next >= t0() + ERROR_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn cron_failure_never_retries_sooner_than_the_backoff() {
+        // Every-minute schedule → 07:17 would be sooner than the floor.
+        let next = compute_next_run_after_error_at("cron", Some("* * * * *"), t0());
+        assert_eq!(next, t0() + ERROR_RETRY_BACKOFF);
     }
 }
 
