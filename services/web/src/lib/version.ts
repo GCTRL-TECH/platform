@@ -51,6 +51,10 @@ export interface AgentUpdateFlags {
   latestVersion?: string | null
   updateAvailable?: boolean
   updateRequired?: boolean
+  /** Which signal produced `updateAvailable`: `"digest"` = the API compared the
+   *  installed image digests with the registry (authoritative), `"semver"` = the
+   *  version-number fallback. Absent on APIs older than 2026-09-17. */
+  updateMethod?: 'digest' | 'semver' | null
 }
 
 export interface UpdateState {
@@ -61,7 +65,12 @@ export interface UpdateState {
 /**
  * Decide whether to show an update prompt.
  *
- * - When the running platform version is known, the agent's flags are only
+ * - A digest-based `updateAvailable` is taken as is. Version numbers cannot answer
+ *   "is there an update": the number is a CI run counter baked into the API image
+ *   only, so the channel can name a version no image carries (the banner then never
+ *   clears, however often you update) or miss one that exists (only `web` rebuilt).
+ *   `updateRequired` is the licence server's call and keeps its semver gate.
+ * - Otherwise, when the running platform version is known, the agent's flags are only
  *   honoured if `latestVersion` is semver-newer than the platform. An agent
  *   that is behind on its own bookkeeping can no longer trigger a false prompt.
  * - When the platform version is unknown (config not loaded / unparseable),
@@ -78,7 +87,7 @@ export function resolveUpdateState(
   if (cmp === null) return { updateAvailable: available || required, updateRequired: required }
   const newer = cmp > 0
   return {
-    updateAvailable: newer && (available || required),
+    updateAvailable: agent.updateMethod === 'digest' ? available || (newer && required) : newer && (available || required),
     updateRequired: newer && required,
   }
 }

@@ -11,6 +11,15 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 16aaf14 -->
 
+## v0.9.13 - "Update available" tells the truth, on every install
+
+*17 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The update banner now follows what is actually installed, not a version number.** GCTRL has long detected updates the reliable way - each instance compares the digests of its running images with the registry, no matter where it runs or how it was installed. But the yellow banner and the bell in the header did not use that result: they compared version numbers, and the number is a release counter baked into the API image only. On 17 September two website-only releases advanced the counter without building a single product image. Every instance showed "Update available", the in-app update correctly found nothing to pull - and the banner stayed, however often you updated. The banner and bell now take the digest verdict: they appear when an image of yours is behind the registry and disappear the moment the update has been installed. The version comparison remains only as a fallback for installs that cannot reach the registry.
+- **It also catches updates the version number used to miss.** The mirror image of the same flaw: a release that rebuilt only the web interface left the API's number unchanged, so an instance could be told it was current while a newer image was waiting. Digests have no such blind spot.
+- **A version is only announced when there is something to pull.** The release pipeline publishes a new version to the update channel and the license service only if at least one product image was built for it; a website or documentation release re-ships the version that is already live.
+- **Seeing the banner right now?** Run the in-app update once (or `curl -fsSL https://gctrl.tech/update | bash`). That installs this release, and the banner clears when it finishes.
+
 ## v0.9.12 - Scoped tokens now scope source passages too
 
 *17 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

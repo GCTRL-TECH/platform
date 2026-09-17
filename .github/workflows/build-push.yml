@@ -297,13 +297,30 @@ jobs:
       # such file existed — the SPA's index.html fallback was served instead, so
       # the version channel never worked. CI-generated only; never committed
       # (see .gitignore) so a stray local build can't ship a stale one.
+      #
+      # A version is only NEW when a customer image was built for it. VERSION is a
+      # run counter, so a portal-only push (docs, blog, this workflow) used to
+      # publish a number that no customer image carries: on 2026-09-17 0.1.290 and
+      # 0.1.291 did exactly that, every instance showed "Update available", the
+      # in-app update pulled nothing, and the banner never cleared. Such a run now
+      # re-ships the version.json that is already live.
       - name: Generate version.json
         # Block scalar: the inline JSON contains ": " which YAML would parse as
         # a mapping in a plain scalar (this exact line broke the workflow once).
+        env:
+          CUSTOMER_IMAGE_CHANGED: ${{ needs.changes.outputs.kex == 'true' || needs.changes.outputs.fuse == 'true' || needs.changes.outputs.agent == 'true' || needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.fusion == 'true' || github.event_name == 'workflow_dispatch' }}
         run: |
-          printf '{"version": "%s", "channel": "stable", "publishedAt": "%s"}\n' \
-            "${VERSION}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > services/portal/public/version.json
-          cat services/portal/public/version.json
+          out=services/portal/public/version.json
+          if [ "$CUSTOMER_IMAGE_CHANGED" != "true" ] \
+             && curl -fsS -m 15 https://gctrl.tech/version.json -o /tmp/live-version.json \
+             && jq -e '.version | strings | test("^[0-9]+[.][0-9]+[.][0-9]+$")' /tmp/live-version.json >/dev/null; then
+            echo "No customer image changed in this run - keeping the published version."
+            cp /tmp/live-version.json "$out"
+          else
+            printf '{"version": "%s", "channel": "stable", "publishedAt": "%s"}\n' \
+              "${VERSION}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$out"
+          fi
+          cat "$out"
       - uses: docker/build-push-action@v5
         with:
           context: services/portal
@@ -328,7 +345,14 @@ jobs:
       - build-api-rs
       - build-web
       - build-fusion-engine
-    if: always() && github.event_name == 'push'
+    # Only when at least one customer image was actually built: a version the
+    # license API advertises must be one an instance can pull (see build-portal's
+    # version.json step for the 2026-09-17 phantom-version incident).
+    if: |
+      always() && github.event_name == 'push' &&
+      (needs.build-kex.result == 'success' || needs.build-fuse.result == 'success' ||
+       needs.build-agent-rs.result == 'success' || needs.build-api-rs.result == 'success' ||
+       needs.build-web.result == 'success' || needs.build-fusion-engine.result == 'success')
     runs-on: ubuntu-latest
     # Never let a publish hiccup fail the overall build — it's best-effort.
     continue-on-error: true

@@ -114,7 +114,12 @@ struct CheckParams {
 /// and `note` explain why — never a false "up to date". Results are cached for
 /// [`CHECK_CACHE_TTL`] so bell polling and repeated Settings visits stay cheap.
 async fn check_update(Query(params): Query<CheckParams>) -> Json<Value> {
-    let force = params.force.as_deref() == Some("1");
+    Json(update_check_payload(params.force.as_deref() == Some("1")).await)
+}
+
+/// The cache-aware check behind `/api/update/check`. Also feeds the banner/bell
+/// verdict in [`agent_status`], so both surfaces always agree.
+async fn update_check_payload(force: bool) -> Value {
     let current = current_version();
 
     // Serve from cache if fresh (unless the caller explicitly asked to bypass it).
@@ -122,7 +127,7 @@ async fn check_update(Query(params): Query<CheckParams>) -> Json<Value> {
         if let Ok(guard) = check_cache().lock() {
             if let Some(c) = guard.as_ref() {
                 if c.fetched_at.elapsed() < CHECK_CACHE_TTL {
-                    return Json(c.payload.clone());
+                    return c.payload.clone();
                 }
             }
         }
@@ -175,7 +180,26 @@ async fn check_update(Query(params): Query<CheckParams>) -> Json<Value> {
         *guard = Some(CachedCheck { payload: payload.clone(), fetched_at: Instant::now() });
     }
 
-    Json(payload)
+    payload
+}
+
+/// Drop the cached check so the next poll re-derives it. Called at the end of an
+/// in-app update: a verdict cached BEFORE the update would otherwise keep
+/// advertising the update that was just installed for up to [`CHECK_CACHE_TTL`].
+fn invalidate_check_cache() {
+    if let Ok(mut guard) = check_cache().lock() {
+        *guard = None;
+    }
+}
+
+/// The digest verdict of a check payload: `Some(update_available)` only when the
+/// digest pass actually ran (`method == "digest"`). `None` for the semver/unavailable
+/// degradations - those are not evidence about the installed images.
+fn digest_verdict(check: &Value) -> Option<bool> {
+    if check.get("method").and_then(|m| m.as_str()) != Some("digest") {
+        return None;
+    }
+    check.get("updateAvailable").and_then(|v| v.as_bool())
 }
 
 // ─── Digest-based detection ─────────────────────────────────────────────────
@@ -411,7 +435,8 @@ async fn agent_status(Extension(claims): Extension<Option<JwtClaims>>) -> Json<V
                 let activated = v.get("activated").cloned().unwrap_or(json!(false));
                 return Json(json!({ "reachable": true, "activated": activated }));
             }
-            reconcile_agent_status(&mut v, &current_version());
+            let verdict = digest_verdict(&update_check_payload(false).await);
+            reconcile_agent_status(&mut v, &current_version(), verdict);
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("reachable".to_string(), json!(true));
             }
@@ -430,15 +455,29 @@ async fn agent_status(Extension(claims): Extension<Option<JwtClaims>>) -> Json<V
 /// agent's `latestVersion` (the agent's value is kept as `agentCurrentVersion`
 /// so the drift stays diagnosable). A missing/unparseable `latestVersion`
 /// yields `false` — `version_gt` is conservative.
-fn reconcile_agent_status(status: &mut Value, running: &str) {
+///
+/// `digest_verdict` (see [`digest_verdict`]) OVERRIDES that semver compare whenever
+/// the digest pass ran. Version numbers are the wrong tool for "is there an update":
+/// every service ships as `:latest`, the number is a CI run counter baked into the
+/// API image only, and the channel can name a version no customer image carries
+/// (a run that built nothing for customers) or lag behind one that exists (a run
+/// that rebuilt only `web`, a failed best-effort publish). Comparing image digests
+/// with the registry has neither problem. `updateMethod` tells the client which
+/// signal produced the flag. `updateRequired` is the licence server's call and is
+/// left untouched.
+fn reconcile_agent_status(status: &mut Value, running: &str, digest_verdict: Option<bool>) {
     let Some(obj) = status.as_object_mut() else { return };
     let latest = obj.get("latestVersion").and_then(|v| v.as_str()).map(str::to_string);
     if let Some(prev) = obj.get("currentVersion").cloned() {
         obj.insert("agentCurrentVersion".to_string(), prev);
     }
     obj.insert("currentVersion".to_string(), json!(running));
-    let available = latest.as_deref().is_some_and(|l| version_gt(l, running));
+    let (available, method) = match digest_verdict {
+        Some(v) => (v, "digest"),
+        None => (latest.as_deref().is_some_and(|l| version_gt(l, running)), "semver"),
+    };
     obj.insert("updateAvailable".to_string(), json!(available));
+    obj.insert("updateMethod".to_string(), json!(method));
 }
 
 /// Fetch the latest version. Tries the configured version channel first, then
@@ -707,6 +746,7 @@ async fn run_update(tx: mpsc::UnboundedSender<Result<Event, Infallible>>) {
         format!("Still outdated after update: {}", still_outdated.join(", "))
     };
     send("progress", json!({ "step": "verify", "message": verify_message }));
+    invalidate_check_cache();
 
     // Step 3: The api cannot delete-and-recreate its own container without
     // dying mid-operation, so the gctrl-agent does it on the api's behalf — it
@@ -1456,7 +1496,7 @@ mod tests {
             "latestVersion": "0.1.278",
             "updateAvailable": true,
         });
-        reconcile_agent_status(&mut s, "0.1.278");
+        reconcile_agent_status(&mut s, "0.1.278", None);
         assert_eq!(s["currentVersion"], "0.1.278");
         assert_eq!(s["agentCurrentVersion"], "0.1.267");
         assert_eq!(s["updateAvailable"], false);
@@ -1466,27 +1506,68 @@ mod tests {
     #[test]
     fn reconcile_keeps_a_real_update_visible() {
         let mut s = json!({ "currentVersion": "0.1.270", "latestVersion": "0.1.278", "updateAvailable": false });
-        reconcile_agent_status(&mut s, "0.1.270");
+        reconcile_agent_status(&mut s, "0.1.270", None);
         assert_eq!(s["updateAvailable"], true, "agent lagging behind must not hide a real update");
-        reconcile_agent_status(&mut s, "v0.1.279");
+        reconcile_agent_status(&mut s, "v0.1.279", None);
         assert_eq!(s["updateAvailable"], false, "running ahead of the channel is not an update");
     }
 
     #[test]
     fn reconcile_without_latest_version_is_conservative() {
         let mut s = json!({ "currentVersion": "0.1.267", "updateAvailable": true });
-        reconcile_agent_status(&mut s, "0.1.278");
+        reconcile_agent_status(&mut s, "0.1.278", None);
         assert_eq!(s["updateAvailable"], false);
         assert_eq!(s["currentVersion"], "0.1.278");
 
         let mut s = json!({ "latestVersion": "garbage" });
-        reconcile_agent_status(&mut s, "0.1.278");
+        reconcile_agent_status(&mut s, "0.1.278", None);
         assert_eq!(s["updateAvailable"], false);
         assert!(s.get("agentCurrentVersion").is_none(), "nothing to preserve");
 
         let mut not_an_object = json!("unexpected");
-        reconcile_agent_status(&mut not_an_object, "0.1.278");
+        reconcile_agent_status(&mut not_an_object, "0.1.278", None);
         assert_eq!(not_an_object, json!("unexpected"));
+    }
+
+    /// The 2026-09-17 case: CI published 0.1.291 from a portal-only run, so no
+    /// customer image carries it. Every image digest matches the registry, the
+    /// in-app update pulls nothing - and the semver compare kept the banner up
+    /// forever. The digest verdict is the truth and must win.
+    #[test]
+    fn reconcile_digest_verdict_clears_a_phantom_version() {
+        let mut s = json!({ "currentVersion": "0.1.289", "latestVersion": "0.1.291", "updateAvailable": true });
+        reconcile_agent_status(&mut s, "0.1.289", Some(false));
+        assert_eq!(s["updateAvailable"], false);
+        assert_eq!(s["updateMethod"], "digest");
+        assert_eq!(s["currentVersion"], "0.1.289");
+    }
+
+    /// The mirror case: only `web` was rebuilt, or the best-effort version publish
+    /// failed - the channel shows nothing newer than the running API, yet an image
+    /// IS outdated. Semver would hide a real update.
+    #[test]
+    fn reconcile_digest_verdict_shows_an_update_the_channel_missed() {
+        let mut s = json!({ "currentVersion": "0.1.289", "latestVersion": "0.1.289", "updateAvailable": false });
+        reconcile_agent_status(&mut s, "0.1.289", Some(true));
+        assert_eq!(s["updateAvailable"], true);
+        assert_eq!(s["updateMethod"], "digest");
+    }
+
+    #[test]
+    fn reconcile_without_a_digest_verdict_falls_back_to_semver() {
+        let mut s = json!({ "latestVersion": "0.1.291" });
+        reconcile_agent_status(&mut s, "0.1.289", None);
+        assert_eq!(s["updateAvailable"], true);
+        assert_eq!(s["updateMethod"], "semver");
+    }
+
+    #[test]
+    fn digest_verdict_only_trusts_a_digest_check() {
+        assert_eq!(digest_verdict(&json!({ "method": "digest", "updateAvailable": false })), Some(false));
+        assert_eq!(digest_verdict(&json!({ "method": "digest", "updateAvailable": true })), Some(true));
+        assert_eq!(digest_verdict(&json!({ "method": "semver", "updateAvailable": true })), None);
+        assert_eq!(digest_verdict(&json!({ "method": "unavailable", "updateAvailable": false })), None);
+        assert_eq!(digest_verdict(&json!({})), None);
     }
 
     // ── short_name_from_image / ghcr_repo_from_image ───────────────────────────
