@@ -299,6 +299,10 @@ struct ListQuery {
     /// used to filter the 20 newest graphs client-side, so a folder holding older
     /// graphs opened empty under a non-zero card count.
     #[serde(rename = "folderId")] folder_id: Option<String>,
+    /// Filter to one compilation type (RAW | WIKI | CODE). The wiki page used to
+    /// pick WIKIs out of the N newest graphs client-side, so on an instance with
+    /// more graphs than the limit an older wiki vanished ("No wikis yet").
+    #[serde(rename = "type")] comp_type: Option<String>,
 }
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
@@ -891,6 +895,8 @@ async fn list(
     let offset = q.offset.unwrap_or(0);
     let folder_filter: Option<String> = q.folder_id.as_ref()
         .map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+    let type_filter: Option<String> = q.comp_type.as_ref()
+        .map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty());
     // Visibility, per row:
     //   - classified within clearance (cl.rank <= $2), OR
     //   - unclassified — but ONLY for uncapped requests ($5): a rank-limited
@@ -925,10 +931,11 @@ async fn list(
            AND ($8::text IS NULL
                 OR ($8::text = 'root' AND c.folder_id IS NULL)
                 OR c.folder_id::text = $8::text)
+           AND ($9::text IS NULL OR c.type::text = $9::text)
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
      .bind(rank_capped).bind(claims.api_key_id).bind(claims.code_access)
-     .bind(folder_filter.as_deref())
+     .bind(folder_filter.as_deref()).bind(type_filter.as_deref())
      .fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
@@ -991,9 +998,10 @@ async fn list(
                AND ($5 OR c.type::text <> 'CODE')
                AND ($6::text IS NULL
                     OR ($6::text = 'root' AND c.folder_id IS NULL)
-                    OR c.folder_id::text = $6::text)"
+                    OR c.folder_id::text = $6::text)
+               AND ($7::text IS NULL OR c.type::text = $7::text)"
         ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
-         .bind(claims.code_access).bind(folder_filter.as_deref())
+         .bind(claims.code_access).bind(folder_filter.as_deref()).bind(type_filter.as_deref())
          .fetch_one(&state.db).await?
     };
 

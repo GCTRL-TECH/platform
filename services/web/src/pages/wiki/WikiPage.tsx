@@ -169,30 +169,45 @@ function rewriteWikilinks(md: string): string {
 export function WikiPage() {
   const queryClient = useQueryClient()
 
-  // All compilations — we derive the set of accessible WIKI spaces from these.
+  // The accessible WIKI spaces, plus the RAW graphs offered as wiki sources.
   // The query key MUST encode the limit: Dashboard/KG list/FUSE cache plain
   // '/kg/compilations' (server default: 20 newest) under ['kg','compilations'].
   // Sharing that key made this page render from their 20-newest cache — which
   // often contains no WIKI compilations — so the wiki list showed empty until
   // a hard refresh. (invalidateQueries on the ['kg','compilations'] prefix
   // still reaches this key.)
+  //
+  // Filter by type SERVER-side: the list is newest-first, so picking WIKIs out
+  // of "the N newest graphs" dropped an older wiki as soon as the instance held
+  // more graphs than the limit ("No wikis yet" on a box with 110 graphs). The
+  // client-side filters below stay as a guard for an API that predates `type`
+  // (it ignores the param and returns all types, up to the server max of 500).
   const {
-    data: compsData,
-    isLoading: compsLoading,
-    error: compsError,
+    data: wikiData,
+    isLoading: wikisLoading,
+    error: wikisError,
   } = useApiQuery<CompilationsResponse>(
-    ['kg', 'compilations', { limit: 100 }],
-    '/kg/compilations?limit=100'
+    ['kg', 'compilations', { type: 'WIKI', limit: 500 }],
+    '/kg/compilations?type=WIKI&limit=500'
   )
+  const {
+    data: rawData,
+    isLoading: rawsLoading,
+    error: rawsError,
+  } = useApiQuery<CompilationsResponse>(
+    ['kg', 'compilations', { type: 'RAW', limit: 500 }],
+    '/kg/compilations?type=RAW&limit=500'
+  )
+  const compsLoading = wikisLoading || rawsLoading
+  const compsError = wikisError ?? rawsError
 
-  const compilations = compsData?.compilations ?? []
   const wikis = useMemo(
-    () => compilations.filter((c) => c.type === 'WIKI'),
-    [compilations]
+    () => (wikiData?.compilations ?? []).filter((c) => c.type === 'WIKI'),
+    [wikiData]
   )
   const rawCompilations = useMemo(
-    () => compilations.filter((c) => (c.type ?? 'RAW') === 'RAW'),
-    [compilations]
+    () => (rawData?.compilations ?? []).filter((c) => (c.type ?? 'RAW') === 'RAW'),
+    [rawData]
   )
 
   // Which wiki space is open. Null = show the selector.

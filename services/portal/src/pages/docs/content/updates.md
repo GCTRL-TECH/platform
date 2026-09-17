@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: ef264b5 -->
 
+## v0.9.11 - The Knowledge Wiki stays visible on large instances
+
+*17 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The Wiki page finds your wiki no matter how many knowledge bases you have.** The page loaded the 100 newest knowledge bases and picked the wikis out of that list in the browser. On an instance that had grown past 100 knowledge bases - easy to reach once an integration such as Anvil files a knowledge base and a code graph per project - an older Knowledge Wiki fell out of that window and the page showed "No wikis yet", although the wiki was intact and had been distilled the same day. The list endpoint now filters by type on the server (`GET /api/kg/compilations?type=WIKI`, also `RAW` and `CODE`; `total` respects the filter), and the Wiki page asks for exactly the wikis, plus exactly the raw knowledge bases for the source picker, which had the same blind spot. Nothing was lost and nothing needs to be re-distilled - the wiki reappears with the update.
+
 ## v0.9.10 - A trigger that fails once is retried, not retired
 
 *11 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
