@@ -362,6 +362,9 @@ jobs:
       !failure() && !cancelled() &&
       (needs.build-license-api.result == 'success' || needs.build-portal.result == 'success')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Deploy portal + license-api to VPS
         uses: appleboy/ssh-action@v1
@@ -369,11 +372,16 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: GHCR_TOKEN
+          envs: GHCR_TOKEN,GHCR_USER
           script: |
             set -e
             cd /docker/gctrl
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u TortillaJackson --password-stdin || echo "ghcr login skipped (images are public)"
+            # Log in with the job's own GITHUB_TOKEN (valid only while this job runs),
+            # not a PAT: the 90-day PAT expired silently on 2026-09-15 and took the
+            # portal deploy down with it. Always log out again - a dead credential left
+            # in ~/.docker/config.json makes even PUBLIC ghcr pulls fail with "denied".
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
             sed -i 's|image: ghcr.io/gctrl-tech/web:latest|image: ghcr.io/gctrl-tech/portal:latest|' docker-compose.yml
 
@@ -383,7 +391,8 @@ jobs:
             echo "=== Portal containers ==="
             docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" | grep -E "NAME|gctrl-api|gctrl-web"
         env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
 
   # The legacy "deploy-vps" job used to `docker run` a standalone `gctrl-app`
   # API container outside of Compose (no labels, no ports, DATABASE_URL pointing
