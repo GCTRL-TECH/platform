@@ -137,6 +137,91 @@ pub(crate) async fn api_key_scoped_jobs(
     Some(jobs.into_iter().map(|j| j.to_string()).collect())
 }
 
+/// The job ids whose text CHUNKS this request may read — the chunk-side twin of
+/// `api_key_scoped_jobs`. Same contract: `None` = no restriction, `Some(empty)` =
+/// nothing visible (the caller returns no chunks and does not even ask KEX).
+///
+/// Chunks are keyed by JOB, not by compilation: `text_chunks.compilation_id` is
+/// NULL on a large share of chunks (which is why KEX treats `compilation_id` as a
+/// soft preference with an owner-corpus fallback), while `job_id` is always
+/// written. Until 2026-09-17 chunk retrieval was scoped by owner + clearance only,
+/// so a KB-scoped token read passages out of every other knowledge base of the
+/// account — through `search_chunks`, and through the answer + citations of
+/// `/rag/query`. See docs/security/2026-09-17-chunk-scope.md.
+///
+///   * `compilation_id` given → the `source_job_ids` of THAT compilation, and only
+///     when the caller owns it and (KB-scoped token) holds a grant on it / (Codebase
+///     access off) it is not a CODE graph. Anything else → `Some(empty)`: an empty
+///     result, never an error that would confirm the compilation exists. This makes
+///     `compilationId` a HARD filter for every caller, JWT sessions included.
+///     A WIKI compilation has no jobs of its own — it distils from RAW sources — so
+///     it resolves to the jobs of its sources (for a KB-scoped token: only the
+///     sources that token is granted as well).
+///   * no `compilation_id` → `api_key_scoped_jobs`, i.e. unchanged (`None`) for a
+///     JWT session or an unrestricted full-owner token.
+///
+/// EVERY chunk read must go through this (guard test:
+/// `every_kex_search_call_site_is_job_scoped`).
+pub(crate) async fn chunk_job_scope(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+    compilation_id: Option<Uuid>,
+) -> Option<Vec<String>> {
+    let Some(cid) = compilation_id else { return api_key_scoped_jobs(db, claims).await; };
+    let scope = api_key_scope(db, claims).await;
+    if matches!(&scope, Some(set) if !set.contains(&cid)) { return Some(Vec::new()); }
+    if !claims.code_access && compilation_is_code(db, cid).await { return Some(Vec::new()); }
+    // The compilation itself plus, for a WIKI, the RAW graphs it distils from
+    // (`wiki_sources`, and the legacy single-source mirror column).
+    let mut comp_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT source_compilation_id FROM wiki_sources WHERE wiki_compilation_id = $1
+         UNION
+         SELECT wiki_source_compilation_id FROM compilations
+          WHERE id = $1 AND wiki_source_compilation_id IS NOT NULL"
+    ).bind(cid).fetch_all(db).await.unwrap_or_default();
+    if let Some(ref set) = scope { comp_ids.retain(|c| set.contains(c)); }
+    comp_ids.push(cid);
+    // `user_id = $2` is the ownership check: a foreign (or unknown) compilation id
+    // contributes no jobs and the result is the same empty list.
+    let jobs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT unnest(COALESCE(source_job_ids, '{}'::uuid[])) FROM compilations
+         WHERE id = ANY($1) AND user_id = $2"
+    ).bind(&comp_ids).bind(claims.sub).fetch_all(db).await.unwrap_or_default();
+    Some(jobs.into_iter().map(|j| j.to_string()).collect())
+}
+
+/// Caller-supplied chunk `limit`: default 5, clamped to 1..=50.
+pub(crate) fn clamp_chunk_limit(requested: Option<i64>) -> usize {
+    requested.unwrap_or(5).clamp(1, 50) as usize
+}
+
+/// How many chunks to ask KEX for. Unscoped: exactly what was requested. Under a
+/// job scope: over-fetch (x10, capped at 60) so that `retain_allowed_chunks` still
+/// has enough left after dropping foreign hits when the KEX image predates the
+/// `job_ids` filter and ranks the whole owner corpus.
+pub(crate) fn chunk_fetch_limit(limit: usize, scoped: bool) -> usize {
+    if scoped { (limit.saturating_mul(10)).min(60).max(limit) } else { limit }
+}
+
+/// Defense in depth, independent of the KEX image version: keep only the chunks
+/// whose job is in the allow-list, THEN cut to `limit`. No scope (`None`) returns
+/// the input untouched. Under a scope a chunk WITHOUT a job id is dropped — it
+/// cannot be attributed to a knowledge base, so it fails closed. Generic over the
+/// chunk type because agent.rs handles raw JSON and rag.rs a typed struct.
+pub(crate) fn retain_allowed_chunks<T>(
+    chunks: Vec<T>,
+    allowed: Option<&std::collections::HashSet<String>>,
+    limit: usize,
+    job_of: impl Fn(&T) -> Option<&str>,
+) -> Vec<T> {
+    let Some(allowed) = allowed else { return chunks; };
+    chunks
+        .into_iter()
+        .filter(|c| job_of(c).is_some_and(|j| allowed.contains(&j.to_ascii_lowercase())))
+        .take(limit)
+        .collect()
+}
+
 /// The compilations this request's API key holds a READ-ONLY grant on (migration
 /// 088, `api_key_grants.read_only`). Empty for JWT sessions and for keys without
 /// such grants. Independent of `kb_scoped`: a read-only grant is honoured on an
@@ -4429,5 +4514,109 @@ mod user_folder_segments_tests {
             user_folder_segments(Some("  fabio  @5monti.com"), uid),
             vec!["Users".to_string(), "fabio".to_string()]
         );
+    }
+}
+
+// ── Chunk job scope (KB boundary of chunk retrieval) ──────────────────────────
+#[cfg(test)]
+mod chunk_scope_tests {
+    use super::{chunk_fetch_limit, clamp_chunk_limit, retain_allowed_chunks};
+    use serde_json::{json, Value};
+    use std::collections::HashSet;
+
+    fn allow(jobs: &[&str]) -> HashSet<String> { jobs.iter().map(|j| j.to_string()).collect() }
+    fn job_of(c: &Value) -> Option<&str> { c.get("job_id").and_then(|v| v.as_str()) }
+    fn texts(chunks: &[Value]) -> Vec<&str> {
+        chunks.iter().map(|c| c["text"].as_str().unwrap_or("")).collect()
+    }
+
+    /// The 2026-09-17 leak in one assertion: a chunk of a job outside the scope
+    /// never reaches the caller, whatever KEX returned.
+    #[test]
+    fn foreign_job_chunks_are_dropped() {
+        let chunks = vec![
+            json!({ "text": "mine",    "job_id": "job-a" }),
+            json!({ "text": "foreign", "job_id": "job-b" }),
+            json!({ "text": "mine-2",  "job_id": "job-a" }),
+        ];
+        let kept = retain_allowed_chunks(chunks, Some(&allow(&["job-a"])), 5, job_of);
+        assert_eq!(texts(&kept), vec!["mine", "mine-2"]);
+    }
+
+    /// Fail closed: a chunk that cannot be attributed to a job (missing / null /
+    /// non-string `job_id`) is not visible under a scope.
+    #[test]
+    fn chunk_without_job_id_is_dropped_under_scope() {
+        let chunks = vec![
+            json!({ "text": "no-key" }),
+            json!({ "text": "null-job", "job_id": Value::Null }),
+            json!({ "text": "num-job",  "job_id": 7 }),
+            json!({ "text": "ok",       "job_id": "job-a" }),
+        ];
+        let kept = retain_allowed_chunks(chunks, Some(&allow(&["job-a"])), 5, job_of);
+        assert_eq!(texts(&kept), vec!["ok"]);
+    }
+
+    /// `None` = JWT session / unrestricted token: nothing is filtered and nothing
+    /// is truncated — today's behaviour exactly, jobless chunks included.
+    #[test]
+    fn no_scope_leaves_chunks_untouched() {
+        let chunks = vec![
+            json!({ "text": "a", "job_id": "job-a" }),
+            json!({ "text": "b" }),
+            json!({ "text": "c", "job_id": "job-c" }),
+        ];
+        assert_eq!(retain_allowed_chunks(chunks.clone(), None, 1, job_of), chunks);
+    }
+
+    /// An empty scope is "nothing visible", not "no filter".
+    #[test]
+    fn empty_scope_drops_everything() {
+        let chunks = vec![json!({ "text": "a", "job_id": "job-a" }), json!({ "text": "b" })];
+        assert!(retain_allowed_chunks(chunks, Some(&HashSet::new()), 5, job_of).is_empty());
+    }
+
+    /// The limit applies AFTER filtering — cutting first would let foreign hits at
+    /// the top of the over-fetch crowd out the caller's own passages.
+    #[test]
+    fn truncates_after_filtering_and_keeps_rank_order() {
+        let mut chunks: Vec<Value> = (0..6)
+            .map(|i| json!({ "text": format!("foreign-{i}"), "job_id": "job-b" })).collect();
+        chunks.extend((0..4).map(|i| json!({ "text": format!("mine-{i}"), "job_id": "job-a" })));
+        let kept = retain_allowed_chunks(chunks, Some(&allow(&["job-a"])), 3, job_of);
+        assert_eq!(texts(&kept), vec!["mine-0", "mine-1", "mine-2"]);
+    }
+
+    /// KEX reports the job as Postgres/Qdrant stored it; `Uuid::to_string` (the
+    /// allow-list) is lowercase. A differently-cased id is still the same job.
+    #[test]
+    fn job_id_match_ignores_case() {
+        let chunks = vec![json!({ "text": "upper", "job_id": "ABCDEF00-0000-0000-0000-000000000001" })];
+        let allowed = allow(&["abcdef00-0000-0000-0000-000000000001"]);
+        assert_eq!(retain_allowed_chunks(chunks, Some(&allowed), 5, job_of).len(), 1);
+    }
+
+    #[test]
+    fn limit_is_clamped_with_a_default_of_five() {
+        assert_eq!(clamp_chunk_limit(None), 5);
+        assert_eq!(clamp_chunk_limit(Some(12)), 12);
+        assert_eq!(clamp_chunk_limit(Some(0)), 1);
+        assert_eq!(clamp_chunk_limit(Some(-3)), 1);
+        assert_eq!(clamp_chunk_limit(Some(50)), 50);
+        assert_eq!(clamp_chunk_limit(Some(51)), 50);
+        assert_eq!(clamp_chunk_limit(Some(i64::MAX)), 50);
+    }
+
+    /// Unscoped requests ask KEX for exactly what they need; scoped ones over-fetch
+    /// x10 up to 60 — but never LESS than the requested limit.
+    #[test]
+    fn scoped_requests_overfetch_bounded() {
+        assert_eq!(chunk_fetch_limit(5, false), 5);
+        assert_eq!(chunk_fetch_limit(24, false), 24);
+        assert_eq!(chunk_fetch_limit(1, true), 10);
+        assert_eq!(chunk_fetch_limit(5, true), 50);
+        assert_eq!(chunk_fetch_limit(24, true), 60);
+        assert_eq!(chunk_fetch_limit(50, true), 60);
+        assert_eq!(chunk_fetch_limit(usize::MAX, true), usize::MAX);
     }
 }
