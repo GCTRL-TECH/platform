@@ -9,7 +9,7 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: cb81a4c -->
+<!-- baseline-sha: 1ddb8d3 -->
 
 ## v0.9.12 - Scoped tokens now scope source passages too
 
