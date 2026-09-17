@@ -21,6 +21,8 @@ import logging
 import math
 from typing import Callable, Optional
 
+from . import search_scope
+
 logger = logging.getLogger(__name__)
 
 PRIOR_SCALE = 0.1          # bonus = PRIOR_SCALE * ln(1 + heat)
@@ -123,10 +125,16 @@ def _normalize(rid, content, mentions, job_id, comp_id) -> dict:
 
 
 def load_prior_inputs(conn, user_id: Optional[str], chunks: list[dict],
-                      max_rank: Optional[int], compilation_id: Optional[str]
+                      max_rank: Optional[int], compilation_id: Optional[str],
+                      job_ids=None
                       ) -> tuple[dict[str, float], list[tuple[str, dict, float]]]:
     """Read heats for the candidates and their strongest co-activation neighbours
-    (owner + archived + clearance + soft compilation scoped, like _scope_sql)."""
+    (owner + archived + clearance + soft compilation scoped, like _scope_sql).
+
+    `job_ids` (un-annotated on purpose — Cython) is the HARD knowledge-base scope of
+    src/search_scope.py: co-activation pairs are per OWNER, so without it a pair
+    wired by the owner's own session would pull a chunk of another knowledge base
+    into a KB-scoped token's result."""
     ids = [c.get("chunk_id") for c in chunks if c.get("chunk_id")]
     if not ids:
         return {}, []
@@ -166,6 +174,10 @@ def load_prior_inputs(conn, user_id: Optional[str], chunks: list[dict],
     if compilation_id:
         clauses.append("(compilation_id = %(comp)s OR compilation_id IS NULL)")
         params["comp"] = compilation_id
+    job_clause, job_params = search_scope.sql_clause(job_ids)
+    if job_clause:
+        clauses.append(job_clause)
+        params.update(job_params)
     neighbours: list[tuple[str, dict, float]] = []
     with conn.cursor() as cur:
         cur.execute(
@@ -181,7 +193,7 @@ def load_prior_inputs(conn, user_id: Optional[str], chunks: list[dict],
 
 def rerank_with_memory(chunks: list[dict], *, user_id: Optional[str], limit: int,
                        max_rank: Optional[int], compilation_id: Optional[str],
-                       conn_factory: Callable[[], object]) -> list[dict]:
+                       conn_factory: Callable[[], object], job_ids=None) -> list[dict]:
     """Entry point for /search. Never raises; keeps the input order on any problem."""
     limit = max(1, int(limit))
     if not chunks:
@@ -190,7 +202,7 @@ def rerank_with_memory(chunks: list[dict], *, user_id: Optional[str], limit: int
         conn = conn_factory()
         if conn is None:
             return chunks[:limit]
-        heats, neighbours = load_prior_inputs(conn, user_id, chunks, max_rank, compilation_id)
+        heats, neighbours = load_prior_inputs(conn, user_id, chunks, max_rank, compilation_id, job_ids)
         out = apply_prior(chunks, heats, neighbours, limit)
         pulled = sum(1 for c in out if c.get("via") == "coactivation")
         lifted = sum(1 for c in out if (c.get("hebb_bonus") or 0) > 0)

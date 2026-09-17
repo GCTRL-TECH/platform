@@ -50,6 +50,7 @@ from .pii_detector import detect_pii, redact_pii
 from .relex import get_extractor
 from . import reranker
 from . import hebb
+from . import search_scope
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
@@ -1265,6 +1266,12 @@ class SearchReq(BaseModel):
     # Most-permissive classification rank the caller may retrieve. Chunks with a
     # higher min_rank are filtered out of vector search. None = no clearance cap.
     max_rank: Optional[int] = None
+    # HARD knowledge-base scope (src/search_scope.py): the job ids the caller may
+    # read chunks of. None = unscoped (unchanged behaviour); [] = nothing visible.
+    # Unlike `compilation_id` (a soft preference — it is NULL on many chunks) this
+    # is enforced in every channel and never relaxed by a fallback. api-rs sends it
+    # for KB-scoped access tokens and whenever a compilation is targeted.
+    job_ids: Optional[list[str]] = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────
@@ -1540,9 +1547,9 @@ async def search_health_endpoint():
 
 
 def _dense_search(vector, req: "SearchReq") -> list[dict]:
-    """Dense (vector) channel of hybrid retrieval. Owner + clearance are ALWAYS
-    enforced; the compilation scope is a SOFT, droppable filter with an owner-
-    corpus fallback. Returns normalized chunk dicts in rank order (best first).
+    """Dense (vector) channel of hybrid retrieval. Owner + clearance + the job
+    scope (`req.job_ids`, when given) are ALWAYS enforced; the compilation scope is
+    a SOFT, droppable filter with an owner-corpus fallback. Returns normalized chunk dicts in rank order (best first).
     Raises HTTPException only when Qdrant is genuinely unavailable.
     """
     def _owner_clearance_conditions() -> list:
@@ -1555,6 +1562,11 @@ def _dense_search(vector, req: "SearchReq") -> list[dict]:
                 FieldCondition(key="min_rank", range=Range(lte=float(req.max_rank))),
                 IsEmptyCondition(is_empty=PayloadField(key="min_rank")),
             ]))
+        # Hard KB boundary — lives HERE (not next to the soft compilation filter)
+        # so the owner-corpus fallback below keeps it too.
+        job_cond = search_scope.qdrant_condition(req.job_ids)
+        if job_cond is not None:
+            conds.append(job_cond)
         return conds
 
     must_conditions = _owner_clearance_conditions()
@@ -1586,7 +1598,8 @@ def _dense_search(vector, req: "SearchReq") -> list[dict]:
         hits = _run(qdrant_filter)
         if not hits and req.compilation_id:
             logger.info("/search dense: 0 hits scoped to compilation %s — owner-corpus fallback", req.compilation_id)
-            hits = _run(Filter(must=_owner_clearance_conditions()) if (req.user_id or req.max_rank is not None) else None)
+            fallback_conds = _owner_clearance_conditions()
+            hits = _run(Filter(must=fallback_conds) if fallback_conds else None)
     except UnexpectedResponse as exc:
         if exc.status_code == 404:
             logger.warning(f"/search dense: collection '{config.QDRANT_COLLECTION}' not found")
@@ -1630,6 +1643,7 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
     Mirrors the dense path's security/scoping EXACTLY:
       * owner: user_id = req.user_id (when provided)
       * clearance: min_rank IS NULL OR min_rank <= req.max_rank (null-tolerant)
+      * job scope: job_id = ANY(req.job_ids) when given — HARD, kept by the fallback
       * soft compilation: compilation_id = req.compilation_id OR compilation_id IS NULL,
         with an owner-corpus fallback when the scoped query returns nothing.
 
@@ -1660,6 +1674,9 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
         if req.max_rank is not None:
             clauses.append("(tc.min_rank IS NULL OR tc.min_rank <= %(rank)s)")
             params["rank"] = req.max_rank
+        job_clause, job_params = search_scope.sql_clause(req.job_ids, column="tc.job_id")
+        if job_clause:
+            clauses.append(job_clause); params.update(job_params)
         if include_comp and req.compilation_id:
             clauses.append("(tc.compilation_id = %(comp)s OR tc.compilation_id IS NULL)")
             params["comp"] = req.compilation_id
@@ -1681,6 +1698,9 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             clauses.append("tc.user_id = %(uid)s"); params["uid"] = req.user_id
         if req.max_rank is not None:
             clauses.append("(tc.min_rank IS NULL OR tc.min_rank <= %(rank)s)"); params["rank"] = req.max_rank
+        job_clause, job_params = search_scope.sql_clause(req.job_ids, column="tc.job_id")
+        if job_clause:
+            clauses.append(job_clause); params.update(job_params)
         if include_comp and req.compilation_id:
             clauses.append("(tc.compilation_id = %(comp)s OR tc.compilation_id IS NULL)"); params["comp"] = req.compilation_id
         sql = (
@@ -1848,12 +1868,22 @@ async def search_endpoint(req: SearchReq, request: Request):
       2. lexical channel (exact tokens, SAME scoping, with ILIKE substring rescue)
       3. RRF fusion of the two into one ranked list
       4. fallback: if fusion is empty, lexical-only over the whole owner corpus
+
+    `job_ids` (when given) is a HARD allow-list through all four steps and the
+    Hebbian pull-in — see src/search_scope.py.
     """
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail={"error": "query must not be empty"})
     if len(query) > 2000:
         raise HTTPException(status_code=400, detail={"error": "query exceeds 2000 character limit"})
+
+    # Hard KB boundary. Normalized once and written back onto the request so every
+    # channel below reads the same canonical list. An empty scope short-circuits
+    # BEFORE any embedding/DB work: a token with nothing granted sees nothing.
+    req.job_ids = search_scope.normalize_job_ids(req.job_ids)
+    if search_scope.denies_all(req.job_ids):
+        return {"chunks": []}
 
     # Dense channel — embed the query; embedding failure degrades to lexical-only
     # rather than 503, so exact-token retrieval still works if Ollama is down.
@@ -1873,8 +1903,12 @@ async def search_endpoint(req: SearchReq, request: Request):
     # Final fallback: nothing fused (e.g. compilation scope hid everything and the
     # dense fallback also empty) → lexical-only over the WHOLE owner corpus.
     if not fused:
+        # "Whole corpus" drops the SOFT compilation preference only — the job scope
+        # travels along, or this fallback would hand a scoped token the owner's
+        # other knowledge bases (the 2026-09-17 leak).
         corpus_req = SearchReq(query=req.query, limit=req.limit, compilation_id=None,
-                               user_id=req.user_id, max_rank=req.max_rank)
+                               user_id=req.user_id, max_rank=req.max_rank,
+                               job_ids=req.job_ids)
         corpus_lex = _lexical_search(corpus_req)
         fused = _rrf_fuse([corpus_lex], limit=max(1, req.limit))
 
@@ -1890,8 +1924,11 @@ async def search_endpoint(req: SearchReq, request: Request):
     reranked = hebb.rerank_with_memory(
         reranked, user_id=req.user_id, limit=max(1, req.limit),
         max_rank=req.max_rank, compilation_id=req.compilation_id,
-        conn_factory=get_search_pg,
+        conn_factory=get_search_pg, job_ids=req.job_ids,
     )
+    # Last word: whatever the channels, the reranker or a co-activated neighbour
+    # produced, nothing outside the job scope leaves this endpoint.
+    reranked = search_scope.filter_chunks(reranked, req.job_ids)
 
     logger.info(
         "/search hybrid: dense=%d lexical=%d fused=%d reranked=%d (comp=%s)",
