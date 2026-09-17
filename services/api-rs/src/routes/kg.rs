@@ -4619,4 +4619,50 @@ mod chunk_scope_tests {
         assert_eq!(chunk_fetch_limit(50, true), 60);
         assert_eq!(chunk_fetch_limit(usize::MAX, true), usize::MAX);
     }
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src dir readable").flatten() {
+            let p = entry.path();
+            if p.is_dir() { rust_sources(&p, out); }
+            else if p.extension().is_some_and(|e| e == "rs") { out.push(p); }
+        }
+    }
+
+    /// Source-level guard, same idea as `neo4j::no_compilation_read_falls_back_to_
+    /// the_whole_account`: the leak was never inside a helper, it was a call site
+    /// that talked to the KEX `/search` endpoint with owner + clearance only. So
+    /// this walks EVERY source file of the crate: whoever posts to the worker's
+    /// `/search` must resolve `chunk_job_scope`, forward it as `job_ids`, and run
+    /// the answer through `retain_allowed_chunks` — once per call site.
+    #[test]
+    fn every_kex_search_call_site_is_job_scoped() {
+        // Split so this file's own test code never looks like a call site.
+        let endpoint = ["/sea", "rch\""].concat();
+        let worker = ["kex_worker", "_url"].concat();
+        let mut files = Vec::new();
+        rust_sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 10, "source walk found too few files — guard is blind");
+
+        let mut call_sites = 0;
+        for path in files {
+            let src = std::fs::read_to_string(&path).expect("source readable");
+            let n = src.lines()
+                .filter(|l| l.contains(&endpoint) && l.contains(&worker))
+                .count();
+            if n == 0 { continue; }
+            call_sites += n;
+            for needle in ["chunk_job_scope(", "retain_allowed_chunks(", "[\"job_ids\"]"] {
+                assert!(
+                    src.matches(needle).count() >= n,
+                    "{} posts to the KEX /search endpoint {n}x but has fewer `{needle}` — a chunk \
+                     retrieval path without the knowledge-base job scope leaks passages across \
+                     knowledge bases to KB-scoped tokens (docs/security/2026-09-17-chunk-scope.md)",
+                    path.display()
+                );
+            }
+        }
+        // agent.rs (`search_chunks`) + rag.rs (`/rag/query`). Zero means the needle
+        // rotted (URL built differently) and the guard silently checks nothing.
+        assert!(call_sites >= 2, "expected the known /search call sites, found {call_sites}");
+    }
 }

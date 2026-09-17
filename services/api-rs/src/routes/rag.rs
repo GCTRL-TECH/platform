@@ -639,21 +639,40 @@ async fn query(
         chunks: Vec<KexChunk>,
     }
 
+    // KB boundary of chunk retrieval (`kg::chunk_job_scope`): the jobs whose chunks
+    // this caller may read. `None` = no restriction — a JWT session or unrestricted
+    // token without `compilationId`, and the unauthenticated public path, which has
+    // no claims, may not name a compilation (rejected above) and stays capped at
+    // PUBLIC clearance exactly as before. With `compilationId` set this is a HARD
+    // filter for every caller. Without it a KB-scoped token grounded (and cited) its
+    // answer on passages of knowledge bases it was never granted.
+    let job_scope: Option<Vec<String>> = match &claims {
+        Some(c) => crate::routes::kg::chunk_job_scope(&state.db, c, req.compilation_id).await,
+        None => None,
+    };
+    // Candidate pool the rerank below works on (unchanged: 24).
+    const KEX_POOL: usize = 24;
+
     let kex_url = format!("{}/search", state.cfg.kex_worker_url);
-    let kex_body = json!({
+    let mut kex_body = json!({
         // Contextualized query (resolves follow-up references); falls back to the
         // raw message on the first turn. Fetch a larger candidate pool (12) so the
         // hybrid dense+lexical fusion has more to rank — wider net = more distinct
         // source sessions for parent-document expansion (Hebel 1: recall).
         "query":          search_query,
-        "limit":          24,
+        "limit":          crate::routes::kg::chunk_fetch_limit(KEX_POOL, job_scope.is_some()),
         "compilation_id": req.compilation_id,
         // Scope retrieval to the caller's own chunks (grounding + no cross-user leak).
         "user_id":        claims.as_ref().map(|c| c.sub),
         "max_rank":       eff_rank,
     });
+    // Only sent when a scope applies; KEX enforces it as a hard filter in every channel.
+    if let Some(ref jobs) = job_scope { kex_body["job_ids"] = json!(jobs); }
 
-    let mut chunks: Vec<KexChunk> = match client
+    // An empty scope (nothing granted / compilation outside the grants) sees no
+    // chunks — KEX is not even asked.
+    let scope_denies_all = matches!(&job_scope, Some(jobs) if jobs.is_empty());
+    let mut chunks: Vec<KexChunk> = if scope_denies_all { vec![] } else { match client
         .post(&kex_url)
         .header("X-Internal-Secret", &state.cfg.internal_secret)
         .json(&kex_body)
@@ -672,7 +691,18 @@ async fn query(
             tracing::warn!("KEX search unreachable: {e}");
             vec![]
         }
-    };
+    } };
+
+    // Defense in depth, independent of the KEX image version (an older worker
+    // ignores `job_ids`): drop every chunk outside the job scope, then cut the
+    // over-fetch back to the pool size. Same position and reasoning as the CODE
+    // drop below — BEFORE the rerank/prompt, not just off the `sources` list, so the
+    // model never sees foreign text and the heat bump never touches it. A chunk
+    // without a job id cannot be attributed to a knowledge base → dropped.
+    let allowed_jobs: Option<std::collections::HashSet<String>> =
+        job_scope.map(|jobs| jobs.into_iter().collect());
+    chunks = crate::routes::kg::retain_allowed_chunks(
+        chunks, allowed_jobs.as_ref(), KEX_POOL, |ch| ch.job_id.as_deref());
 
     // Migration 078 - Codebase access off: KEX scopes retrieval by owner +
     // clearance only, so a CODE-origin chunk would otherwise ground (and be
@@ -1019,11 +1049,18 @@ async fn query(
             // This is the episodic log ordering questions actually need; the
             // session-digest below only serves corpora ingested before fact
             // logging existed.
+            //
+            // Both digests span "ALL of the caller's sessions" — which for a job-
+            // scoped request means all sessions INSIDE the scope, not the account's.
+            let digest_jobs: Option<Vec<Uuid>> = allowed_jobs.as_ref().map(|set| {
+                set.iter().filter_map(|j| Uuid::parse_str(j).ok()).collect()
+            });
             let fact_rows: Vec<(String,)> = sqlx::query_as(
                 "SELECT tc.content FROM text_chunks tc JOIN jobs j ON j.id = tc.job_id \
                  WHERE tc.user_id = $1 AND tc.chunk_sequence >= 5000 AND tc.archived = false \
+                   AND ($2::uuid[] IS NULL OR tc.job_id = ANY($2)) \
                  ORDER BY j.created_at ASC, tc.chunk_sequence ASC LIMIT 350",
-            ).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default();
+            ).bind(c.sub).bind(&digest_jobs).fetch_all(&state.db).await.unwrap_or_default();
             if !fact_rows.is_empty() {
                 let lines: Vec<String> = fact_rows.iter().enumerate()
                     .map(|(i, (f,))| format!("{}. {}", i + 1, f.chars().take(260).collect::<String>()))
@@ -1037,8 +1074,9 @@ async fn query(
             let rows: Vec<(String,)> = if !fact_rows.is_empty() { vec![] } else { sqlx::query_as(
                 "SELECT COALESCE(input->>'text','') FROM jobs \
                  WHERE user_id = $1 AND type = 'kex_extract' AND status = 'completed' \
+                   AND ($2::uuid[] IS NULL OR id = ANY($2)) \
                  ORDER BY created_at ASC LIMIT 200",
-            ).bind(c.sub).fetch_all(&state.db).await.unwrap_or_default() };
+            ).bind(c.sub).bind(&digest_jobs).fetch_all(&state.db).await.unwrap_or_default() };
             if !rows.is_empty() {
                 // Group document parts by their SESSION (the "[… session N …]"
                 // header ingestion stamps on each part). Sessions are the real
