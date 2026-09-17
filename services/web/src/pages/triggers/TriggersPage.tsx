@@ -106,7 +106,8 @@ export default function TriggersPage() {
 
   async function loadWikis() {
     try {
-      const { data } = await api.get('/kg/compilations?limit=100')
+      // type= filters server-side: WIKIs picked out of "the 100 newest" vanished on large instances.
+      const { data } = await api.get('/kg/compilations?type=WIKI&limit=500')
       setWikis((data.compilations || []).filter((c: WikiComp) => c.type === 'WIKI'))
     } catch { /* ignore */ }
   }
