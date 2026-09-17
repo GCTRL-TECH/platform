@@ -850,9 +850,16 @@ fn relation_to_json(r: &Relation) -> Value {
 /// Returns `[{id, snippet, sourceDocumentId, jobId, createdAt}]`, newest first.
 pub(crate) async fn fetch_grounding_chunks(
     state: &Arc<crate::models::AppState>,
-    user_id: Uuid,
+    claims: &JwtClaims,
     uri: &str,
 ) -> Vec<Value> {
+    // KB boundary: an entity that exists in several knowledge bases shares ONE uri,
+    // so `entity_uris && $2` alone hands a KB-scoped token the verbatim source text
+    // of the OTHER knowledge bases' chunks. Same job allow-list as every chunk read
+    // (`None` = unrestricted, empty = nothing).
+    let job_scope: Option<Vec<Uuid>> = api_key_scoped_jobs(&state.db, claims).await
+        .map(|jobs| jobs.iter().filter_map(|j| Uuid::parse_str(j).ok()).collect());
+    if matches!(&job_scope, Some(jobs) if jobs.is_empty()) { return Vec::new(); }
     let mut uris = vec![uri.to_string()];
     if let Ok(mut stream) = state.neo.execute(
         neo_query("MATCH (m)-[:SIMILAR_TO]->(n {uri: $uri}) RETURN DISTINCT m.uri AS u")
@@ -870,10 +877,12 @@ pub(crate) async fn fetch_grounding_chunks(
             "SELECT id, content, source_document_id, job_id, created_at
                FROM text_chunks
               WHERE user_id = $1 AND entity_uris && $2
+                AND ($3::uuid[] IS NULL OR job_id = ANY($3))
               ORDER BY created_at DESC LIMIT 3"
         )
-        .bind(user_id)
+        .bind(claims.sub)
         .bind(&uris)
+        .bind(&job_scope)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
@@ -2718,7 +2727,7 @@ async fn entity_detail(
     //    or when the caller opts out via ?include_chunks=false).
     let grounding_chunks: Vec<Value> = if q.include_chunks {
         match props.get("uri").and_then(|v| v.as_str()) {
-            Some(uri) => fetch_grounding_chunks(&state, claims.sub, uri).await,
+            Some(uri) => fetch_grounding_chunks(&state, &claims, uri).await,
             None => Vec::new(),
         }
     } else {
@@ -3081,7 +3090,7 @@ async fn get_dossier(
     // key (name|type|source_job), not the graph uri, so resolve the graph node's
     // uri by name first, then fetch its precise grounding chunks.
     let grounding_chunks: Vec<Value> = match resolve_graph_uri(&state, claims.sub, &d.entity_name).await {
-        Some(uri) => fetch_grounding_chunks(&state, claims.sub, &uri).await,
+        Some(uri) => fetch_grounding_chunks(&state, &claims, &uri).await,
         None => Vec::new(),
     };
 
@@ -4664,5 +4673,22 @@ mod chunk_scope_tests {
         // agent.rs (`search_chunks`) + rag.rs (`/rag/query`). Zero means the needle
         // rotted (URL built differently) and the guard silently checks nothing.
         assert!(call_sites >= 2, "expected the known /search call sites, found {call_sites}");
+    }
+
+    /// `groundingChunks` (get_entity / get_dossier / the REST entity + dossier reads)
+    /// is the one chunk read that never touches KEX: it selects from `text_chunks`
+    /// by entity uri. A uri is shared across knowledge bases, so it needs the same
+    /// job allow-list — and must stop early on an empty scope.
+    #[test]
+    fn grounding_chunks_are_job_scoped() {
+        let kg = include_str!("kg.rs");
+        let start = kg.find("pub(crate) async fn fetch_grounding_chunks(").expect("fn renamed?");
+        let body = &kg[start..start + kg[start..].find("
+}
+").expect("fn end")];
+        assert!(body.contains("api_key_scoped_jobs("), "grounding chunks lost the job scope");
+        assert!(body.contains("job_id = ANY($3)"), "grounding chunk SQL no longer filters by job");
+        assert!(body.contains("jobs.is_empty()) { return Vec::new(); }"),
+                "an empty scope must see no grounding chunks");
     }
 }

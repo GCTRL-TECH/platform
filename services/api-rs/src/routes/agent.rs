@@ -831,7 +831,7 @@ async fn execute_tool_inner(
                     // P2a — grounded nodes: precise grounding chunks via the node's uri.
                     let grounding_chunks: Vec<Value> = if include_chunks {
                         match row.get::<String>("uri").ok() {
-                            Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims.sub, &uri).await,
+                            Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims, &uri).await,
                             None => Vec::new(),
                         }
                     } else {
@@ -941,7 +941,7 @@ async fn execute_tool_inner(
                     // (the dossier's own entity_uri is a dossier-scoped key, not
                     // the graph uri) and fetch its precise grounding chunks.
                     let grounding_chunks = match crate::routes::kg::resolve_graph_uri(state, claims.sub, &d.entity_name).await {
-                        Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims.sub, &uri).await,
+                        Some(uri) => crate::routes::kg::fetch_grounding_chunks(state, claims, &uri).await,
                         None => Vec::new(),
                     };
                     json!({
