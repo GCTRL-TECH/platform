@@ -270,7 +270,7 @@ Read tools:
 - get_dossier        : Read the AUTHORITATIVE entity dossier (HOT memory) — a compiled summary, key facts (with confidence), origin files, timeline, AND `groundingChunks` (verbatim source-text snippets) for a named entity. This is the HIGHEST-TRUST source: when a dossier exists for the asked entity, it directly answers "who/what is X" and "where does X come from" — use it and state the answer, do NOT hedge. Key facts may carry `authority` ("current" | "superseded") + `supersededByDoc` — prefer the current fact and cite it as "current per <doc>; an older value came from <doc>". Args: { name: string }
 - get_neighbors      : List entities within N hops of a node (dependency tracing; code graphs — what does X touch?). Args: { name: string, depth?: number }
 - shortest_path      : Shortest path between two entities (how A connects to B / does X depend on Y). Args: { from: string, to: string }
-- search_chunks      : Retrieve source text passages for a question (RAG retrieval — use this to ANSWER questions, then cite the passages). Args: { query: string, compilationId?: string }
+- search_chunks      : Retrieve source text passages for a question (RAG retrieval — use this to ANSWER questions, then cite the passages). compilationId is a HARD filter: only passages of that knowledge base come back. Args: { query: string, compilationId?: string, limit?: number (default 5, max 50) }
 - list_extractions   : List KEX extraction jobs. Status `completed_degraded` means the job finished but a phase (relations / embeddings) was skipped — the graph is incomplete and `degradedReason` says why. No args.
 - list_conflicts     : List open conflicts: classification conflicts AND fact conflicts (kind "fact" — sources assert DIFFERENT values for a functional relation, e.g. two CEOs for one org; competingValues are ranked by source recency, authorityWinner is the current one). No args.
 - list_sources       : List connected data sources. No args.
@@ -367,7 +367,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?). Use depth 1 first; increase only if needed. Limit is fixed at 100.", "args": { "name": "string", "depth": "number?" } },
             { "name": "shortest_path",      "description": "Find the shortest path between two entities (how is A connected to B / does X depend on Y)", "args": { "from": "string", "to": "string" } },
             { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline, groundingChunks — verbatim source-text snippets). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
-            { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval)", "args": { "query": "string", "compilationId": "string?" } },
+            { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval). compilationId is a hard filter (only that knowledge base's passages). Use limit for more passages (default 5, max 50).", "args": { "query": "string", "compilationId": "string?", "limit": "number?" } },
             { "name": "list_wiki_pages",    "description": "List the distilled pages of a WIKI compilation (clearance-filtered — you only see pages you're cleared for)", "args": { "compilationId": "string" } },
             { "name": "get_wiki_page",      "description": "Read one distilled wiki page (markdown body + citations) by slug from a WIKI compilation", "args": { "compilationId": "string", "slug": "string" } },
             { "name": "detect_communities", "description": "Run community detection + centrality on a graph (writes community/god-node tags onto nodes); returns the cluster summary + top 'god nodes'", "args": { "compilationId": "string" } },
@@ -971,9 +971,26 @@ async fn execute_tool_inner(
                 Some(cid) => crate::routes::kg::effective_rank_for_compilation(&state.db, claims, cid).await as i64,
                 None => crate::routes::kg::get_user_clearance_rank(&state.db, claims).await as i64,
             };
+            let limit = crate::routes::kg::clamp_chunk_limit(args["limit"].as_i64());
+            // KB boundary: the jobs whose chunks this caller may read (`None` = JWT /
+            // unrestricted token). Owner + clearance alone let a KB-scoped token read
+            // passages out of every other knowledge base of the account. An empty scope
+            // (nothing granted, or a compilationId outside the grants) answers with no
+            // chunks — never an error that would confirm the compilation exists.
+            let job_scope = crate::routes::kg::chunk_job_scope(&state.db, claims, compilation_id).await;
+            if matches!(&job_scope, Some(jobs) if jobs.is_empty()) {
+                crate::services::audit::log_access(&state.db, claims, "agent.search_chunks", "chunks", "*", rank as i32, None, true, None).await;
+                return json!({ "chunks": [] });
+            }
             let client = reqwest::Client::new();
             // Scope to the caller's own chunks (grounding + no cross-user leak).
-            let body = json!({ "query": query, "limit": 5, "compilation_id": compilation_id, "user_id": claims.sub, "max_rank": rank });
+            let mut body = json!({
+                "query": query, "compilation_id": compilation_id, "user_id": claims.sub, "max_rank": rank,
+                "limit": crate::routes::kg::chunk_fetch_limit(limit, job_scope.is_some()),
+            });
+            // Only sent when a scope applies, so an unscoped request is byte-identical
+            // to before. KEX enforces it as a hard filter in every channel.
+            if let Some(ref jobs) = job_scope { body["job_ids"] = json!(jobs); }
             let mut chunks = match client.post(format!("{}/search", state.cfg.kex_worker_url))
                 .header("X-Internal-Secret", &state.cfg.internal_secret)
                 .json(&body).timeout(Duration::from_secs(10)).send().await
@@ -981,6 +998,19 @@ async fn execute_tool_inner(
                 Ok(r) => r.json::<Value>().await.unwrap_or_else(|_| json!({ "chunks": [] })),
                 Err(_) => json!({ "chunks": [] }),
             };
+            // Defense in depth — do not rely on the KEX image honouring `job_ids` (an
+            // older worker ignores the field): drop every chunk outside the scope here,
+            // then cut the over-fetch back to the requested limit. Runs BEFORE the
+            // Hebbian write below, so a caller can neither reinforce nor co-activate
+            // chunks it is not allowed to see.
+            let allowed: Option<std::collections::HashSet<String>> =
+                job_scope.map(|jobs| jobs.into_iter().collect());
+            if let Some(arr) = chunks.get_mut("chunks").and_then(|v| v.as_array_mut()) {
+                *arr = crate::routes::kg::retain_allowed_chunks(
+                    std::mem::take(arr), allowed.as_ref(), limit,
+                    |c| c.get("job_id").and_then(|v| v.as_str()),
+                );
+            }
             // Migration 078 - Codebase access off: retrieval must not smuggle code
             // back in as source text. KEX scopes by owner + clearance only, so the
             // CODE-origin chunks are dropped here.
