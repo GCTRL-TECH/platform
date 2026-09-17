@@ -410,7 +410,7 @@ jobs:
       needs.build-api-rs.result == 'success'
     runs-on: ubuntu-latest
     # Best-effort hygiene: the VPS SSH endpoint occasionally times out (transient
-    # :22 i/o timeout); that must never fail the run or block update-deploy-repo.
+    # :22 i/o timeout); that must never fail the run.
     continue-on-error: true
     steps:
       - name: Remove legacy standalone gctrl-app container (if present)
@@ -428,24 +428,9 @@ jobs:
             echo "=== Restarting containers (should be none) ==="
             docker ps -a --filter status=restarting --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
 
-  update-deploy-repo:
-    needs: [cleanup-legacy-vps, build-api-rs]
-    if: |
-      always() &&
-      !cancelled() &&
-      needs.build-api-rs.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: gctrl-tech/deploy
-          token: ${{ secrets.GHCR_TOKEN }}
-          path: deploy-repo
-      - name: Update version tag in installer
-        run: |
-          cd deploy-repo
-          sed -i "s/GCTRL_VERSION=.*/GCTRL_VERSION=${{ github.sha }}/" install.sh
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git commit -am "chore: update to ${{ github.sha }}" || echo "No changes"
-          git push
+  # update-deploy-repo was removed on 2026-09-17. It rewrote `GCTRL_VERSION=<sha>` in
+  # gctrl-tech/deploy/install.sh on every release - a variable that script never reads,
+  # in a legacy installer nobody is sent to: the live installer is
+  # services/portal/public/install (served as gctrl.tech/install, shipped with the portal
+  # image, defaults to :latest). The job needed a cross-repo write credential purely for
+  # that no-op and went red when its 90-day PAT expired. No credential, no job.
