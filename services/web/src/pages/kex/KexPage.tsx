@@ -44,6 +44,7 @@ import {
   ensureReadPermission,
   type LocalVault,
 } from '@/lib/localVaults'
+import { KbSelect } from '@/components/kb/KbSelect'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -157,8 +158,9 @@ export function KexPage() {
   const { data: ontologiesData } = useApiQuery<OntologiesResponse>(['ontologies'], '/ontologies')
   const ontologies = ontologiesData?.ontologies ?? []
 
-  // Compilations for Auto-FUSE dropdown
-  const { data: compilationsData } = useApiQuery<{ compilations: Array<{ id: string; name: string; nodeCount: number }> }>(['compilations'], '/kg/compilations')
+  // Compilations for Auto-FUSE dropdown. limit=500: ohne Angabe sind es die 100
+  // neuesten - auf einer geteilten Instanz fehlen dann aeltere Zielgraphen.
+  const { data: compilationsData } = useApiQuery<{ compilations: Array<{ id: string; name: string; nodeCount: number; folderId?: string | null }> }>(['kg', 'compilations', 'all'], '/kg/compilations?limit=500')
 
   // Classification levels for Classification dropdown
   const { data: classificationData } = useApiQuery<{ levels: ClassificationLevel[] }>(['classification', 'levels'], '/classification/levels')
@@ -1038,11 +1040,15 @@ export function KexPage() {
               <div className="flex-1 space-y-1.5">
                 <div className="flex items-center gap-2">
                   <div className="relative">
-                    <select value={autoFuseTarget || ''} onChange={(e) => { setAutoFuseTarget(e.target.value || null); if (!e.target.value) setForceSingleGraphs(false) }}
-                      className="w-48 appearance-none rounded border border-slate-700 bg-slate-800 px-2 py-1 pr-6 text-[10px] text-slate-300 focus:border-indigo-500 focus:outline-none">
-                      <option value="">None (standalone graph)</option>
-                      {compilationsList.map((c) => (<option key={c.id} value={c.id}>{c.name} ({c.nodeCount} nodes)</option>))}
-                    </select>
+                    <KbSelect
+                      value={autoFuseTarget || ''}
+                      onChange={(id) => { setAutoFuseTarget(id || null); if (!id) setForceSingleGraphs(false) }}
+                      items={compilationsList}
+                      placeholder="None (standalone graph)"
+                      chevron={false}
+                      className="w-48 appearance-none rounded border border-slate-700 bg-slate-800 px-2 py-1 pr-6 text-[10px] text-slate-300 focus:border-indigo-500 focus:outline-none"
+                      meta={(c) => `${c.nodeCount} nodes`}
+                    />
                     <ChevronDown size={9} className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-500" />
                   </div>
                   <span className="text-[10px] text-slate-600">

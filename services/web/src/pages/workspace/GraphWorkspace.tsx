@@ -32,10 +32,13 @@ import { WorkspaceCanvas } from './WorkspaceCanvas'
 import { EmbedShareDialog } from './EmbedShareDialog'
 import { PrivacyDialog, type PrivacyMode } from './PrivacyDialog'
 import { HeaderCorner } from '@/components/layout/HeaderCorner'
+import { useKbGroups } from '@/lib/kbFolders'
 
 interface CompilationSummary {
   id: string
   name: string
+  /** Wo der Graph abgelegt ist - die Gruppierung der Graphenliste (lib/kbFolders.ts). */
+  folderId?: string | null
   nodeCount: number
   edgeCount: number
   classification: string
@@ -98,7 +101,10 @@ export function GraphWorkspace() {
   const compilationId = id ?? ''
   const queryClient = useQueryClient()
 
-  const { data: compsData } = useApiQuery<{ compilations: CompilationSummary[] }>(['kg', 'compilations'], '/kg/compilations')
+  // limit=500: die Vorgabe des Servers sind die 100 neuesten - die Graphenliste der
+  // Werkbank soll den ganzen Bestand zeigen, nicht nur die juengsten.
+  const { data: compsData } = useApiQuery<{ compilations: CompilationSummary[] }>(
+    ['kg', 'compilations', 'all'], '/kg/compilations?limit=500')
   const comps = compsData?.compilations ?? []
   const current = comps.find((c) => c.id === compilationId)
 
@@ -123,7 +129,9 @@ export function GraphWorkspace() {
   const pickerResize = useColResize(pickerWidth, setPickerWidth, 'right', 180, () => 420, 'gw.pickerWidth')
   const contextResize = useColResize(contextWidth, setContextWidth, 'left', 280, () => Math.min(window.innerWidth * 0.7, 900), 'gw.contextWidth')
 
-  const filteredComps = comps.filter((c) => c.name.toLowerCase().includes(pickerQuery.toLowerCase()))
+  // Gruppiert nach Ordner, Suche ueber Name UND Ordnerpfad: mehrere Graphen heissen
+  // gleich, erst der Pfad (Users/<Person>, Projects/<Kunde>) macht sie unterscheidbar.
+  const { groups: compGroups, matched: matchedComps } = useKbGroups(comps, pickerQuery)
 
   // Left-column mode: search compilations ("Graphs") or nodes within this graph.
   const [leftTab, setLeftTab] = useState<'graphs' | 'nodes'>('graphs')
@@ -296,18 +304,25 @@ export function GraphWorkspace() {
                     </div>
                   </div>
                   <div className="flex-1 overflow-y-auto p-1.5">
-                    {filteredComps.map((c) => (
-                      <button key={c.id} onClick={() => { navigate(`/graphs/${c.id}/workspace`); setSelectedName(null) }}
-                        className={cn('mb-0.5 flex w-full flex-col items-start gap-0.5 rounded-md px-2.5 py-2 text-left transition-colors',
-                          c.id === compilationId ? 'bg-indigo-500/15 ring-1 ring-indigo-500/30' : 'hover:bg-slate-800/60')}>
-                        <span className="truncate text-xs font-medium text-slate-200">{c.name}</span>
-                        <span className="flex items-center gap-2 text-[10px] text-slate-500">
-                          <span className={cn(CLS_BADGE[c.classification] ?? 'badge-slate', 'text-[9px]')}>{c.classification}</span>
-                          {c.nodeCount.toLocaleString()} nodes
-                        </span>
-                      </button>
+                    {compGroups.map((g) => (
+                      <div key={g.path}>
+                        <p className="sticky top-0 z-10 bg-slate-900/95 px-2 py-1 text-[9px] font-semibold uppercase tracking-wider text-slate-500 backdrop-blur">
+                          {g.path}
+                        </p>
+                        {g.items.map((c) => (
+                          <button key={c.id} onClick={() => { navigate(`/graphs/${c.id}/workspace`); setSelectedName(null) }}
+                            className={cn('mb-0.5 flex w-full flex-col items-start gap-0.5 rounded-md px-2.5 py-2 text-left transition-colors',
+                              c.id === compilationId ? 'bg-indigo-500/15 ring-1 ring-indigo-500/30' : 'hover:bg-slate-800/60')}>
+                            <span className="truncate text-xs font-medium text-slate-200">{c.name}</span>
+                            <span className="flex items-center gap-2 text-[10px] text-slate-500">
+                              <span className={cn(CLS_BADGE[c.classification] ?? 'badge-slate', 'text-[9px]')}>{c.classification}</span>
+                              {c.nodeCount.toLocaleString()} nodes
+                            </span>
+                          </button>
+                        ))}
+                      </div>
                     ))}
-                    {filteredComps.length === 0 && <p className="px-2 py-4 text-center text-[11px] text-slate-600">No graphs.</p>}
+                    {matchedComps === 0 && <p className="px-2 py-4 text-center text-[11px] text-slate-600">No graphs.</p>}
                   </div>
                 </>
               ) : (

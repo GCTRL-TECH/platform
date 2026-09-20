@@ -18,7 +18,6 @@ import {
   UserCheck,
   ScrollText,
   GitMerge,
-  ChevronDown,
   CheckCircle,
   Workflow,
   GitFork,
@@ -29,6 +28,7 @@ import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+import { KbSelect } from '@/components/kb/KbSelect'
 
 interface KexJobsResponse {
   jobs: SourceJobInfo[]
@@ -51,6 +51,8 @@ interface Compilation {
   nodeCount: number
   edgeCount: number
   entityCount: number
+  /** Wo der Graph abgelegt ist - Ordner-Gruppierung der Picker (lib/kbFolders.ts). */
+  folderId?: string | null
   duplicateCount: number
   linkCount: number
   createdAt: string
@@ -242,8 +244,10 @@ function MergeAnotherPanel({ compilation }: { compilation: Compilation }) {
   const [mergeError, setMergeError] = useState<string | null>(null)
   const [mergeSuccess, setMergeSuccess] = useState(false)
 
+  // limit=500: die Vorgabe des Servers sind die 100 neuesten - der Merge-Dialog
+  // soll auch aeltere Graphen anbieten.
   const { data: compilationsData, isLoading: compilationsLoading } =
-    useApiQuery<CompilationsResponse>(['kg', 'compilations'], '/kg/compilations', {
+    useApiQuery<CompilationsResponse>(['kg', 'compilations', 'all'], '/kg/compilations?limit=500', {
       enabled: open,
     })
 
@@ -314,24 +318,14 @@ function MergeAnotherPanel({ compilation }: { compilation: Compilation }) {
           ) : (
             <div>
               <label className="label">Source Graph to Merge In</label>
-              <div className="relative">
-                <select
-                  value={selectedId}
-                  onChange={(e) => setSelectedId(e.target.value)}
-                  className="input-field appearance-none pr-8"
-                >
-                  <option value="">Select a graph...</option>
-                  {others.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} — {c.nodeCount.toLocaleString()} nodes
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown
-                  size={13}
-                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
-                />
-              </div>
+              <KbSelect
+                value={selectedId}
+                onChange={setSelectedId}
+                items={others}
+                placeholder="Select a graph..."
+                className="input-field pr-8"
+                meta={(c) => `${c.nodeCount.toLocaleString()} nodes`}
+              />
               {selectedCompilation && (
                 <p className="mt-1.5 text-xs text-slate-600">
                   This will add {selectedCompilation.sourceJobIds.length} source job(s) from{' '}

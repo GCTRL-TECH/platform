@@ -22,6 +22,7 @@ import { useApiQuery } from '@/hooks/useApi'
 import { apiGet, apiPost, apiPut } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { WikiGraph, rankColor } from './WikiGraph'
+import { folderPathOf, matchesKbQuery, useFolderPaths } from '@/lib/kbFolders'
 
 const MarkdownView = lazy(
   () => import('@/components/graph-explorer/MarkdownView')
@@ -35,6 +36,8 @@ interface Compilation {
   id: string
   name: string
   type?: GraphType
+  /** Wo das Wiki abgelegt ist - Suche und Karte zeigen es (lib/kbFolders.ts). */
+  folderId?: string | null
   isSystem?: boolean
   lastDistillAt?: string | null
   pageCount?: number
@@ -270,17 +273,17 @@ function WikiSelector({
   onSelect: (id: string) => void
 }) {
   const [q, setQ] = useState('')
+  const paths = useFolderPaths()
   const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase()
-    const list = needle
-      ? wikis.filter((w) => w.name.toLowerCase().includes(needle))
-      : wikis
+    // Suche ueber Name UND Ordnerpfad - dieselbe Regel wie in jedem anderen
+    // Wissensbasen-Picker (lib/kbFolders.ts).
+    const list = wikis.filter((w) => matchesKbQuery(w, paths, q))
     // System wiki(s) pinned first, then alphabetical.
     return [...list].sort((a, b) => {
       if (!!a.isSystem !== !!b.isSystem) return a.isSystem ? -1 : 1
       return a.name.localeCompare(b.name)
     })
-  }, [wikis, q])
+  }, [wikis, q, paths])
 
   return (
     <div className="animate-slide-up space-y-6">
@@ -302,7 +305,7 @@ function WikiSelector({
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Search wikis…"
+          placeholder="Search by name or folder…"
           className="w-full rounded-lg border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-sm text-slate-200 placeholder:text-slate-600 focus:border-blue-500/50 focus:outline-none"
         />
       </div>
@@ -331,6 +334,7 @@ function WikiSelector({
                 )}
               </div>
               <p className="font-semibold text-slate-100 group-hover:text-white">{w.name}</p>
+              <p className="truncate text-[10px] text-slate-600">{folderPathOf(w.folderId, paths)}</p>
               <p className="flex items-center gap-1.5 text-xs text-slate-500">
                 <Clock size={12} />
                 {w.lastDistillAt

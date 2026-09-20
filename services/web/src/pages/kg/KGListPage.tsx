@@ -26,6 +26,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
 import { useUiMode } from '@/hooks/useUiMode'
+import { KbSelect } from '@/components/kb/KbSelect'
 
 type Classification = 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'RESTRICTED'
 
@@ -232,18 +233,13 @@ function CreateModal({ onClose, onCreated, rawCompilations }: CreateModalProps) 
                   No RAW graphs available. Create or extract a RAW graph first.
                 </p>
               ) : (
-                <select
+                <KbSelect
                   value={wikiSourceId}
-                  onChange={(e) => setWikiSourceId(e.target.value)}
-                  className="input-field"
-                >
-                  <option value="">Select a RAW graph…</option>
-                  {rawCompilations.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setWikiSourceId}
+                  items={rawCompilations}
+                  placeholder="Select a RAW graph…"
+                  className="input-field pr-8"
+                />
               )}
             </div>
           )}

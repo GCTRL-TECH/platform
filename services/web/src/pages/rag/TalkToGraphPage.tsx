@@ -49,6 +49,7 @@ import { isCompleted, isDegraded } from '@/lib/jobStatus'
 import { getToken } from '@/lib/auth'
 import { pickDefaultChatModel, isValidChatSelection } from '@/lib/models'
 import { formatDistanceToNow } from 'date-fns'
+import { KbSelect } from '@/components/kb/KbSelect'
 
 /// Safe relative-time formatter. `formatDistanceToNow(new Date(undefined))` throws
 /// "Invalid time value" — which the app error boundary turns into a blank screen.
@@ -125,6 +126,8 @@ interface Compilation {
   id: string
   name: string
   entityCount: number
+  /** Wo der Graph abgelegt ist - die Ordner-Gruppierung der Picker (lib/kbFolders.ts). */
+  folderId?: string | null
 }
 
 interface RagQueryResponse {
@@ -957,19 +960,16 @@ function DroppedFileCard({
           <p className="text-xs text-slate-500">{(file.size / 1024).toFixed(1)} KB — Extract knowledge from this file?</p>
 
           <div className="mt-3 flex items-center gap-2">
-            <select
+            <KbSelect
               value={selectedCompilation}
-              onChange={(e) => setSelectedCompilation(e.target.value)}
-              className="input-field h-8 flex-1 py-0 text-xs"
+              onChange={setSelectedCompilation}
+              items={compilations}
+              placeholder="Select target graph..."
+              className="input-field h-8 w-full py-0 text-xs"
+              chevron={false}
               disabled={isExtracting}
-            >
-              <option value="">Select target graph...</option>
-              {compilations.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name} ({c.entityCount} entities)
-                </option>
-              ))}
-            </select>
+              meta={(c) => `${c.entityCount} entities`}
+            />
             <button
               onClick={() => onExtract(selectedCompilation)}
               disabled={isExtracting}
@@ -1183,9 +1183,11 @@ export function TalkToGraphPage() {
     { retry: false, staleTime: 60_000 }
   )
 
+  // limit=500 + eigener Schluessel: ohne Angabe liefert der Server die 100 neuesten,
+  // auf einer geteilten Instanz fehlen dann aeltere Wissensbasen in der Auswahl.
   const { data: compilationsData } = useApiQuery<CompilationsResponse>(
-    ['kg', 'compilations'],
-    '/kg/compilations',
+    ['kg', 'compilations', 'all'],
+    '/kg/compilations?limit=500',
     { retry: false, staleTime: 30_000 }
   )
 
@@ -1940,19 +1942,16 @@ export function TalkToGraphPage() {
               {/* Compilation selector */}
               <div className="relative flex items-center">
                 <Database size={12} className="absolute left-2.5 text-slate-600 pointer-events-none z-10" />
-                <select
+                <KbSelect
                   value={selectedCompilation}
-                  onChange={(e) => setSelectedCompilation(e.target.value)}
+                  onChange={setSelectedCompilation}
+                  items={compilations}
+                  placeholder="All Graphs"
+                  chevron={false}
                   className="w-auto min-w-[130px] rounded-md border border-slate-700/50 bg-slate-950/60 px-2.5 py-1 pl-7 pr-6 text-[11px] text-slate-200 focus:border-slate-600 focus:outline-none transition-all hover:border-slate-600 hover:text-white cursor-pointer"
                   style={{ colorScheme: 'dark' }}
-                >
-                  <option value="">All Graphs</option>
-                  {compilations.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.entityCount} entities)
-                    </option>
-                  ))}
-                </select>
+                  meta={(c) => `${c.entityCount} entities`}
+                />
                 <ChevronDown size={12} className="absolute right-3 text-slate-400 pointer-events-none" />
               </div>
 

@@ -29,6 +29,8 @@ import { isCompleted, type JobStatus } from '@/lib/jobStatus'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
 import { useAuth } from '@/hooks/useAuth'
 import { resolveSourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+import { KbSelect } from '@/components/kb/KbSelect'
+import { folderPathOf, useFolderPaths } from '@/lib/kbFolders'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -59,6 +61,8 @@ interface Compilation {
   id: string
   name: string
   description: string | null
+  /** Wo der Graph abgelegt ist - die Ordner-Gruppierung der Picker (lib/kbFolders.ts). */
+  folderId?: string | null
   nodeCount: number
   edgeCount: number
   classification: Classification
@@ -460,6 +464,7 @@ function KnowledgeGraphsSection({
   isLoading: boolean
 }) {
   const navigate = useNavigate()
+  const folderPaths = useFolderPaths()
 
   return (
     <div className="card p-0 overflow-hidden">
@@ -517,8 +522,14 @@ function KnowledgeGraphsSection({
                     <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-800">
                       <Network size={12} className="text-violet-400" />
                     </div>
-                    <span className="block text-xs font-medium text-slate-300 truncate">
-                      {c.name}
+                    <span className="block min-w-0">
+                      <span className="block text-xs font-medium text-slate-300 truncate">
+                        {c.name}
+                      </span>
+                      {/* Mehrere Graphen heissen gleich - der Ordner sagt, wessen. */}
+                      <span className="block truncate text-[10px] text-slate-600">
+                        {folderPathOf(c.folderId, folderPaths)}
+                      </span>
                     </span>
                   </div>
                 </td>
@@ -581,8 +592,10 @@ export function FusePage() {
   const [selectedOntologyId, setSelectedOntologyId] = useState<string | null>(null)
 
   // Fetch compilations for "enrich existing"
+  // limit=500 + eigener Schluessel: ohne Angabe liefert der Server die 100 neuesten,
+  // auf einer geteilten Instanz fehlen dann aeltere Wissensbasen in der Auswahl.
   const { data: compilationsData, isLoading: compilationsLoading } =
-    useApiQuery<CompilationsResponse>(['kg', 'compilations'], '/kg/compilations')
+    useApiQuery<CompilationsResponse>(['kg', 'compilations', 'all'], '/kg/compilations?limit=500')
   const compilations = compilationsData?.compilations ?? []
 
   // Fetch fuse jobs for active jobs section
@@ -995,24 +1008,14 @@ export function FusePage() {
                 </p>
               </div>
             ) : (
-              <div className="relative">
-                <select
-                  value={targetCompilationId}
-                  onChange={(e) => setTargetCompilationId(e.target.value)}
-                  className="input-field appearance-none pr-8"
-                >
-                  <option value="">Select a knowledge graph...</option>
-                  {compilations.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} — {c.nodeCount.toLocaleString()} nodes, {c.edgeCount.toLocaleString()} edges
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown
-                  size={14}
-                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
-                />
-              </div>
+              <KbSelect
+                value={targetCompilationId}
+                onChange={setTargetCompilationId}
+                items={compilations}
+                placeholder="Select a knowledge graph..."
+                className="input-field pr-8"
+                meta={(c) => `${c.nodeCount.toLocaleString()} nodes, ${c.edgeCount.toLocaleString()} edges`}
+              />
             )}
 
             {/* Selected compilation preview */}

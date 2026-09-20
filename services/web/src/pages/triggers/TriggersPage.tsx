@@ -6,6 +6,7 @@ import {
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { formatDistanceToNow } from 'date-fns'
+import { KbSelect } from '@/components/kb/KbSelect'
 
 type TriggerModule = 'kex' | 'fuse' | 'compilation' | 'obsidian' | 'distill'
 
@@ -24,7 +25,7 @@ interface Trigger {
   createdAt: string
 }
 
-interface WikiComp { id: string; name: string; type?: string; isSystem?: boolean }
+interface WikiComp { id: string; name: string; type?: string; isSystem?: boolean; folderId?: string | null }
 
 const MODULE_ICONS: Record<string, typeof Zap> = {
   kex: Zap, fuse: GitMerge, compilation: Database, obsidian: FolderSync, distill: BookOpenText,
@@ -312,13 +313,15 @@ function DistillTriggerSection({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-slate-500">Wiki</label>
-              <select value={wikiId} onChange={(e) => setWikiId(e.target.value)}
-                className="w-full rounded border border-slate-700 bg-slate-800 px-2 py-1.5 text-xs text-slate-200 focus:border-violet-500 focus:outline-none">
-                <option value="">Select a wiki…</option>
-                {wikis.map((w) => (
-                  <option key={w.id} value={w.id}>{w.name}{w.isSystem ? ' (system)' : ''}</option>
-                ))}
-              </select>
+              <KbSelect
+                value={wikiId}
+                onChange={setWikiId}
+                items={wikis}
+                placeholder="Select a wiki…"
+                chevron={false}
+                className="w-full rounded border border-slate-700 bg-slate-800 px-2 py-1.5 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
+                meta={(w) => (w.isSystem ? 'system' : null)}
+              />
             </div>
             <div>
               <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-slate-500">Mode</label>
