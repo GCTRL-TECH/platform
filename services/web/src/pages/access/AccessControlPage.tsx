@@ -2,7 +2,7 @@ import { useState, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Shield, KeyRound, ScrollText, Plus, Trash2, X, Copy, Check,
-  Loader2, Coins, Pencil, Bot, ChevronDown, ChevronUp, Code2,
+  Loader2, Coins, Pencil, Bot, ChevronDown, ChevronUp, Code2, Search,
 } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
@@ -10,6 +10,8 @@ import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Tabs } from '@/components/ui/Tabs'
 import ClassificationPage from '@/pages/admin/ClassificationPage'
+import { KbPickerList } from '@/components/kb/KbPickerList'
+import { useKbGroups } from '@/lib/kbFolders'
 
 // ─── Shared types ──────────────────────────────────────────────────────────────
 
@@ -26,10 +28,19 @@ interface ApiKey {
   kbScoped?: boolean
   /** Capability switch (server: api_keys.code_access). Undefined = on. */
   codeAccess?: boolean
+  /** Release class (server: api_keys.class_scope_level_id, migration 089): the token
+   *  additionally READS every non-personal knowledge base up to this classification,
+   *  including ones created later. Null = no class. */
+  classScopeLevelId?: string | null
+  classScopeLevel?: string | null
   grants: Grant[]
 }
 interface Level { id: string; name: string; display_name: string; rank: number; color: string; is_system?: boolean }
-interface Compilation { id: string; name: string; classification: string; type?: string }
+interface Compilation {
+  id: string; name: string; classification: string; type?: string
+  /** Where it is filed — the only thing that tells two same-named graphs apart. */
+  folderId?: string | null
+}
 
 const CLEARANCE_BADGE: Record<string, string> = {
   PUBLIC: 'badge-green', INTERNAL: 'badge-blue',
@@ -80,7 +91,11 @@ function TokensSection() {
   const qc = useQueryClient()
   const { data: keysData, isLoading } = useApiQuery<{ apiKeys: ApiKey[] }>(['users', 'api-keys'], '/users/api-keys')
   const { data: levelsData } = useApiQuery<{ levels: Level[] }>(['classification', 'levels'], '/classification/levels')
-  const { data: compsData } = useApiQuery<{ compilations: Compilation[] }>(['kg', 'compilations'], '/kg/compilations')
+  // limit=500: ohne Angabe liefert der Server die 100 neuesten - auf einer geteilten
+  // Instanz fehlen im Picker dann die aelteren Wissensbasen, ausgerechnet die
+  // etablierten. (500 ist die Obergrenze des Servers.)
+  const { data: compsData } = useApiQuery<{ compilations: Compilation[] }>(
+    ['kg', 'compilations', 'all'], '/kg/compilations?limit=500')
 
   const keys = keysData?.apiKeys ?? []
   const levels = (levelsData?.levels ?? []).slice().sort((a, b) => a.rank - b.rank)
@@ -91,7 +106,10 @@ function TokensSection() {
   const [levelId, setLevelId] = useState('')
   const [expiryDays, setExpiryDays] = useState<number | null>(null)
   const [grantIds, setGrantIds] = useState<Set<string>>(new Set())
+  const [grantQuery, setGrantQuery] = useState('')
   const [kbScoped, setKbScoped] = useState(false)
+  // Freigabeklasse (Migration 089): '' = keine.
+  const [classScopeLevelId, setClassScopeLevelId] = useState('')
   // Codebase access defaults ON - a new token behaves exactly like before.
   const [codeAccess, setCodeAccess] = useState(true)
   const [creating, setCreating] = useState(false)
@@ -112,7 +130,7 @@ function TokensSection() {
 
   function reset() {
     setName(''); setLevelId(''); setExpiryDays(null); setGrantIds(new Set()); setKbScoped(false)
-    setCodeAccess(true); setError(null)
+    setCodeAccess(true); setError(null); setGrantQuery(''); setClassScopeLevelId('')
   }
 
   async function handleCreate() {
@@ -128,8 +146,12 @@ function TokensSection() {
       // otherwise-full token anymore.
       const { data } = await api.post<{ key: string }>('/users/api-keys', {
         name: name.trim(), maxClearanceLevelId: levelId || defaultLevelId, expiresAt, grants,
-        kbScoped: kbScoped || grants.length > 0,
+        // A release class also makes the token a scoped one (the server enforces it):
+        // "sees everything internal" is a limit, and only means something on a
+        // token that is limited in the first place.
+        kbScoped: kbScoped || grants.length > 0 || classScopeLevelId !== '',
         codeAccess,
+        classScopeLevelId: classScopeLevelId || undefined,
       })
       setFreshKey(data.key)
       setShowForm(false); reset()
@@ -266,36 +288,57 @@ function TokensSection() {
             </span>
           </label>
 
+          {/* Release class - the rule-based half of the scope (migration 089).
+              An explicit list is a snapshot: a colleague with "internal" clearance saw
+              only the knowledge bases that existed when the token was minted. A class
+              keeps up: every graph classified at or below it, including future ones. */}
+          <div>
+            <label className="label">Release class (optional)</label>
+            <select value={classScopeLevelId} onChange={(e) => setClassScopeLevelId(e.target.value)}
+              className="input-field">
+              <option value="">No class - only the graphs selected below</option>
+              {levels.map((l) => (
+                <option key={l.id} value={l.id}>{l.display_name}{l.is_system === false ? ' (custom)' : ''}</option>
+              ))}
+            </select>
+            <p className="mt-1.5 text-[11px] text-slate-600">
+              In addition to the selection, this token READS every knowledge base of the account
+              classified at or below this class, including ones created later. Two limits always
+              hold: personal knowledge bases (folder <span className="font-mono text-slate-500">Users/…</span>)
+              are never included, and a class never grants writing - writing still needs a graph
+              selected below. The token's base clearance caps the class.
+            </p>
+          </div>
+
           <div>
             <label className="label">Knowledge bases this token may access (exclusive)</label>
             <p className="mb-2 text-[11px] text-slate-600">
               A token with a selection can read &amp; write ONLY the selected graphs (full access to each
-              selected graph, regardless of its classification). Nothing else is visible.
+              selected graph, regardless of its classification) plus, if set, the release class above.
+              Search matches the name and the folder.
             </p>
-            <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-slate-800 p-2">
-              {comps.length === 0 ? (
-                <p className="px-2 py-3 text-center text-[11px] text-slate-600">No graphs yet.</p>
-              ) : comps.map((c) => {
-                const checked = grantIds.has(c.id)
-                const isCode = c.type === 'CODE'
-                // A code graph cannot be granted to a token without Codebase access.
-                const locked = isCode && !codeAccess
-                return (
-                  <label key={c.id} className={cn('flex items-center gap-2 rounded px-2 py-1.5',
-                    locked ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-slate-800/50')}>
-                    <input type="checkbox" checked={checked} disabled={locked}
-                      onChange={() => setGrantIds((prev) => { const n = new Set(prev); checked ? n.delete(c.id) : n.add(c.id); return n })} />
-                    <span className="flex-1 text-xs text-slate-300">{c.name}</span>
-                    {isCode && (
-                      <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
-                        Code
-                      </span>
-                    )}
-                    <span className={cn('text-[10px]', CLEARANCE_BADGE[c.classification] ?? 'badge-slate')}>{c.classification}</span>
-                  </label>
-                )
+            <KbPickerList
+              items={comps}
+              selected={grantIds}
+              query={grantQuery}
+              onQueryChange={setGrantQuery}
+              onToggle={(id) => setGrantIds((prev) => {
+                const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n
               })}
-            </div>
+              // A code graph cannot be granted to a token without Codebase access.
+              lockedReason={(c) => (c.type === 'CODE' && !codeAccess ? 'Codebase access is off for this token' : null)}
+              maxHeightClass="max-h-56"
+              badge={(c) => (
+                <>
+                  {c.type === 'CODE' && (
+                    <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
+                      Code
+                    </span>
+                  )}
+                  <span className={cn('text-[10px]', CLEARANCE_BADGE[c.classification] ?? 'badge-slate')}>{c.classification}</span>
+                </>
+              )}
+            />
           </div>
 
           <div className="flex items-center justify-end gap-2">
@@ -350,6 +393,12 @@ function TokensSection() {
                           </button>
                         </>
                       )}
+                      {k.classScopeLevel && (
+                        <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-emerald-300 ring-1 ring-emerald-500/30"
+                          title={`Release class: reads every non-personal knowledge base classified at or below ${k.classScopeLevel}, including future ones`}>
+                          Class {k.classScopeLevel}
+                        </span>
+                      )}
                       {k.kbScoped && (
                         <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-violet-300 ring-1 ring-violet-500/30" title="Scoped to specific knowledge bases only">
                           KB-scoped
@@ -379,7 +428,14 @@ function TokensSection() {
                     {/* Grants */}
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
                       <span className="text-[10px] uppercase tracking-wide text-slate-600">Graph access:</span>
-                      {k.grants.length === 0 && <span className="text-[11px] text-slate-600">base clearance only</span>}
+                      {k.grants.length === 0 && !k.classScopeLevel && (
+                        <span className="text-[11px] text-slate-600">base clearance only</span>
+                      )}
+                      {k.grants.length === 0 && k.classScopeLevel && (
+                        <span className="text-[11px] text-slate-600">
+                          read-only via class {k.classScopeLevel}, no writable graph
+                        </span>
+                      )}
                       {k.grants.map((g) => (
                         <span key={g.compilationId} className="inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300">
                           {g.compilationName}
@@ -413,14 +469,18 @@ function GrantAdder({ comps, existing, codeAccess, onAdd }: {
 }) {
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const [q, setQ] = useState('')
   const btnRef = useRef<HTMLButtonElement>(null)
   const available = comps.filter((c) => !existing.has(c.id))
+  // Suche + Ordnergruppen wie im Anlege-Picker: dieselbe Liste, dieselbe Regel.
+  const { groups, matched, total } = useKbGroups(available, q)
   if (available.length === 0) return null
 
   function toggle() {
     if (!open && btnRef.current) {
       const r = btnRef.current.getBoundingClientRect()
       setPos({ top: r.bottom + 4, left: r.left })
+      setQ('')
     }
     setOpen((v) => !v)
   }
@@ -436,28 +496,48 @@ function GrantAdder({ comps, existing, codeAccess, onAdd }: {
       {open && pos && createPortal(
         <>
           <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
-          <div className="fixed z-[61] max-h-56 w-56 overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 p-1 shadow-2xl"
+          <div className="fixed z-[61] w-72 rounded-lg border border-slate-700 bg-slate-900 p-1 shadow-2xl"
             style={{ top: pos.top, left: pos.left }}>
-            {available.map((c) => {
-              // A code graph cannot be granted to a token whose Codebase access is
-              // off - the server would drop it from the token's scope anyway, so the
-              // entry is shown disabled rather than silently accepted.
-              const locked = c.type === 'CODE' && !codeAccess
-              return (
-                <button key={c.id} disabled={locked}
-                  onClick={() => { if (!locked) { onAdd(c.id); setOpen(false) } }}
-                  title={locked ? 'Codebase access is off for this token' : undefined}
-                  className={cn('flex w-full items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs',
-                    locked ? 'cursor-not-allowed text-slate-600' : 'text-slate-300 hover:bg-slate-800')}>
-                  <span className="flex-1 truncate">{c.name}</span>
-                  {c.type === 'CODE' && (
-                    <span className="rounded bg-cyan-500/15 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
-                      Code
-                    </span>
-                  )}
-                </button>
-              )
-            })}
+            <div className="relative p-1">
+              <Search size={11} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input autoFocus value={q} onChange={(e) => setQ(e.target.value)}
+                placeholder="Search by name or folder…"
+                className="w-full rounded border border-slate-800 bg-slate-950/60 py-1 pl-6 pr-2 text-[11px] text-slate-200 placeholder:text-slate-600 focus:border-indigo-500/50 focus:outline-none" />
+            </div>
+            <div className="max-h-56 overflow-y-auto">
+              {matched === 0 ? (
+                <p className="px-2 py-3 text-center text-[11px] text-slate-600">No graph matches.</p>
+              ) : groups.map((g) => (
+                <div key={g.path}>
+                  <p className="sticky top-0 z-10 bg-slate-900/95 px-2 py-1 text-[9px] font-semibold uppercase tracking-wider text-slate-500 backdrop-blur">
+                    {g.path}
+                  </p>
+                  {g.items.map((c) => {
+                    // A code graph cannot be granted to a token whose Codebase access is
+                    // off - the server would drop it from the token's scope anyway, so the
+                    // entry is shown disabled rather than silently accepted.
+                    const locked = c.type === 'CODE' && !codeAccess
+                    return (
+                      <button key={c.id} disabled={locked}
+                        onClick={() => { if (!locked) { onAdd(c.id); setOpen(false) } }}
+                        title={locked ? 'Codebase access is off for this token' : undefined}
+                        className={cn('flex w-full items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs',
+                          locked ? 'cursor-not-allowed text-slate-600' : 'text-slate-300 hover:bg-slate-800')}>
+                        <span className="flex-1 truncate">{c.name}</span>
+                        {c.type === 'CODE' && (
+                          <span className="rounded bg-cyan-500/15 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
+                            Code
+                          </span>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              ))}
+            </div>
+            {q.trim() !== '' && (
+              <p className="px-2 py-1 text-[10px] text-slate-600">{matched} of {total} graphs</p>
+            )}
           </div>
         </>,
         document.body,

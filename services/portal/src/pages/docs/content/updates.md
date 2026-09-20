@@ -11,6 +11,15 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 89e9fbb -->
 
+## v0.9.14 - Every knowledge base list now shows where things live
+
+*21 September 2026 - [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Knowledge bases are grouped by folder, everywhere you pick one.** A picker used to be one flat run of names in creation order. On an instance where a whole team works in one account that is a wall of look-alikes: several graphs named "Personal", one "Standard", one graph per project room. Every list that offers knowledge bases now groups them by their folder (`Users/...`, `Projects/<client>`, `Global/...`) and shows that path: the token dialog, the FUSE target picker, the Talk-to-Graph selector, the auto-FUSE target in extraction, the wiki and trigger pickers, the merge dialog and the graph list of the workspace. Two graphs with the same name are finally distinguishable at a glance.
+- **The knowledge base picker of an access token has a search field.** Type part of a name or part of a folder and the list narrows while you type, with a count that tells you the list is filtered rather than short. The same search sits in the "grant" menu on an existing token.
+- **Pickers no longer stop at the 100 newest knowledge bases.** Several lists asked for the server default. On a large instance the older, most established knowledge bases silently fell out of the window, which looked like they had been deleted. Every picker now asks for the full set.
+- **New: a token can carry a release class instead of a fixed list.** An explicit list of knowledge bases is a snapshot of the day the token was issued, so a colleague with an internal clearance kept seeing only the knowledge that existed back then, and every new project graph had to be granted by hand. A token can now carry a classification as its release class and automatically READS every knowledge base of the account classified at or below it, including ones created later. Two limits are built in and cannot be switched off: personal knowledge bases (anything under `Users/`) are never part of a class, and a class never grants writing, which still requires an explicit grant on a graph. The token's own clearance caps the class, and an unfiled knowledge base is never included.
+
 ## v0.9.13 - "Update available" tells the truth, on every install
 
 *17 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
