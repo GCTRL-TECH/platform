@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>Unified Interface for Multiple AI Agents: The Case for Dashboards</title>
+      <link>https://gctrl.tech/blog/the-case-for-unified-ai-agent-dashboards</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/the-case-for-unified-ai-agent-dashboards</guid>
+      <description>Learn how a unified interface for multiple AI agents reduces friction by consolidating specialized agents into a single control plane for coordination.</description>
+      <pubDate>Tue, 22 Sep 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>Rootless Docker UI Tools List: Top Self-Hosted Options</title>
       <link>https://gctrl.tech/blog/top-self-hosted-docker-uis-that-fully-support-rootless-mode</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/top-self-hosted-docker-uis-that-fully-support-rootless-mode</guid>

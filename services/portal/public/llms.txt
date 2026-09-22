@@ -45,6 +45,7 @@ Agent skill: https://gctrl.tech/skill.md
 
 ## Articles
 
+- [Unified Interface for Multiple AI Agents: The Case for Dashboards](https://gctrl.tech/blog/the-case-for-unified-ai-agent-dashboards): Learn how a unified interface for multiple AI agents reduces friction by consolidating specialized agents into a single control plane for coordination.
 - [Rootless Docker UI Tools List: Top Self-Hosted Options](https://gctrl.tech/blog/top-self-hosted-docker-uis-that-fully-support-rootless-mode): Find a rootless docker ui tools list featuring Lazydocker, Portainer CE, Dockge, and Komodo. Learn which UIs support user-specific socket path configuration.
 - [How to Extract TIF Raster Coordinates in R When rasterToPoints Fa](https://gctrl.tech/blog/fixing-r-rastertopoints-extracting-tif-coordinates-when-it-fails): Learn how to extract tif raster coordinates r using terra::extract() to avoid memory crashes and handle large TIF files more efficiently than rasterToPoints.
 - [Enterprise Software Moving Away from SaaS: The Shift Explained](https://gctrl.tech/blog/the-enterprise-shift-why-companies-are-leaving-saas): Explore why enterprise software moving away from saas is driven by AI agents, seat-based pricing failures, and a shift toward private cloud deployments.
