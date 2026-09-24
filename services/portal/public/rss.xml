@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>How to Sync AI Coding Agents with Figma for Continuous Loops</title>
+      <link>https://gctrl.tech/blog/automating-sync-between-figma-designs-and-coding-agents</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/automating-sync-between-figma-designs-and-coding-agents</guid>
+      <description>Learn how to sync ai coding agents with figma using MCP to enable bidirectional data flow and replace static handoffs with continuous design-to-code loops.</description>
+      <pubDate>Thu, 24 Sep 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>Unified Interface for Multiple AI Agents: The Case for Dashboards</title>
       <link>https://gctrl.tech/blog/the-case-for-unified-ai-agent-dashboards</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/the-case-for-unified-ai-agent-dashboards</guid>
