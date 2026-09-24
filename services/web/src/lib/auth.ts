@@ -1,3 +1,5 @@
+import { UI_MODE_KEY } from '@/hooks/useUiMode'
+
 const TOKEN_KEY = 'GCTRL_token'
 const REFRESH_TOKEN_KEY = 'GCTRL_refresh_token'
 
@@ -56,5 +58,9 @@ export function isTokenExpired(token: string): boolean {
 export function clearAuthStorage(): void {
   removeToken()
   removeRefreshToken()
+  // The Easy/Expert mode is a PERSONAL preference, not device state: leaving it
+  // behind on logout hands it to whoever signs in next on a shared machine.
+  // try/catch mirrors useUiMode — storage access may throw (private mode, policy).
+  try { localStorage.removeItem(UI_MODE_KEY) } catch { /* non-persistent env */ }
 }
 
