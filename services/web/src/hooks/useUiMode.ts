@@ -10,7 +10,10 @@ import { useSyncExternalStore } from 'react'
  */
 
 export type UiMode = 'easy' | 'expert'
-const KEY = 'gctrl_ui_mode'
+// Exported so clearAuthStorage() can drop the mode on logout — it is a personal
+// preference and must not leak to the next account on a shared machine.
+export const UI_MODE_KEY = 'gctrl_ui_mode'
+const KEY = UI_MODE_KEY
 const listeners = new Set<() => void>()
 
 // try/catch: this getter backs useSyncExternalStore for the whole app shell —

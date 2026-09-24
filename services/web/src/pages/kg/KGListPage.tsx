@@ -124,11 +124,13 @@ interface CreateModalProps {
   onClose: () => void
   onCreated: (id: string) => void
   rawCompilations: Compilation[]
+  /** Folder the list is currently showing — the new graph is filed there. */
+  currentFolderId: string | null
 }
 
 type GraphType = 'RAW' | 'WIKI'
 
-function CreateModal({ onClose, onCreated, rawCompilations }: CreateModalProps) {
+function CreateModal({ onClose, onCreated, rawCompilations, currentFolderId }: CreateModalProps) {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [classification, setClassification] = useState<Classification>('INTERNAL')
@@ -174,6 +176,12 @@ function CreateModal({ onClose, onCreated, rawCompilations }: CreateModalProps) 
         ...(graphType === 'WIKI' && wikiSourceId
           ? { wikiSourceCompilationId: wikiSourceId }
           : {}),
+        // Create INSIDE a folder → file the graph there, instead of dropping
+        // every UI-created graph unfiled into the root. At the root (or when
+        // this dialog is ever used without a folder context) nothing is sent,
+        // so the server default stays in charge (unfiled; CODE gets its own
+        // default folder server-side).
+        ...(currentFolderId ? { folderId: currentFolderId } : {}),
       },
     })
   }
@@ -344,7 +352,9 @@ function CompilationCard({
   const edgeCount = compilation.edgeCount ?? 0
   const isWiki = compilation.type === 'WIKI'
   const isSystem = compilation.isSystem === true
-  // Easy mode has no folder drop targets — dragging would be a dead affordance (W7).
+  // isExpert STAYS on draggable: moving graphs between folders is folder
+  // MANAGEMENT, Expert-only — even though Easy now renders the folder tree
+  // (navigation is mode-independent, see KGListPage).
   const { isExpert } = useUiMode()
 
   return (
@@ -497,16 +507,21 @@ export function KGListPage() {
     }
   }
 
-  // Expert mode lists ONE folder at a time straight from the server (`folderId`
+  // The list shows ONE folder at a time straight from the server (`folderId`
   // filter, limit 500). The old client-side filter ran over the 20 newest graphs
   // of the whole account, so a folder holding older graphs opened empty while
-  // its card (counted server-side) said "7 graphs". Easy mode keeps a flat list.
-  const folderParam = isExpert ? (currentFolderId ?? 'root') : null
+  // its card (counted server-side) said "7 graphs".
+  //
+  // Easy-lens boundary (revised): 50264c6 made the folder FLATTEN part of the
+  // Easy lens, but the mode lives in localStorage (default 'easy', per device) —
+  // so an admin logging in on a fresh machine saw every KB dumped flat into the
+  // root. New boundary: folder NAVIGATION (this param, the folderId filter,
+  // folder cards, breadcrumb, back target) renders in ALL modes; only folder
+  // MANAGEMENT (New Folder, folder delete, drag&drop moves) stays Expert.
+  const folderParam = currentFolderId ?? 'root'
   const { data, isLoading, error } = useApiQuery<CompilationsResponse>(
-    ['kg', 'compilations', folderParam ?? 'all'],
-    folderParam
-      ? `/kg/compilations?folderId=${encodeURIComponent(folderParam)}&limit=500`
-      : '/kg/compilations?limit=500'
+    ['kg', 'compilations', folderParam],
+    `/kg/compilations?folderId=${encodeURIComponent(folderParam)}&limit=500`
   )
   const compilations = data?.compilations ?? []
 
@@ -524,15 +539,16 @@ export function KGListPage() {
     (f) => (f.parentFolderId ?? null) === currentFolderId
   )
 
-  // Easy mode has no folder navigation — flatten by ignoring folderId so
-  // nothing disappears from view; folder cards/breadcrumb/back-target are
-  // gated off below (render-only, filtering is unchanged).
-  const compilationsInFolder = isExpert
-    ? filtered.filter((c) => (c.folderId ?? null) === currentFolderId)
-    : filtered
+  // Folder scoping is unconditional (all modes — see the boundary note above).
+  // The server already filters by folderId; this re-filter only keeps a stale
+  // cached response from leaking other folders' graphs into view.
+  const compilationsInFolder = filtered.filter(
+    (c) => (c.folderId ?? null) === currentFolderId
+  )
 
   // Easy mode sorts system graphs first, then WIKI, then the rest — display
-  // order only, no data mutation.
+  // order only, no data mutation. isExpert STAYS here: pure presentation,
+  // not folder navigation.
   const displayedCompilations = isExpert
     ? compilationsInFolder
     : [...compilationsInFolder].sort((a, b) => {
@@ -614,6 +630,9 @@ export function KGListPage() {
             Manage and explore your knowledge compilations.
           </p>
         </div>
+        {/* isExpert STAYS: New Folder is folder management; New Compilation was
+            hidden in Easy by 50264c6 independently of the folder flatten —
+            creation remains part of the Expert lens. */}
         {isExpert && (
           <div className="flex items-center gap-2">
             <button
@@ -646,6 +665,8 @@ export function KGListPage() {
             placeholder="Search knowledge graphs..."
           />
         </div>
+        {/* isExpert STAYS: the classification filter is an Easy-lens
+            simplification unrelated to folders. */}
         {isExpert && (
           <select
             value={filterClassification}
@@ -669,8 +690,10 @@ export function KGListPage() {
           folder cards), so its position depended on how many subfolders the
           folder had and it vanished entirely on the empty/filtered state.
           Here it sits outside the grid, independent of sorting, filters and
-          item count. It stays a drop target for moving a graph one level up. */}
-      {isExpert && folderPath.length > 0 && (
+          item count. It stays a drop target for moving a graph one level up.
+          Rendered in ALL modes (navigation); the drop handlers are inert in
+          Easy because nothing is draggable there. */}
+      {folderPath.length > 0 && (
         <div className="flex items-center gap-3 text-sm">
           {currentFolderId && (
             <button
@@ -740,7 +763,7 @@ export function KGListPage() {
             <p className="mt-0.5 text-xs text-slate-500">Check your connection and try again.</p>
           </div>
         </div>
-      ) : filtered.length === 0 && !(isExpert && foldersInView.length > 0) ? (
+      ) : filtered.length === 0 && foldersInView.length === 0 ? (
         <div className="flex flex-col items-center gap-4 py-24 text-center">
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-800">
             <Database size={24} className="text-slate-600" />
@@ -757,6 +780,7 @@ export function KGListPage() {
                 : 'Try adjusting your search or filter'}
             </p>
           </div>
+          {/* isExpert STAYS: creation is Expert-only (matches the header). */}
           {isExpert && compilations.length === 0 && (
             <button onClick={() => setShowCreateModal(true)} className="btn-primary">
               <Plus size={15} />
@@ -766,8 +790,9 @@ export function KGListPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {/* Folder cards (Expert only — Easy mode is flattened) */}
-          {isExpert && foldersInView.map((folder) => (
+          {/* Folder cards — all modes (navigation). Drop handlers are inert in
+              Easy (nothing draggable); only the delete affordance is Expert. */}
+          {foldersInView.map((folder) => (
             <button
               key={folder.id}
               onClick={() => navigateToFolder(folder)}
@@ -812,14 +837,17 @@ export function KGListPage() {
                 </p>
               </div>
               <ChevronRight size={14} className="text-slate-700 opacity-0 group-hover:opacity-100 transition-opacity" />
-              <div
-                className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity"
-                onClick={(e) => { e.stopPropagation(); handleDeleteFolder(folder.id) }}
-                role="button"
-                title="Delete folder (contents move up)"
-              >
-                <Trash2 size={12} className="text-slate-600 hover:text-red-400 transition-colors" />
-              </div>
+              {/* isExpert STAYS: folder delete is management, not navigation. */}
+              {isExpert && (
+                <div
+                  className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity"
+                  onClick={(e) => { e.stopPropagation(); handleDeleteFolder(folder.id) }}
+                  role="button"
+                  title="Delete folder (contents move up)"
+                >
+                  <Trash2 size={12} className="text-slate-600 hover:text-red-400 transition-colors" />
+                </div>
+              )}
             </button>
           ))}
 
@@ -843,6 +871,7 @@ export function KGListPage() {
       {showCreateModal && (
         <CreateModal
           rawCompilations={compilations.filter((c) => (c.type ?? 'RAW') === 'RAW')}
+          currentFolderId={currentFolderId}
           onClose={() => setShowCreateModal(false)}
           onCreated={(id) => {
             setShowCreateModal(false)
