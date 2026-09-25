@@ -657,6 +657,8 @@ async fn upload(
     let mut ontology_id: Option<Uuid> = None;
     let mut classification_level_id: Option<Uuid> = None;
     let mut compilation_id: Option<Uuid> = None;
+    // CLI and SDK send the file's real location here; the browser does not.
+    let mut source_ref: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await
         .map_err(|e| AppError::BadRequest(e.to_string()))? {
@@ -677,6 +679,11 @@ async fn upload(
                 let s = field.text().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
                 compilation_id = s.parse().ok();
             }
+            Some("sourceRef") => {
+                let s = field.text().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+                let s = s.trim();
+                if !s.is_empty() { source_ref = Some(s.to_string()); }
+            }
             _ => {}
         }
     }
@@ -684,6 +691,7 @@ async fn upload(
     let bytes = file_bytes.ok_or(AppError::BadRequest("No file field".into()))?;
     let job_id = submit_upload(
         &state, &claims, &bytes, &file_name, ontology_id, classification_level_id, compilation_id,
+        source_ref.as_deref(),
     ).await?;
 
     Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
@@ -746,6 +754,12 @@ pub(crate) async fn submit_upload(
     ontology_id: Option<Uuid>,
     classification_level_id: Option<Uuid>,
     compilation_id: Option<Uuid>,
+    // `source_ref`: where the file actually came from — an absolute path, a URL, a
+    // vault location. `None` falls back to the bare file name, which is what every
+    // caller effectively sent before. The distinction matters: two different
+    // `notes.md` are ONE document under the bare name and two under their paths,
+    // and a reader who only sees "notes.md" cannot tell which one made a claim.
+    source_ref: Option<&str>,
 ) -> Result<Uuid> {
     enforce_classification_ceiling(&state.db, claims, classification_level_id).await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -758,12 +772,18 @@ pub(crate) async fn submit_upload(
 
     let (resolved_ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, ontology_id).await;
 
-    // P2b: identity keyed on (user, path). Direct upload has no folder path —
-    // `path` is the file name, and there is no source-side mtime (neither the
-    // browser nor an agent sends one), so modified_at is left unknown.
+    // P2b: identity keyed on (user, path). The caller's `sourceRef` IS that path
+    // when it sent one (CLI sends the absolute path, the SDK the connector
+    // location, an agent the original URL); otherwise the bare file name stands
+    // in, as it always did. No source-side mtime either way — neither browser nor
+    // agent sends one — so modified_at stays unknown.
+    let source_path = source_ref
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(file_name);
     let content_hash = crate::services::source_docs::hash_content(bytes);
     let source_doc = crate::services::source_docs::resolve_source_document(
-        &state.db, claims.sub, None, file_name, Some(file_name),
+        &state.db, claims.sub, None, source_path, Some(file_name),
         &content_hash, None,
     ).await.ok();
     let source_document_id = source_doc.as_ref().map(|d| d.id);
@@ -773,7 +793,13 @@ pub(crate) async fn submit_upload(
          VALUES ($1, $2, 'kex_upload', 'pending', $3, $4, $5, $6)"
     )
     .bind(job_id).bind(claims.sub)
-    .bind(json!({ "fileName": file_name, "ontologyId": resolved_ontology_id }))
+    .bind(json!({
+        "fileName": file_name,
+        // Kept alongside fileName so the readable-provenance chain
+        // (COALESCE(fileName, sourceRef, …)) can show the full location.
+        "sourceRef": source_ref,
+        "ontologyId": resolved_ontology_id,
+    }))
     .bind(classification_level_id)
     .bind(source_document_id)
     .bind(claims.api_key_id)
@@ -806,7 +832,7 @@ pub(crate) async fn submit_upload(
         "classification": classification_name,
         "classification_level_id": classification_level_id,
         "source_document_id": source_document_id,
-        "source_path": file_name,
+        "source_path": source_path,
         "source_modified_at": Value::Null,
     });
     crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;

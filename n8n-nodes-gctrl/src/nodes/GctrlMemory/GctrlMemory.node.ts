@@ -75,7 +75,14 @@ class GctrlMemoryProvider {
 				this.ctx as IExecuteFunctions,
 				'POST',
 				'/kex/extract',
-				{ text, title: `Memory: ${this.sessionId}` } as IDataObject,
+				{
+					text,
+					title: `Memory: ${this.sessionId}`,
+					// Provenance of a remembered turn is the conversation it came from:
+					// the session id, worded "session <id>" — the phrasing the API's
+					// recency ranking already looks for inside sourceRef.
+					sourceRef: `n8n memory / session ${this.sessionId}`,
+				} as IDataObject,
 			);
 		} catch {
 			// Non-fatal: don't break the workflow if memory save fails

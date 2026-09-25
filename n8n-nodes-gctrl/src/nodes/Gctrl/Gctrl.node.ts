@@ -7,6 +7,37 @@ import {
 } from 'n8n-workflow';
 import { gctrlApiRequest } from '../../shared/GctrlApiClient';
 
+/**
+ * Provenance for a knowledge write: where the text came from, so the extracted
+ * facts stay traceable in the graph.
+ *
+ * The configured "Source Reference" wins. When it is empty we fall back to what
+ * the incoming item already carries — a file handed over by a previous node
+ * (binary file name, with its folder when known), or a path/URL field on the
+ * item's JSON. That way the origin travels along even when nobody configured
+ * anything, which is the only way provenance actually happens in a workflow.
+ */
+function resolveSourceRef(explicit: string, item: INodeExecutionData | undefined): string | undefined {
+	if (explicit) return explicit;
+	if (!item) return undefined;
+
+	for (const binary of Object.values(item.binary ?? {})) {
+		const fileName = binary?.fileName;
+		if (fileName) {
+			const directory = binary.directory;
+			return directory ? `${directory}/${fileName}` : fileName;
+		}
+	}
+
+	const json = (item.json ?? {}) as IDataObject;
+	for (const key of ['sourceRef', 'filePath', 'fileName', 'url', 'webUrl', 'link']) {
+		const value = json[key];
+		if (typeof value === 'string' && value) return value;
+	}
+
+	return undefined;
+}
+
 export class Gctrl implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Ground Control',
@@ -166,6 +197,20 @@ export class Gctrl implements INodeType {
 					},
 				},
 				description: 'Optional title for the stored knowledge',
+			},
+			{
+				displayName: 'Source Reference',
+				name: 'sourceRef',
+				type: 'string',
+				default: '',
+				displayOptions: {
+					show: {
+						resource: ['knowledge'],
+						operation: ['extract', 'store'],
+					},
+				},
+				description:
+					'Optional: where this knowledge comes from (file path, URL, ticket ID, run identifier), kept with the extraction so facts stay traceable. Leave empty to take the origin from the incoming item (a file from a previous node, or its url/filePath field) — or, for Store, from the title.',
 			},
 			{
 				displayName: 'Question',
@@ -391,15 +436,23 @@ export class Gctrl implements INodeType {
 					const text = this.getNodeParameter('text', i) as string;
 					const ontologyId = this.getNodeParameter('ontologyId', i, '') as string;
 					const discoveryMode = this.getNodeParameter('discoveryMode', i, 'discover') as string;
+					const configuredSourceRef = this.getNodeParameter('sourceRef', i, '') as string;
 					const body: IDataObject = { text, discoveryMode };
 					if (ontologyId) body.ontologyId = ontologyId;
+					const sourceRef = resolveSourceRef(configuredSourceRef, items[i]);
+					if (sourceRef) body.sourceRef = sourceRef;
 					responseData = await gctrlApiRequest(this, 'POST', '/kex/extract', body);
 
 				} else if (operation === 'store') {
 					const text = this.getNodeParameter('text', i) as string;
 					const title = this.getNodeParameter('title', i, '') as string;
+					const configuredSourceRef = this.getNodeParameter('sourceRef', i, '') as string;
 					const body: IDataObject = { text };
 					if (title) body.title = title;
+					// Origin, best first: what was configured, else what the item carries,
+					// else the title — a named note beats no origin at all.
+					const sourceRef = resolveSourceRef(configuredSourceRef, items[i]) ?? (title || undefined);
+					if (sourceRef) body.sourceRef = sourceRef;
 					responseData = await gctrlApiRequest(this, 'POST', '/kex/extract', body);
 
 				} else if (operation === 'listJobs') {

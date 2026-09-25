@@ -235,7 +235,7 @@ Package: `n8n-nodes-gctrl` (at borghive/n8n-nodes-gctrl/)
 ### CLI — `gctrl`
 ```bash
 gctrl auth login|status|logout
-gctrl kex extract --file|--url|--text [--classification INTERNAL] [--wait]
+gctrl kex extract --file|--url|--text [--classification INTERNAL] [--source-ref "Drive / Q3.pdf"] [--wait]
 gctrl kex jobs
 gctrl graph list|get
 gctrl source list

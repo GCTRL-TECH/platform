@@ -235,21 +235,35 @@ async fn reingest_folder_vault(
         })
         .to_string();
 
+        // Document identity for a LOCAL vault note. The bytes are already in hand,
+        // so this is a real content hash: editing a note creates a new version in
+        // the chain instead of a second, unrelated document. The path carries the
+        // vault AND the note's place in it — two notes named "Notizen.md" in
+        // different folders are different documents, and the format matches what
+        // the web UI's Obsidian import already writes into sourceRef.
+        let source_path = format!("Obsidian ({}) / {}", vault.label, rel_str);
+        let content_hash = crate::services::source_docs::hash_content(&bytes);
+        let source_document_id = crate::services::source_docs::resolve_source_document(
+            db, vault.user_id, None, &source_path, Some(&note_name), &content_hash, None,
+        ).await.ok().map(|d| d.id);
+
         let job_id = Uuid::new_v4();
         let insert = sqlx::query(
-            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id)
-             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4)",
+            "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id)
+             VALUES ($1, $2, 'kex_connector', 'pending', $3, $4, $5)",
         )
         .bind(job_id)
         .bind(vault.user_id)
         .bind(json!({
             "fileName":      note_name,
+            "sourceRef":     source_path,
             "vaultId":       vault.id,
             "ontologyId":    opts.ontology_id,
             "compilationId": opts.compilation_id,
             "discoveryMode": opts.discovery_mode,
         }))
         .bind(opts.classification_level_id)
+        .bind(source_document_id)
         .execute(db)
         .await;
 
@@ -281,6 +295,9 @@ async fn reingest_folder_vault(
             "ontology_id":             opts.ontology_id,
             "classification":          opts.classification_name,
             "classification_level_id": opts.classification_level_id,
+            // Stamped onto every chunk and node the worker creates from this note.
+            "source_document_id":      source_document_id,
+            "source_path":             source_path,
         });
         crate::services::llm::inject_ollama_overrides(db, vault.user_id, &mut payload).await;
 

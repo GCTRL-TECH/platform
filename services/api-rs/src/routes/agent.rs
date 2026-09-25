@@ -360,8 +360,8 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "list_graphs",        "description": "List knowledge graphs the caller can access - id, name, type (RAW | WIKI | CODE), folderPath (Users/<name>/..., Projects/<client>/..., Global/...), nodeCount/edgeCount/sourceCount, classification, privacyMode. Pick your target knowledge base by placement and type, never by name alone", "args": {} },
             { "name": "get_graph",          "description": "Read a compilation's entities and relationships. Start with response_format='summary' (default) — returns {name,type,degree} + relation-type counts, much cheaper than 'full'. Only use 'full' if you need the complete edge list. Default limit 100; max 500.", "args": { "compilationId": "string", "limit": "number?", "response_format": "string?" } },
             { "name": "query",              "description": "Blended answer over graph + chunks + dossiers (RAG). Preferred first read tool for open questions — blends all memory tiers automatically and returns a grounded answer with sources + confidence. Args: { message: string, compilationId?: string }", "args": { "message": "string", "compilationId": "string?" } },
-            { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call after ANY substantive task to persist conclusions. Always pass compilationId (find via list_graphs). Args: { text: string, compilationId?: string }", "args": { "text": "string", "compilationId": "string?" } },
-            { "name": "ingest_file",        "description": "Ingest a BINARY file into the knowledge graph — PDF, DOCX, PPTX, XLSX, images (PNG/JPG/WEBP/TIFF/BMP/GIF: transcribed by the vision model when the runtime can see, Tesseract OCR otherwise), scanned PDFs, or any other document — base64-encode the file's bytes and pass them here. Use this instead of create_extraction/store whenever the source is a file rather than plain text (e.g. a screenshot, a whiteboard photo, a Miro board export). Max 25MB decoded.", "args": { "fileName": "string", "contentBase64": "string", "compilationId": "string?", "ontologyId": "string?" } },
+            { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call after ANY substantive task to persist conclusions. Always pass compilationId (find via list_graphs). ALWAYS pass sourceRef too — where this knowledge comes from (file path, URL, ticket/run id, 'conversation with <person> on <date>'). It becomes the traceable origin of every fact extracted from this text; without it the graph can state something but never show where it read it. Args: { text: string, compilationId?: string, sourceRef?: string }", "args": { "text": "string", "compilationId": "string?", "sourceRef": "string?" } },
+            { "name": "ingest_file",        "description": "Ingest a BINARY file into the knowledge graph — PDF, DOCX, PPTX, XLSX, images (PNG/JPG/WEBP/TIFF/BMP/GIF: transcribed by the vision model when the runtime can see, Tesseract OCR otherwise), scanned PDFs, or any other document — base64-encode the file's bytes and pass them here. Use this instead of create_extraction/store whenever the source is a file rather than plain text (e.g. a screenshot, a whiteboard photo, a Miro board export). The fileName becomes the document's name in the graph, so name it after the real source. Pass sourceRef with the full location (absolute path, URL, vault path) when you know it — two files called 'notes.md' are one document under the bare name and two under their paths. Max 25MB decoded.", "args": { "fileName": "string", "contentBase64": "string", "compilationId": "string?", "ontologyId": "string?", "sourceRef": "string?" } },
             { "name": "search_entities",    "description": "Find entities by name (clearance-filtered). Use limit to page through results (default 10, max 50).", "args": { "query": "string", "limit": "number?" } },
             { "name": "get_entity",         "description": "Read one entity, its connections, and its provenance (origin file / sourceRef / extraction job) — use for 'where does X come from / which file'. Also returns groundingChunks (up to 3 verbatim source-text snippets) unless include_chunks=false", "args": { "name": "string", "include_chunks": "boolean?" } },
             { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?). Use depth 1 first; increase only if needed. Limit is fixed at 100.", "args": { "name": "string", "depth": "number?" } },
@@ -382,7 +382,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "list_ontologies",    "description": "List ontologies", "args": {} },
             { "name": "schema",             "description": "Graph schema for your knowledge: distinct entity types (coarse buckets) and relationship types with counts, clearance- and KB-scope-filtered. Use to learn 'what kinds of things and relations exist' before querying. No args", "args": {} },
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
-            { "name": "create_extraction",  "description": "Ingest text into the knowledge graph", "args": { "text": "string", "classificationLevelId": "string?" } },
+            { "name": "create_extraction",  "description": "Ingest text into the knowledge graph. Pass sourceRef with the origin (file path, URL, ticket/run id) so every extracted fact stays traceable to where it came from.", "args": { "text": "string", "classificationLevelId": "string?", "sourceRef": "string?" } },
             { "name": "fuse_graphs",        "description": "Merge graphs by their source job ids", "args": { "name": "string", "sourceJobIds": "string[]" } },
             { "name": "create_compilation", "description": "Create a new empty knowledge graph. ALWAYS pass folderPath so the graph is filed where it belongs (find-or-create): personal graphs under [\"Users\",\"<name>\"], project graphs under [\"Projects\",\"<Kunde>\"]; a graph created without folderPath lands unfiled at the tree root. type 'CODE' creates a Codebase KB (one per repository, default folder Users/<name>/Code) - the only kind a KB-scoped token may create; it is granted onto that token automatically.", "args": { "name": "string", "description": "string?", "folderPath": "string[]?", "type": "string?" } },
             { "name": "delete_compilation", "description": "Delete a compilation the caller owns", "args": { "compilationId": "string" } },
@@ -611,6 +611,94 @@ pub(crate) fn drop_code_chunks(
                 && !hits(&["job_id", "jobId", "source_job", "sourceJob"], code_job_ids)
         })
         .collect()
+}
+
+/// What a text ingest knows about where its content came from.
+///
+/// Every agent-side write goes through here, so provenance is a property of the
+/// PATH, not of the caller's diligence: a client that sends `sourceRef` gets a
+/// named document, one that sends nothing still gets an identity derived from the
+/// text itself (`text:<preview>`, the same fallback the HTTP route has always
+/// used in kex.rs). Before this, `store` and `create_extraction` wrote neither a
+/// `source_document_id` nor the text itself into `jobs.input` — which cost far
+/// more than a label: retry (`kex.rs` reads `input->>'text'`), parent-document
+/// expansion in RAG, and every readable "where is this from?" answer were dead
+/// for agent-written knowledge. A knowledge graph whose statements cannot be
+/// traced back is the one thing a knowledge graph must not be.
+struct IngestProvenance {
+    /// Stable document identity, written to `jobs.source_document_id` and handed
+    /// to the worker so every chunk and every graph node inherits it.
+    source_document_id: Option<uuid::Uuid>,
+    /// Human-readable origin: the caller's `sourceRef`, else `text:<preview>`.
+    /// Surfaces as the entity's `_origin` and as the chunk's source label.
+    source_path: String,
+    /// Caller-supplied origin, if any — kept separate from `source_path` so
+    /// `jobs.input->>'sourceRef'` stays honest about what was actually claimed.
+    source_ref: Option<String>,
+}
+
+/// The caller's claim about origin — pure, so the precedence is testable.
+///
+/// `sourceRef` first, `title` as fallback: the stdio MCP `store` has always taken
+/// a title, and a named title is a better origin than none. Whitespace-only is
+/// treated as absent, not as a document called " ".
+pub(crate) fn derive_source_ref(args: &Value) -> Option<String> {
+    // Trim FIRST, then fall through: a `sourceRef` of "  " must not shadow a usable
+    // `title`. Chaining `.or_else()` on the raw values looked equivalent and was not —
+    // `as_str()` happily returns Some("  "), so the fallback never ran.
+    ["sourceRef", "title"]
+        .iter()
+        .filter_map(|k| args[*k].as_str())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The document PATH an ingest is filed under — the identity key of
+/// `source_documents (user_id, path)`.
+///
+/// Without a caller-supplied origin this falls back to `text:<first 60 chars>`,
+/// byte-for-byte what `/api/kex/extract` has always done (kex.rs). Deliberately
+/// copied rather than improved: two ingest paths inventing two different
+/// identities for the same text is worse than one imperfect rule. Its known
+/// edge — two unrelated texts sharing a 60-char opening become versions of one
+/// document — is the price of that consistency, and any fix belongs in BOTH
+/// places at once.
+pub(crate) fn source_path_for(source_ref: Option<&str>, text: &str) -> String {
+    match source_ref {
+        Some(s) => s.to_string(),
+        None => {
+            let preview: String = text.chars().take(60).collect();
+            format!("text:{preview}")
+        }
+    }
+}
+
+/// Resolve document identity for an agent text ingest. Mirrors kex.rs's
+/// `/api/kex/extract`, deliberately: two ingest paths with two provenance rules
+/// is how the graph ends up half-traceable.
+async fn resolve_ingest_provenance(
+    state: &Arc<crate::models::AppState>,
+    user_id: uuid::Uuid,
+    text: &str,
+    args: &Value,
+) -> IngestProvenance {
+    let source_ref = derive_source_ref(args);
+    let source_path = source_path_for(source_ref.as_deref(), text);
+    let content_hash = crate::services::source_docs::hash_content(text.as_bytes());
+    let source_document_id = crate::services::source_docs::resolve_source_document(
+        &state.db,
+        user_id,
+        None,
+        &source_path,
+        source_ref.as_deref(),
+        &content_hash,
+        None,
+    )
+    .await
+    .ok()
+    .map(|d| d.id);
+    IngestProvenance { source_document_id, source_path, source_ref }
 }
 
 async fn execute_tool_inner(
@@ -1091,19 +1179,36 @@ async fn execute_tool_inner(
                 }
             }
             let job_id = uuid::Uuid::new_v4();
+            let prov = resolve_ingest_provenance(state, claims.sub, text, args).await;
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
                 .bind(claims.sub).execute(&state.db).await;
             let _ = sqlx::query(
-                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
-                 VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5)"
-            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent" })).bind(clf).bind(claims.api_key_id).execute(&state.db).await;
+                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+                 VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5, $6)"
+            )
+            .bind(job_id).bind(claims.sub)
+            // Same reasoning as `store`: without the text, retry and parent-document
+            // expansion have nothing to work with.
+            .bind(json!({
+                "text": text,
+                "source": "agent",
+                "fileName": prov.source_ref,
+                "sourceRef": prov.source_ref,
+            }))
+            .bind(clf)
+            .bind(prov.source_document_id)
+            .bind(claims.api_key_id)
+            .execute(&state.db).await;
             crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
             let clf_name: Option<String> = if let Some(c) = clf {
                 sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1").bind(c).fetch_optional(&state.db).await.ok().flatten()
             } else { None };
             let mut payload = json!({
                 "job_id": job_id, "user_id": claims.sub, "type": "text",
-                "input": text, "classification": clf_name, "classification_level_id": clf
+                "input": text, "classification": clf_name, "classification_level_id": clf,
+                "source_document_id": prov.source_document_id,
+                "source_path": prov.source_path,
+                "source_modified_at": Value::Null,
             });
             crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
             let _ = crate::services::redis::lpush(&state.redis, "kex:jobs", &payload.to_string()).await;
@@ -1372,16 +1477,36 @@ async fn execute_tool_inner(
                 }
             }
             let job_id = uuid::Uuid::new_v4();
+            let prov = resolve_ingest_provenance(state, claims.sub, text, args).await;
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
                 .bind(claims.sub).execute(&state.db).await;
             let _ = sqlx::query(
-                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
-                 VALUES ($1, $2, 'kex_extract', 'pending', $3, NULL, $4)"
-            ).bind(job_id).bind(claims.sub).bind(json!({ "source": "agent_store" })).bind(claims.api_key_id).execute(&state.db).await;
+                "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+                 VALUES ($1, $2, 'kex_extract', 'pending', $3, NULL, $4, $5)"
+            )
+            .bind(job_id).bind(claims.sub)
+            // The TEXT belongs in here, not just a marker: retry (kex.rs), the RAG
+            // parent-document expansion and every readable provenance answer read
+            // `jobs.input`. `{"source":"agent_store"}` alone made all three dead ends.
+            .bind(json!({
+                "text": text,
+                "source": "agent_store",
+                // entity_detail reads input->>'fileName' for the origin label.
+                "fileName": prov.source_ref,
+                "sourceRef": prov.source_ref,
+            }))
+            .bind(prov.source_document_id)
+            .bind(claims.api_key_id)
+            .execute(&state.db).await;
             crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
             let mut payload = json!({
                 "job_id": job_id, "user_id": claims.sub, "type": "text",
-                "input": text, "classification": null, "classification_level_id": null
+                "input": text, "classification": null, "classification_level_id": null,
+                // The worker stamps these onto every chunk and every graph node it
+                // creates — this is where provenance stops being a promise.
+                "source_document_id": prov.source_document_id,
+                "source_path": prov.source_path,
+                "source_modified_at": Value::Null,
             });
             crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
             let _ = crate::services::redis::lpush(&state.redis, "kex:jobs", &payload.to_string()).await;
@@ -1442,8 +1567,13 @@ async fn execute_tool_inner(
                 }
             }
 
+            // An agent usually knows more than the file name it invented — the URL it
+            // downloaded, the vault path, the ticket. `derive_source_ref` also accepts
+            // `title`, so a caller that only names its document still gets provenance.
+            let source_ref = derive_source_ref(args);
             match crate::routes::kex::submit_upload(
                 state, claims, &bytes, &file_name, ontology_id, None, compilation_id,
+                source_ref.as_deref(),
             ).await {
                 Ok(job_id) => json!({ "jobId": job_id, "status": "pending" }),
                 Err(e) => json!({ "error": e.to_string() }),
@@ -2966,5 +3096,52 @@ mod agent_tool_registration_tests {
         for t in ["code_symbol", "code_trace", "code_impact", "code_architecture"] {
             assert!(READ_TOOLS.contains(&t), "{t} must be allowed for read-only tokens");
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::{derive_source_ref, source_path_for};
+    use serde_json::json;
+
+    #[test]
+    fn source_ref_wins_over_title_and_blank_counts_as_absent() {
+        assert_eq!(
+            derive_source_ref(&json!({ "sourceRef": "https://example.org/a", "title": "Notiz" })),
+            Some("https://example.org/a".to_string())
+        );
+        // A title is accepted as provenance — better a name than nothing.
+        assert_eq!(derive_source_ref(&json!({ "title": "Notiz" })), Some("Notiz".to_string()));
+        // Whitespace is not a document identity.
+        assert_eq!(derive_source_ref(&json!({ "sourceRef": "   " })), None);
+        assert_eq!(derive_source_ref(&json!({ "sourceRef": "  ", "title": " x " })), Some("x".to_string()));
+        assert_eq!(derive_source_ref(&json!({})), None);
+        // Wrong types must not panic or fabricate an origin.
+        assert_eq!(derive_source_ref(&json!({ "sourceRef": 42 })), None);
+    }
+
+    #[test]
+    fn without_an_origin_the_text_itself_becomes_the_identity() {
+        // Same shape as /api/kex/extract — the two paths MUST agree, otherwise the
+        // same text ingested twice would split into two documents.
+        assert_eq!(source_path_for(None, "Hallo Welt"), "text:Hallo Welt");
+        assert_eq!(source_path_for(Some("file.md"), "Hallo Welt"), "file.md");
+    }
+
+    #[test]
+    fn the_preview_is_cut_by_CHARACTERS_not_bytes() {
+        // A byte-slice would panic mid-codepoint on German or emoji text; this ran
+        // on a route that ingests arbitrary user content.
+        let text = "ä".repeat(100);
+        let path = source_path_for(None, &text);
+        assert_eq!(path, format!("text:{}", "ä".repeat(60)));
+        let emoji = "🧠".repeat(80);
+        assert_eq!(source_path_for(None, &emoji), format!("text:{}", "🧠".repeat(60)));
+    }
+
+    #[test]
+    fn short_text_is_not_padded_or_truncated() {
+        assert_eq!(source_path_for(None, "kurz"), "text:kurz");
+        assert_eq!(source_path_for(None, ""), "text:");
     }
 }

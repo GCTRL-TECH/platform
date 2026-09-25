@@ -25,8 +25,9 @@ export function registerKex(program: Command): void {
     .option('-t, --text <text>', 'Text to extract from')
     .option('-c, --classification <level>', 'Classification level (PUBLIC|INTERNAL|CONFIDENTIAL|STRICTLY_CONFIDENTIAL)')
     .option('-o, --ontology <id>', 'Ontology ID to use')
+    .option('-s, --source-ref <ref>', 'Where this knowledge comes from (file path, URL, ticket ID) — kept with the extraction so facts stay traceable. Defaults to the file path / URL.')
     .option('-w, --wait', 'Wait for job to complete')
-    .action(async (opts: { file?: string; url?: string; text?: string; classification?: string; ontology?: string; wait?: boolean }) => {
+    .action(async (opts: { file?: string; url?: string; text?: string; classification?: string; ontology?: string; sourceRef?: string; wait?: boolean }) => {
       const client = createClient()
       const spinner = createSpinner('Submitting extraction job...')
       spinner.start()
@@ -38,6 +39,10 @@ export function registerKex(program: Command): void {
           fd.append('file', fs.createReadStream(filePath), path.basename(filePath))
           if (opts.ontology) fd.append('ontologyId', opts.ontology)
           if (opts.classification) fd.append('classificationLevelId', opts.classification)
+          // Provenance without the user having to think about it: the full path
+          // says WHICH "notes.md" this was, where the upload's file name alone
+          // cannot. An explicit --source-ref wins (e.g. the URL a file came from).
+          fd.append('sourceRef', opts.sourceRef ?? filePath)
           const { data } = await client.post('/kex/upload', fd, { headers: fd.getHeaders() })
           jobId = (data as { jobId: string }).jobId
         } else if (opts.url ?? opts.text) {
@@ -45,6 +50,10 @@ export function registerKex(program: Command): void {
             text: opts.url ?? opts.text,
             ontologyId: opts.ontology,
             classificationLevelId: opts.classification,
+            // A URL is its own origin — use it unless the caller named a better one.
+            // Plain --text has no origin, so this stays undefined and the API
+            // falls back to its text preview, exactly as before.
+            sourceRef: opts.sourceRef ?? opts.url,
           })
           jobId = (data as { jobId: string }).jobId
         } else {

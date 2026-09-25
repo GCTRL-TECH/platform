@@ -111,13 +111,17 @@ def _mention_names(mentions) -> list[str]:
     return names
 
 
-def _normalize(rid, content, mentions, job_id, comp_id) -> dict:
-    """Same chunk shape the dense/lexical channels produce (rag.rs deserializes it)."""
+def _normalize(rid, content, mentions, job_id, comp_id, source_doc=None) -> dict:
+    """Same chunk shape the dense/lexical channels produce (rag.rs deserializes it).
+
+    A chunk pulled in by co-activation is a retrieval hit like any other, so it
+    carries its document provenance too — main.py resolves the raw handle to the
+    readable source name for the whole result set."""
     return {
         "text": content or "",
         "score": NEIGHBOUR_CONFIDENCE,
         "entity_mentions": _mention_names(mentions),
-        "source": "",
+        "source": source_doc or "",
         "chunk_id": rid,
         "compilation_id": comp_id,
         "job_id": job_id,
@@ -181,13 +185,14 @@ def load_prior_inputs(conn, user_id: Optional[str], chunks: list[dict],
     neighbours: list[tuple[str, dict, float]] = []
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id::text, content, entity_mentions, job_id::text, compilation_id::text "
+            "SELECT id::text, content, entity_mentions, job_id::text, compilation_id::text, "
+            "source_document_id::text "
             "FROM text_chunks WHERE " + " AND ".join(clauses),
             params,
         )
-        for rid, content, mentions, job_id, comp_id in cur.fetchall():
+        for rid, content, mentions, job_id, comp_id, src_doc in cur.fetchall():
             anchor, w = best[rid]
-            neighbours.append((anchor, _normalize(rid, content, mentions, job_id, comp_id), w))
+            neighbours.append((anchor, _normalize(rid, content, mentions, job_id, comp_id, src_doc), w))
     return heats, neighbours
 
 

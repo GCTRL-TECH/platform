@@ -15,6 +15,7 @@ import os
 import threading
 import time
 import traceback
+import uuid as uuid_lib
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -1682,6 +1683,7 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             params["comp"] = req.compilation_id
         sql = (
             "SELECT tc.id::text, tc.content, tc.entity_mentions, tc.job_id::text, tc.compilation_id::text, "
+            "       tc.source_document_id::text, "
             "       ts_rank_cd(tc.content_tsv, websearch_to_tsquery('simple', %(q)s)) AS rank "
             "FROM text_chunks tc "
             "WHERE " + " AND ".join(clauses) + " "
@@ -1709,7 +1711,8 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
         )
         return sql, params
 
-    def _normalize(row_id: str, content: str, mentions, job_id=None, comp_id=None) -> dict:
+    def _normalize(row_id: str, content: str, mentions, job_id=None, comp_id=None,
+                   source_doc=None) -> dict:
         names: list[str] = []
         seen: set[str] = set()
         items = mentions if isinstance(mentions, list) else []
@@ -1720,7 +1723,9 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
                 seen.add(nm); names.append(nm)
         # job_id resolves to the source graph via compilations.source_job_ids (the
         # API traces a source back to the exact compilation it came from).
-        return {"text": content or "", "entity_mentions": names, "source": "",
+        # source_doc is the document-level provenance the dense channel also carries —
+        # a chunk must not lose its origin just because it was recalled lexically.
+        return {"text": content or "", "entity_mentions": names, "source": source_doc or "",
                 "chunk_id": row_id, "job_id": job_id, "compilation_id": comp_id}
 
     def _query(include_comp: bool) -> list[dict]:
@@ -1730,9 +1735,9 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             with conn.cursor() as cur:
                 sql, params = _scope_sql(include_comp)
                 cur.execute(sql, params)
-                for rid, content, mentions, job_id, comp_id, rank in cur.fetchall():
+                for rid, content, mentions, job_id, comp_id, src_doc, rank in cur.fetchall():
                     if rid not in results:
-                        results[rid] = _normalize(rid, content, mentions, job_id, comp_id)
+                        results[rid] = _normalize(rid, content, mentions, job_id, comp_id, src_doc)
                         results[rid]["score"] = float(rank or 0.0)
                         order.append(rid)
             # OR-relaxation: websearch_to_tsquery AND-semantics drops statements
@@ -1751,9 +1756,9 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
                         params = dict(params)
                         params["q"] = " OR ".join(toks)
                         cur.execute(sql, params)
-                        for rid, content, mentions, job_id, comp_id, rank in cur.fetchall():
+                        for rid, content, mentions, job_id, comp_id, src_doc, rank in cur.fetchall():
                             if rid not in results:
-                                results[rid] = _normalize(rid, content, mentions, job_id, comp_id)
+                                results[rid] = _normalize(rid, content, mentions, job_id, comp_id, src_doc)
                                 results[rid]["score"] = float(rank or 0.0) * 0.5
                                 order.append(rid)
             # ILIKE fallback for exact substrings (punctuated IDs/filenames). These
@@ -1771,10 +1776,10 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
                         lead.append(rid)
                     else:
                         with conn.cursor() as cur:
-                            cur.execute("SELECT id::text, content, entity_mentions, job_id::text, compilation_id::text FROM text_chunks WHERE id = %s", (rid,))
+                            cur.execute("SELECT id::text, content, entity_mentions, job_id::text, compilation_id::text, source_document_id::text FROM text_chunks WHERE id = %s", (rid,))
                             row = cur.fetchone()
                         if row:
-                            results[rid] = _normalize(row[0], row[1], row[2], row[3], row[4])
+                            results[rid] = _normalize(row[0], row[1], row[2], row[3], row[4], row[5])
                             results[rid]["score"] = 0.0
                             lead.append(rid)
                 order = lead + [r for r in order if r not in set(lead)]
@@ -1788,6 +1793,63 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
         logger.info("/search lexical: 0 hits scoped to compilation %s — owner-corpus fallback", req.compilation_id)
         hits = _query(include_comp=False)
     return hits
+
+
+def _resolve_sources(chunks):
+    """Turn each hit's `source` provenance handle into something a human can read.
+
+    A chunk records its origin as `source_documents.id` — a UUID. No consumer
+    (the RAG prompt, an agent, the source cards in the UI) can do anything with
+    that, so the readable `name` (falling back to `path`) is substituted here.
+    Done ONCE for the whole result set (`id = ANY`) rather than per chunk, so an
+    N-hit search still costs a single query.
+
+    Two values are deliberately left untouched:
+      * a handle that is not a UUID — the code KB stores the file path itself
+        (code_job.py), which IS the readable form already;
+      * a UUID that resolves to no row — it stays raw. That is exactly what the
+        dense channel has always returned, and it remains a handle the caller
+        can look up; guessing a name for it would be worse than a UUID.
+
+    `chunks` is un-annotated on purpose (the Cython prod build enforces a `list`
+    annotation as an exact-type check). Mutates and returns the same list.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for ch in chunks:
+        src = (ch.get("source") or "").strip()
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        try:
+            uuid_lib.UUID(src)
+        except (ValueError, AttributeError, TypeError):
+            continue
+        ids.append(src)
+    if not ids:
+        return chunks
+    conn = get_search_pg()
+    if conn is None:
+        return chunks
+    readable: dict[str, str] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, name, path FROM source_documents WHERE id = ANY(%s::uuid[])",
+                (ids,),
+            )
+            for sid, name, path in cur.fetchall():
+                label = ((name or "") or (path or "")).strip()
+                if label:
+                    readable[sid] = label
+    except Exception as exc:  # noqa: BLE001 — provenance is a nicety, never a 500
+        logger.warning("/search source resolve failed: %s", exc)
+        return chunks
+    for ch in chunks:
+        label = readable.get((ch.get("source") or "").strip())
+        if label:
+            ch["source"] = label
+    return chunks
 
 
 def _rrf_fuse(channels: list[list[dict]], limit: int, k: int = 60) -> list[dict]:
@@ -1827,6 +1889,10 @@ def _rrf_fuse(channels: list[list[dict]], limit: int, k: int = 60) -> list[dict]
                 # Prefer the entity_mentions from whichever channel actually has them.
                 if not fused[key].get("entity_mentions") and ch.get("entity_mentions"):
                     fused[key]["entity_mentions"] = ch["entity_mentions"]
+                # Same for provenance: whichever channel knows the chunk's origin
+                # wins, so a hit never loses its source to a channel that lacks it.
+                if not fused[key].get("source") and ch.get("source"):
+                    fused[key]["source"] = ch["source"]
                 if not fused[key].get("text") and ch.get("text"):
                     fused[key]["text"] = ch["text"]
 
@@ -1929,6 +1995,11 @@ async def search_endpoint(req: SearchReq, request: Request):
     # Last word: whatever the channels, the reranker or a co-activated neighbour
     # produced, nothing outside the job scope leaves this endpoint.
     reranked = search_scope.filter_chunks(reranked, req.job_ids)
+
+    # Provenance, last: every channel above carries the raw source_documents.id,
+    # so resolving the readable name here covers dense, lexical AND the Hebbian
+    # pull-in with a single query over the final result set.
+    reranked = _resolve_sources(reranked)
 
     logger.info(
         "/search hybrid: dense=%d lexical=%d fused=%d reranked=%d (comp=%s)",

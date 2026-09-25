@@ -281,6 +281,18 @@ function registerToolWithAlias<TArgs>(
   );
 }
 
+// ── Provenance ───────────────────────────────────────────────────────────────
+//
+// Every write into the graph should say WHERE the knowledge came from, so a fact
+// stays provable afterwards ("which file / which conversation said this?").
+// `POST /kex/extract` stores `sourceRef` as the job's source (and as its
+// `fileName`), which is what the entity detail view and `get_entity` read back.
+// It is optional on the wire — but these tools fill it in whenever they can,
+// because provenance that depends on someone remembering it does not happen.
+
+const SOURCE_REF_DESCRIPTION =
+  'Provenance — where this knowledge comes from, so it stays traceable in the graph: a file path or URL, a document/ticket ID, or a conversation/run identifier (e.g. "Slack #ops / 2026-09-25" or "Session 42"). Pass it whenever you know the origin.';
+
 // ── Tool: Extract Knowledge (KEX) ────────────────────────────────────────────
 
 const extractSchema = {
@@ -288,6 +300,7 @@ const extractSchema = {
   compilationId: z.string().optional().describe('Optional: target knowledge graph compilation ID. The extracted job will be auto-linked to this compilation. Use gctrl_list_graphs to find IDs.'),
   ontologyId: z.string().optional().describe('Optional ontology ID to guide entity type extraction'),
   discoveryMode: z.enum(['strict', 'discover']).default('discover').describe('strict = only ontology types, discover = find all types and extend ontology'),
+  sourceRef: z.string().optional().describe(SOURCE_REF_DESCRIPTION),
 };
 
 registerToolWithAlias<{
@@ -295,16 +308,20 @@ registerToolWithAlias<{
   compilationId?: string;
   ontologyId?: string;
   discoveryMode: 'strict' | 'discover';
+  sourceRef?: string;
 }>(
   'gctrl_extract',
   'borghive_extract',
-  'Extract structured knowledge (entities, relations) from text. Creates a knowledge graph in Neo4j and vector embeddings in Qdrant. Use this to ingest new information into Ground Control. Specify a compilationId to add the results to a specific knowledge graph (e.g. an agent\'s dedicated graph).',
+  'Extract structured knowledge (entities, relations) from text. Creates a knowledge graph in Neo4j and vector embeddings in Qdrant. Use this to ingest new information into Ground Control. Specify a compilationId to add the results to a specific knowledge graph (e.g. an agent\'s dedicated graph), and a sourceRef so the result stays traceable to its origin.',
   extractSchema,
-  async ({ text, compilationId, ontologyId, discoveryMode }) => {
+  async ({ text, compilationId, ontologyId, discoveryMode, sourceRef }) => {
     const result = await apiCall('POST', '/kex/extract', {
       text,
       ontologyId,
       discoveryMode,
+      // Omitted when undefined (JSON.stringify drops it) — the route then falls
+      // back to its own text-preview source, exactly as before.
+      sourceRef,
     }) as { jobId: string; status: string };
 
     // Wait for completion (poll)
@@ -950,6 +967,7 @@ const storeSchema = {
   title: z.string().optional().describe('Optional title/label for this knowledge'),
   compilationId: z.string().optional().describe('Target knowledge graph compilation ID. RECOMMENDED: always specify this to store into the correct agent graph. Use gctrl_list_graphs to find IDs.'),
   ontologyId: z.string().optional().describe('Optional ontology to guide extraction'),
+  sourceRef: z.string().optional().describe(`${SOURCE_REF_DESCRIPTION} Defaults to the title when omitted.`),
 };
 
 registerToolWithAlias<{
@@ -957,18 +975,25 @@ registerToolWithAlias<{
   title?: string;
   compilationId?: string;
   ontologyId?: string;
+  sourceRef?: string;
 }>(
   'gctrl_store',
   'borghive_store',
-  'WRITE your conclusions back into GCTRL — call this after ANY substantive task so your memory compounds across sessions (this is the point of GCTRL). Extracts entities + builds graph from the text, like saving notes but structured. IMPORTANT: always pass a compilationId for your assigned knowledge base (find it via gctrl_list_graphs) so nothing is orphaned.',
+  'WRITE your conclusions back into GCTRL — call this after ANY substantive task so your memory compounds across sessions (this is the point of GCTRL). Extracts entities + builds graph from the text, like saving notes but structured. IMPORTANT: always pass a compilationId for your assigned knowledge base (find it via gctrl_list_graphs) so nothing is orphaned, and a sourceRef (or at least a title) so the stored facts keep their origin.',
   storeSchema,
-  async ({ text, title, compilationId, ontologyId }) => {
+  async ({ text, title, compilationId, ontologyId, sourceRef }) => {
     const fullText = title ? `${title}\n\n${text}` : text;
+
+    // Provenance, in order of quality: what the caller stated, else the title —
+    // a named note is a better origin than none, and the title is the only thing
+    // most callers bother to pass. Both undefined = unchanged old behaviour.
+    const provenance = sourceRef ?? title;
 
     const result = await apiCall('POST', '/kex/extract', {
       text: fullText,
       ontologyId,
       discoveryMode: 'discover',
+      sourceRef: provenance,
     }) as { jobId: string };
 
     // Wait briefly for extraction to complete, then link to compilation
@@ -1124,13 +1149,14 @@ const ingestFileSchema = {
   path: z.string().describe('Absolute (or cwd-relative) path to the local file to ingest, e.g. a PDF, DOCX or an image (PNG/JPG/WEBP: screenshot, whiteboard photo, Miro export)'),
   compilationId: z.string().optional().describe('Optional: target knowledge graph compilation ID. Omit to fall back to your default knowledge base.'),
   ontologyId: z.string().optional().describe('Optional ontology ID to guide entity type extraction'),
+  sourceRef: z.string().optional().describe(`${SOURCE_REF_DESCRIPTION} Defaults to the file's full path — pass it only to name a better origin than the path (e.g. the URL the file was downloaded from).`),
 };
 
-registerTool<{ path: string; compilationId?: string; ontologyId?: string }>(
+registerTool<{ path: string; compilationId?: string; ontologyId?: string; sourceRef?: string }>(
   'gctrl_ingest_file',
   'Ingest a PDF, DOCX, PPTX, image (PNG/JPG/WEBP/TIFF/BMP/GIF — transcribed by the vision model when the runtime can see, OCR otherwise), scanned PDF, or other binary file into the knowledge graph. Use this whenever the user drops, mentions, or references a file (not raw text) that should become knowledge — reads the file from local disk, uploads it, and starts extraction. For plain text, use gctrl_extract/gctrl_store instead.',
   ingestFileSchema,
-  async ({ path: filePath, compilationId, ontologyId }) => {
+  async ({ path: filePath, compilationId, ontologyId, sourceRef }) => {
     let bytes: Buffer;
     try {
       bytes = fs.readFileSync(filePath);
@@ -1141,11 +1167,18 @@ registerTool<{ path: string; compilationId?: string; ontologyId?: string }>(
       return { content: [{ type: 'text' as const, text: `File too large (${(bytes.length / 1024 / 1024).toFixed(1)}MB) — max 25MB.` }] };
     }
     const fileName = nodePath.basename(filePath);
+    // The upload path already keeps the file NAME as provenance, but the name
+    // alone does not say which of the three "notes.md" it was. The absolute path
+    // does — send it as the origin unless the caller knows a better one. (The
+    // agent tool route currently persists `fileName`; `sourceRef` rides along so
+    // the full path lands as the source the moment the route reads it.)
+    const origin = sourceRef ?? nodePath.resolve(filePath);
     const r = await apiCall('POST', '/agent/tools/ingest_file', {
       fileName,
       contentBase64: bytes.toString('base64'),
       compilationId,
       ontologyId,
+      sourceRef: origin,
     }) as { jobId?: string; status?: string; error?: string };
     if (r.error) return { content: [{ type: 'text' as const, text: `Error: ${r.error}` }] };
     return {

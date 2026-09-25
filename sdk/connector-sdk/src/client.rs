@@ -48,10 +48,32 @@ impl GctrlClient {
     ///
     /// Optional `compilation_id` associates the job with an existing KG
     /// compilation; if omitted, GCTRL creates a transient extraction.
+    ///
+    /// Provenance defaults to the file name. Use
+    /// [`GctrlClient::submit_for_extraction_with_source`] when the connector
+    /// knows a better origin (a full path, a Drive URL, a ticket ID).
     pub async fn submit_for_extraction(
         &self,
         content: ConnectorContent,
         compilation_id: Option<&str>,
+    ) -> ConnectorResult<String> {
+        self.submit_for_extraction_with_source(content, compilation_id, None)
+            .await
+    }
+
+    /// Same as [`GctrlClient::submit_for_extraction`], but states WHERE the
+    /// document came from.
+    ///
+    /// `source_ref` is a human-readable origin — `"google_drive / Reports/Q3.pdf"`,
+    /// a URL, a ticket ID — stored with the extraction job so every fact derived
+    /// from the document stays provable afterwards. Passing `None` falls back to
+    /// the file name, which the upload already carries; nothing is ever lost by
+    /// omitting it, but a bare name rarely says which file it really was.
+    pub async fn submit_for_extraction_with_source(
+        &self,
+        content: ConnectorContent,
+        compilation_id: Option<&str>,
+        source_ref: Option<&str>,
     ) -> ConnectorResult<String> {
         let url = format!("{}/api/kex/upload", self.api_url);
 
@@ -72,6 +94,11 @@ impl GctrlClient {
             .map_err(|e| ConnectorError::Http(e))?;
 
         let mut form = reqwest::multipart::Form::new().part("file", part);
+
+        // Provenance always travels with the document: the connector's origin when
+        // it named one, otherwise the file name.
+        let origin = source_ref.unwrap_or(&content.file_name).to_owned();
+        form = form.text("sourceRef", origin);
 
         if let Some(cid) = compilation_id {
             form = form.text("compilation_id", cid.to_owned());
@@ -163,8 +190,14 @@ impl GctrlClient {
                 }
             };
 
-            // Submit for extraction
-            match self.submit_for_extraction(content, compilation_id).await {
+            // Submit for extraction. The sync knows more about the origin than the
+            // upload does — which connector it came from and the entry's name — so
+            // it states it; nobody has to configure anything for provenance to land.
+            let source_ref = format!("{} / {}", connector.provider(), file.name);
+            match self
+                .submit_for_extraction_with_source(content, compilation_id, Some(&source_ref))
+                .await
+            {
                 Ok(job_id) => {
                     debug!(file_name = %file.name, %job_id, "Submitted successfully");
                     synced += 1;

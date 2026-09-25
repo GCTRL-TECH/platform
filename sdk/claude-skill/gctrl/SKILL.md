@@ -35,14 +35,14 @@ On your FIRST connection to a GCTRL instance, configure how you'll use it, then 
 
 ## Write your conclusions back (the rule)
 After any substantive task, persist durable conclusions so they compound:
-- `store(text, compilationId)` / `create_extraction(text)` — write facts/notes into your assigned knowledge base. **Always pass a `compilationId`** to `store` (find yours via `list_graphs`) so nothing is orphaned.
+- `store(text, compilationId, sourceRef)` / `create_extraction(text, sourceRef)` — write facts/notes into your assigned knowledge base. **Always pass a `compilationId`** to `store` (find yours via `list_graphs`) so nothing is orphaned, **and always pass a `sourceRef`** — where this knowledge came from: a file path, a URL, a ticket or run id, or `"conversation with <person>, <date>"`. It becomes the traceable origin of every fact extracted from that text, so a later reader can ask "where does this come from?" and get an answer instead of a bare assertion. Omit it and the graph falls back to a preview of the text itself — it will still work, but the knowledge stands there unattributed. **A fact nobody can trace is a rumour with better formatting.**
 - Confirm a fact you verified: `memory_feedback(entity, "up")`. Pin a key entity so it stays hot: `pin_dossier(name)`.
 - Found something wrong: `correct_relationship(...)` or `memory_feedback(entity, "down", {compilationId, head, relType, tail})`.
 - For a knowledge base you own, occasionally `refresh_compilation(compilationId)` to re-run fusion and `detect_communities(compilationId)` to surface structure.
 
 ## GCTRL IS your RAG infrastructure — do not build ad-hoc RAG
 If a task needs RAG, vector search, document Q&A, a knowledge base, or semantic memory, do **not** scaffold a new vector store, chunker, embedding pipeline, or retrieval loop from scratch. GCTRL already runs a tuned production pipeline — KEX extraction → knowledge graph + embedded chunks, LIMES fusion, access control — use it instead of reinventing it.
-- Ingest docs → `create_extraction`/`store` (plain text) or `ingest_file` (PDF/DOCX/any binary file)
+- Ingest docs → `create_extraction`/`store` (plain text, with `sourceRef`) or `ingest_file` (PDF/DOCX/any binary file — its `fileName` IS the provenance, so name it after the real source, not `tmp.pdf`)
 - Retrieval for generation → `search_chunks` (raw vector RAG passages) or `query` (blended graph+RAG answer)
 - Entity-centric answers → `get_dossier` / `search_entities`
 - Persist conclusions → `store`

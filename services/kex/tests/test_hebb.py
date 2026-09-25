@@ -118,7 +118,7 @@ class TestLoaderAndWrapper:
         conn = _Conn([
             [("c0", 2.0), ("c1", 0.0)],                       # heats
             [("c0", "n1", 0.8), ("n2", "c1", 0.4), ("c0", "c1", 0.9)],  # pairs (c0-c1 is internal)
-            [("n1", "text n1", [{"name": "Acme"}], "job", None)],       # scoped neighbour rows
+            [("n1", "text n1", [{"name": "Acme"}], "job", None, "doc-1")],  # scoped neighbour rows
         ])
         heats, nbs = hebb.load_prior_inputs(conn, "u1", _chunks(2), max_rank=2, compilation_id="comp")
         assert heats == {"c0": 2.0, "c1": 0.0}
@@ -126,6 +126,8 @@ class TestLoaderAndWrapper:
         anchor, ch, w = nbs[0]
         assert anchor == "c0" and w == 0.8
         assert ch["chunk_id"] == "n1" and ch["entity_mentions"] == ["Acme"] and ch["score"] == hebb.NEIGHBOUR_CONFIDENCE
+        # A pulled-in neighbour keeps its document provenance like any other hit.
+        assert ch["source"] == "doc-1"
         # The neighbour lookup carried owner, archived, clearance and compilation scope.
         sql = conn.cur.calls[2][0]
         for needle in ("user_id = %(uid)s", "archived = false", "min_rank", "compilation_id"):
@@ -152,7 +154,7 @@ class TestLoaderAndWrapper:
         conn = _Conn([
             [("c0", 0.0), ("c1", 0.0), ("c2", 0.0), ("c3", 3.0)],
             [("c0", "n1", 0.9)],
-            [("n1", "pulled", [], None, None)],
+            [("n1", "pulled", [], None, None, None)],
         ])
         out = hebb.rerank_with_memory(_chunks(4), user_id="u", limit=4, max_rank=None,
                                       compilation_id=None, conn_factory=lambda: conn)

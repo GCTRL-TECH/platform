@@ -87,22 +87,35 @@ async fn crawl(
 
     let (ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, req.ontology_id).await;
 
+    // A crawl knows its origin better than any other ingest — the URL IS the
+    // provenance. It was nonetheless the one path without a source document, so
+    // crawled knowledge could never answer "which page said that?". The content
+    // hash is over the URL, not the page body: the body does not exist yet here,
+    // and re-crawling the same address should keep one document identity whose
+    // version chain tracks the site's changes.
+    let content_hash = crate::services::source_docs::hash_content(url.as_bytes());
+    let source_document_id = crate::services::source_docs::resolve_source_document(
+        &state.db, claims.sub, None, &url, Some(&url), &content_hash, None,
+    ).await.ok().map(|d| d.id);
+
     let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, api_key_id)
-         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5)"
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+         VALUES ($1, $2, 'kex_extract', 'pending', $3, $4, $5, $6)"
     )
     .bind(job_id).bind(claims.sub)
     .bind(json!({
         "source": "web_crawl",
         "url": url,
         "fileName": url,
+        "sourceRef": url,
         "maxDepth": max_depth,
         "maxPages": max_pages,
         "ontologyId": ontology_id,
         "discoveryMode": req.discovery_mode.clone().unwrap_or_else(|| "discover".into()),
     }))
     .bind(req.classification_level_id)
+    .bind(source_document_id)
     .bind(claims.api_key_id)
     .execute(&state.db).await?;
 
@@ -130,6 +143,10 @@ async fn crawl(
         "ontology_id": ontology_id,
         "classification": classification_name,
         "classification_level_id": req.classification_level_id,
+        // The worker stamps these onto every chunk and node it creates.
+        "source_document_id": source_document_id,
+        "source_path": url,
+        "source_modified_at": Value::Null,
     });
     crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
