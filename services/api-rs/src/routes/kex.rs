@@ -900,16 +900,22 @@ async fn retry_job(
     State(state): State<Arc<crate::models::AppState>>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let (jtype, status, input, clf, source_doc_id) = sqlx::query_as::<_, (String, String, Value, Option<Uuid>, Option<Uuid>)>(
-        "SELECT type, status, input, classification_level_id, source_document_id \
+    let (jtype, status, input, clf, source_doc_id, result) = sqlx::query_as::<_, (String, String, Value, Option<Uuid>, Option<Uuid>, Option<Value>)>(
+        "SELECT type, status, input, classification_level_id, source_document_id, result \
          FROM jobs WHERE id = $1 AND user_id = $2"
     )
     .bind(job_id).bind(claims.sub)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound)?;
 
-    if status != "failed" {
-        return Err(AppError::BadRequest(format!("only failed jobs can be retried (current status: {status})")));
+    // A `completed_degraded` job (entities written, relations/embeddings skipped
+    // because the LLM or embedder was unreachable) is retryable too: once the
+    // runtime is fixed, re-running it in place adds the missing edges and vectors.
+    // Without this the user was stuck with a graph of isolated nodes (2026-09-25,
+    // Bifroest demo: 577 nodes, 0 relations) and could only delete and re-upload.
+    let (presented, _) = presented_status(&status, result.as_ref());
+    if status != "failed" && presented != "completed_degraded" {
+        return Err(AppError::BadRequest(format!("only failed or incomplete jobs can be retried (current status: {presented})")));
     }
     // Unlimited tiers (business/enterprise + transitional starter/pro aliases)
     // never block on the local balance — tokens_balance keeps tracking spend,

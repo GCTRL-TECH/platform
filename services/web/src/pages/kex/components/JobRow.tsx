@@ -143,7 +143,7 @@ export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProp
 
       {/* Actions — fixed width */}
       <div className="shrink-0 w-12 flex justify-end gap-1.5">
-        {job.status === 'failed' && onRetry && (
+        {(job.status === 'failed' || job.status === 'completed_degraded') && onRetry && (
           <button
             onClick={(e: MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); onRetry(job.id) }}
             className="text-slate-600 hover:text-indigo-400 transition-colors"
