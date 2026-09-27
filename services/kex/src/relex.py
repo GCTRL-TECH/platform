@@ -776,6 +776,7 @@ class RelationExtractor:
             if fallback and fallback != primary:
                 candidates.append(fallback)
 
+        last_status = None
         for idx, m in enumerate(candidates):
             # Backstop: a primary that already timed out / was found unavailable
             # this process is skipped, so windows 2..N and the gap-fill pass go
@@ -812,18 +813,26 @@ class RelationExtractor:
                     if idx == 0:
                         _relex_dead_primaries.add(m)
                 continue  # pull failed or still unusable → try the next candidate
-            if status == "server_error":
-                # OOM / crashed runner / timeout on this model → try the lighter fallback.
+            if status in ("server_error", "empty"):
+                # OOM / crashed runner / timeout / blank answer on this model → try
+                # the lighter fallback.
                 if idx == 0 and kind == "ollama":
                     # Don't re-pay the full timeout on this primary next window.
                     _relex_dead_primaries.add(m)
                 logger.warning(f"RelEx model '{m}' could not run; trying fallback model")
+                last_status = status
                 continue
             if status == "unreachable":
                 break  # server is down — a different model won't help.
 
         self.last_degraded = True
-        if kind == "ollama":
+        if last_status == "empty":
+            self.last_degraded_reason = (
+                f"Relation extraction skipped — '{primary}' answered with nothing. A reasoning "
+                f"model can burn the whole token budget on its hidden thinking: raise "
+                f"RELEX_NUM_PREDICT (2048 today) or pick a non-reasoning relation model."
+            )
+        elif kind == "ollama":
             self.last_degraded_reason = (
                 "Relation extraction skipped — no usable relation model. Connect a working "
                 "Ollama (Settings → Infrastructure) or pick an installed model (Settings → AI Models)."
@@ -869,6 +878,24 @@ class RelationExtractor:
                 timeout=getattr(config, "RELEX_TIMEOUT", 180),
                 max_concurrency=max_concurrency,
             )
+            # A 2xx with a BLANK completion is a failure, not a success. Reasoning
+            # models reached over an OpenAI-compatible endpoint spend the whole
+            # `max_tokens` budget on the hidden chain-of-thought and then return
+            # empty `content` - `enable_thinking: false` is silently ignored by
+            # some hosted endpoints. Measured on Ollama Cloud (2026-09-25):
+            # deepseek-v4.1-flash at the default 2048 returned 1 char and thus 0
+            # relations, while the same prompt at 8192 returned 11 and the
+            # non-reasoning gemma4:31b returned 12 within 2048. Reported as "ok",
+            # that empty answer produced a graph with entities and NO edges and no
+            # warning anywhere. Treat it like a model that could not run: Ollama
+            # falls back to the lighter model, /v1 degrades with a reason the user
+            # can act on.
+            if not (text or "").strip():
+                logger.warning(
+                    f"LLM returned an empty completion for relation model '{model}' "
+                    f"(num_predict={num_predict}) - treating it as unusable"
+                )
+                return ("empty", None)
             return ("ok", text)
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0

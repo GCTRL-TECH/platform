@@ -802,9 +802,9 @@ pub async fn resolve_for_user(
     // requested provider is still honoured above; only the implicit
     // "most recent active row" pick is subject to this rule.
     let row = match row {
-        Some((ref provider, ref api_key, ref base_url, ref default_model))
+        Some((ref provider, _, ref base_url, ref default_model))
             if requested.is_none()
-                && placeholder_ollama_row(provider, api_key.as_deref(), base_url.as_deref(), default_model.as_deref())
+                && placeholder_ollama_row(provider, base_url.as_deref(), default_model.as_deref())
                 && active_runtime_config(db).await.is_some() =>
         {
             None
@@ -838,16 +838,27 @@ pub async fn resolve_for_user(
 }
 
 /// True for a `user_llm_providers` row that says nothing but "local Ollama":
-/// provider `ollama` with no key, no base URL and no default model. Such a row
-/// must not shadow a configured global runtime (see `resolve_for_user`).
+/// provider `ollama` with no base URL and no default model. Such a row must not
+/// shadow a configured global runtime (see `resolve_for_user`).
+///
+/// A stored API KEY does NOT make the row informative. An Ollama key buys access
+/// to Ollama CLOUD, which is reached through the explicit `ollama_cloud` provider
+/// (and is what surfaces the hosted models in the pickers) - it says nothing
+/// about wanting LOCAL Ollama as the implicit default for every purpose. Treating
+/// a key-only row as a real connection is how a box with a healthy cloud runtime
+/// still sent relation extraction to the local CPU Ollama: `qwen2.5:7b` timed out
+/// after 90 s, the `qwen2.5:3b` fallback timed out too, and the job finished
+/// DEGRADED with 0 relations (Bifroest demo, 2026-09-25 - same failure as the
+/// Asgard/oMLX incident documented at the call site). A row with an explicit
+/// `base_url` (someone's own remote/auth-protected Ollama) still shadows, as
+/// before, and with no global runtime configured this rule never fires.
 pub fn placeholder_ollama_row(
     provider: &str,
-    api_key: Option<&str>,
     base_url: Option<&str>,
     default_model: Option<&str>,
 ) -> bool {
     let empty = |o: Option<&str>| o.map(str::trim).filter(|s| !s.is_empty()).is_none();
-    provider == "ollama" && empty(api_key) && empty(base_url) && empty(default_model)
+    provider == "ollama" && empty(base_url) && empty(default_model)
 }
 
 /// Resolve the owner's runtime-configured Ollama base URL (Settings →
@@ -872,11 +883,32 @@ pub async fn resolve_ollama_base_for_user(
     .ok()
     .flatten();
 
-    let raw = stored.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
-    match validate_llm_base("ollama", Some(&raw)) {
-        Ok(u) => Some(containerize_ollama_base(u.as_str().trim_end_matches('/'))),
-        Err(_) => None,
+    worker_ollama_base(stored.as_deref())
+}
+
+/// Pure: the Ollama base a KEYLESS worker (KEX/FUSE) may be pointed at.
+///
+/// `raw` is the stored `user_llm_providers.base_url`. The worker payload carries
+/// no credential on purpose (spec D7 keeps secrets out of Redis), so a base that
+/// NEEDS a bearer token is useless to it: with `https://ollama.com` in that field
+/// every embed/generate call comes back 401 and the job finishes DEGRADED - a real
+/// install logged `Embedded: 0/119 vectors` that way, visible only as a warning in
+/// the worker log. A cloud base is therefore dropped here so the worker keeps its
+/// local `OLLAMA_BASE`. Nothing is lost: Ollama Cloud serves no embedding models
+/// at all, and cloud GENERATION belongs on the `openai_compatible` runtime, which
+/// does carry a key. Local / LAN / docker bases pass through unchanged.
+pub fn worker_ollama_base(raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    let u = validate_llm_base("ollama", Some(raw)).ok()?;
+    let base = u.as_str().trim_end_matches('/').to_string();
+    if crate::services::privacy::is_cloud_target("ollama", Some(&base), None) {
+        tracing::warn!(
+            base = %base,
+            "ignoring cloud Ollama base for the keyless KEX/FUSE payload - workers keep their local OLLAMA_BASE"
+        );
+        return None;
     }
+    Some(containerize_ollama_base(&base))
 }
 
 /// Pure helper: given a resolved `LlmTarget`, decide whether to inject
@@ -2257,12 +2289,11 @@ mod tests {
 
     #[test]
     fn placeholder_ollama_row_detection() {
-        assert!(placeholder_ollama_row("ollama", None, None, None));
-        assert!(placeholder_ollama_row("ollama", Some(" "), Some(""), None));
-        assert!(!placeholder_ollama_row("ollama", Some("k"), None, None));
-        assert!(!placeholder_ollama_row("ollama", None, Some("http://host.docker.internal:11434"), None));
-        assert!(!placeholder_ollama_row("ollama", None, None, Some("qwen2.5:7b")));
-        assert!(!placeholder_ollama_row("openai_compatible", None, None, None));
+        assert!(placeholder_ollama_row("ollama", None, None));
+        assert!(placeholder_ollama_row("ollama", Some(""), None));
+        assert!(!placeholder_ollama_row("ollama", Some("http://host.docker.internal:11434"), None));
+        assert!(!placeholder_ollama_row("ollama", None, Some("qwen2.5:7b")));
+        assert!(!placeholder_ollama_row("openai_compatible", None, None));
     }
 }
 
@@ -2288,5 +2319,41 @@ mod vision_tests {
         assert!(!ollama_show_has_vision(&json!({ "capabilities": ["completion"] })));
         assert!(!ollama_show_has_vision(&json!({})));
         assert!(!ollama_show_has_vision(&json!({ "capabilities": "vision" })));
+    }
+}
+
+#[cfg(test)]
+mod worker_base_tests {
+    use super::worker_ollama_base;
+
+    #[test]
+    fn cloud_base_is_dropped_so_workers_keep_local_ollama() {
+        // The 401 trap: a user who pastes the Ollama Cloud URL into the base field
+        // must not silently break KEX embeddings (0 vectors) - the keyless worker
+        // falls back to its own OLLAMA_BASE instead.
+        assert_eq!(worker_ollama_base(Some("https://ollama.com")), None);
+        assert_eq!(worker_ollama_base(Some("https://ollama.com/")), None);
+        assert_eq!(worker_ollama_base(Some("https://api.ollama.com/v1")), None);
+    }
+
+    #[test]
+    fn empty_and_invalid_stay_none() {
+        assert_eq!(worker_ollama_base(None), None);
+        assert_eq!(worker_ollama_base(Some("   ")), None);
+        assert_eq!(worker_ollama_base(Some("not a url")), None);
+        assert_eq!(worker_ollama_base(Some("ftp://box:11434")), None);
+    }
+
+    #[test]
+    fn local_lan_and_docker_bases_pass_through() {
+        for base in [
+            "http://gctrl-ollama:11434",
+            "http://ollama:11434",
+            "http://192.168.1.50:11434",
+            "http://10.0.0.8:11434",
+            "http://host.docker.internal:11434",
+        ] {
+            assert_eq!(worker_ollama_base(Some(base)).as_deref(), Some(base), "{base}");
+        }
     }
 }

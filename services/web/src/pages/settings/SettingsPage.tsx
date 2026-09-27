@@ -895,9 +895,18 @@ function ModelsTab() {
           </div>
           <p className="mt-1.5 text-xs text-slate-500">
             Local Ollama models (llama3.2, mistral, qwen2.5, etc.) run on your machine and are always
-            available without API keys — fully GDPR-compliant, no data leaves your device. For a
-            remote or auth-protected Ollama (e.g. ollama.com / <code>:cloud</code> models), set the
-            base URL and an API key below.
+            available without API keys — fully GDPR-compliant, no data leaves your device.
+            <strong className="text-slate-400"> Ollama Cloud:</strong> paste your key from{' '}
+            <a
+              href="https://ollama.com/settings/keys"
+              target="_blank"
+              rel="noreferrer"
+              className="text-blue-400 hover:text-blue-300"
+            >ollama.com/settings/keys</a>{' '}
+            below and leave the base URL on your local Ollama — the hosted models then show up as
+            their own <code>Ollama Cloud</code> group in every model picker. Only point the base URL
+            elsewhere for a remote or auth-protected Ollama of your own; a cloud URL there stops KEX
+            from embedding (the cloud serves no embedding models).
           </p>
           <div className="mt-3 space-y-2">
             <input
@@ -911,7 +920,7 @@ function ModelsTab() {
                 type="password"
                 value={ollamaKey}
                 onChange={(e) => setOllamaKey(e.target.value)}
-                placeholder={ollamaHasKey ? '•••••••• (key stored — leave blank to keep)' : 'API key (optional, for remote/cloud Ollama)'}
+                placeholder={ollamaHasKey ? '•••••••• (key stored — leave blank to keep)' : 'API key (optional) — unlocks Ollama Cloud models'}
                 className="flex-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
               />
               <button
