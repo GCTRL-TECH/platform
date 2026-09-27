@@ -584,6 +584,44 @@ def _union_labels(members: list[dict]) -> tuple[list[str], list[int], int, bool]
     return class_labels, ranks_sorted, ranks_sorted[0], len(ranks_sorted) > 1
 
 
+def _canonical_by_uri(
+    clusters: dict[int, list[str]], entity_by_uri: dict[str, dict]
+) -> dict[str, tuple[str, str]]:
+    """Map every member URI to the (name, type) of its cluster's canonical member
+    (``members[0]``, the same pick _write_merged_graph writes the merged node under)."""
+    out: dict[str, tuple[str, str]] = {}
+    for members in clusters.values():
+        if not members:
+            continue
+        canonical = entity_by_uri.get(members[0], {})
+        key = (canonical.get("name", ""), canonical.get("type", ""))
+        for uri in members:
+            out[uri] = key
+    return out
+
+
+def _group_relations_onto_canonical(
+    relations: list[dict], canonical_by_uri: dict[str, tuple[str, str]]
+) -> dict[tuple, list[dict]]:
+    """Group source relations by (head, rel_type, tail) AFTER re-pointing both ends
+    onto their canonical merged node, so the merged relation carries the UNION of
+    its sources' classification labels. An edge whose ends collapsed into the same
+    cluster ("Nordlicht Robotics GmbH" -RELATED_TO-> "Nordlicht Robotics") is a
+    self-loop created by the merge itself and is dropped. Endpoints without a
+    mapping keep their raw name/type (previous behaviour)."""
+    grouped: dict[tuple, list[dict]] = {}
+    for rel in relations:
+        head = canonical_by_uri.get(rel.get("head_uri") or "",
+                                    (rel["head_name"], rel["head_type"]))
+        tail = canonical_by_uri.get(rel.get("tail_uri") or "",
+                                    (rel["tail_name"], rel["tail_type"]))
+        if head == tail:
+            continue
+        key = (head[0], head[1], rel["rel_type"], tail[0], tail[1])
+        grouped.setdefault(key, []).append(rel)
+    return grouped
+
+
 class ThreeStageEntityMerger:
     """Merge entities across knowledge graphs using three-stage pipeline."""
 
@@ -784,9 +822,10 @@ class ThreeStageEntityMerger:
             source_job_ids, user_id, classification
         )
 
-        # Merge relations
+        # Merge relations — endpoints re-pointed onto each cluster's canonical node
         rel_count = self._merge_relations(
-            compilation_id, source_job_ids, user_id, classification
+            compilation_id, source_job_ids, user_id, classification,
+            canonical_by_uri=stats.pop("_canonical_by_uri", None),
         )
 
         # Aggregate classification conflicts (node + edge) surfaced by the merge.
@@ -2022,6 +2061,11 @@ class ThreeStageEntityMerger:
         # Create merged entities in Neo4j
         unique_clusters = set(uri_to_cluster.values())
         conflicts: list[dict] = []
+        # Every member URI -> the (name, type) its cluster's merged node is written
+        # under. _merge_relations needs it: a merged node exists ONLY under the
+        # canonical member's name, so an edge attached to any other member
+        # ("Maren Thiele" when the cluster is "Dr. Maren Thiele") would find no node.
+        canonical_by_uri = _canonical_by_uri(clusters, entity_by_uri)
 
         with self.driver.session() as session:
             # Create compilation node
@@ -2115,6 +2159,7 @@ class ThreeStageEntityMerger:
             "duplicates_found": duplicates_found,
             "nodes_total": entities_created,
             "_conflicts": conflicts,
+            "_canonical_by_uri": canonical_by_uri,
         }
 
     def _merge_relations(
@@ -2123,14 +2168,22 @@ class ThreeStageEntityMerger:
         source_job_ids: list[str],
         user_id: str,
         classification: str,
+        canonical_by_uri: dict[str, tuple[str, str]] | None = None,
     ) -> int:
-        """Copy relations from source jobs to merged entities."""
+        """Copy relations from source jobs to merged entities.
+
+        ``canonical_by_uri`` (from _write_merged_graph) re-points each endpoint onto
+        its cluster's canonical node. Without it every edge touching a non-canonical
+        member was silently dropped — the better the linking, the more edges vanished
+        (2026-09-28, Bifroest demo: 4 of 5 relations lost in a 2-document merge).
+        """
         query = f"""
         MATCH (a:Entity)-[r]->(b:Entity)
         WHERE {job_scope('a')}
           AND {job_scope('b')}
           AND NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
-        RETURN a.name AS head_name, a.type AS head_type,
+        RETURN a.uri AS head_uri, b.uri AS tail_uri,
+               a.name AS head_name, a.type AS head_type,
                type(r) AS rel_type,
                b.name AS tail_name, b.type AS tail_type,
                r._source_job AS source_job,
@@ -2145,13 +2198,7 @@ class ThreeStageEntityMerger:
             result = session.run(query, job_ids=source_job_ids)
             relations = [dict(record) for record in result]
 
-        # Group duplicate source relations by (head,tail,rel_type) so the merged
-        # relation carries the UNION of their classification labels.
-        grouped: dict[tuple, list[dict]] = {}
-        for rel in relations:
-            key = (rel["head_name"], rel["head_type"], rel["rel_type"],
-                   rel["tail_name"], rel["tail_type"])
-            grouped.setdefault(key, []).append(rel)
+        grouped = _group_relations_onto_canonical(relations, canonical_by_uri or {})
 
         count = 0
         conflicts: list[dict] = []
