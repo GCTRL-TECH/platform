@@ -279,8 +279,18 @@ jobs:
             ghcr.io/gctrl-tech/fusion-engine:v${{ env.VERSION }}
 
   build-portal:
-    needs: changes
-    if: needs.changes.outputs.portal == 'true' || github.event_name == 'workflow_dispatch'
+    # Also runs after a customer-image build, so gctrl.tech/version.json moves with
+    # the version the license API advertises. Runs 293/294 (2026-09-24/25) built only
+    # web/api/kex: the license API said 0.1.294, version.json stayed on 0.1.292, and
+    # /api/update/check reported "latest 0.1.292" next to a banner saying 0.1.294.
+    # Waiting for the builds also means version.json never names an unpushed image.
+    needs: [changes, build-kex, build-fuse, build-agent-rs, build-api-rs, build-web, build-fusion-engine]
+    if: |
+      always() && !cancelled() &&
+      (needs.changes.outputs.portal == 'true' || github.event_name == 'workflow_dispatch' ||
+       needs.build-kex.result == 'success' || needs.build-fuse.result == 'success' ||
+       needs.build-agent-rs.result == 'success' || needs.build-api-rs.result == 'success' ||
+       needs.build-web.result == 'success' || needs.build-fusion-engine.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -308,7 +318,8 @@ jobs:
         # Block scalar: the inline JSON contains ": " which YAML would parse as
         # a mapping in a plain scalar (this exact line broke the workflow once).
         env:
-          CUSTOMER_IMAGE_CHANGED: ${{ needs.changes.outputs.kex == 'true' || needs.changes.outputs.fuse == 'true' || needs.changes.outputs.agent == 'true' || needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.fusion == 'true' || github.event_name == 'workflow_dispatch' }}
+          # A customer image counts only once it was actually BUILT (pushed), not merely changed.
+          CUSTOMER_IMAGE_CHANGED: ${{ needs.build-kex.result == 'success' || needs.build-fuse.result == 'success' || needs.build-agent-rs.result == 'success' || needs.build-api-rs.result == 'success' || needs.build-web.result == 'success' || needs.build-fusion-engine.result == 'success' || github.event_name == 'workflow_dispatch' }}
         run: |
           out=services/portal/public/version.json
           if [ "$CUSTOMER_IMAGE_CHANGED" != "true" ] \
@@ -381,9 +392,11 @@ jobs:
 
   deploy-portal:
     needs: [build-license-api, build-portal]
+    # Explicit results instead of !failure(): build-portal now depends on the customer
+    # builds, and a failed kex build must not block the portal/license-api deploy.
     if: |
-      always() &&
-      !failure() && !cancelled() &&
+      always() && !cancelled() &&
+      needs.build-license-api.result != 'failure' && needs.build-portal.result != 'failure' &&
       (needs.build-license-api.result == 'success' || needs.build-portal.result == 'success')
     runs-on: ubuntu-latest
     permissions:
