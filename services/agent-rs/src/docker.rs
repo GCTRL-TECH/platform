@@ -183,6 +183,54 @@ fn build_create_config(inspect: &Value) -> Value {
     body
 }
 
+/// Re-bases the image-baked parts of a copied `Config` onto the NEW image — same
+/// rule as api-rs `rebase_image_defaults` (keep the two in sync). Env entries
+/// identical to the old image's are image-baked and replaced by the new image's;
+/// everything else is operator-set and wins. `Cmd`/`Entrypoint` equal to the old
+/// image's follow the new image. Without both image configs: unchanged.
+/// Why: verbatim copies froze image ENV at the old release (2026-09-28: the api
+/// kept `GCTRL_VERSION=0.1.294` after the in-app update to 0.1.295).
+fn rebase_image_defaults(mut config: Value, old_image: Option<&Value>, new_image: Option<&Value>) -> Value {
+    let (Some(old_img), Some(new_img)) = (old_image, new_image) else { return config };
+    let strs = |v: &Value| -> Vec<String> {
+        v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    let key = |e: &str| e.split_once('=').map(|(k, _)| k.to_string()).unwrap_or_else(|| e.to_string());
+
+    let old_env = strs(&old_img["Env"]);
+    // GCTRL_VERSION is only ever baked by our release build, never operator-set: always the
+    // new image's. That also heals installs whose containers already carry a stale value
+    // from earlier in-app updates (it would otherwise look like an operator override).
+    let operator: Vec<String> = strs(&config["Env"])
+        .into_iter()
+        .filter(|e| !old_env.contains(e) && key(e) != "GCTRL_VERSION")
+        .collect();
+    let mut env: Vec<String> = strs(&new_img["Env"]);
+    for o in &operator {
+        match env.iter().position(|e| key(e) == key(o)) {
+            Some(i) => env[i] = o.clone(),
+            None => env.push(o.clone()),
+        }
+    }
+    config["Env"] = json!(env);
+
+    for field in ["Cmd", "Entrypoint"] {
+        if config[field] == old_img[field] {
+            config[field] = new_img[field].clone();
+        }
+    }
+    config
+}
+
+/// `Config` of image `reference` (an id or a tag), `None` if it is not present locally.
+fn image_config(reference: &str) -> Option<Value> {
+    let (status, body) = docker_http("GET", &format!("/images/{reference}/json"), None, 10).ok()?;
+    if status != 200 {
+        return None;
+    }
+    Some(json_from_body(&body)["Config"].clone())
+}
+
 /// Recreates `name` from its (already-pulled) image, preserving its runtime
 /// config. Ported from api-rs's `recreate_container` (the one it uses to
 /// recreate every other service each update run) — the api container gets the
@@ -199,7 +247,11 @@ pub fn recreate_container(name: &str) -> Result<bool, String> {
     }
     let inspect = json_from_body(&body);
 
-    let create_cfg = build_create_config(&inspect).to_string();
+    // Old image = the id the container runs; new image = its tag, already moved by the pull.
+    let old_image = inspect["Image"].as_str().and_then(image_config);
+    let new_image = inspect["Config"]["Image"].as_str().and_then(image_config);
+    let create_cfg =
+        rebase_image_defaults(build_create_config(&inspect), old_image.as_ref(), new_image.as_ref()).to_string();
 
     // Remove old container (force-stop + delete)
     docker_http("DELETE", &format!("/containers/{name}?force=true"), None, 30)?;
@@ -348,6 +400,16 @@ mod tests {
         let mut i = sample_inspect();
         i["HostConfig"]["NetworkMode"] = json!("");
         assert_eq!(build_create_config(&i)["HostConfig"]["NetworkMode"], "bridge");
+    }
+
+    #[test]
+    fn rebase_takes_image_baked_env_from_the_new_image_and_keeps_operator_env() {
+        let old = json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.294"], "Cmd": ["gctrl-api"], "Entrypoint": null });
+        let new = json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.295"], "Cmd": ["gctrl-api"], "Entrypoint": null });
+        let cfg = json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.294", "RUST_LOG=info"], "Cmd": ["gctrl-api"], "Entrypoint": null });
+        let out = rebase_image_defaults(cfg, Some(&old), Some(&new));
+        assert_eq!(out["Env"], json!(["PATH=/usr/bin", "GCTRL_VERSION=0.1.295", "RUST_LOG=info"]));
+        assert_eq!(rebase_image_defaults(json!({"Env": ["A=1"]}), None, Some(&new)), json!({"Env": ["A=1"]}));
     }
 
     #[test]

@@ -1141,6 +1141,58 @@ fn build_create_config(inspect: &Value) -> Value {
     body
 }
 
+/// Re-bases the image-baked parts of a copied `Config` onto the NEW image.
+///
+/// `Config.Env` of a running container is the old IMAGE's `ENV` lines plus what the
+/// operator set (compose `environment:`, overrides). Copying it verbatim onto the new
+/// image froze every image-baked value at the old release: after the in-app update
+/// to 0.1.295 the api still reported `GCTRL_VERSION=0.1.294` (seen live 2026-09-28,
+/// Bifroest demo), and any new or changed `ENV` default of a release never arrived.
+/// An entry identical to the old image's is image-baked and is replaced by the new
+/// image's value; everything else is operator-set and wins. `Cmd`/`Entrypoint` follow
+/// the same rule (equal to the old image's = take the new image's).
+/// Without both image configs the config is returned unchanged (previous behaviour).
+fn rebase_image_defaults(mut config: Value, old_image: Option<&Value>, new_image: Option<&Value>) -> Value {
+    let (Some(old_img), Some(new_img)) = (old_image, new_image) else { return config };
+    let strs = |v: &Value| -> Vec<String> {
+        v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    let key = |e: &str| e.split_once('=').map(|(k, _)| k.to_string()).unwrap_or_else(|| e.to_string());
+
+    let old_env = strs(&old_img["Env"]);
+    // GCTRL_VERSION is only ever baked by our release build, never operator-set: always the
+    // new image's. That also heals installs whose containers already carry a stale value
+    // from earlier in-app updates (it would otherwise look like an operator override).
+    let operator: Vec<String> = strs(&config["Env"])
+        .into_iter()
+        .filter(|e| !old_env.contains(e) && key(e) != "GCTRL_VERSION")
+        .collect();
+    let mut env: Vec<String> = strs(&new_img["Env"]);
+    for o in &operator {
+        match env.iter().position(|e| key(e) == key(o)) {
+            Some(i) => env[i] = o.clone(),
+            None => env.push(o.clone()),
+        }
+    }
+    config["Env"] = json!(env);
+
+    for field in ["Cmd", "Entrypoint"] {
+        if config[field] == old_img[field] {
+            config[field] = new_img[field].clone();
+        }
+    }
+    config
+}
+
+/// `Config` of image `reference` (an id or a tag), `None` if it is not present locally.
+fn image_config(reference: &str) -> Option<Value> {
+    let (status, body) = docker_http("GET", &format!("/images/{reference}/json"), None, 10).ok()?;
+    if status != 200 {
+        return None;
+    }
+    Some(json_from_body(&body)["Config"].clone())
+}
+
 /// Recreates `name` from its (already-pulled) image, preserving its runtime config.
 /// Returns `Ok(true)` when recreated, `Ok(false)` when the container simply isn't
 /// deployed on this install (404 on inspect) — that's a normal skip, not a failure.
@@ -1155,7 +1207,11 @@ fn recreate_container(name: &str) -> Result<bool, String> {
     }
     let inspect = json_from_body(&body);
 
-    let create_cfg = build_create_config(&inspect).to_string();
+    // Old image = the id the container runs; new image = its tag, already moved by the pull.
+    let old_image = inspect["Image"].as_str().and_then(image_config);
+    let new_image = inspect["Config"]["Image"].as_str().and_then(image_config);
+    let create_cfg =
+        rebase_image_defaults(build_create_config(&inspect), old_image.as_ref(), new_image.as_ref()).to_string();
 
     // Remove old container (force-stop + delete)
     docker_http("DELETE", &format!("/containers/{name}?force=true"), None, 30)?;
@@ -1461,6 +1517,53 @@ mod tests {
         let mut i = sample_inspect();
         i["HostConfig"]["NetworkMode"] = json!("");
         assert_eq!(build_create_config(&i)["HostConfig"]["NetworkMode"], "bridge");
+    }
+
+    // Real case 2026-09-28: in-app update 0.1.294 -> 0.1.295 left GCTRL_VERSION=0.1.294.
+    fn release_images() -> (Value, Value) {
+        (
+            json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.294"], "Cmd": ["gctrl-api"], "Entrypoint": null }),
+            json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.295", "NEW_DEFAULT=1"], "Cmd": ["gctrl-api", "--serve"], "Entrypoint": null }),
+        )
+    }
+
+    #[test]
+    fn rebase_takes_image_baked_env_from_the_new_image_and_keeps_operator_env() {
+        let (old, new) = release_images();
+        let cfg = json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.294", "RUST_LOG=info", "PATH_EXTRA=x"],
+                          "Cmd": ["gctrl-api"], "Entrypoint": null });
+        let out = rebase_image_defaults(cfg, Some(&old), Some(&new));
+        let env: Vec<&str> = out["Env"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(env.contains(&"GCTRL_VERSION=0.1.295"), "{env:?}");
+        assert!(!env.contains(&"GCTRL_VERSION=0.1.294"));
+        assert!(env.contains(&"NEW_DEFAULT=1"), "a new image default must arrive");
+        assert!(env.contains(&"RUST_LOG=info") && env.contains(&"PATH_EXTRA=x"), "operator env survives");
+        assert_eq!(out["Cmd"], json!(["gctrl-api", "--serve"]), "image default cmd follows the new image");
+    }
+
+    #[test]
+    fn rebase_lets_an_operator_override_of_an_image_key_win() {
+        let (old, new) = release_images();
+        // Operator set PATH deliberately (differs from the old image's value).
+        let cfg = json!({ "Env": ["PATH=/opt/custom", "GCTRL_VERSION=0.1.294"], "Cmd": ["-s"], "Entrypoint": null });
+        let out = rebase_image_defaults(cfg, Some(&old), Some(&new));
+        assert!(out["Env"].as_array().unwrap().contains(&json!("PATH=/opt/custom")));
+        assert_eq!(out["Cmd"], json!(["-s"]), "a compose `command:` is operator-set and kept");
+    }
+
+    #[test]
+    fn rebase_heals_a_gctrl_version_frozen_by_an_earlier_update() {
+        // Container already stale (0.1.293) from an update run with the old logic.
+        let (old, new) = release_images();
+        let cfg = json!({ "Env": ["PATH=/usr/bin", "GCTRL_VERSION=0.1.293"], "Cmd": ["gctrl-api"], "Entrypoint": null });
+        let out = rebase_image_defaults(cfg, Some(&old), Some(&new));
+        assert!(out["Env"].as_array().unwrap().contains(&json!("GCTRL_VERSION=0.1.295")));
+    }
+
+    #[test]
+    fn rebase_without_image_configs_is_a_no_op() {
+        let cfg = json!({ "Env": ["A=1"], "Cmd": ["x"] });
+        assert_eq!(rebase_image_defaults(cfg.clone(), None, None), cfg);
     }
 
     // ── version_gt / parse_version (pre-existing behavior, unchanged) ─────────
