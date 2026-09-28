@@ -9,7 +9,14 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 48fbb43 -->
+<!-- baseline-sha: 37436e5 -->
+
+## v0.9.15 - The in-app update installs a release's own settings, too
+
+*28 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **After an in-app update, each service runs with the settings of the new release.** The in-app update pulls the new images and recreates every service with its existing configuration, so your own settings (environment overrides, labels, volumes, networks) survive. That configuration also contained the defaults baked into the previous image, and they were carried over unchanged: the most visible one is the version number, so after updating to 0.1.295 an instance still reported 0.1.294, and any new default a release introduced never took effect after an in-app update. The update now tells the two apart: values that came from the old image are replaced by those of the new image, values you set yourself are kept, and the start command follows the new image unless you changed it.
+- **Instances that already show a version behind catch up by themselves.** The version number is never something you set, so it now always comes from the new image. The next update corrects it on every install, including those whose number fell behind during earlier updates.
 
 ## v0.9.14 - Fused graphs keep their relations, and cloud-only installs stay on the cloud
 
