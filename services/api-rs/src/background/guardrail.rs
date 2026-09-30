@@ -52,6 +52,17 @@ const PROBE_TIMEOUT_SECS: u64 = 60;
 /// Fallback reachability check (bundled Ollama `/api/tags`).
 const FALLBACK_PROBE_SECS: u64 = 3;
 
+/// `GCTRL_GUARDRAIL_REVERT` (default on). Off = never switch the runtime to
+/// bundled Ollama, only raise `runtime_unhealthy`. For single-hot-model hosts
+/// (Asgard: one oMLX model, 48 GB) where a revert loads a second model next to
+/// it and outlives the outage — reverts are once-only until re-applied.
+fn revert_enabled(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
 fn probe_interval_secs() -> u64 {
     std::env::var("GUARDRAIL_PROBE_SECS")
         .ok()
@@ -177,6 +188,13 @@ async fn run_tick(state: &AppState) {
             );
 
             if new_count >= CONSECUTIVE_FAILURE_THRESHOLD {
+                if !revert_enabled(std::env::var("GCTRL_GUARDRAIL_REVERT").ok().as_deref()) {
+                    mark_unhealthy(
+                        state, &reason, "auto-revert disabled (GCTRL_GUARDRAIL_REVERT=false)",
+                        &provider, base_url.as_deref(), model.as_deref(),
+                    ).await;
+                    return;
+                }
                 match fallback_usable().await {
                     Ok(()) => {
                         revert_runtime(state, &provider, base_url.as_deref(), model.as_deref(), &reason).await
@@ -457,7 +475,17 @@ async fn check_degraded_jobs(state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_error, ProbeFailure};
+    use super::{classify_error, revert_enabled, ProbeFailure};
+
+    #[test]
+    fn revert_is_on_unless_explicitly_disabled() {
+        assert!(revert_enabled(None));
+        assert!(revert_enabled(Some("")));
+        assert!(revert_enabled(Some("true")));
+        for off in ["false", "0", "no", "off", " FALSE "] {
+            assert!(!revert_enabled(Some(off)), "{off:?} must disable the revert");
+        }
+    }
 
     fn transient(s: &str) -> bool { matches!(classify_error(s), ProbeFailure::Transient(_)) }
     fn fatal(s: &str) -> bool { matches!(classify_error(s), ProbeFailure::Fatal(_)) }

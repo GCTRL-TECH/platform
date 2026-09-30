@@ -861,8 +861,13 @@ def _distill_impl(
         dossiers: dict = {}
         try:
             from . import dossier as _dossier
+            # Same runtime as the wiki pages above: without it the dossier
+            # summaries fell back to GCTRL_DISTILL_MODEL on Ollama and loaded a
+            # second model next to the hot runtime model.
             dossiers = _dossier.build_top_dossiers(
-                compilation_id, user_id, source_job_ids, top_n=min(limit, 10)
+                compilation_id, user_id, source_job_ids, top_n=min(limit, 10),
+                model=model, ollama_base=ollama_base, kind=kind,
+                api_key=api_key, max_concurrency=max_concurrency,
             )
         except Exception as exc:
             logger.warning(f"[distill {compilation_id}] dossier refresh failed: {exc}")

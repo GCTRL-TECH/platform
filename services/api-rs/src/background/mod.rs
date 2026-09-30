@@ -1710,10 +1710,19 @@ async fn promote_hot_entities(state: &AppState) -> i64 {
             continue;
         }
 
+        // With the DISTILL runtime (spec D8) like every other /dossier/build call:
+        // a bare body made FUSE fall back to its env model on Ollama, loading a
+        // second model on every promotion tick (Asgard, 2026-09-30).
         let url = format!("{}/dossier/build", state.cfg.fuse_url);
+        let body = crate::routes::kg::dossier_build_body(
+            state,
+            user_id,
+            json!({ "user_id": user_id.to_string(), "entity_name": name }),
+        )
+        .await;
         let resp = reqwest::Client::new()
             .post(&url)
-            .json(&json!({ "user_id": user_id.to_string(), "entity_name": name }))
+            .json(&body)
             .timeout(std::time::Duration::from_secs(180))
             .send()
             .await;

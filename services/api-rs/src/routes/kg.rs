@@ -2892,8 +2892,8 @@ pub(crate) async fn build_dossier_via_fuse(
 /// (spec D8): `distill_model` always, plus `generation_kind/base/model/
 /// max_concurrency/api_key` when that runtime is openai_compatible. The key may
 /// travel here because this is a direct internal HTTP hop to FUSE, never Redis.
-async fn dossier_build_body(
-    state: &Arc<crate::models::AppState>,
+pub(crate) async fn dossier_build_body(
+    state: &crate::models::AppState,
     user_id: Uuid,
     mut body: Value,
 ) -> Value {

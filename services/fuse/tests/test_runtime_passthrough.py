@@ -114,6 +114,27 @@ class TestDossierSummaryRuntime:
             assert kwargs[k] == v
 
 
+class TestDistillDossierRefreshRuntime:
+    def test_distill_forwards_runtime_to_top_dossiers(self):
+        """The dossier refresh at the end of every distill run must use the SAME
+        runtime as the wiki pages. It used to call build_top_dossiers without it,
+        so each distill loaded GCTRL_DISTILL_MODEL into Ollama next to the hot
+        runtime model (Asgard, 2026-09-30)."""
+        from src import distiller
+        with patch("src.distiller._pg_connect", return_value=MagicMock()), \
+             patch("src.distiller._resolve_wiki_source", return_value=(["s1"], ["j1"])), \
+             patch("src.distiller.GraphDatabase", MagicMock()), \
+             patch("src.distiller._fetch_entities_with_neighbors", return_value=[]), \
+             patch("src.distiller._count_source_entities", return_value=0), \
+             patch("src.distiller._append_log"), \
+             patch("src.dossier.build_top_dossiers", return_value={"dossiers_built": 0}) as mock_top:
+            distiller._distill_impl("c1", "u1", limit=5, **RUNTIME)
+        assert mock_top.called
+        _args, kwargs = mock_top.call_args
+        for k, v in RUNTIME.items():
+            assert kwargs[k] == v, (k, kwargs)
+
+
 class TestUserProfileRuntime:
     def test_build_profile_forwards_runtime(self):
         from src import user_profile
