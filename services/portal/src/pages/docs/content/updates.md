@@ -9,7 +9,14 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 37436e5 -->
+<!-- baseline-sha: aa5e84f -->
+
+## v0.9.16 - Every background job uses the model you chose
+
+*30 September 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Dossiers are written by your active model, never by a second one.** After each wiki distillation GCTRL refreshes the dossiers of the most important entities, and the memory cycle regularly promotes frequently used entities to dossiers. Both steps ignored the runtime you selected and asked the default model of the local Ollama instead, so a host running one model on a dedicated server (oMLX, vLLM, llama.cpp) loaded a second model next to it about once an hour. Both now use the runtime and model of the distill task, like the wiki pages already did.
+- **You can stop the runtime guardrail from switching to Ollama.** When the active runtime fails repeatedly, the guardrail switches GCTRL to the bundled Ollama and stays there until you re-apply your runtime. On a host sized for exactly one model that switch does more harm than the outage. Set `GCTRL_GUARDRAIL_REVERT=false` on the api service and the guardrail only reports the failing runtime in the dashboard; your runtime stays selected and resumes as soon as the server is back. Without the setting nothing changes.
 
 ## v0.9.15 - The in-app update installs a release's own settings, too
 
