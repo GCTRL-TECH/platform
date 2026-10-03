@@ -9,7 +9,13 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: aa5e84f -->
+<!-- baseline-sha: e5051ed -->
+
+## v0.9.16.1 - The cloak gateway also covers agent turns
+
+*3 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Agent turns are cloaked like chat turns.** The cloak gateway pseudonymizes names, e-mail addresses and phone numbers before a request reaches a cloud model. It did so only when a message carried its text as a plain string. Agent harnesses send every message as a list of content parts, and the gateway forwarded those unchanged, so the cloud model read the original text although the turn was routed through the gateway. Text parts are now cloaked exactly like plain text. Images and tool results stay untouched, as before. If you route an agent through `/v1/chat/completions` with a cloud model, update the api service.
 
 ## v0.9.16 - Every background job uses the model you chose
 
