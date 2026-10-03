@@ -275,36 +275,15 @@ async fn chat_completions_inner(
     // read once per request rather than once per message.
     let mut out_body = parsed.clone();
     let ns = [namespace];
-    let mut slots: Vec<usize> = Vec::new();
-    let mut plain: Vec<String> = Vec::new();
-    if let Some(messages) = out_body.get("messages").and_then(|m| m.as_array()) {
-        for (idx, msg) in messages.iter().enumerate() {
-            // NEVER cloak tool RESULT messages: their content is verbatim tool
-            // output (file listings, paths, IDs) that the model copies straight
-            // into its NEXT assistant `tool_calls[].function.arguments`.
-            // Pseudonymizing it corrupts those literals — e.g. a write path
-            // shipped as `/Users/Org-46/asgard_Term-3170/...` = silent file
-            // corruption. (Likewise `tools[]` definitions and `tool_calls`
-            // arguments are NEVER cloaked here — they are only DE-cloaked on the
-            // response side; keep it that way in any future refactor.)
-            if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
-                continue;
-            }
-            let Some(content) = msg.get("content").and_then(|c| c.as_str()) else { continue };
-            if content.is_empty() {
-                continue;
-            }
-            slots.push(idx);
-            plain.push(content.to_string());
-        }
-    }
+    let (slots, plain) = out_body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|m| collect_cloak_texts(m))
+        .unwrap_or_default();
     let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
     let (cloaked, cloak_session) = privacy::cloak_batch(&state.db, &ns, &candidates, &refs).await;
     if let Some(messages) = out_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for (slot, idx) in slots.iter().enumerate() {
-            let (Some(msg), Some(text)) = (messages.get_mut(*idx), cloaked.get(slot)) else { continue };
-            msg["content"] = json!(text);
-        }
+        write_cloaked_texts(messages, &slots, &cloaked);
     }
     tracing::debug!(
         "llm_gateway: cloaked {} entities for user {} (model {})",
@@ -607,10 +586,99 @@ fn upstream_unreachable(e: reqwest::Error) -> Response {
         .into_response()
 }
 
+/// Where a cloakable text sits inside `messages`: the message index and, for the
+/// content-parts form (`content: [{ "type": "text", "text": "…" }]`), the part index.
+type CloakSlot = (usize, Option<usize>);
+
+/// Every free-text a cloud model would read, in request order. A message's `content`
+/// is either a plain string or an array of parts — agent harnesses (pi) send the
+/// array form for EVERY message, so skipping it shipped whole turns in plaintext
+/// while the caller believed they were cloaked. Non-text parts (images) stay as-is.
+fn collect_cloak_texts(messages: &[Value]) -> (Vec<CloakSlot>, Vec<String>) {
+    let mut slots: Vec<CloakSlot> = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        // NEVER cloak tool RESULT messages: their content is verbatim tool
+        // output (file listings, paths, IDs) that the model copies straight
+        // into its NEXT assistant `tool_calls[].function.arguments`.
+        // Pseudonymizing it corrupts those literals — e.g. a write path
+        // shipped as `/Users/Org-46/asgard_Term-3170/...` = silent file
+        // corruption. (Likewise `tools[]` definitions and `tool_calls`
+        // arguments are NEVER cloaked here — they are only DE-cloaked on the
+        // response side; keep it that way in any future refactor.)
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            continue;
+        }
+        match msg.get("content") {
+            Some(Value::String(content)) if !content.is_empty() => {
+                slots.push((idx, None));
+                plain.push(content.clone());
+            }
+            Some(Value::Array(parts)) => {
+                for (pidx, part) in parts.iter().enumerate() {
+                    let Some(text) = part.get("text").and_then(|t| t.as_str()) else { continue };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    slots.push((idx, Some(pidx)));
+                    plain.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    (slots, plain)
+}
+
+/// Write the cloaked texts back to the slots `collect_cloak_texts` reported.
+fn write_cloaked_texts(messages: &mut [Value], slots: &[CloakSlot], cloaked: &[String]) {
+    for ((idx, part), text) in slots.iter().zip(cloaked) {
+        let Some(msg) = messages.get_mut(*idx) else { continue };
+        match part {
+            None => msg["content"] = json!(text),
+            Some(pidx) => {
+                if let Some(p) = msg.get_mut("content").and_then(|c| c.get_mut(*pidx)) {
+                    p["text"] = json!(text);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn cloak_texts_cover_string_and_content_parts() {
+        let mut messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "user", "content": [
+                { "type": "text", "text": "hello Ada" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "text", "text": "" },
+                { "type": "text", "text": "mail ada@example.org" },
+            ] }),
+            json!({ "role": "tool", "content": "/Users/ada/file.txt" }),
+            json!({ "role": "tool", "content": [{ "type": "text", "text": "/Users/ada/other.txt" }] }),
+            json!({ "role": "assistant", "content": null }),
+        ];
+        let (slots, plain) = collect_cloak_texts(&messages);
+        assert_eq!(slots, vec![(0, None), (1, Some(0)), (1, Some(3))]);
+        assert_eq!(plain, vec!["sys", "hello Ada", "mail ada@example.org"]);
+
+        let cloaked: Vec<String> = plain.iter().map(|p| format!("<{p}>")).collect();
+        write_cloaked_texts(&mut messages, &slots, &cloaked);
+        assert_eq!(messages[0]["content"], "<sys>");
+        assert_eq!(messages[1]["content"][0]["text"], "<hello Ada>");
+        assert_eq!(messages[1]["content"][1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(messages[1]["content"][2]["text"], "");
+        assert_eq!(messages[1]["content"][3]["text"], "<mail ada@example.org>");
+        // Tool results stay verbatim in both forms.
+        assert_eq!(messages[2]["content"], "/Users/ada/file.txt");
+        assert_eq!(messages[3]["content"][0]["text"], "/Users/ada/other.txt");
+    }
 
     #[test]
     fn cloud_tag_detection() {
