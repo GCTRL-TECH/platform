@@ -25,6 +25,26 @@
 //! `routes::rag` (fast + deep Talk-to-Graph) and `routes::agent` (Pi chat).
 //! Each call site documents exactly how airtight (or best-effort) its
 //! enforcement is; see those modules for the honest caveats.
+//!
+//! Matching rules for the entity dictionary (`prepare_candidates`,
+//! `apply_pseudonyms`):
+//!   - Matches only on word boundaries and never inside an identifier (path,
+//!     slug, host, env var); identifier-shaped NAMES (glue chars, bare
+//!     lowercase/digit tokens like `gctrl` or the KEX artefact `mit`) are never
+//!     dictionary keys.
+//!   - A name that equals a German/English function word or very common word
+//!     (`STOP_WORDS`: `mit`, `will`, `the`, ...) is never cloaked, in any case
+//!     variant. Only exception: an ALL-CAPS name (`MIT`), which as a short
+//!     acronym is matched case-sensitively (next rule) and so can never hit the
+//!     preposition `mit`. Observed live 2026-10-06: the org entities "MIT"/"mit"
+//!     cloaked every German "mit" to `Org-259`.
+//!   - A single-token key of at most `CASE_SENSITIVE_MAX_CHARS` (4) alphanumeric
+//!     chars with an uppercase letter (`MIT`, `SAP`, `BMW`, `Bild`) matches
+//!     CASE-SENSITIVELY: `SAP` cloaks `SAP`, never `sap`.
+//!   - Every other key (longer or multi-word) matches case-insensitively, so the
+//!     user's own spelling variants (`nexovar gmbh`) are still caught.
+//!   - The token pre-filter (`key_can_occur`) applies the same case rule, and
+//!     de-cloaking restores the exact surface form the request used.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -270,6 +290,11 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
         }
         let entry = agg.entry(key).or_insert_with(|| (0, c.clone()));
         entry.0 += 1;
+        // A pure-lowercase variant ("mit") is dropped later as identifier-shaped; keeping it
+        // here would silently lose the real entity ("MIT"). Prefer a cased spelling.
+        if !entry.1.name.chars().any(char::is_uppercase) && c.name.chars().any(char::is_uppercase) {
+            entry.1 = c;
+        }
     }
     let mut items: Vec<(usize, EntityCandidate)> = agg.into_values().collect();
     items.sort_by(|a, b| {
@@ -460,9 +485,91 @@ fn is_identifier_like(name: &str) -> bool {
     !has_upper && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+/// German + English function words and very common words. A dictionary entity whose
+/// name equals one of these (case-insensitively) is never cloaked: KEX does extract
+/// "MIT"/"mit" as an organisation or "Will" as a person, and cloaking them garbles every
+/// sentence the cloud model reads ("Org-122 plant Org-259 der Org-27"). Lowercase,
+/// compared against [`lower_key`] of the name.
+static STOP_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    [
+        // German
+        "der", "die", "das", "den", "dem", "des", "ein", "eine", "einer", "eines", "einem",
+        "einen", "und", "oder", "aber", "mit", "ohne", "f\u{fc}r", "fuer", "von", "vom", "zu",
+        "zum", "zur", "im", "in", "an", "auf", "aus", "bei", "nach", "\u{fc}ber", "ueber", "unter",
+        "vor", "hinter", "neben", "zwischen", "durch", "gegen", "um", "bis", "seit", "ab",
+        "als", "wie", "wenn", "dass", "ob", "weil", "denn", "doch", "nur", "auch", "noch",
+        "schon", "sehr", "mehr", "ist", "sind", "war", "waren", "wird", "werden", "hat",
+        "haben", "kann", "k\u{f6}nnen", "koennen", "muss", "m\u{fc}ssen", "muessen", "soll", "sollen",
+        "will", "wollen", "darf", "d\u{fc}rfen", "duerfen", "mag", "m\u{f6}gen", "moegen", "nicht",
+        "kein", "keine", "ja", "nein", "ich", "du", "er", "sie", "es", "wir", "ihr", "man",
+        "sich", "mein", "dein", "sein", "unser", "euer", "dies", "diese", "dieser", "dieses",
+        "jener", "welche", "welcher", "hier", "dort", "da", "wo", "wann", "was", "wer", "wen",
+        "wem", "wessen",
+        // English
+        "the", "a", "an", "and", "or", "but", "with", "without", "for", "of", "to", "from",
+        "in", "on", "at", "by", "into", "onto", "over", "under", "before", "after", "between",
+        "through", "against", "about", "as", "if", "that", "this", "these", "those", "is",
+        "are", "was", "were", "be", "been", "being", "has", "have", "had", "do", "does", "did",
+        "can", "could", "will", "would", "shall", "should", "may", "might", "must", "not",
+        "no", "yes", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us",
+        "them", "my", "your", "his", "its", "our", "their", "here", "there", "where", "when",
+        "what", "who", "whom", "whose", "which", "how", "all", "any", "some", "each", "every",
+        "both", "few", "more", "most", "other", "such", "than", "too", "very", "just", "also",
+        "only", "own", "same", "so",
+    ]
+    .into_iter()
+    .collect()
+});
+
+/// Longest single-token key (in chars) that is matched case-sensitively.
+const CASE_SENSITIVE_MAX_CHARS: usize = 4;
+
+/// PURE: is `key` a short acronym-like token that must match CASE-SENSITIVELY? A single run
+/// of 1..=[`CASE_SENSITIVE_MAX_CHARS`] alphanumeric chars with at least one uppercase letter
+/// (`MIT`, `SAP`, `Bild`). Folded keys ([`lower_key`]) never qualify, so every longer or
+/// multi-word key keeps case-insensitive matching.
+fn is_case_sensitive_key(key: &str) -> bool {
+    let mut n = 0usize;
+    let mut has_upper = false;
+    for c in key.chars() {
+        if !c.is_alphanumeric() {
+            return false;
+        }
+        n += 1;
+        if n > CASE_SENSITIVE_MAX_CHARS {
+            return false;
+        }
+        has_upper |= c.is_uppercase();
+    }
+    n > 0 && has_upper
+}
+
+/// PURE: the key [`apply_pseudonyms`] matches a candidate by: its exact spelling for a short
+/// acronym-like token (see [`is_case_sensitive_key`]), otherwise the folded [`lower_key`].
+fn match_key(name: &str) -> String {
+    let t = name.trim();
+    if is_case_sensitive_key(t) {
+        t.to_string()
+    } else {
+        lower_key(t)
+    }
+}
+
+/// PURE: is `name` a stop-word that must never be cloaked? ALL-CAPS short names (`MIT`) are
+/// exempt: they are acronyms matched case-sensitively, so they can never hit the
+/// lowercase/title-case function word in running text.
+fn is_stop_word_entity(name: &str) -> bool {
+    let t = name.trim();
+    if !STOP_WORDS.contains(lower_key(t).as_str()) {
+        return false;
+    }
+    let all_caps = t.chars().any(char::is_uppercase) && !t.chars().any(char::is_lowercase);
+    !(all_caps && is_case_sensitive_key(t))
+}
+
 /// PURE: fold a candidate dictionary into match keys once, dropping entries too
-/// short to be worth hiding (they would match noise) and identifier-shaped names
-/// (see [`is_identifier_like`]).
+/// short to be worth hiding (they would match noise), identifier-shaped names
+/// (see [`is_identifier_like`]) and stop-words (see [`STOP_WORDS`]).
 fn prepare_candidates(candidates: &[EntityCandidate]) -> Vec<PreparedCandidate> {
     let mut out = Vec::with_capacity(candidates.len());
     for c in candidates {
@@ -474,26 +581,44 @@ fn prepare_candidates(candidates: &[EntityCandidate]) -> Vec<PreparedCandidate> 
         if is_identifier_like(trimmed) {
             continue;
         }
+        if is_stop_word_entity(trimmed) {
+            continue;
+        }
         out.push((key, c.kind.clone(), trimmed.to_string()));
     }
     out
 }
 
-/// PURE: the set of alphanumeric word tokens in `text`, folded with the same
-/// per-char lowering [`lower_key`] uses so both sides of a comparison agree.
-fn text_tokens(text: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+/// The alphanumeric word tokens of a text, twice: `folded` with the same per-char
+/// lowering [`lower_key`] uses (for case-insensitive keys), and `exact` holding only the
+/// tokens short enough to serve a case-sensitive key (see [`is_case_sensitive_key`]).
+struct TextTokens {
+    folded: HashSet<String>,
+    exact: HashSet<String>,
+}
+
+/// PURE: tokenize `text` into [`TextTokens`].
+fn text_tokens(text: &str) -> TextTokens {
+    fn flush(cur: &mut String, out: &mut TextTokens) {
+        if cur.is_empty() {
+            return;
+        }
+        if cur.chars().count() <= CASE_SENSITIVE_MAX_CHARS {
+            out.exact.insert(cur.clone());
+        }
+        out.folded.insert(lower_key(cur));
+        cur.clear();
+    }
+    let mut out = TextTokens { folded: HashSet::new(), exact: HashSet::new() };
     let mut cur = String::new();
     for c in text.chars() {
         if c.is_alphanumeric() {
-            cur.push(c.to_lowercase().next().unwrap_or(c));
-        } else if !cur.is_empty() {
-            out.insert(std::mem::take(&mut cur));
+            cur.push(c);
+        } else {
+            flush(&mut cur, &mut out);
         }
     }
-    if !cur.is_empty() {
-        out.insert(cur);
-    }
+    flush(&mut cur, &mut out);
     out
 }
 
@@ -505,13 +630,19 @@ fn text_tokens(text: &str) -> HashSet<String> {
 /// a complete token of the text (the run's outer edge is the boundary guard, its
 /// inner edges are the key's own separators). One missing run therefore proves
 /// the key cannot match. A key with no alphanumeric run at all (pure
-/// punctuation) is unfilterable and always kept.
+/// punctuation) is unfilterable and always kept. `key` is a [`match_key`]: a
+/// case-sensitive one (`MIT`) is checked against the EXACT tokens, so a text
+/// that only says "mit" drops it, exactly as the substitution would.
 ///
 /// Why it matters: without it EVERY dictionary entry entered the pseudonym map,
 /// making each request O(text × whole dictionary) — 60k chars against a
 /// 2000-entity dictionary measured at tens of seconds — and minting a
 /// `cloak_maps` row for every entity the user never actually mentioned.
-fn key_can_occur(key: &str, tokens: &HashSet<String>) -> bool {
+fn key_can_occur(key: &str, tokens: &TextTokens) -> bool {
+    if is_case_sensitive_key(key) {
+        return tokens.exact.contains(key);
+    }
+    let tokens = &tokens.folded;
     let mut run = String::new();
     for c in key.chars() {
         if c.is_alphanumeric() {
@@ -540,7 +671,7 @@ fn collect_prepared(
     let tokens = text_tokens(text);
     let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
     for (key, kind, canonical) in prepared {
-        if !key_can_occur(key, &tokens) {
+        if !key_can_occur(&match_key(canonical), &tokens) {
             continue;
         }
         seen.entry(key.clone()).or_insert_with(|| (kind.clone(), canonical.clone()));
@@ -563,9 +694,11 @@ fn collect_candidates(
     collect_prepared(&prepare_candidates(candidates), text)
 }
 
-/// PURE: longest-match-first, case-insensitive substitution of `text` using an
-/// already-resolved `lower_key -> pseudonym` map. Non-candidate text is copied
-/// through unchanged (byte-for-byte via the original `chars`).
+/// PURE: longest-match-first substitution of `text` using an already-resolved
+/// `match key -> pseudonym` map. A key is matched case-insensitively, except a
+/// short acronym-like key (see [`is_case_sensitive_key`]: `MIT`), which must match
+/// the text exactly. Non-candidate text is copied through unchanged (byte-for-byte
+/// via the original `chars`).
 pub fn apply_pseudonyms(text: &str, key_to_pseudonym: &HashMap<String, String>) -> String {
     let mut surfaces = HashMap::new();
     apply_pseudonyms_recording(text, key_to_pseudonym, &mut surfaces)
@@ -595,19 +728,20 @@ pub fn apply_pseudonyms_recording(
     // chars and heap-allocated a window `String` for every (position × key)
     // pair — the O(text × dictionary) cost behind the multi-second cloak
     // overhead on long chat prompts.
-    let mut keys: Vec<(Vec<char>, &str)> = key_to_pseudonym
+    let mut keys: Vec<(Vec<char>, &str, bool)> = key_to_pseudonym
         .iter()
-        .map(|(k, p)| (k.chars().collect::<Vec<char>>(), p.as_str()))
-        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, p)| (k.chars().collect::<Vec<char>>(), p.as_str(), is_case_sensitive_key(k)))
+        .filter(|(k, _, _)| !k.is_empty())
         .collect();
     // Longest first, so a longer entity always wins over one that prefixes it.
-    keys.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-    // Bucket by first char (the sort order carries into each bucket, keeping
+    keys.sort_by_key(|(k, _, _)| std::cmp::Reverse(k.len()));
+    // Bucket by FOLDED first char (the sort order carries into each bucket, keeping
     // longest-match-first intact): a position whose char starts no key costs one
-    // hash lookup instead of a full sweep over the dictionary.
+    // hash lookup instead of a full sweep over the dictionary. Case-sensitive keys
+    // share the folded bucket and compare against the original chars below.
     let mut by_first: HashMap<char, Vec<usize>> = HashMap::new();
-    for (n, (k, _)) in keys.iter().enumerate() {
-        by_first.entry(k[0]).or_default().push(n);
+    for (n, (k, _, _)) in keys.iter().enumerate() {
+        by_first.entry(k[0].to_lowercase().next().unwrap_or(k[0])).or_default().push(n);
     }
 
     let chars: Vec<char> = text.chars().collect();
@@ -618,9 +752,10 @@ pub fn apply_pseudonyms_recording(
     'outer: while i < chars.len() {
         if let Some(bucket) = by_first.get(&lower_chars[i]) {
             for &n in bucket {
-                let (key, pseudonym) = &keys[n];
+                let (key, pseudonym, case_sensitive) = &keys[n];
                 let klen = key.len();
-                if i + klen > lower_chars.len() || lower_chars[i..i + klen] != key[..] {
+                let hay = if *case_sensitive { &chars } else { &lower_chars };
+                if i + klen > hay.len() || hay[i..i + klen] != key[..] {
                     continue;
                 }
                 // WORD-BOUNDARY guard: a key must never match INSIDE a word. Without
@@ -898,7 +1033,9 @@ pub async fn cloak_batch(
         // Provisional: the canonical spelling, replaced below by the surface form the request
         // actually used (a key narrowed to this request always matches at least once).
         session.map.insert(pseudonym.clone(), canonical.clone());
-        key_to_pseudonym.insert(key.clone(), pseudonym);
+        // The registry stays keyed by the folded key (stable pseudonyms); the substitution
+        // map uses the match key so a short acronym matches case-sensitively.
+        key_to_pseudonym.insert(match_key(canonical), pseudonym);
     }
     let mut surfaces: HashMap<String, String> = HashMap::with_capacity(key_to_pseudonym.len());
     let cloaked = texts
@@ -1341,6 +1478,111 @@ mod tests {
     }
 
     // ── privacy mode strictness ordering ─────────────────────────────────
+
+    // ── stop-words + short acronyms (2026-10-06) ──────────────────────────
+
+    /// The production path in miniature: prepare + pre-filter the dictionary, mint
+    /// a pseudonym per surviving key, substitute with match keys (as `cloak_batch`).
+    fn cloak_pure(candidates: &[EntityCandidate], text: &str) -> (String, CloakSession) {
+        let seen = collect_candidates(candidates, text);
+        let mut keys: Vec<(&String, &(Option<String>, String))> = seen.iter().collect();
+        keys.sort_by(|a, b| a.0.cmp(b.0));
+        let map: HashMap<String, String> = keys
+            .iter()
+            .enumerate()
+            .map(|(n, (_, (_, canonical)))| (match_key(canonical), format!("Org-{n}")))
+            .collect();
+        let mut surfaces = HashMap::new();
+        let cloaked = apply_pseudonyms_recording(text, &map, &mut surfaces);
+        let mut session = CloakSession::empty();
+        session.map.extend(surfaces);
+        (cloaked, session)
+    }
+
+    #[test]
+    fn the_preposition_mit_is_never_cloaked_but_the_acronym_mit_is() {
+        // Live 2026-10-06: KEX extracted "MIT" and "mit" as organisations and every
+        // German "mit" went to the cloud as `Org-259`.
+        let candidates = vec![cand("MIT", Some("organization")), cand("mit", Some("organization"))];
+        let text = "Maren plant mit der Nexovar GmbH.";
+        let (cloaked, _) = cloak_pure(&candidates, text);
+        assert_eq!(cloaked, text, "the preposition must reach the model untouched");
+        assert!(collect_candidates(&candidates, text).is_empty());
+
+        let text = "Maren forscht am MIT mit Kollegen.";
+        let (cloaked, session) = cloak_pure(&candidates, text);
+        assert_eq!(cloaked, "Maren forscht am Org-0 mit Kollegen.");
+        assert_eq!(decloak(&session, &cloaked), text, "round trip is byte-exact");
+    }
+
+    #[test]
+    fn a_stop_word_entity_never_cloaks_any_case_variant() {
+        let candidates = vec![cand("Will", Some("person")), cand("WILL", Some("person"))];
+        for text in ["Ich will das morgen.", "Will you call me?", "Will Smith kommt."] {
+            assert!(collect_candidates(&[cand("Will", Some("person"))], text).is_empty(), "{text:?}");
+            assert_eq!(cloak_pure(&candidates[..1], text).0, text);
+        }
+        assert!(is_stop_word_entity("Will") && is_stop_word_entity("will") && is_stop_word_entity("Mit"));
+        assert!(is_stop_word_entity("The") && is_stop_word_entity("über"));
+        // ALL-CAPS acronyms are exempt: they match case-sensitively and never hit the function word.
+        assert!(!is_stop_word_entity("MIT") && !is_stop_word_entity("US"));
+        assert!(!is_stop_word_entity("Bosch") && !is_stop_word_entity("Nexovar GmbH"));
+    }
+
+    #[test]
+    fn long_keys_stay_case_insensitive() {
+        let candidates = vec![cand("Nexovar GmbH", Some("organization")), cand("Bosch", Some("organization"))];
+        let text = "Termin mit nexovar gmbh und bosch.";
+        let (cloaked, session) = cloak_pure(&candidates, text);
+        assert!(!cloaked.contains("nexovar") && !cloaked.contains("bosch"), "got {cloaked:?}");
+        assert!(cloaked.starts_with("Termin mit Org-"), "the preposition stays: {cloaked:?}");
+        assert_eq!(decloak(&session, &cloaked), text);
+    }
+
+    #[test]
+    fn short_acronyms_match_case_sensitively() {
+        let candidates = vec![cand("SAP", Some("organization")), cand("Bosch", Some("organization"))];
+        assert_eq!(cloak_pure(&candidates, "Wir nutzen SAP.").0, "Wir nutzen Org-0.");
+        assert_eq!(cloak_pure(&candidates, "ein sap im Baum").0, "ein sap im Baum");
+        assert_eq!(cloak_pure(&candidates, "Ein Sap im Baum").0, "Ein Sap im Baum");
+        assert_eq!(cloak_pure(&candidates, "BOSCH liefert").0, "Org-0 liefert");
+        assert!(is_case_sensitive_key("SAP") && is_case_sensitive_key("Bild") && is_case_sensitive_key("X9"));
+        assert!(!is_case_sensitive_key("sap") && !is_case_sensitive_key("Bosch") && !is_case_sensitive_key("A B"));
+        assert_eq!(match_key("SAP"), "SAP");
+        assert_eq!(match_key("Bosch"), "bosch");
+    }
+
+    #[test]
+    fn prefilter_agrees_with_case_sensitive_matching() {
+        assert!(!key_can_occur("MIT", &text_tokens("plant mit der Nexovar")));
+        assert!(!key_can_occur("MIT", &text_tokens("plant Mit der Nexovar")));
+        assert!(key_can_occur("MIT", &text_tokens("forscht am MIT.")));
+        assert!(key_can_occur("bosch", &text_tokens("BOSCH liefert")));
+        // Exhaustive agreement over a corpus, using production match keys.
+        let names = ["MIT", "SAP", "Bild", "X9", "Nexovar GmbH", "Bosch", "ACME & Co."];
+        let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, None)).collect();
+        for text in [
+            "mit der Nexovar", "am MIT", "sap und SAP", "ein bild", "das Bild", "Wert x9", "Wert X9",
+            "NEXOVAR GMBH", "acme & co. liefert", "bosch", "",
+        ] {
+            let survived = collect_candidates(&candidates, text);
+            for name in names {
+                let mut only = HashMap::new();
+                only.insert(match_key(name), "PSEUDO".to_string());
+                let substitutes = apply_pseudonyms(text, &only) != text;
+                let passes = survived.contains_key(&lower_key(name));
+                assert_eq!(substitutes, passes, "{name:?} in {text:?}: matcher {substitutes}, prefilter {passes}");
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_prefers_the_cased_spelling_over_a_lowercase_artefact() {
+        let arrays = vec![mentions(&[("mit", "organization")]), mentions(&[("MIT", "organization")])];
+        let out = candidates_from_mentions_capped(&arrays, 2000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "MIT", "the lowercase variant would be dropped later and lose the entity");
+    }
 
     // ── request-side cloak cost ───────────────────────────────────────────
 
