@@ -85,6 +85,10 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/cloak/capabilities", get(capabilities))
+        .merge(super::llm_gateway_anthropic::router())
+        // Whitelist: every other /v1/* path is a clear 404, never a silent passthrough.
+        // Static routes above win over this wildcard; it only claims /v1/* paths.
+        .route("/v1/*rest", axum::routing::any(super::llm_gateway_anthropic::not_proxied))
 }
 
 /// Capability probe (no auth): which upstreams this gateway can cloak for.
@@ -485,10 +489,11 @@ async fn chat_completions_inner(
     // OpenAI is always a cloud egress (not tag based); Ollama keeps the tag rule.
     let is_cloud = upstream == Upstream::OpenAi || model_targets_cloud(&model);
     let cloak_on = is_cloud && !cloak_disabled(&headers);
+    let upstream_name = if upstream == Upstream::OpenAi { "OpenAI" } else { "Ollama" };
 
     // ── Transparent passthrough: local model, or cloud with cloak explicitly off.
     if !cloak_on {
-        return proxy_passthrough(body, stream, url, upstream_headers).await;
+        return proxy_passthrough(body, stream, url, upstream_headers, upstream_name).await;
     }
 
     // ── Cloak path (cloud model + toggle on) — FAIL CLOSED from here on. ──
@@ -541,9 +546,9 @@ async fn chat_completions_inner(
     };
 
     if stream {
-        proxy_stream_decloaked(out_bytes, cloak_session, url, upstream_headers).await
+        proxy_stream_decloaked(out_bytes, cloak_session, url, upstream_headers, upstream_name).await
     } else {
-        proxy_once_decloaked(out_bytes, cloak_session, url, upstream_headers).await
+        proxy_once_decloaked(out_bytes, cloak_session, url, upstream_headers, upstream_name).await
     }
 }
 
@@ -551,7 +556,7 @@ async fn chat_completions_inner(
 
 /// Byte-for-byte reverse proxy to Ollama. Streams the upstream body through
 /// unchanged; used for local models and for cloud+cloak-off.
-async fn proxy_passthrough(body: Bytes, stream: bool, url: String, upstream_headers: HeaderMap) -> Response {
+async fn proxy_passthrough(body: Bytes, stream: bool, url: String, upstream_headers: HeaderMap, upstream_name: &str) -> Response {
     let resp = match HTTP
         .post(url)
         .headers(upstream_headers)
@@ -560,7 +565,7 @@ async fn proxy_passthrough(body: Bytes, stream: bool, url: String, upstream_head
         .await
     {
         Ok(r) => r,
-        Err(e) => return upstream_unreachable(e),
+        Err(e) => return upstream_unreachable(upstream_name, e),
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -589,6 +594,7 @@ async fn proxy_stream_decloaked(
     session: privacy::CloakSession,
     url: String,
     upstream_headers: HeaderMap,
+    upstream_name: &str,
 ) -> Response {
     let resp = match HTTP
         .post(url)
@@ -598,7 +604,7 @@ async fn proxy_stream_decloaked(
         .await
     {
         Ok(r) => r,
-        Err(e) => return upstream_unreachable(e),
+        Err(e) => return upstream_unreachable(upstream_name, e),
     };
     if !resp.status().is_success() {
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -783,6 +789,7 @@ async fn proxy_once_decloaked(
     session: privacy::CloakSession,
     url: String,
     upstream_headers: HeaderMap,
+    upstream_name: &str,
 ) -> Response {
     let resp = match HTTP
         .post(url)
@@ -792,7 +799,7 @@ async fn proxy_once_decloaked(
         .await
     {
         Ok(r) => r,
-        Err(e) => return upstream_unreachable(e),
+        Err(e) => return upstream_unreachable(upstream_name, e),
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let relayed = relay_response_headers(resp.headers());
@@ -841,10 +848,15 @@ async fn proxy_once_decloaked(
     out
 }
 
-fn upstream_unreachable(e: reqwest::Error) -> Response {
+/// Message for an unreachable upstream; `name` is "Ollama" / "OpenAI" / "Anthropic".
+pub(super) fn upstream_unreachable_message(name: &str, e: &reqwest::Error) -> String {
+    format!("{name} upstream unreachable: {e}")
+}
+
+fn upstream_unreachable(name: &str, e: reqwest::Error) -> Response {
     (
         StatusCode::BAD_GATEWAY,
-        Json(json!({ "error": { "message": format!("Ollama upstream unreachable: {e}"), "type": "upstream_error" } })),
+        Json(json!({ "error": { "message": upstream_unreachable_message(name, &e), "type": "upstream_error" } })),
     )
         .into_response()
 }

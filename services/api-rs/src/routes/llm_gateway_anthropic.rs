@@ -10,18 +10,31 @@
 //! * non-stream: recursive de-cloak of a finished message.
 //!
 //! No reqwest/axum in the state machine so it stays fuzzable. The HTTP handlers
-//! come in a later task, hence the `dead_code` allowance.
-#![allow(dead_code)]
+//! (`POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`)
+//! live further down in this file.
 
 use std::collections::HashMap;
 
-use axum::{
-    body::Body,
-    http::{header, StatusCode},
-    response::Response,
-};
-use serde_json::{json, Value};
+use std::sync::Arc;
 
+use axum::{
+    body::{Body, Bytes},
+    extract::{RawQuery, State},
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
+    routing::{get, post},
+    Router,
+};
+use futures::StreamExt;
+use once_cell::sync::Lazy;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use super::llm_gateway::{
+    authenticate_gateway, cloak_disabled, cloak_namespace, forward_headers, has_upstream_credential,
+    relay_response_headers, upstream_base, upstream_unreachable_message, Upstream,
+};
+use crate::models::AppState;
 use crate::services::privacy;
 
 /// Anthropic error envelope with `application/json`.
@@ -138,6 +151,10 @@ enum BlockKind {
 
 pub(super) struct AnthropicSseDecloaker {
     session: privacy::CloakSession,
+    /// Same pseudonyms, but the original VALUES are JSON-string-escaped: used for
+    /// `input_json_delta` chunks, where the replacement lands INSIDE a JSON string
+    /// literal (an original containing `"` or `\` must not break the arguments).
+    json_session: privacy::CloakSession,
     line_buf: Vec<u8>,
     event_lines: Vec<String>,
     event_name: Option<String>,
@@ -149,8 +166,20 @@ pub(super) struct AnthropicSseDecloaker {
 
 impl AnthropicSseDecloaker {
     pub fn new(session: privacy::CloakSession) -> Self {
+        let json_session = privacy::CloakSession {
+            map: session
+                .map
+                .iter()
+                .map(|(k, v)| {
+                    let quoted = serde_json::to_string(v).unwrap_or_default();
+                    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
+                    (k.clone(), inner.to_string())
+                })
+                .collect(),
+        };
         Self {
             session,
+            json_session,
             line_buf: Vec::new(),
             event_lines: Vec::new(),
             event_name: None,
@@ -244,7 +273,8 @@ impl AnthropicSseDecloaker {
 
     fn flush_index(&mut self, index: u64) {
         if let (Some(kind), Some(mut buf)) = (self.kinds.get(&index).copied(), self.bufs.remove(&index)) {
-            let tail = privacy::decloak_stream_finish(&self.session, &mut buf);
+            let session = if kind == BlockKind::InputJson { &self.json_session } else { &self.session };
+            let tail = privacy::decloak_stream_finish(session, &mut buf);
             self.emit_tail(index, kind, tail);
         }
     }
@@ -302,7 +332,8 @@ impl AnthropicSseDecloaker {
                     self.emit_verbatim(&lines);
                     return;
                 };
-                let emitted = privacy::decloak_stream_chunk(&self.session, buf, &original);
+                let session = if field == "partial_json" { &self.json_session } else { &self.session };
+                let emitted = privacy::decloak_stream_chunk(session, buf, &original);
                 if emitted == original {
                     self.emit_verbatim(&lines);
                 } else {
@@ -314,7 +345,6 @@ impl AnthropicSseDecloaker {
             ("content_block_stop", Some(i)) => {
                 self.flush_index(i);
                 self.kinds.remove(&i);
-                self.bufs.remove(&i);
                 self.emit_verbatim(&lines);
             }
             ("message_stop", _) => {
@@ -358,6 +388,368 @@ pub(super) fn decloak_anthropic_message(session: &privacy::CloakSession, msg: &m
             _ => {}
         }
     }
+}
+
+// ── HTTP handlers ───────────────────────────────────────────────────────────
+
+/// Like `llm_gateway::HTTP`, but never follows redirects: a 3xx from the upstream
+/// must not carry `x-api-key` / `authorization` to another host.
+static HTTP_NOREDIRECT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client builds")
+});
+
+const UPSTREAM_NAME: &str = "Anthropic";
+
+/// 401 hint when no vendor credential travels with the request.
+const CREDENTIAL_HINT: &str =
+    "no upstream credential: send x-api-key or Authorization: Bearer sk-ant-... and the gctrl token in X-GCTRL-Token";
+
+/// Only these paths are proxied under /v1 (everything else is a 404, never a
+/// silent plaintext passthrough).
+const NOT_PROXIED_MESSAGE: &str =
+    "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models are proxied";
+
+fn messages_url(base: &str) -> String {
+    format!("{}/v1/messages", base.trim_end_matches('/'))
+}
+
+fn count_tokens_url(base: &str) -> String {
+    format!("{}/v1/messages/count_tokens", base.trim_end_matches('/'))
+}
+
+fn models_url(base: &str, query: Option<&str>) -> String {
+    let url = format!("{}/v1/models", base.trim_end_matches('/'));
+    match query.filter(|q| !q.is_empty()) {
+        Some(q) => format!("{url}?{q}"),
+        None => url,
+    }
+}
+
+pub(super) fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/models", get(models))
+}
+
+/// Auth + upstream credential + upstream base + the caller's provider header,
+/// in fail-closed order (nothing is sent upstream before all of it passes).
+struct Gate {
+    user_id: Uuid,
+    fwd: HeaderMap,
+    base: String,
+}
+
+async fn gate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Gate, Response> {
+    let provider = headers
+        .get("x-upstream-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !provider.is_empty() && provider != "anthropic" {
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("X-Upstream-Provider '{provider}' does not match this endpoint (anthropic)"),
+        ));
+    }
+    let Some(identity) = authenticate_gateway(state, headers).await else {
+        return Err(anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "missing or invalid gctrl token (send it in X-GCTRL-Token, or as `ApiKey <token>` / `Bearer <token>` in Authorization)",
+        ));
+    };
+    if !has_upstream_credential(headers, identity.consumed_authorization) {
+        return Err(anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", CREDENTIAL_HINT));
+    }
+    let base = match upstream_base(Upstream::Anthropic) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                format!("invalid upstream base: {e}"),
+            ))
+        }
+    };
+    Ok(Gate {
+        user_id: identity.claims.sub,
+        fwd: forward_headers(headers, Upstream::Anthropic, identity.consumed_authorization),
+        base,
+    })
+}
+
+/// Traced wrapper: one CHAIN span per gateway request, exported to Phoenix when
+/// enabled. Delegates so every early return of the inner handler is captured.
+async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    use tracing::Instrument;
+    let model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "gctrl.cloak_gateway",
+        "openinference.span.kind" = "CHAIN",
+        "llm.model_name" = %model,
+        "gctrl.cloaked" = !cloak_disabled(&headers),
+        "gctrl.upstream" = "anthropic",
+        "gctrl.route" = "/v1/messages",
+        "http.status_code" = tracing::field::Empty,
+    );
+    let resp = messages_inner(state, headers, body).instrument(span.clone()).await;
+    span.record("http.status_code", resp.status().as_u16());
+    resp
+}
+
+fn parse_body(body: &Bytes) -> Result<Value, Response> {
+    serde_json::from_slice(body)
+        .map_err(|e| anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("invalid JSON body: {e}")))
+}
+
+async fn messages_inner(state: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let g = match gate(&state, &headers).await {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let parsed = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let model = parsed.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let stream = parsed.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let url = messages_url(&g.base);
+
+    // Every request on this route is a cloud egress; the toggle is the only opt-out.
+    if cloak_disabled(&headers) {
+        return proxy_passthrough_anthropic(reqwest::Method::POST, url, g.fwd, Some(body)).await;
+    }
+    let (out_bytes, session) = match cloak_anthropic_request(&state, g.user_id, parsed, &model).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if stream {
+        proxy_stream_decloaked_anthropic(url, g.fwd, out_bytes, session).await
+    } else {
+        proxy_once_decloaked_anthropic(url, g.fwd, out_bytes, session).await
+    }
+}
+
+/// Token counting never produces text, so the response needs no de-cloaking; the
+/// request is cloaked all the same (it carries the full prompt to Anthropic).
+async fn count_tokens(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    count_tokens_inner(state, headers, body).await
+}
+
+async fn count_tokens_inner(state: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let g = match gate(&state, &headers).await {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let parsed = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let url = count_tokens_url(&g.base);
+    if cloak_disabled(&headers) {
+        return proxy_passthrough_anthropic(reqwest::Method::POST, url, g.fwd, Some(body)).await;
+    }
+    let model = parsed.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let (out_bytes, _session) = match cloak_anthropic_request(&state, g.user_id, parsed, &model).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    proxy_passthrough_anthropic(reqwest::Method::POST, url, g.fwd, Some(out_bytes)).await
+}
+
+/// Plain proxy for the model list (no prompt content): gctrl auth and an upstream
+/// credential are still required.
+async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    let g = match gate(&state, &headers).await {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    proxy_passthrough_anthropic(reqwest::Method::GET, models_url(&g.base, query.as_deref()), g.fwd, None).await
+}
+
+/// 404 for every other `/v1/*` path.
+pub(super) async fn not_proxied() -> Response {
+    anthropic_error(StatusCode::NOT_FOUND, "not_found_error", NOT_PROXIED_MESSAGE)
+}
+
+/// Cloak the request body. FAIL CLOSED: no owned compilation -> 422, any
+/// encode/length problem -> 500; plaintext is never returned as a fallback.
+async fn cloak_anthropic_request(
+    state: &Arc<AppState>,
+    user_id: Uuid,
+    mut body: Value,
+    model: &str,
+) -> Result<(Bytes, privacy::CloakSession), Response> {
+    let Some(namespace) = cloak_namespace(state, user_id).await else {
+        return Err(anthropic_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cloak_unavailable",
+            "cloaking required but this account owns no knowledge base to anchor the cloak map - create one, or send X-Anvil-Cloak: off to route plaintext.",
+        ));
+    };
+    let candidates = privacy::user_entity_candidates(&state.db, user_id).await;
+    let (slots, plain) = collect_anthropic_cloak_texts(&body);
+    let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
+    let (cloaked, session) = privacy::cloak_batch(&state.db, &[namespace], &candidates, &refs).await;
+    // write_anthropic_cloaked_texts zips: a short result would leave plaintext slots.
+    if cloaked.len() != slots.len() {
+        return Err(anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cloak_error",
+            "cloak result does not match the request texts",
+        ));
+    }
+    write_anthropic_cloaked_texts(&mut body, &slots, &cloaked);
+    tracing::debug!(
+        "llm_gateway_anthropic: cloaked {} entities for user {} (model {})",
+        session.map.len(),
+        user_id,
+        model
+    );
+    match serde_json::to_vec(&body) {
+        Ok(b) => Ok((Bytes::from(b), session)),
+        Err(e) => Err(anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cloak_error",
+            format!("cloak encode failed: {e}"),
+        )),
+    }
+}
+
+fn unreachable_response(e: reqwest::Error) -> Response {
+    anthropic_error(StatusCode::BAD_GATEWAY, "api_error", upstream_unreachable_message(UPSTREAM_NAME, &e))
+}
+
+/// Non-2xx from the upstream: status, relayed headers (content-type included) and
+/// the body bytes verbatim - never decoded.
+async fn relay_error(resp: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let relayed = relay_response_headers(resp.headers());
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let mut out = Response::builder().status(status);
+    for (n, v) in relayed {
+        out = out.header(n, v);
+    }
+    out.body(Body::from(bytes)).expect("relayed parts are valid")
+}
+
+/// Byte-for-byte proxy (cloak off, count_tokens, models): body streamed through.
+async fn proxy_passthrough_anthropic(
+    method: reqwest::Method,
+    url: String,
+    fwd: HeaderMap,
+    body: Option<Bytes>,
+) -> Response {
+    let mut req = HTTP_NOREDIRECT.request(method, url).headers(fwd);
+    if let Some(b) = body {
+        req = req.body(b);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return unreachable_response(e),
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let relayed = relay_response_headers(resp.headers());
+    let mut out = Response::builder().status(status);
+    for (n, v) in relayed {
+        out = out.header(n, v);
+    }
+    let upstream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+    out.body(Body::from_stream(upstream)).expect("relayed parts are valid")
+}
+
+/// Cloaked streaming: re-stream the SSE response through the decloaker.
+async fn proxy_stream_decloaked_anthropic(
+    url: String,
+    fwd: HeaderMap,
+    body: Bytes,
+    session: privacy::CloakSession,
+) -> Response {
+    let resp = match HTTP_NOREDIRECT.post(url).headers(fwd).body(body).send().await {
+        Ok(r) => r,
+        Err(e) => return unreachable_response(e),
+    };
+    if !resp.status().is_success() {
+        return relay_error(resp).await;
+    }
+    let relayed: Vec<_> = relay_response_headers(resp.headers())
+        .into_iter()
+        .filter(|(n, _)| n != "content-type")
+        .collect();
+
+    let out = async_stream::stream! {
+        let mut bytes = resp.bytes_stream();
+        let mut dec = AnthropicSseDecloaker::new(session);
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(b) => {
+                    let text = dec.feed(&b);
+                    if !text.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(text));
+                    }
+                }
+                Err(e) => {
+                    let ev = json!({"type": "error", "error": {"type": "api_error", "message": format!("stream: {e}")}});
+                    yield Ok(Bytes::from(format!("event: error\ndata: {ev}\n\n")));
+                    return;
+                }
+            }
+        }
+        let tail = dec.finish();
+        if !tail.is_empty() {
+            yield Ok(Bytes::from(tail));
+        }
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache");
+    for (n, v) in relayed {
+        builder = builder.header(n, v);
+    }
+    builder.body(Body::from_stream(out)).expect("relayed parts are valid")
+}
+
+/// Non-streaming cloak path: forward, de-cloak the finished message, re-serialize.
+async fn proxy_once_decloaked_anthropic(
+    url: String,
+    fwd: HeaderMap,
+    body: Bytes,
+    session: privacy::CloakSession,
+) -> Response {
+    let resp = match HTTP_NOREDIRECT.post(url).headers(fwd).body(body).send().await {
+        Ok(r) => r,
+        Err(e) => return unreachable_response(e),
+    };
+    if !resp.status().is_success() {
+        return relay_error(resp).await;
+    }
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let relayed = relay_response_headers(resp.headers());
+    let mut v: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", format!("upstream decode: {e}"));
+        }
+    };
+    decloak_anthropic_message(&session, &mut v);
+    let mut out = Response::builder().status(status).header("content-type", "application/json");
+    for (n, val) in relayed {
+        if n != "content-type" {
+            out = out.header(n, val);
+        }
+    }
+    out.body(Body::from(v.to_string())).expect("relayed parts are valid")
 }
 
 #[cfg(test)]
@@ -823,5 +1215,77 @@ mod tests {
         let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({"type": "error", "error": {"type": "cloak_unavailable", "message": "no compilation"}}));
+    }
+
+    // 19
+    #[test]
+    fn input_json_original_with_quote_and_backslash_stays_valid_json() {
+        let original = r#"Ada "Lovelace" \ Co"#;
+        let mut map = HashMap::new();
+        map.insert("Person-27".to_string(), original.to_string());
+        let input = start(0, "tool_use") + &pj(0, r#"{"p":"Per"#) + &pj(0, "son-") + &pj(0, r#"27"}"#) + &stop(0);
+        let out = run(privacy::CloakSession { map }, &[input.as_bytes()]);
+        let acc: String = parse_events(&out)
+            .iter()
+            .filter_map(|(_, d)| d["delta"]["partial_json"].as_str().map(str::to_string))
+            .collect();
+        let v: Value = serde_json::from_str(&acc).expect("accumulated partial_json must be valid JSON");
+        assert_eq!(v["p"], original);
+    }
+
+    // 20
+    #[test]
+    fn input_json_escaped_original_in_held_tail_is_flushed_valid() {
+        let original = r#"A "B" \ C"#;
+        let mut map = HashMap::new();
+        map.insert("Person-27".to_string(), original.to_string());
+        // stream ends right after the pseudonym: the replacement comes from the tail flush
+        let input = start(0, "tool_use") + &pj(0, r#"{"p":"Person-27"#) + &stop(0);
+        let out = run(privacy::CloakSession { map }, &[input.as_bytes()]);
+        let acc: String = parse_events(&out)
+            .iter()
+            .filter_map(|(_, d)| d["delta"]["partial_json"].as_str().map(str::to_string))
+            .collect();
+        let v: Value = serde_json::from_str(&format!("{acc}\"}}")).unwrap();
+        assert_eq!(v["p"], original);
+    }
+
+    // 21
+    #[test]
+    fn upstream_urls_join_cleanly() {
+        assert_eq!(messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(messages_url("http://x:1/"), "http://x:1/v1/messages");
+        assert_eq!(count_tokens_url("http://x:1/"), "http://x:1/v1/messages/count_tokens");
+        assert_eq!(models_url("http://x:1/", None), "http://x:1/v1/models");
+        assert_eq!(models_url("http://x:1", Some("")), "http://x:1/v1/models");
+        assert_eq!(models_url("http://x:1", Some("limit=5&after_id=a")), "http://x:1/v1/models?limit=5&after_id=a");
+    }
+
+    // 22
+    #[tokio::test]
+    async fn not_proxied_is_an_anthropic_404() {
+        let r = not_proxied().await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "error", "error": {"type": "not_found_error",
+                "message": "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models are proxied"}})
+        );
+    }
+
+    // 23
+    #[test]
+    fn credential_hint_names_both_headers() {
+        assert!(CREDENTIAL_HINT.contains("x-api-key or Authorization: Bearer sk-ant-"));
+        assert!(CREDENTIAL_HINT.contains("X-GCTRL-Token"));
+    }
+
+    // 24
+    #[test]
+    fn routers_build_without_route_conflicts() {
+        let _ = router();
+        let _ = super::super::llm_gateway::router();
     }
 }

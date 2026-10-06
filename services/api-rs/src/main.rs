@@ -182,7 +182,8 @@ fn build_router(state: Arc<models::AppState>) -> Router {
         // GET /api/internal/generation-credential — worker-to-api hop guarded by
         // X-Internal-Secret, not a user session (see routes::infra::public_router).
         .merge(routes::infra::public_router())
-        // Cloaking LLM gateway: OpenAI-compatible POST /v1/chat/completions. Mounted
+        // Cloaking LLM gateway: POST /v1/chat/completions (OpenAI-compatible) and
+        // POST /v1/messages (+ count_tokens, GET /v1/models; Anthropic). Mounted
         // OUTSIDE the auth middleware — it does its own auth so it can accept a gctrl
         // token sent as either `ApiKey <t>` or `Bearer <t>` (some OpenAI clients force
         // Bearer). See routes::llm_gateway.
