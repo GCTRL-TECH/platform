@@ -19,13 +19,29 @@
 //! localhost → `host.docker.internal` so the natural `http://localhost:11434`
 //! just works from inside Docker.
 //!
+//! ## Upstream selection
+//! `X-Upstream-Provider: anthropic|openai` (case-insensitive) picks the upstream;
+//! absent/empty = local Ollama, byte for byte today's behaviour. This module serves
+//! `POST /v1/chat/completions` for Ollama and OpenAI; Anthropic's `/v1/messages`
+//! lives in the sibling module `llm_gateway_anthropic`, which builds on the
+//! `pub(super)` items here (auth, upstream base, header allowlist, cloak helpers).
+//! Bases come from `ANTHROPIC_BASE` / `OPENAI_BASE` (official host pinned via
+//! `validate_llm_base`; dev escape hatch `GCTRL_CLOAK_UPSTREAM_UNPINNED=1`).
+//! `GET /v1/cloak/capabilities` (no auth) lists the supported upstreams.
+//!
 //! ## Auth
-//! `Authorization: ApiKey <gctrl-token>` (same scheme as the agent MCP endpoint)
-//! OR `Authorization: Bearer <gctrl-token>` — some OpenAI clients (pi's
-//! `--api-key`) force Bearer, so both prefixes are accepted and resolved against
-//! `api_keys` first, then tried as a JWT. Missing/invalid → 401. This route is
-//! mounted OUTSIDE the auth middleware so it can accept the Bearer-as-api-key
-//! shape (the shared middleware treats Bearer strictly as a JWT).
+//! Ollama route: `Authorization: ApiKey <gctrl-token>` OR `Authorization: Bearer
+//! <gctrl-token>` (pi's `--api-key` forces Bearer), resolved against `api_keys`
+//! first, then tried as a JWT. Missing/invalid -> 401. This route is mounted
+//! OUTSIDE the auth middleware so it can accept the Bearer-as-api-key shape (the
+//! shared middleware treats Bearer strictly as a JWT).
+//!
+//! Vendor upstreams (OpenAI/Anthropic): the caller's vendor credential travels in
+//! the STANDARD place (`x-api-key` or `Authorization: Bearer`) and is forwarded;
+//! the gctrl token goes in `X-GCTRL-Token` (optional `ApiKey `/`Bearer ` prefix).
+//! If `X-GCTRL-Token` is absent the gctrl token is read from `Authorization`
+//! (fallback) and that header is then NOT forwarded upstream. Only an ALLOWLIST
+//! of request headers reaches the upstream (see [`forward_headers`]).
 //!
 //! ## Cloak toggle
 //! `X-Anvil-Cloak: on|off` (default **on**). `off` forces transparent
@@ -45,7 +61,7 @@ use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use futures::StreamExt;
@@ -58,7 +74,7 @@ use crate::services::privacy;
 
 /// Reused across requests so the upstream Ollama connection is keep-alived and
 /// the proxy hop stays sub-millisecond (no fresh TCP/TLS per request).
-static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+pub(super) static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
@@ -66,7 +82,18 @@ static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
 });
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/cloak/capabilities", get(capabilities))
+}
+
+/// Capability probe (no auth): which upstreams this gateway can cloak for.
+/// Anvil polls it to decide what to offer; keep the list stable.
+async fn capabilities() -> Json<Value> {
+    Json(json!({
+        "upstreams": ["ollama", "anthropic", "openai"],
+        "version": crate::routes::update::current_version(),
+    }))
 }
 
 // ── Upstream resolution ──────────────────────────────────────────────────────
@@ -92,6 +119,117 @@ fn completions_url() -> String {
     format!("{}/v1/chat/completions", ollama_base().trim_end_matches('/'))
 }
 
+/// Which upstream a request is bound for (`X-Upstream-Provider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Upstream {
+    Ollama,
+    Anthropic,
+    OpenAi,
+}
+
+/// Read `x-upstream-provider`. Absent/empty -> Ollama; unknown -> 400.
+pub(super) fn upstream_from_headers(headers: &HeaderMap) -> Result<Upstream, Response> {
+    let raw = headers
+        .get("x-upstream-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match raw.as_str() {
+        "" => Ok(Upstream::Ollama),
+        "anthropic" => Ok(Upstream::Anthropic),
+        "openai" => Ok(Upstream::OpenAi),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai; omit for ollama)"), "type": "invalid_request_error" } })),
+        )
+            .into_response()),
+    }
+}
+
+/// Pure core of [`upstream_base`] (testable without env). `raw` is the env value;
+/// `unpinned` skips the official-host pin (dev only).
+pub(super) fn upstream_base_from(upstream: Upstream, raw: Option<&str>, unpinned: bool) -> Result<String, String> {
+    let (provider, default) = match upstream {
+        Upstream::Ollama => return Ok(ollama_base()),
+        Upstream::Anthropic => ("anthropic", "https://api.anthropic.com"),
+        Upstream::OpenAi => ("openai", "https://api.openai.com"),
+    };
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty());
+    if unpinned {
+        tracing::warn!("GCTRL_CLOAK_UPSTREAM_UNPINNED set: {provider} upstream base is NOT pinned to the official host");
+        return Ok(raw.unwrap_or(default).trim_end_matches('/').to_string());
+    }
+    let url = crate::services::llm::validate_llm_base(provider, raw)?;
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Resolve the upstream base URL from env (`ANTHROPIC_BASE` / `OPENAI_BASE`).
+/// An invalid base is an error (-> 500 api_error), never a silent fallback.
+pub(super) fn upstream_base(upstream: Upstream) -> Result<String, String> {
+    let var = match upstream {
+        Upstream::Ollama => return Ok(ollama_base()),
+        Upstream::Anthropic => "ANTHROPIC_BASE",
+        Upstream::OpenAi => "OPENAI_BASE",
+    };
+    let unpinned = std::env::var("GCTRL_CLOAK_UPSTREAM_UNPINNED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+        .unwrap_or(false);
+    upstream_base_from(upstream, std::env::var(var).ok().as_deref(), unpinned)
+}
+
+// ── Header allowlist ─────────────────────────────────────────────────────────
+
+/// Build the upstream request headers from the caller's. ALLOWLIST only: anything
+/// not listed (host, content-length, accept-encoding, hop-by-hop, cookie,
+/// x-forwarded-*, x-gctrl-token, x-anvil-cloak, x-upstream-provider, ...) is
+/// dropped. `authorization` is dropped when it carried the gctrl token.
+pub(super) fn forward_headers(incoming: &HeaderMap, upstream: Upstream, consumed_authorization: bool) -> HeaderMap {
+    const ALLOW: [&str; 8] = [
+        "x-api-key",
+        "authorization",
+        "anthropic-version",
+        "anthropic-beta",
+        "user-agent",
+        "x-app",
+        "anthropic-dangerous-direct-browser-access",
+        "accept",
+    ];
+    let mut out = HeaderMap::new();
+    for (name, value) in incoming.iter() {
+        let n = name.as_str();
+        if n == "authorization" && consumed_authorization {
+            continue;
+        }
+        if ALLOW.contains(&n) || n.starts_with("x-stainless-") {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+    if upstream == Upstream::Anthropic && !out.contains_key("anthropic-version") {
+        out.insert("anthropic-version", axum::http::HeaderValue::from_static("2023-06-01"));
+    }
+    out
+}
+
+/// Upstream response headers worth relaying to the caller.
+pub(super) fn relay_response_headers(
+    upstream: &reqwest::header::HeaderMap,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    upstream
+        .iter()
+        .filter(|(n, _)| {
+            let n = n.as_str();
+            matches!(n, "content-type" | "request-id" | "retry-after") || n.starts_with("anthropic-ratelimit-")
+        })
+        .filter_map(|(n, v)| {
+            Some((
+                axum::http::HeaderName::from_bytes(n.as_str().as_bytes()).ok()?,
+                axum::http::HeaderValue::from_bytes(v.as_bytes()).ok()?,
+            ))
+        })
+        .collect()
+}
+
 // ── Cloud-vs-local decision ──────────────────────────────────────────────────
 
 /// Does this model tag route OUT to a cloud provider (via Ollama's cloud
@@ -105,7 +243,7 @@ fn model_targets_cloud(model: &str) -> bool {
 
 /// Is the caller opting OUT of cloaking? `X-Anvil-Cloak: off|0|false` disables it;
 /// anything else (including absent) leaves the default ON.
-fn cloak_disabled(headers: &HeaderMap) -> bool {
+pub(super) fn cloak_disabled(headers: &HeaderMap) -> bool {
     headers
         .get("x-anvil-cloak")
         .or_else(|| headers.get("x-cloak"))
@@ -116,10 +254,10 @@ fn cloak_disabled(headers: &HeaderMap) -> bool {
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
-/// Resolve `Authorization` to a user. Accepts `ApiKey <t>` and `Bearer <t>`; the
-/// token is tried as a gctrl api-key first (hash lookup), then as a JWT. Returns
-/// `None` for missing/invalid/expired/inactive.
-async fn authenticate(
+/// Resolve `Authorization` to a user. Accepts `ApiKey <t>` and `Bearer <t>`;
+/// the token is handed to [`resolve_gctrl_token`]. Returns `None` for
+/// missing/invalid/expired/inactive.
+pub(super) async fn authenticate(
     state: &Arc<crate::models::AppState>,
     headers: &HeaderMap,
 ) -> Option<JwtClaims> {
@@ -129,7 +267,14 @@ async fn authenticate(
         .or_else(|| raw.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty())?;
+    resolve_gctrl_token(state, token).await
+}
 
+/// Resolve a bare gctrl token to a user: api-key hash lookup first, then JWT.
+pub(super) async fn resolve_gctrl_token(
+    state: &Arc<crate::models::AppState>,
+    token: &str,
+) -> Option<JwtClaims> {
     // 1. Try as a gctrl access token (the primary shape — same query the auth
     //    middleware uses). Inactive users / expired keys are filtered by the join.
     let hash = hex::encode(Sha256::digest(token.as_bytes()));
@@ -179,7 +324,7 @@ async fn authenticate(
 /// entity → the same pseudonym across turns and sessions of free chat (there is
 /// no per-conversation graph here). Returns `None` if the user owns no
 /// compilation — the caller then fails closed rather than send plaintext.
-async fn cloak_namespace(state: &Arc<crate::models::AppState>, user_id: uuid::Uuid) -> Option<uuid::Uuid> {
+pub(super) async fn cloak_namespace(state: &Arc<crate::models::AppState>, user_id: uuid::Uuid) -> Option<uuid::Uuid> {
     sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT id FROM compilations WHERE user_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1",
     )
@@ -188,6 +333,50 @@ async fn cloak_namespace(state: &Arc<crate::models::AppState>, user_id: uuid::Uu
     .await
     .ok()
     .flatten()
+}
+
+/// Who is calling, and whether their `Authorization` header was spent on the
+/// gctrl token (then it must NOT be forwarded as the vendor credential).
+pub(super) struct GatewayIdentity {
+    pub claims: JwtClaims,
+    pub consumed_authorization: bool,
+}
+
+/// Vendor-route auth: `X-GCTRL-Token` first (optional `ApiKey `/`Bearer ` prefix),
+/// else fall back to `Authorization` (consumed).
+pub(super) async fn authenticate_gateway(
+    state: &Arc<crate::models::AppState>,
+    headers: &HeaderMap,
+) -> Option<GatewayIdentity> {
+    let dedicated = headers
+        .get("x-gctrl-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if let Some(raw) = dedicated {
+        let token = raw
+            .strip_prefix("ApiKey ")
+            .or_else(|| raw.strip_prefix("Bearer "))
+            .map(str::trim)
+            .unwrap_or(raw);
+        let claims = resolve_gctrl_token(state, token).await?;
+        return Some(GatewayIdentity { claims, consumed_authorization: false });
+    }
+    let claims = authenticate(state, headers).await?;
+    Some(GatewayIdentity { claims, consumed_authorization: true })
+}
+
+/// Does the request carry a vendor credential for the upstream? Non-empty
+/// `x-api-key`, or an `authorization` header that was not spent on the gctrl token.
+pub(super) fn has_upstream_credential(headers: &HeaderMap, consumed_authorization: bool) -> bool {
+    let non_empty = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    non_empty("x-api-key") || (!consumed_authorization && non_empty("authorization"))
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
@@ -206,11 +395,14 @@ async fn chat_completions(
         .ok()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .unwrap_or_default();
-    let cloak_on = model_targets_cloud(&model) && !cloak_disabled(&headers);
+    let upstream = upstream_from_headers(&headers).unwrap_or(Upstream::Ollama);
+    let cloud = upstream == Upstream::OpenAi || model_targets_cloud(&model);
+    let cloak_on = cloud && !cloak_disabled(&headers);
     let span = tracing::info_span!(
         "gctrl.cloak_gateway",
         "openinference.span.kind" = "CHAIN",
         "llm.model_name" = %model,
+        "gctrl.upstream" = ?upstream,
         "gctrl.cloaked" = cloak_on,
         "http.status_code" = tracing::field::Empty,
     );
@@ -224,13 +416,56 @@ async fn chat_completions_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Auth (manual — this route is not behind the auth middleware).
-    let Some(claims) = authenticate(&state, &headers).await else {
+    let upstream = match upstream_from_headers(&headers) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    if upstream == Upstream::Anthropic {
         return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "use /v1/messages for anthropic", "type": "invalid_request_error" } })),
+        )
+            .into_response();
+    }
+    let unauthorized = || {
+        (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": { "message": "missing or invalid Authorization (use `ApiKey <token>` or `Bearer <token>`)", "type": "unauthorized" } })),
         )
-            .into_response();
+            .into_response()
+    };
+
+    // Auth (manual — this route is not behind the auth middleware).
+    let (claims, url, upstream_headers) = if upstream == Upstream::OpenAi {
+        let Some(identity) = authenticate_gateway(&state, &headers).await else {
+            return unauthorized();
+        };
+        if !has_upstream_credential(&headers, identity.consumed_authorization) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": { "message": "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token", "type": "unauthorized" } })),
+            )
+                .into_response();
+        }
+        let base = match upstream_base(upstream) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": { "message": format!("invalid upstream base: {e}"), "type": "api_error" } })),
+                )
+                    .into_response()
+            }
+        };
+        let fwd = forward_headers(&headers, upstream, identity.consumed_authorization);
+        (identity.claims, format!("{base}/v1/chat/completions"), fwd)
+    } else {
+        let Some(claims) = authenticate(&state, &headers).await else {
+            return unauthorized();
+        };
+        let mut fwd = HeaderMap::new();
+        fwd.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+        (claims, completions_url(), fwd)
     };
 
     // Parse the OpenAI body.
@@ -247,12 +482,13 @@ async fn chat_completions_inner(
 
     let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let stream = parsed.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let is_cloud = model_targets_cloud(&model);
+    // OpenAI is always a cloud egress (not tag based); Ollama keeps the tag rule.
+    let is_cloud = upstream == Upstream::OpenAi || model_targets_cloud(&model);
     let cloak_on = is_cloud && !cloak_disabled(&headers);
 
     // ── Transparent passthrough: local model, or cloud with cloak explicitly off.
     if !cloak_on {
-        return proxy_passthrough(body, stream).await;
+        return proxy_passthrough(body, stream, url, upstream_headers).await;
     }
 
     // ── Cloak path (cloud model + toggle on) — FAIL CLOSED from here on. ──
@@ -305,9 +541,9 @@ async fn chat_completions_inner(
     };
 
     if stream {
-        proxy_stream_decloaked(out_bytes, cloak_session).await
+        proxy_stream_decloaked(out_bytes, cloak_session, url, upstream_headers).await
     } else {
-        proxy_once_decloaked(out_bytes, cloak_session).await
+        proxy_once_decloaked(out_bytes, cloak_session, url, upstream_headers).await
     }
 }
 
@@ -315,10 +551,10 @@ async fn chat_completions_inner(
 
 /// Byte-for-byte reverse proxy to Ollama. Streams the upstream body through
 /// unchanged; used for local models and for cloud+cloak-off.
-async fn proxy_passthrough(body: Bytes, stream: bool) -> Response {
+async fn proxy_passthrough(body: Bytes, stream: bool, url: String, upstream_headers: HeaderMap) -> Response {
     let resp = match HTTP
-        .post(completions_url())
-        .header("content-type", "application/json")
+        .post(url)
+        .headers(upstream_headers)
         .body(body)
         .send()
         .await
@@ -328,19 +564,18 @@ async fn proxy_passthrough(body: Bytes, stream: bool) -> Response {
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| if stream { "text/event-stream".into() } else { "application/json".into() });
+    let relayed = relay_response_headers(resp.headers());
+    let has_content_type = relayed.iter().any(|(n, _)| n == "content-type");
 
     let upstream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
-    Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(Body::from_stream(upstream))
-        .unwrap()
+    let mut out = Response::builder().status(status);
+    if !has_content_type {
+        out = out.header("content-type", if stream { "text/event-stream" } else { "application/json" });
+    }
+    for (n, v) in relayed {
+        out = out.header(n, v);
+    }
+    out.body(Body::from_stream(upstream)).unwrap()
 }
 
 // ── Cloaked streaming ────────────────────────────────────────────────────────
@@ -349,10 +584,15 @@ async fn proxy_passthrough(body: Bytes, stream: bool) -> Response {
 /// de-cloaking each `choices[].delta.content` (streaming-safe across chunk
 /// boundaries) so the CALLER receives plaintext. The SSE envelope is preserved —
 /// only the delta text is rewritten.
-async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> Response {
+async fn proxy_stream_decloaked(
+    body: Bytes,
+    session: privacy::CloakSession,
+    url: String,
+    upstream_headers: HeaderMap,
+) -> Response {
     let resp = match HTTP
-        .post(completions_url())
-        .header("content-type", "application/json")
+        .post(url)
+        .headers(upstream_headers)
         .body(body)
         .send()
         .await
@@ -362,9 +602,18 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
     };
     if !resp.status().is_success() {
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let relayed = relay_response_headers(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        return (status, text).into_response();
+        let mut out = (status, text).into_response();
+        for (n, v) in relayed {
+            out.headers_mut().insert(n, v);
+        }
+        return out;
     }
+    let relayed: Vec<_> = relay_response_headers(resp.headers())
+        .into_iter()
+        .filter(|(n, _)| n != "content-type")
+        .collect();
 
     let out = async_stream::stream! {
         let mut bytes = resp.bytes_stream();
@@ -517,20 +766,27 @@ async fn proxy_stream_decloaked(body: Bytes, session: privacy::CloakSession) -> 
         }
     };
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(out))
-        .unwrap()
+        .header("cache-control", "no-cache");
+    for (n, v) in relayed {
+        builder = builder.header(n, v);
+    }
+    builder.body(Body::from_stream(out)).unwrap()
 }
 
 /// Non-streaming cloak path: forward, then de-cloak each choice's
 /// `message.content` in the full JSON response before returning it.
-async fn proxy_once_decloaked(body: Bytes, session: privacy::CloakSession) -> Response {
+async fn proxy_once_decloaked(
+    body: Bytes,
+    session: privacy::CloakSession,
+    url: String,
+    upstream_headers: HeaderMap,
+) -> Response {
     let resp = match HTTP
-        .post(completions_url())
-        .header("content-type", "application/json")
+        .post(url)
+        .headers(upstream_headers)
         .body(body)
         .send()
         .await
@@ -539,6 +795,7 @@ async fn proxy_once_decloaked(body: Bytes, session: privacy::CloakSession) -> Re
         Err(e) => return upstream_unreachable(e),
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let relayed = relay_response_headers(resp.headers());
     let mut v: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": { "message": format!("upstream decode: {e}"), "type": "upstream_error" } }))).into_response(),
@@ -575,7 +832,13 @@ async fn proxy_once_decloaked(body: Bytes, session: privacy::CloakSession) -> Re
             }
         }
     }
-    (status, Json(v)).into_response()
+    let mut out = (status, Json(v)).into_response();
+    for (n, v) in relayed {
+        if n != "content-type" {
+            out.headers_mut().insert(n, v);
+        }
+    }
+    out
 }
 
 fn upstream_unreachable(e: reqwest::Error) -> Response {
@@ -705,6 +968,88 @@ mod tests {
         assert!(cloak_disabled(&h));
         h.insert("x-anvil-cloak", HeaderValue::from_static("FALSE"));
         assert!(cloak_disabled(&h));
+    }
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn upstream_selection_from_header() {
+        assert_eq!(upstream_from_headers(&HeaderMap::new()).ok(), Some(Upstream::Ollama));
+        assert_eq!(upstream_from_headers(&hm(&[("x-upstream-provider", "")])).ok(), Some(Upstream::Ollama));
+        assert_eq!(upstream_from_headers(&hm(&[("x-upstream-provider", "anthropic")])).ok(), Some(Upstream::Anthropic));
+        assert_eq!(upstream_from_headers(&hm(&[("x-upstream-provider", "OPENAI")])).ok(), Some(Upstream::OpenAi));
+        let err = upstream_from_headers(&hm(&[("x-upstream-provider", "foo")])).err().expect("unknown -> Err");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn upstream_base_is_pinned_unless_unpinned() {
+        for (up, def) in [(Upstream::Anthropic, "https://api.anthropic.com"), (Upstream::OpenAi, "https://api.openai.com")] {
+            assert_eq!(upstream_base_from(up, None, false).unwrap(), def);
+            assert_eq!(upstream_base_from(up, Some(&format!("{def}/")), false).unwrap(), def);
+            assert!(upstream_base_from(up, Some("http://169.254.169.254"), false).is_err());
+            assert!(upstream_base_from(up, Some("https://evil.example"), false).is_err());
+            assert_eq!(upstream_base_from(up, Some("http://localhost:18434"), true).unwrap(), "http://localhost:18434");
+        }
+    }
+
+    #[test]
+    fn upstream_credential_detection() {
+        assert!(has_upstream_credential(&hm(&[("x-api-key", "sk-1")]), true));
+        assert!(has_upstream_credential(&hm(&[("authorization", "Bearer sk-1")]), false));
+        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer gctrl")]), true));
+        assert!(!has_upstream_credential(&hm(&[("x-api-key", "  ")]), false));
+        assert!(!has_upstream_credential(&HeaderMap::new(), false));
+    }
+
+    #[test]
+    fn forward_headers_is_an_allowlist() {
+        let incoming = hm(&[
+            ("x-gctrl-token", "t"), ("x-anvil-cloak", "on"), ("x-upstream-provider", "anthropic"),
+            ("host", "gw"), ("connection", "keep-alive"), ("cookie", "a=b"), ("content-length", "12"),
+            ("accept-encoding", "gzip"), ("x-forwarded-for", "1.2.3.4"), ("x-api-key", "sk-1"),
+            ("authorization", "Bearer sk-2"), ("anthropic-beta", "b1"), ("user-agent", "ua"),
+            ("x-app", "cli"), ("x-stainless-retry-count", "0"),
+        ]);
+        let out = forward_headers(&incoming, Upstream::Anthropic, false);
+        let mut names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["anthropic-beta", "anthropic-version", "authorization", "content-type", "user-agent", "x-api-key", "x-app", "x-stainless-retry-count"]
+        );
+        assert_eq!(out["anthropic-version"], "2023-06-01");
+
+        let consumed = forward_headers(&incoming, Upstream::Anthropic, true);
+        assert!(!consumed.contains_key("authorization"));
+        assert!(consumed.contains_key("x-api-key"));
+
+        let openai = forward_headers(&incoming, Upstream::OpenAi, false);
+        assert!(!openai.contains_key("anthropic-version"));
+
+        let own = forward_headers(&hm(&[("anthropic-version", "2024-01-01")]), Upstream::Anthropic, false);
+        assert_eq!(own["anthropic-version"], "2024-01-01");
+    }
+
+    #[test]
+    fn relay_response_headers_picks_only_known() {
+        let mut up = reqwest::header::HeaderMap::new();
+        for (k, v) in [
+            ("content-type", "application/json"), ("request-id", "r1"), ("retry-after", "3"),
+            ("anthropic-ratelimit-requests-remaining", "9"), ("set-cookie", "x=y"),
+            ("content-length", "5"), ("server", "cf"),
+        ] {
+            up.insert(reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), reqwest::header::HeaderValue::from_str(v).unwrap());
+        }
+        let mut names: Vec<String> = relay_response_headers(&up).into_iter().map(|(n, _)| n.to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["anthropic-ratelimit-requests-remaining", "content-type", "request-id", "retry-after"]);
     }
 
     #[test]
