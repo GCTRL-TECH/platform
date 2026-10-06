@@ -81,6 +81,41 @@ pub(super) static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("reqwest client builds")
 });
 
+/// Like [`HTTP`], but never follows redirects: a 3xx from a cloud upstream must
+/// not carry `x-api-key` / `authorization` to another host.
+pub(super) static HTTP_NOREDIRECT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client builds")
+});
+
+/// Cloud upstream (OpenAI) -> no-redirect client; Ollama keeps the plain one.
+fn client_for(upstream_name: &str) -> &'static reqwest::Client {
+    if upstream_name == "OpenAI" {
+        &HTTP_NOREDIRECT
+    } else {
+        &HTTP
+    }
+}
+
+/// Header marking an error response produced by the gateway itself (as opposed
+/// to an upstream error relayed verbatim).
+pub(super) const GATEWAY_ERROR_HEADER: &str = "x-cloak-gateway-error";
+
+/// Stamp [`GATEWAY_ERROR_HEADER`] on a gateway-generated response.
+pub(super) fn mark_gateway_error(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(GATEWAY_ERROR_HEADER, axum::http::HeaderValue::from_static("1"));
+    resp
+}
+
+/// OpenAI-style error JSON `{"error":{"message","type"}}` produced by the gateway.
+pub(super) fn gateway_error_json(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
+    mark_gateway_error((status, Json(json!({ "error": { "message": message.into(), "type": kind } }))).into_response())
+}
+
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -142,11 +177,11 @@ pub(super) fn upstream_from_headers(headers: &HeaderMap) -> Result<Upstream, Res
         "" => Ok(Upstream::Ollama),
         "anthropic" => Ok(Upstream::Anthropic),
         "openai" => Ok(Upstream::OpenAi),
-        other => Err((
+        other => Err(gateway_error_json(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "message": format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai; omit for ollama)"), "type": "invalid_request_error" } })),
-        )
-            .into_response()),
+            "invalid_request_error",
+            format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai; omit for ollama)"),
+        )),
     }
 }
 
@@ -160,7 +195,10 @@ pub(super) fn upstream_base_from(upstream: Upstream, raw: Option<&str>, unpinned
     };
     let raw = raw.map(str::trim).filter(|s| !s.is_empty());
     if unpinned {
-        tracing::warn!("GCTRL_CLOAK_UPSTREAM_UNPINNED set: {provider} upstream base is NOT pinned to the official host");
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!("GCTRL_CLOAK_UPSTREAM_UNPINNED set: {provider} upstream base is NOT pinned to the official host");
+        });
         return Ok(raw.unwrap_or(default).trim_end_matches('/').to_string());
     }
     let url = crate::services::llm::validate_llm_base(provider, raw)?;
@@ -183,6 +221,19 @@ pub(super) fn upstream_base(upstream: Upstream) -> Result<String, String> {
 
 // ── Header allowlist ─────────────────────────────────────────────────────────
 
+/// Is this credential header value really a gctrl token (a misconfigured caller
+/// put it into `x-api-key` / `Authorization`)? Optional `ApiKey ` / `Bearer ` prefix.
+fn is_gctrl_credential(value: &axum::http::HeaderValue) -> bool {
+    let Ok(raw) = value.to_str() else { return false };
+    let raw = raw.trim();
+    let bare = ["apikey ", "bearer "]
+        .iter()
+        .find(|p| raw.len() >= p.len() && raw.is_char_boundary(p.len()) && raw[..p.len()].eq_ignore_ascii_case(p))
+        .map(|p| &raw[p.len()..])
+        .unwrap_or(raw);
+    bare.trim_start().starts_with("gctrl_")
+}
+
 /// Build the upstream request headers from the caller's. ALLOWLIST only: anything
 /// not listed (host, content-length, accept-encoding, hop-by-hop, cookie,
 /// x-forwarded-*, x-gctrl-token, x-anvil-cloak, x-upstream-provider, ...) is
@@ -198,10 +249,25 @@ pub(super) fn forward_headers(incoming: &HeaderMap, upstream: Upstream, consumed
         "anthropic-dangerous-direct-browser-access",
         "accept",
     ];
+    // OpenAI takes ONLY `authorization` as credential; Anthropic-specific headers
+    // and `x-api-key` are never sent to it.
+    const ANTHROPIC_ONLY: [&str; 5] = [
+        "x-api-key",
+        "anthropic-version",
+        "anthropic-beta",
+        "anthropic-dangerous-direct-browser-access",
+        "x-app",
+    ];
     let mut out = HeaderMap::new();
     for (name, value) in incoming.iter() {
         let n = name.as_str();
         if n == "authorization" && consumed_authorization {
+            continue;
+        }
+        if upstream == Upstream::OpenAi && ANTHROPIC_ONLY.contains(&n) {
+            continue;
+        }
+        if (n == "authorization" || n == "x-api-key") && is_gctrl_credential(value) {
             continue;
         }
         if ALLOW.contains(&n) || n.starts_with("x-stainless-") {
@@ -372,15 +438,19 @@ pub(super) async fn authenticate_gateway(
 
 /// Does the request carry a vendor credential for the upstream? Non-empty
 /// `x-api-key`, or an `authorization` header that was not spent on the gctrl token.
-pub(super) fn has_upstream_credential(headers: &HeaderMap, consumed_authorization: bool) -> bool {
-    let non_empty = |name: &str| {
+/// OpenAI accepts only `authorization`. A gctrl token in either header is no credential.
+pub(super) fn has_upstream_credential(headers: &HeaderMap, upstream: Upstream, consumed_authorization: bool) -> bool {
+    let usable = |name: &str| {
         headers
             .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| !v.trim().is_empty())
+            .map(|v| v.to_str().map(|s| !s.trim().is_empty()).unwrap_or(false) && !is_gctrl_credential(v))
             .unwrap_or(false)
     };
-    non_empty("x-api-key") || (!consumed_authorization && non_empty("authorization"))
+    let auth = !consumed_authorization && usable("authorization");
+    match upstream {
+        Upstream::OpenAi => auth,
+        _ => usable("x-api-key") || auth,
+    }
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
@@ -425,18 +495,14 @@ async fn chat_completions_inner(
         Err(resp) => return resp,
     };
     if upstream == Upstream::Anthropic {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "message": "use /v1/messages for anthropic", "type": "invalid_request_error" } })),
-        )
-            .into_response();
+        return gateway_error_json(StatusCode::BAD_REQUEST, "invalid_request_error", "use /v1/messages for anthropic");
     }
     let unauthorized = || {
-        (
+        gateway_error_json(
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": { "message": "missing or invalid Authorization (use `ApiKey <token>` or `Bearer <token>`)", "type": "unauthorized" } })),
+            "unauthorized",
+            "missing or invalid Authorization (use `ApiKey <token>` or `Bearer <token>`)",
         )
-            .into_response()
     };
 
     // Auth (manual — this route is not behind the auth middleware).
@@ -444,21 +510,17 @@ async fn chat_completions_inner(
         let Some(identity) = authenticate_gateway(&state, &headers).await else {
             return unauthorized();
         };
-        if !has_upstream_credential(&headers, identity.consumed_authorization) {
-            return (
+        if !has_upstream_credential(&headers, upstream, identity.consumed_authorization) {
+            return gateway_error_json(
                 StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": { "message": "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token", "type": "unauthorized" } })),
-            )
-                .into_response();
+                "unauthorized",
+                "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token",
+            );
         }
         let base = match upstream_base(upstream) {
             Ok(b) => b,
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": { "message": format!("invalid upstream base: {e}"), "type": "api_error" } })),
-                )
-                    .into_response()
+                return gateway_error_json(StatusCode::INTERNAL_SERVER_ERROR, "api_error", format!("invalid upstream base: {e}"))
             }
         };
         let fwd = forward_headers(&headers, upstream, identity.consumed_authorization);
@@ -476,11 +538,7 @@ async fn chat_completions_inner(
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": { "message": format!("invalid JSON body: {e}"), "type": "invalid_request_error" } })),
-            )
-                .into_response()
+            return gateway_error_json(StatusCode::BAD_REQUEST, "invalid_request_error", format!("invalid JSON body: {e}"))
         }
     };
 
@@ -500,11 +558,11 @@ async fn chat_completions_inner(
     // Namespace to key the persistent pseudonym registry. No owned compilation →
     // we cannot durably/stably cloak → refuse (never forward plaintext to cloud).
     let Some(namespace) = cloak_namespace(&state, claims.sub).await else {
-        return (
+        return gateway_error_json(
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": { "message": "cloaking required for a cloud model but this account owns no knowledge base to anchor the cloak map — create one, or send X-Anvil-Cloak: off to route plaintext.", "type": "cloak_unavailable" } })),
-        )
-            .into_response();
+            "cloak_unavailable",
+            "cloaking required for a cloud model but this account owns no knowledge base to anchor the cloak map — create one, or send X-Anvil-Cloak: off to route plaintext.",
+        );
     };
 
     // Dictionary of the user's own extracted entities (+ PII regex fallback inside
@@ -537,11 +595,7 @@ async fn chat_completions_inner(
         Ok(b) => Bytes::from(b),
         // Serializing our own JSON should never fail; fail closed if it somehow does.
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": { "message": format!("cloak encode failed: {e}"), "type": "cloak_error" } })),
-            )
-                .into_response()
+            return gateway_error_json(StatusCode::INTERNAL_SERVER_ERROR, "cloak_error", format!("cloak encode failed: {e}"))
         }
     };
 
@@ -557,7 +611,7 @@ async fn chat_completions_inner(
 /// Byte-for-byte reverse proxy to Ollama. Streams the upstream body through
 /// unchanged; used for local models and for cloud+cloak-off.
 async fn proxy_passthrough(body: Bytes, stream: bool, url: String, upstream_headers: HeaderMap, upstream_name: &str) -> Response {
-    let resp = match HTTP
+    let resp = match client_for(upstream_name)
         .post(url)
         .headers(upstream_headers)
         .body(body)
@@ -585,6 +639,36 @@ async fn proxy_passthrough(body: Bytes, stream: bool, url: String, upstream_head
 
 // ── Cloaked streaming ────────────────────────────────────────────────────────
 
+/// Reassembles SSE lines from raw upstream bytes. Works on bytes so a TCP read
+/// boundary inside a multi-byte UTF-8 char loses nothing: only COMPLETE lines are
+/// decoded (lossily). Each returned line keeps its trailing `\n`.
+#[derive(Default)]
+pub(super) struct OpenAiSseLines {
+    buf: Vec<u8>,
+}
+
+impl OpenAiSseLines {
+    pub(super) fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let rest = self.buf.split_off(pos + 1);
+            let line = std::mem::replace(&mut self.buf, rest);
+            lines.push(String::from_utf8_lossy(&line).into_owned());
+        }
+        lines
+    }
+
+    /// EOF: the dangling partial line (no trailing newline), if any.
+    pub(super) fn finish(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned())
+        }
+    }
+}
+
 /// Forward the cloaked body with `stream:true` and re-stream the SSE response,
 /// de-cloaking each `choices[].delta.content` (streaming-safe across chunk
 /// boundaries) so the CALLER receives plaintext. The SSE envelope is preserved —
@@ -596,7 +680,7 @@ async fn proxy_stream_decloaked(
     upstream_headers: HeaderMap,
     upstream_name: &str,
 ) -> Response {
-    let resp = match HTTP
+    let resp = match client_for(upstream_name)
         .post(url)
         .headers(upstream_headers)
         .body(body)
@@ -623,7 +707,7 @@ async fn proxy_stream_decloaked(
 
     let out = async_stream::stream! {
         let mut bytes = resp.bytes_stream();
-        let mut line_buf = String::new();      // reassembles SSE lines across TCP chunks
+        let mut sse_lines = OpenAiSseLines::default(); // reassembles SSE lines across TCP chunks (bytes)
         let mut decloak_buf = String::new();   // holds partial pseudonyms across content deltas
         // Reasoning models stream their chain-of-thought as a SEPARATE delta field
         // (`reasoning`/`reasoning_content`/`thinking`) that quotes the cloaked
@@ -638,17 +722,16 @@ async fn proxy_stream_decloaked(
         // here — tool-call args are NEVER cloaked on the request side.
         let mut toolarg_bufs: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
 
-        while let Some(chunk) = bytes.next().await {
-            let chunk = match chunk {
-                Ok(b) => b,
-                Err(e) => { yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {{\"error\":\"stream: {e}\"}}\n\n"))); break; }
+        let mut eof = false;
+        while !eof {
+            let lines: Vec<String> = match bytes.next().await {
+                Some(Ok(b)) => sse_lines.feed(&b),
+                Some(Err(e)) => { yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {{\"error\":\"stream: {e}\"}}\n\n"))); break; }
+                None => { eof = true; sse_lines.finish().into_iter().collect() }
             };
-            let Ok(text) = std::str::from_utf8(&chunk) else { continue };
-            line_buf.push_str(text);
 
-            while let Some(nl) = line_buf.find('\n') {
-                // Keep the newline semantics: take the line incl. trailing \n.
-                let raw_line: String = line_buf.drain(..=nl).collect();
+            for raw_line in lines {
+                // Lines keep their trailing \n (verbatim passthrough needs it).
                 let line = raw_line.trim_end_matches(['\n', '\r']);
 
                 let Some(data) = line.strip_prefix("data:") else {
@@ -791,7 +874,7 @@ async fn proxy_once_decloaked(
     upstream_headers: HeaderMap,
     upstream_name: &str,
 ) -> Response {
-    let resp = match HTTP
+    let resp = match client_for(upstream_name)
         .post(url)
         .headers(upstream_headers)
         .body(body)
@@ -805,7 +888,7 @@ async fn proxy_once_decloaked(
     let relayed = relay_response_headers(resp.headers());
     let mut v: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": { "message": format!("upstream decode: {e}"), "type": "upstream_error" } }))).into_response(),
+        Err(e) => return gateway_error_json(StatusCode::BAD_GATEWAY, "upstream_error", format!("upstream decode: {e}")),
     };
     if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
         for choice in choices.iter_mut() {
@@ -854,11 +937,7 @@ pub(super) fn upstream_unreachable_message(name: &str, e: &reqwest::Error) -> St
 }
 
 fn upstream_unreachable(name: &str, e: reqwest::Error) -> Response {
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({ "error": { "message": upstream_unreachable_message(name, &e), "type": "upstream_error" } })),
-    )
-        .into_response()
+    gateway_error_json(StatusCode::BAD_GATEWAY, "upstream_error", upstream_unreachable_message(name, &e))
 }
 
 /// Where a cloakable text sits inside `messages`: the message index and, for the
@@ -1013,11 +1092,115 @@ mod tests {
 
     #[test]
     fn upstream_credential_detection() {
-        assert!(has_upstream_credential(&hm(&[("x-api-key", "sk-1")]), true));
-        assert!(has_upstream_credential(&hm(&[("authorization", "Bearer sk-1")]), false));
-        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer gctrl")]), true));
-        assert!(!has_upstream_credential(&hm(&[("x-api-key", "  ")]), false));
-        assert!(!has_upstream_credential(&HeaderMap::new(), false));
+        use Upstream::{Anthropic, OpenAi};
+        assert!(has_upstream_credential(&hm(&[("x-api-key", "sk-1")]), Anthropic, true));
+        assert!(has_upstream_credential(&hm(&[("authorization", "Bearer sk-1")]), Anthropic, false));
+        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer gctrl")]), Anthropic, true));
+        assert!(!has_upstream_credential(&hm(&[("x-api-key", "  ")]), Anthropic, false));
+        assert!(!has_upstream_credential(&HeaderMap::new(), Anthropic, false));
+        // OpenAI: only an unconsumed `authorization` counts; x-api-key does not.
+        assert!(has_upstream_credential(&hm(&[("authorization", "Bearer sk-1")]), OpenAi, false));
+        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer sk-1")]), OpenAi, true));
+        assert!(!has_upstream_credential(&hm(&[("x-api-key", "sk-1")]), OpenAi, false));
+        assert!(!has_upstream_credential(&hm(&[("x-api-key", "sk-1")]), OpenAi, true));
+        // A gctrl token in a credential header is no credential.
+        assert!(!has_upstream_credential(&hm(&[("x-api-key", "gctrl_abc")]), Anthropic, false));
+        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer gctrl_abc")]), OpenAi, false));
+    }
+
+    #[test]
+    fn gctrl_token_in_credential_header_is_never_forwarded() {
+        let incoming = hm(&[
+            ("x-api-key", "gctrl_secret"),
+            ("authorization", "Bearer gctrl_secret2"),
+            ("user-agent", "ua"),
+        ]);
+        for up in [Upstream::Anthropic, Upstream::OpenAi] {
+            let out = forward_headers(&incoming, up, false);
+            assert!(!out.contains_key("x-api-key"), "{up:?}");
+            assert!(!out.contains_key("authorization"), "{up:?}");
+            assert!(out.contains_key("user-agent"));
+        }
+        for v in ["ApiKey gctrl_x", "apikey gctrl_x", "Bearer gctrl_x", "gctrl_x", " Bearer  gctrl_x "] {
+            let out = forward_headers(&hm(&[("authorization", v)]), Upstream::Anthropic, false);
+            assert!(!out.contains_key("authorization"), "{v}");
+        }
+        // A real vendor key survives.
+        let out = forward_headers(&hm(&[("x-api-key", "sk-ant-1"), ("authorization", "Bearer sk-1")]), Upstream::Anthropic, false);
+        assert_eq!(out["x-api-key"], "sk-ant-1");
+        assert_eq!(out["authorization"], "Bearer sk-1");
+    }
+
+    #[test]
+    fn openai_forwards_only_authorization_as_credential() {
+        let incoming = hm(&[
+            ("x-api-key", "sk-ant-1"), ("authorization", "Bearer sk-oa"), ("anthropic-version", "2023-06-01"),
+            ("anthropic-beta", "b"), ("anthropic-dangerous-direct-browser-access", "true"), ("x-app", "cli"),
+            ("user-agent", "ua"), ("accept", "text/event-stream"), ("x-stainless-lang", "js"),
+        ]);
+        let out = forward_headers(&incoming, Upstream::OpenAi, false);
+        let mut names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["accept", "authorization", "content-type", "user-agent", "x-stainless-lang"]);
+        // Anthropic keeps its allowlist.
+        let a = forward_headers(&incoming, Upstream::Anthropic, false);
+        for k in ["x-api-key", "authorization", "anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access", "x-app"] {
+            assert!(a.contains_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn openai_sse_lines_survive_a_split_inside_a_multibyte_char() {
+        let line = "data: {\"choices\":[{\"delta\":{\"content\":\"Müller\"}}]}\n";
+        let bytes = line.as_bytes();
+        let split = line.find('ü').unwrap() + 1; // between the two bytes of ü
+        assert!(!line.is_char_boundary(split));
+        let mut l = OpenAiSseLines::default();
+        assert!(l.feed(&bytes[..split]).is_empty());
+        let got = l.feed(&bytes[split..]);
+        assert_eq!(got, vec![line.to_string()]);
+        assert!(l.finish().is_none());
+        // Multiple lines in one chunk + dangling tail at EOF.
+        let mut l = OpenAiSseLines::default();
+        assert_eq!(l.feed(b"a\nb\nc"), vec!["a\n".to_string(), "b\n".to_string()]);
+        assert_eq!(l.finish().as_deref(), Some("c"));
+    }
+
+    #[tokio::test]
+    async fn gateway_error_json_is_marked_and_shaped() {
+        let r = gateway_error_json(StatusCode::UNPROCESSABLE_ENTITY, "cloak_unavailable", "nope");
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(r.headers()[GATEWAY_ERROR_HEADER], "1");
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({ "error": { "message": "nope", "type": "cloak_unavailable" } }));
+    }
+
+    #[tokio::test]
+    async fn gateway_routes_without_state() {
+        use axum::routing::any;
+        use tower::util::ServiceExt;
+        // Same handlers/paths as `router()` (which needs an AppState with live
+        // Postgres/Neo4j/Redis handles); none of these two touch state.
+        let app: Router = Router::new()
+            .route("/v1/cloak/capabilities", get(capabilities))
+            .route("/v1/*rest", any(super::super::llm_gateway_anthropic::not_proxied));
+        let res = app
+            .clone()
+            .oneshot(axum::http::Request::builder().uri("/v1/cloak/capabilities").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai"]));
+        let res = app
+            .oneshot(axum::http::Request::builder().uri("/v1/does-not-exist").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(res.headers()[GATEWAY_ERROR_HEADER], "1");
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "not_found_error");
     }
 
     #[test]

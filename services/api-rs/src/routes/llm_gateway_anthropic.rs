@@ -26,25 +26,28 @@ use axum::{
     Router,
 };
 use futures::StreamExt;
-use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::llm_gateway::{
     authenticate_gateway, cloak_disabled, cloak_namespace, forward_headers, has_upstream_credential,
-    relay_response_headers, upstream_base, upstream_unreachable_message, Upstream,
+    mark_gateway_error, relay_response_headers, upstream_base, upstream_unreachable_message, Upstream,
+    HTTP_NOREDIRECT,
 };
 use crate::models::AppState;
 use crate::services::privacy;
 
-/// Anthropic error envelope with `application/json`.
+/// Anthropic error envelope with `application/json`, marked as produced by the
+/// gateway itself (`x-cloak-gateway-error: 1`; relayed upstream errors never carry it).
 pub(super) fn anthropic_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     let body = json!({"type": "error", "error": {"type": kind, "message": message.into()}});
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-        .expect("static response parts are valid")
+    mark_gateway_error(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("static response parts are valid"),
+    )
 }
 
 // ── request cloaker ─────────────────────────────────────────────────────────
@@ -57,20 +60,32 @@ pub(super) enum AnthropicSlot {
     MessageBlock(usize, usize),
 }
 
-/// The Claude Code identity block must reach Anthropic byte-identical.
+/// The Claude Code identity block must reach Anthropic byte-identical. Narrow on
+/// purpose: short (<= 300 chars trimmed) and only ever in `system` (see
+/// `cloakable_system`); a user message that happens to start like it is cloaked.
 pub(super) fn is_identity_block(text: &str) -> bool {
-    text.trim_start().starts_with("You are Claude Code")
+    let t = text.trim();
+    t.len() <= 300 && t.starts_with("You are Claude Code")
 }
 
+/// Message content: every non-empty text is cloaked.
 fn cloakable(text: &str) -> bool {
+    !text.is_empty()
+}
+
+/// `system` text: cloaked unless it is the Claude Code identity block.
+fn cloakable_system(text: &str) -> bool {
     !text.is_empty() && !is_identity_block(text)
 }
 
-fn text_block_text(block: &Value) -> Option<&str> {
+fn text_block_text(block: &Value, system: bool) -> Option<&str> {
     if block.get("type").and_then(Value::as_str) != Some("text") {
         return None;
     }
-    block.get("text").and_then(Value::as_str).filter(|t| cloakable(t))
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|t| if system { cloakable_system(t) } else { cloakable(t) })
 }
 
 /// Walk the request in order and return every cloakable text with its slot.
@@ -78,13 +93,13 @@ pub(super) fn collect_anthropic_cloak_texts(body: &Value) -> (Vec<AnthropicSlot>
     let mut slots = Vec::new();
     let mut texts = Vec::new();
     match body.get("system") {
-        Some(Value::String(s)) if cloakable(s) => {
+        Some(Value::String(s)) if cloakable_system(s) => {
             slots.push(AnthropicSlot::SystemString);
             texts.push(s.clone());
         }
         Some(Value::Array(blocks)) => {
             for (i, b) in blocks.iter().enumerate() {
-                if let Some(t) = text_block_text(b) {
+                if let Some(t) = text_block_text(b, true) {
                     slots.push(AnthropicSlot::SystemBlock(i));
                     texts.push(t.to_string());
                 }
@@ -101,7 +116,7 @@ pub(super) fn collect_anthropic_cloak_texts(body: &Value) -> (Vec<AnthropicSlot>
                 }
                 Some(Value::Array(blocks)) => {
                     for (j, b) in blocks.iter().enumerate() {
-                        if let Some(t) = text_block_text(b) {
+                        if let Some(t) = text_block_text(b, false) {
                             slots.push(AnthropicSlot::MessageBlock(i, j));
                             texts.push(t.to_string());
                         }
@@ -319,6 +334,9 @@ impl AnthropicSseDecloaker {
                 self.emit_verbatim(&lines);
             }
             ("content_block_delta", Some(i)) => {
+                // Only text_delta / input_json_delta are decloaked. Other delta
+                // kinds (e.g. citations_delta) and server_tool_use input reach the
+                // client still pseudonymised: cosmetic only, never a cloud leak.
                 let field = match json.pointer("/delta/type").and_then(Value::as_str) {
                     Some("text_delta") => "text",
                     Some("input_json_delta") => "partial_json",
@@ -392,16 +410,6 @@ pub(super) fn decloak_anthropic_message(session: &privacy::CloakSession, msg: &m
 
 // ── HTTP handlers ───────────────────────────────────────────────────────────
 
-/// Like `llm_gateway::HTTP`, but never follows redirects: a 3xx from the upstream
-/// must not carry `x-api-key` / `authorization` to another host.
-static HTTP_NOREDIRECT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("reqwest client builds")
-});
-
 const UPSTREAM_NAME: &str = "Anthropic";
 
 /// 401 hint when no vendor credential travels with the request.
@@ -464,7 +472,7 @@ async fn gate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Gate, Respon
             "missing or invalid gctrl token (send it in X-GCTRL-Token, or as `ApiKey <token>` / `Bearer <token>` in Authorization)",
         ));
     };
-    if !has_upstream_credential(headers, identity.consumed_authorization) {
+    if !has_upstream_credential(headers, Upstream::Anthropic, identity.consumed_authorization) {
         return Err(anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", CREDENTIAL_HINT));
     }
     let base = match upstream_base(Upstream::Anthropic) {
@@ -668,6 +676,10 @@ async fn proxy_passthrough_anthropic(
 }
 
 /// Cloaked streaming: re-stream the SSE response through the decloaker.
+///
+/// On a mid-stream transport error the decloaker's held-back tail is deliberately
+/// DROPPED (not flushed): it may be a half-reversed pseudonym, and the client gets
+/// an `error` event instead of a truncated, possibly corrupted fragment.
 async fn proxy_stream_decloaked_anthropic(
     url: String,
     fwd: HeaderMap,
@@ -869,7 +881,7 @@ mod tests {
 
     // 2
     #[test]
-    fn identity_block_is_never_cloaked_in_any_position() {
+    fn identity_block_is_exempt_only_in_system_and_only_when_short() {
         let ident = "  You are Claude Code, Anthropic's official CLI";
         let mut body = json!({
             "system": [
@@ -883,13 +895,22 @@ mod tests {
         });
         let before = body.clone();
         let (slots, texts) = collect_anthropic_cloak_texts(&body);
-        assert_eq!(texts, vec!["second system", "hi"]);
+        // System identity block exempt; the SAME text in messages is cloaked.
+        assert_eq!(texts, vec!["second system", "hi", ident, ident]);
         let cloaked: Vec<String> = texts.iter().map(|t| format!("C({t})")).collect();
         write_anthropic_cloaked_texts(&mut body, &slots, &cloaked);
         assert_eq!(body["system"][0], before["system"][0]);
-        assert_eq!(body["messages"][0]["content"][1], before["messages"][0]["content"][1]);
-        assert_eq!(body["messages"][1], before["messages"][1]);
         assert_eq!(body["system"][1]["text"], "C(second system)");
+        assert_eq!(body["messages"][0]["content"][1]["text"], format!("C({ident})"));
+        assert_eq!(body["messages"][1]["content"], format!("C({ident})"));
+        // String-form system identity is exempt too.
+        let (_, t) = collect_anthropic_cloak_texts(&json!({"system": "You are Claude Code, x"}));
+        assert!(t.is_empty());
+        // A long system text starting with the phrase is NOT exempt (smuggling guard).
+        let long = format!("You are Claude Code. {}", "secret ".repeat(60));
+        assert!(long.len() > 300);
+        let (_, t) = collect_anthropic_cloak_texts(&json!({"system": long.clone()}));
+        assert_eq!(t, vec![long]);
         assert!(is_identity_block("\n You are Claude Code"));
         assert!(!is_identity_block("Hello, You are Claude Code"));
     }
@@ -1212,6 +1233,7 @@ mod tests {
         let r = anthropic_error(StatusCode::UNPROCESSABLE_ENTITY, "cloak_unavailable", "no compilation");
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(r.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(r.headers()["x-cloak-gateway-error"], "1");
         let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({"type": "error", "error": {"type": "cloak_unavailable", "message": "no compilation"}}));

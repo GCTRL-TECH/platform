@@ -33,6 +33,11 @@ services:
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}
       - QDRANT_URL=http://qdrant:6333
       - OLLAMA_BASE=http://ollama:11434
+      # Cloak Gateway cloud upstreams (default: the official hosts, pinned).
+      # - ANTHROPIC_BASE=https://api.anthropic.com
+      # - OPENAI_BASE=https://api.openai.com
+      # Skips the official-host pin on those bases. Dev only, never in prod.
+      # - GCTRL_CLOAK_UPSTREAM_UNPINNED=1
       # OAuth Connectors (set in .env or override here)
       - GCTRL_BASE_URL=${GCTRL_BASE_URL:-http://localhost:4000}
       # Root under which server-side Obsidian folder vaults must live (read-only mount below).
