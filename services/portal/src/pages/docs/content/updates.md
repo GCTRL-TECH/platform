@@ -9,7 +9,17 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: e5051ed -->
+<!-- baseline-sha: 6f3f8c6 -->
+
+## v0.9.17 - The cloak gateway now covers Anthropic and OpenAI directly
+
+*6 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Claude and GPT requests are pseudonymized, too.** Until now the cloak gateway only protected cloud models that your local Ollama passes through (`:cloud` tags). Requests sent straight to `api.anthropic.com` or `api.openai.com` left the machine in plain text. The gateway now speaks Anthropic's Messages API at `POST /v1/messages` (streaming and non-streaming, `count_tokens`, `GET /v1/models`) and accepts an OpenAI upstream on `POST /v1/chat/completions`. Send your vendor key where the SDK puts it (`x-api-key` or `Authorization: Bearer`, Claude subscription tokens included), your GCTRL token in `X-GCTRL-Token`, and `X-Upstream-Provider: anthropic` or `openai`. Names, organizations, e-mail addresses, IBANs and phone numbers reach the vendor as stable pseudonyms; text and tool arguments in the reply are translated back before your client sees them. Thinking blocks, tool results, tool definitions and the Claude Code identity block are forwarded unchanged on purpose. Without the new headers everything behaves exactly as before.
+- **Clients can tell which upstreams a gateway offers.** `GET /v1/cloak/capabilities` answers `{"upstreams": ["ollama", "anthropic", "openai"]}` without authentication, so a client talking to an older gateway keeps its old routing. Errors produced by the gateway itself carry the response header `x-cloak-gateway-error: 1`, so a client can tell a gateway refusal from a relayed vendor error and will not blame your vendor key for it.
+- **Only vendor headers travel upstream.** The gateway forwards an allow-list of headers and drops everything else, including cookies, `accept-encoding` and the GCTRL token itself. Vendor hosts are pinned to `api.anthropic.com` and `api.openai.com`; redirects are never followed. Set `ANTHROPIC_BASE` or `OPENAI_BASE` on the api service only if you really run a mirror.
+- **Common words are no longer pseudonymized.** When an extracted entity equals a German or English function word (an organization named "MIT" turned every "mit" into `Org-259`), it stays untouched, and short acronyms of up to four letters now match case-sensitively: "MIT" is cloaked, "mit" is not. Longer names keep matching regardless of case.
+- **Streaming is safe across every byte boundary.** A chunk that was cut inside a multi-byte character (an umlaut, for example) could be dropped by the OpenAI-format stream parser. Lines are now reassembled at the byte level before they are decoded.
 
 ## v0.9.16.1 - The cloak gateway also covers agent turns
 
