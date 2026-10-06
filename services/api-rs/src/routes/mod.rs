@@ -21,6 +21,7 @@ pub mod agent;
 pub mod code_tools;
 pub mod agent_gateway;
 pub mod llm_gateway;
+pub mod llm_gateway_anthropic;
 pub mod skills;
 pub mod classification;
 pub mod audit;
