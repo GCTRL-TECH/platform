@@ -38,11 +38,14 @@
 //!     acronym is matched case-sensitively (next rule) and so can never hit the
 //!     preposition `mit`. Observed live 2026-10-06: the org entities "MIT"/"mit"
 //!     cloaked every German "mit" to `Org-259`.
-//!   - A single-token key of at most `CASE_SENSITIVE_MAX_CHARS` (4) alphanumeric
-//!     chars with an uppercase letter (`MIT`, `SAP`, `BMW`, `Bild`) matches
-//!     CASE-SENSITIVELY: `SAP` cloaks `SAP`, never `sap`.
-//!   - Every other key (longer or multi-word) matches case-insensitively, so the
-//!     user's own spelling variants (`nexovar gmbh`) are still caught.
+//!   - A single-token ALL-CAPS key of at most `CASE_SENSITIVE_MAX_CHARS` (4)
+//!     alphanumeric chars (`MIT`, `SAP`, `IBM`, `BMW`) matches CASE-SENSITIVELY:
+//!     `SAP` cloaks `SAP`, never `sap` or `Sap`.
+//!   - Every other key (Title-case or mixed short keys like `Audi`, longer or
+//!     multi-word keys) matches case-insensitively, so the user's own spelling
+//!     variants (`AUDI`, `nexovar gmbh`) are still caught.
+//!   - When the dictionary holds several spellings of one entity, the one with the
+//!     most uppercase letters wins (`MIT` over `Mit` over `mit`).
 //!   - The token pre-filter (`key_can_occur`) applies the same case rule, and
 //!     de-cloaking restores the exact surface form the request used.
 
@@ -290,9 +293,12 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
         }
         let entry = agg.entry(key).or_insert_with(|| (0, c.clone()));
         entry.0 += 1;
-        // A pure-lowercase variant ("mit") is dropped later as identifier-shaped; keeping it
-        // here would silently lose the real entity ("MIT"). Prefer a cased spelling.
-        if !entry.1.name.chars().any(char::is_uppercase) && c.name.chars().any(char::is_uppercase) {
+        // Keep the spelling with the MOST uppercase letters (ALL-CAPS > Title-case >
+        // lowercase; ties keep the first seen). A lowercase "mit" is dropped later as
+        // identifier-shaped and a Title-case "Mit"/"Sap" as a stop-word or a non-acronym;
+        // keeping either here would silently lose the real entity ("MIT", "SAP").
+        let uppers = |n: &str| n.chars().filter(|ch| ch.is_uppercase()).count();
+        if uppers(&c.name) > uppers(&entry.1.name) {
             entry.1 = c;
         }
     }
@@ -524,15 +530,16 @@ static STOP_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// Longest single-token key (in chars) that is matched case-sensitively.
 const CASE_SENSITIVE_MAX_CHARS: usize = 4;
 
-/// PURE: is `key` a short acronym-like token that must match CASE-SENSITIVELY? A single run
+/// PURE: is `key` a short ALL-CAPS acronym that must match CASE-SENSITIVELY? A single run
 /// of 1..=[`CASE_SENSITIVE_MAX_CHARS`] alphanumeric chars with at least one uppercase letter
-/// (`MIT`, `SAP`, `Bild`). Folded keys ([`lower_key`]) never qualify, so every longer or
-/// multi-word key keeps case-insensitive matching.
+/// and no lowercase letter (`MIT`, `SAP`, `IBM`, `X9`). Title-case or mixed short keys
+/// (`Audi`, `Bild`) and folded keys ([`lower_key`]) never qualify, so they and every longer
+/// or multi-word key keep case-insensitive matching.
 fn is_case_sensitive_key(key: &str) -> bool {
     let mut n = 0usize;
     let mut has_upper = false;
     for c in key.chars() {
-        if !c.is_alphanumeric() {
+        if !c.is_alphanumeric() || c.is_lowercase() {
             return false;
         }
         n += 1;
@@ -563,8 +570,7 @@ fn is_stop_word_entity(name: &str) -> bool {
     if !STOP_WORDS.contains(lower_key(t).as_str()) {
         return false;
     }
-    let all_caps = t.chars().any(char::is_uppercase) && !t.chars().any(char::is_lowercase);
-    !(all_caps && is_case_sensitive_key(t))
+    !is_case_sensitive_key(t)
 }
 
 /// PURE: fold a candidate dictionary into match keys once, dropping entries too
@@ -1546,8 +1552,9 @@ mod tests {
         assert_eq!(cloak_pure(&candidates, "ein sap im Baum").0, "ein sap im Baum");
         assert_eq!(cloak_pure(&candidates, "Ein Sap im Baum").0, "Ein Sap im Baum");
         assert_eq!(cloak_pure(&candidates, "BOSCH liefert").0, "Org-0 liefert");
-        assert!(is_case_sensitive_key("SAP") && is_case_sensitive_key("Bild") && is_case_sensitive_key("X9"));
+        assert!(is_case_sensitive_key("SAP") && is_case_sensitive_key("IBM") && is_case_sensitive_key("X9"));
         assert!(!is_case_sensitive_key("sap") && !is_case_sensitive_key("Bosch") && !is_case_sensitive_key("A B"));
+        assert!(!is_case_sensitive_key("Bild") && !is_case_sensitive_key("Audi") && !is_case_sensitive_key("SAPx"));
         assert_eq!(match_key("SAP"), "SAP");
         assert_eq!(match_key("Bosch"), "bosch");
     }
@@ -1582,6 +1589,36 @@ mod tests {
         let out = candidates_from_mentions_capped(&arrays, 2000);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "MIT", "the lowercase variant would be dropped later and lose the entity");
+    }
+
+    #[test]
+    fn dictionary_keeps_the_most_uppercase_spelling() {
+        let arrays = vec![mentions(&[("Mit", "organization")]), mentions(&[("MIT", "organization")])];
+        let out = candidates_from_mentions_capped(&arrays, 2000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "MIT", "a Title-case 'Mit' is a stop-word and would lose the acronym");
+        let arrays = vec![
+            mentions(&[("sap", "organization")]),
+            mentions(&[("Sap", "organization")]),
+            mentions(&[("SAP", "organization")]),
+        ];
+        let out = candidates_from_mentions_capped(&arrays, 2000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "SAP");
+    }
+
+    #[test]
+    fn title_case_short_keys_stay_case_insensitive() {
+        let candidates = vec![cand("Audi", Some("organization")), cand("SAP", Some("organization"))];
+        for text in ["Termin bei AUDI.", "Termin bei audi.", "Termin bei Audi."] {
+            let (cloaked, session) = cloak_pure(&candidates, text);
+            assert_eq!(cloaked, "Termin bei Org-0.", "{text:?}");
+            assert_eq!(decloak(&session, &cloaked), text);
+        }
+        assert_eq!(match_key("Audi"), "audi");
+        assert_eq!(cloak_pure(&candidates, "ein sap").0, "ein sap", "SAP stays case-sensitive");
+        assert!(key_can_occur("audi", &text_tokens("bei AUDI")));
+        assert!(!key_can_occur("SAP", &text_tokens("ein sap")));
     }
 
     // ── request-side cloak cost ───────────────────────────────────────────
