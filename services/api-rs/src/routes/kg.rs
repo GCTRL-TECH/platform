@@ -53,19 +53,23 @@ pub(crate) async fn clearance_rank_with_cap(db: &sqlx::PgPool, claims: &JwtClaim
     (effective, effective < db_rank)
 }
 
-/// KB-scope of the current request.
+/// The EXPLICITLY granted knowledge bases of the current request — the token's
+/// `api_key_grants` rows and nothing else.
 ///
-/// Returns `Some(set)` of the granted compilation ids when the request used a
-/// **KB-scoped** access token (`api_keys.kb_scoped = true`) — such a token may
-/// only ever read/write compilations in that set, regardless of base clearance.
-/// Returns `None` for JWT auth and for unscoped tokens (full owner access; grants
-/// merely raise clearance). The set may be empty (a scoped token with no grants
-/// can see nothing).
+/// Returns `Some(set)` when the request used a **KB-scoped** access token
+/// (`api_keys.kb_scoped = true`); `None` for JWT auth and for unscoped tokens
+/// (full owner access; grants merely raise clearance). The set may be empty (a
+/// scoped token with no grants can write nowhere).
+///
+/// This is the WRITE authority. Reads additionally honour the token's
+/// classification scope (`api_key_scope`, migration 089) — a class never grants
+/// writing, because "may read everything internal" must not become "may write
+/// into everything internal".
 ///
 /// Migration 078 - "Codebase access": a token with `code_access = false` never
 /// gets CODE compilations back here, so a granted code knowledge base is simply
 /// not part of its scope (invisible, not merely unreadable).
-pub(crate) async fn api_key_scope(
+pub(crate) async fn api_key_grant_scope(
     db: &sqlx::PgPool,
     claims: &JwtClaims,
 ) -> Option<std::collections::HashSet<Uuid>> {
@@ -85,6 +89,197 @@ pub(crate) async fn api_key_scope(
     let rows: Vec<(Uuid,)> = sqlx::query_as(sql)
         .bind(key_id).fetch_all(db).await.unwrap_or_default();
     Some(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// Wurzelordner der persoenlichen Ablage. Was darunter liegt, faellt NIE in einen
+/// Klassen-Scope: `Users/<localpart>/…` ist die persoenliche Wissensbasis eines
+/// Kollegen (Ablageregel, die Anvil beim Provisionieren setzt) und als solche
+/// nichts, was eine Freigabeklasse oeffnen darf — auch wenn sie, wie heute jede
+/// frisch angelegte, nur INTERNAL eingestuft ist.
+pub(crate) const PERSONAL_ROOT_FOLDER: &str = "Users";
+
+/// Einstufungs-Rang einer Wissensbasis: der explizite Level (auch ein eigener),
+/// sonst die Alt-Spalte `compilations.classification`.
+///
+/// Die Alt-Spalte ist der Normalfall — `classification_level_id` steht bei den
+/// allermeisten Graphen auf NULL, `classification` dagegen immer (Vorgabe
+/// INTERNAL). Ein unbekanntes Label zaehlt als HOECHSTE Stufe: eine Einstufung,
+/// die wir nicht kennen, darf keine Klasse oeffnen.
+pub(crate) fn classification_rank_of(level_rank: Option<i32>, legacy: &str) -> i32 {
+    if let Some(r) = level_rank { return r; }
+    match legacy {
+        "PUBLIC" => 0,
+        "INTERNAL" => 100,
+        "CONFIDENTIAL" => 200,
+        _ => 300,
+    }
+}
+
+/// Faellt diese Wissensbasis in die Freigabeklasse `class_rank`?
+///
+/// Zwei Bedingungen, beide fail-closed: sie liegt NICHT in der persoenlichen
+/// Ablage (`root_folder`, der WURZELordner ihres Ordnerpfads — ein Graph ohne
+/// Ordner kommt hier gar nicht erst an), und ihre Einstufung liegt hoechstens
+/// auf der Klasse. "Hoechstens" statt "genau", weil GCTRLs Freigabeleiter
+/// ueberall so laeuft (rank <= clearance): wer Intern sehen darf, sieht auch
+/// Oeffentlich.
+pub(crate) fn class_scope_admits(comp_rank: i32, root_folder: &str, class_rank: i32) -> bool {
+    root_folder != PERSONAL_ROOT_FOLDER && comp_rank <= class_rank
+}
+
+/// Die Wissensbasen, die dem Token ueber seine FREIGABEKLASSE offenstehen
+/// (Migration 089, `api_keys.class_scope_level_id`) — ohne Klasse `None`, und
+/// das kostet genau eine Abfrage, die jedes bestehende Token ohnehin macht.
+///
+/// Die Klasse ist eine Regel statt einer Aufzaehlung: sie trifft auch Graphen,
+/// die es beim Ausstellen des Tokens noch nicht gab. Sie ist nach oben durch die
+/// Freigabestufe des Tokens gedeckelt (`max_clearance_rank`) — ein Token mit
+/// Klasse "vertraulich", aber interner Freigabe, sieht nur Internes.
+pub(crate) async fn api_key_class_scope(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> Option<Vec<Uuid>> {
+    let key_id = claims.api_key_id?;
+    let row: Option<(Option<Uuid>, i32)> = sqlx::query_as(
+        "SELECT class_scope_level_id, max_clearance_rank FROM api_keys WHERE id = $1"
+    ).bind(key_id).fetch_optional(db).await.ok().flatten();
+    let (Some(level_id), key_rank) = row? else { return None; };
+    let level_rank: Option<i32> = sqlx::query_scalar(
+        "SELECT rank FROM classification_levels WHERE id = $1"
+    ).bind(level_id).fetch_optional(db).await.ok().flatten();
+    // Eine geloeschte Klasse oeffnet nichts (statt versehentlich alles).
+    let class_rank = level_rank?.min(key_rank);
+
+    // Ordnerwurzel je Graph: die Ablage entscheidet mit, nicht nur die Einstufung.
+    // Graphen OHNE Ordner sind nicht dabei (INNER JOIN) — ein unabgelegter Graph
+    // ist niemandem zugeordnet und soll nicht automatisch der Klasse zufallen.
+    let rows: Vec<(Uuid, Option<i32>, String, String)> = sqlx::query_as(
+        "WITH RECURSIVE roots AS (
+             SELECT id, name AS root_name FROM kg_folders
+              WHERE user_id = $1 AND parent_folder_id IS NULL
+             UNION ALL
+             SELECT f.id, r.root_name FROM kg_folders f
+               JOIN roots r ON f.parent_folder_id = r.id
+              WHERE f.user_id = $1
+         )
+         SELECT c.id, cl.rank, c.classification::text, r.root_name
+           FROM compilations c
+           JOIN roots r ON r.id = c.folder_id
+           LEFT JOIN classification_levels cl ON cl.id = c.classification_level_id
+          WHERE c.user_id = $1
+            AND ($2 OR c.type::text <> 'CODE')"
+    ).bind(claims.sub).bind(claims.code_access).fetch_all(db).await.unwrap_or_default();
+
+    Some(
+        rows.into_iter()
+            .filter(|(_, lvl, legacy, root)| {
+                class_scope_admits(classification_rank_of(*lvl, legacy), root, class_rank)
+            })
+            .map(|(id, _, _, _)| id)
+            .collect(),
+    )
+}
+
+/// READ-scope of the current request: die explizit gegranteten Wissensbasen
+/// PLUS die der Freigabeklasse (Migration 089).
+///
+/// Dieselbe Vertragslage wie bisher — `None` heisst "keine Beschraenkung" (JWT
+/// oder Voll-Token), `Some(leer)` heisst "sieht nichts". Jede Lesestelle, die
+/// frueher `api_key_scope` rief, ruft weiterhin diese Funktion und bekommt die
+/// Klasse automatisch mit; die SCHREIB-Stellen rufen `api_key_grant_scope`.
+pub(crate) async fn api_key_scope(
+    db: &sqlx::PgPool,
+    claims: &JwtClaims,
+) -> Option<std::collections::HashSet<Uuid>> {
+    let mut set = api_key_grant_scope(db, claims).await?;
+    if let Some(class_ids) = api_key_class_scope(db, claims).await {
+        set.extend(class_ids);
+    }
+    Some(set)
+}
+
+/// Die Freigabeklasse entscheidet ueber FREMDES Wissen — deshalb liegt ihre Regel in
+/// reinen Funktionen und wird hier festgenagelt. Zwei Dinge duerfen nie verrutschen:
+/// eine Klasse oeffnet nichts oberhalb ihrer Stufe, und sie oeffnet nie eine
+/// persoenliche Wissensbasis.
+#[cfg(test)]
+mod class_scope_tests {
+    use super::*;
+
+    const PUBLIC: i32 = 0;
+    const INTERNAL: i32 = 100;
+    const CONFIDENTIAL: i32 = 200;
+
+    #[test]
+    fn klasse_intern_sieht_intern_und_oeffentlich() {
+        assert!(class_scope_admits(INTERNAL, "Projects", INTERNAL));
+        assert!(class_scope_admits(PUBLIC, "Global", INTERNAL));
+    }
+
+    #[test]
+    fn klasse_intern_sieht_nie_vertraulich() {
+        assert!(!class_scope_admits(CONFIDENTIAL, "Projects", INTERNAL));
+        assert!(!class_scope_admits(300, "Global", INTERNAL));
+    }
+
+    #[test]
+    fn persoenliche_wissensbasen_bleiben_aussen_vor() {
+        // Auch OEFFENTLICH eingestuft und auch fuer die hoechste Klasse: was unter
+        // Users/ liegt, gehoert einem Kollegen persoenlich.
+        for class in [PUBLIC, INTERNAL, CONFIDENTIAL, 300] {
+            assert!(!class_scope_admits(PUBLIC, PERSONAL_ROOT_FOLDER, class),
+                "Users/ darf in keiner Klasse auftauchen (class={class})");
+        }
+    }
+
+    #[test]
+    fn unbekannte_einstufung_zaehlt_als_hoechste() {
+        assert_eq!(classification_rank_of(None, "RESTRICTED"), 300);
+        assert_eq!(classification_rank_of(None, "STRICTLY_CONFIDENTIAL"), 300);
+        assert_eq!(classification_rank_of(None, "irgendwas"), 300);
+        assert!(!class_scope_admits(classification_rank_of(None, "irgendwas"), "Projects", INTERNAL));
+    }
+
+    #[test]
+    fn alt_spalte_traegt_die_regel_wenn_kein_level_gesetzt_ist() {
+        // classification_level_id ist bei fast allen Graphen NULL — ohne die
+        // Alt-Spalte waere die Klasse entweder leer oder viel zu weit.
+        assert_eq!(classification_rank_of(None, "PUBLIC"), 0);
+        assert_eq!(classification_rank_of(None, "INTERNAL"), 100);
+        assert_eq!(classification_rank_of(None, "CONFIDENTIAL"), 200);
+    }
+
+    #[test]
+    fn eigener_level_schlaegt_die_alt_spalte() {
+        // Ein eigenes Level mit Rang 250 auf einer Zeile, die in der Alt-Spalte
+        // noch INTERNAL sagt: es zaehlt das Level.
+        assert_eq!(classification_rank_of(Some(250), "INTERNAL"), 250);
+        assert!(!class_scope_admits(classification_rank_of(Some(250), "INTERNAL"), "Projects", INTERNAL));
+    }
+
+    /// Waechter auf Quelltextebene: die SCHREIB-Tore duerfen nie auf den
+    /// Lese-Scope umgestellt werden. Sonst duerfte ein Token mit Klasse "intern"
+    /// in jede interne Wissensbasis des Kontos schreiben — auch in die, die es
+    /// nur sehen sollte.
+    #[test]
+    fn class_scope_never_widens_writes() {
+        let src = include_str!("kg.rs");
+        // Die Nadel wird zusammengesetzt, damit sie nicht als Ganzes im Quelltext
+        // steht - sonst faende `find` diesen Test statt der Funktion.
+        for name in ["enforce_kb_write_scope", "api_key_write_scope"] {
+            let needle = format!("pub(crate) async fn {name}(");
+            let start = src.find(&needle).unwrap_or_else(|| panic!("{name} nicht gefunden"));
+            let body = &src[start..];
+            let end = body.find("
+}
+").expect("Funktionsende nicht gefunden");
+            let body = &body[..end];
+            assert!(body.contains("api_key_grant_scope(db, claims)"),
+                "{name} muss den Grant-Scope benutzen");
+            assert!(!body.contains("api_key_scope(db, claims)"),
+                "{name} benutzt den Lese-Scope - die Freigabeklasse wuerde damit Schreibrechte geben");
+        }
+    }
 }
 
 /// The set of source-job ids a token may traverse in the graph. `None` = no
@@ -237,15 +432,20 @@ pub(crate) async fn api_key_read_only_grants(
     rows.into_iter().map(|(c,)| c).collect()
 }
 
-/// The knowledge bases this request may WRITE into: `api_key_scope` minus the
-/// read-only grants. Same `None` = unrestricted / `Some(empty)` = nothing contract.
-/// Used where a write has to pick a DEFAULT target (job linking, create_extraction):
-/// a read-only grant must never become the silent default of a store.
+/// The knowledge bases this request may WRITE into: the EXPLICIT grants
+/// (`api_key_grant_scope`) minus the read-only ones. Same `None` = unrestricted /
+/// `Some(empty)` = nothing contract. Used where a write has to pick a DEFAULT
+/// target (job linking, create_extraction): a read-only grant must never become
+/// the silent default of a store.
+///
+/// Bewusst NICHT `api_key_scope`: die Freigabeklasse (Migration 089) oeffnet nur
+/// das Lesen. Sonst waere die Vorgabe-Zielbasis eines Tokens plotzlich
+/// irgendeine fremde Wissensbasis derselben Klasse.
 pub(crate) async fn api_key_write_scope(
     db: &sqlx::PgPool,
     claims: &JwtClaims,
 ) -> Option<std::collections::HashSet<Uuid>> {
-    let mut set = api_key_scope(db, claims).await?;
+    let mut set = api_key_grant_scope(db, claims).await?;
     let ro = api_key_read_only_grants(db, claims).await;
     if !ro.is_empty() { set.retain(|c| !ro.contains(c)); }
     Some(set)
@@ -255,15 +455,20 @@ pub(crate) const READ_ONLY_GRANT_DENIED: &str =
     "This access token has read-only access to that knowledge base";
 
 /// Write-scope guard: a KB-scoped token may only WRITE into a compilation in its
-/// grant set, and (migration 088) no token may write into a compilation it holds
-/// a READ-ONLY grant on. JWT callers pass through (ownership is enforced at the
-/// SQL/tool layer as before). Returns Forbidden otherwise.
+/// EXPLICIT grant set, and (migration 088) no token may write into a compilation
+/// it holds a READ-ONLY grant on. JWT callers pass through (ownership is enforced
+/// at the SQL/tool layer as before). Returns Forbidden otherwise.
+///
+/// `api_key_grant_scope`, nicht `api_key_scope`: eine Freigabeklasse (Migration
+/// 089) erlaubt LESEN in ihrer Stufe, nie Schreiben. Wer in eine fremde
+/// Wissensbasis schreiben koennen soll, braucht weiterhin einen Grant darauf.
+/// Waechtertest: `class_scope_never_widens_writes`.
 pub(crate) async fn enforce_kb_write_scope(
     db: &sqlx::PgPool,
     claims: &JwtClaims,
     compilation_id: Uuid,
 ) -> Result<()> {
-    if let Some(set) = api_key_scope(db, claims).await {
+    if let Some(set) = api_key_grant_scope(db, claims).await {
         if !set.contains(&compilation_id) {
             return Err(AppError::Forbidden(
                 "This access token is not scoped to that knowledge base".into(),
@@ -621,6 +826,11 @@ async fn list_folders(
     // and a KB-scoped colleague token learned the size of graphs it may not see.
     let (clearance_rank, rank_capped) = clearance_rank_with_cap(&state.db, &claims).await;
     let scope = api_key_scope(&state.db, &claims).await;
+    // Freigabeklasse (Migration 089, $6): auch die Ordnerzaehlung muss die
+    // Wissensbasen der Klasse mitzaehlen, sonst zeigt der Ordner weniger Graphen
+    // an, als er dem Token wirklich oeffnet. (Keine SQL-Kommentare in dieser
+    // Abfrage: die Zeilenfortsetzung macht daraus EINE Zeile.)
+    let class_ids: Vec<Uuid> = api_key_class_scope(&state.db, &claims).await.unwrap_or_default();
     let visible: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT c.id, c.folder_id FROM compilations c \
          LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id \
@@ -631,10 +841,11 @@ async fn list_folders(
                            WHERE g.api_key_id = $4 AND g.compilation_id = c.id \
                              AND (g.granted_rank IS NULL \
                                   OR c.classification_level_id IS NULL \
-                                  OR g.granted_rank >= cl.rank))) \
+                                  OR g.granted_rank >= cl.rank)) \
+                OR c.id = ANY($6::uuid[])) \
            AND ($5 OR c.type::text <> 'CODE')"
     ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
-     .bind(claims.code_access)
+     .bind(claims.code_access).bind(&class_ids)
      .fetch_all(&state.db).await?;
     let mut direct: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
     for (id, fid) in visible {
@@ -995,8 +1206,11 @@ async fn list(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>> {
     let (clearance_rank, rank_capped) = clearance_rank_with_cap(&state.db, &claims).await;
-    // KB-scoped tokens see only their assigned knowledge base(s).
+    // KB-scoped tokens see only their assigned knowledge base(s) — plus die
+    // Wissensbasen ihrer Freigabeklasse (Migration 089), die hier als $10 auch in
+    // die Sicht-SQL muss, weil sie keinen expliziten Level tragen muessen.
     let scope = api_key_scope(&state.db, &claims).await;
+    let class_ids: Vec<Uuid> = api_key_class_scope(&state.db, &claims).await.unwrap_or_default();
     // Default 100 (was 20): every list consumer - folder view, FUSE picker, MCP
     // list_graphs - read the 20 newest and silently dropped the rest.
     let limit  = q.limit.unwrap_or(100).min(500);
@@ -1037,7 +1251,11 @@ async fn list(
                            WHERE g.api_key_id = $6 AND g.compilation_id = c.id
                              AND (g.granted_rank IS NULL
                                   OR c.classification_level_id IS NULL
-                                  OR g.granted_rank >= cl.rank)))
+                                  OR g.granted_rank >= cl.rank))
+                -- Freigabeklasse (089): ohne diese Zeile faellt eine Wissensbasis
+                -- der Klasse hier heraus, sobald das Token in seiner Freigabestufe
+                -- gedeckelt ist und sie keinen expliziten Level traegt.
+                OR c.id = ANY($11::uuid[]))
            -- Codebase access off (migration 078): CODE knowledge bases are invisible.
            AND ($7 OR c.type::text <> 'CODE')
            AND ($8::text IS NULL
@@ -1049,7 +1267,7 @@ async fn list(
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
      .bind(rank_capped).bind(claims.api_key_id).bind(claims.code_access)
      .bind(folder_filter.as_deref()).bind(type_filter.as_deref())
-     .bind(name_filter.as_deref())
+     .bind(name_filter.as_deref()).bind(&class_ids)
      .fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for

@@ -47,6 +47,14 @@ struct CreateKeyReq {
     /// CODE compilations and cannot write code knowledge.
     #[serde(rename = "codeAccess", default = "default_true")]
     code_access: bool,
+    /// Freigabeklasse (Migration 089): statt (oder zusaetzlich zu) einer festen
+    /// Liste traegt das Token eine Einstufung und erreicht damit LESEND jede
+    /// Wissensbasis des Kontos bis zu dieser Stufe — auch kuenftig angelegte.
+    /// Persoenliche Wissensbasen (`Users/...`) bleiben immer aussen vor, und
+    /// geschrieben wird weiterhin nur in explizit gegrantete (siehe kg.rs,
+    /// `api_key_class_scope`). None = wie bisher.
+    #[serde(rename = "classScopeLevelId", default)]
+    class_scope_level_id: Option<Uuid>,
 }
 
 /// serde default for `codeAccess` - absent means "on", so every existing client
@@ -119,6 +127,11 @@ struct UpdateKeyReq {
     #[serde(rename = "maxClearanceLevelId")] max_clearance_level_id: Option<Uuid>,
     /// Toggle the token's Codebase access after creation. `None` leaves it as is.
     #[serde(rename = "codeAccess")] code_access: Option<bool>,
+    /// Freigabeklasse setzen (Migration 089). `None` laesst sie, wie sie ist.
+    #[serde(rename = "classScopeLevelId")] class_scope_level_id: Option<Uuid>,
+    /// Freigabeklasse entfernen. Eigenes Feld, weil JSON hier nicht zwischen
+    /// "nicht mitgeschickt" und "null" unterscheidet.
+    #[serde(rename = "clearClassScope", default)] clear_class_scope: bool,
 }
 
 #[derive(Serialize)]
@@ -177,15 +190,18 @@ async fn list_keys(
     State(state): State<Arc<crate::models::AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool, bool, bool)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, i32, Option<String>, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, bool, bool, bool, Option<Uuid>, Option<String>)>(
         // Hide auto-minted embed throwaways by default — this list is for tokens
         // the admin deliberately created for colleagues, not iframe embed keys.
         // `?includeEmbed=true` returns them (with an `embed` flag) so they can be
         // audited + revoked.
-        "SELECT id, name, key_prefix, max_clearance_rank, max_clearance_level, max_clearance_level_id,
-                last_used_at, expires_at, created_at, kb_scoped, read_only, embed, code_access
-         FROM api_keys WHERE user_id = $1 AND (embed = false OR $2)
-         ORDER BY created_at DESC"
+        "SELECT k.id, k.name, k.key_prefix, k.max_clearance_rank, k.max_clearance_level, k.max_clearance_level_id,
+                k.last_used_at, k.expires_at, k.created_at, k.kb_scoped, k.read_only, k.embed, k.code_access,
+                k.class_scope_level_id, cs.display_name
+         FROM api_keys k
+         LEFT JOIN classification_levels cs ON cs.id = k.class_scope_level_id
+         WHERE k.user_id = $1 AND (k.embed = false OR $2)
+         ORDER BY k.created_at DESC"
     )
     .bind(claims.sub)
     .bind(q.include_embed)
@@ -194,7 +210,7 @@ async fn list_keys(
     let key_ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     let mut grants = grants_for_keys(&state.db, &key_ids).await;
 
-    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only, embed, code_access)| {
+    let keys: Vec<Value> = rows.into_iter().map(|(id, name, prefix, rank, level, level_id, used, exp, created, kb_scoped, read_only, embed, code_access, class_level_id, class_level_name)| {
         json!({
             "id": id,
             "name": name,
@@ -209,6 +225,8 @@ async fn list_keys(
             "readOnly": read_only,
             "embed": embed,
             "codeAccess": code_access,
+            "classScopeLevelId": class_level_id,
+            "classScopeLevel": class_level_name,
             "grants": grants.remove(&id).unwrap_or_default(),
         })
     }).collect();
@@ -235,7 +253,24 @@ async fn create_key(
     // force kb_scoped so "limited" actually limits. Without this, an unscoped key
     // with grants could still list/read every other knowledge base at its base
     // clearance (grants would merely RAISE access instead of confining it).
-    let kb_scoped = req.kb_scoped || !req.grants.is_empty();
+    //
+    // Eine Freigabeklasse (089) zaehlt genauso: sie beschreibt, WELCHE fremden
+    // Wissensbasen das Token sehen darf — auf einem unbeschraenkten Token waere
+    // das keine Grenze, sondern nur Zierde.
+    let kb_scoped = req.kb_scoped || !req.grants.is_empty() || req.class_scope_level_id.is_some();
+
+    // Die Klasse muss es geben und dem Konto gehoeren (System-Level oder eigenes).
+    // Sonst haette ein Tippfehler in der Id ein Token ohne jede Klasse erzeugt,
+    // das die Oberflaeche trotzdem als "sieht alles Interne" anzeigt.
+    if let Some(cls) = req.class_scope_level_id {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM classification_levels
+              WHERE id = $1 AND (user_id IS NULL OR user_id = $2))"
+        ).bind(cls).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(false);
+        if !exists {
+            return Err(AppError::BadRequest("classScopeLevelId is not a classification level of this account".into()));
+        }
+    }
 
     // ── Packaging boundary: scoped tokens are a Business feature ──────────────
     // Free is "one full-access token for yourself"; issuing SCOPED tokens to
@@ -260,7 +295,9 @@ async fn create_key(
     // graph is a view, not a colleague seat. Decided by REAL capabilities, never
     // the client-set `embed` flag — otherwise a Free user could mint free
     // read-write or multi-graph scoped tokens just by setting embed:true.
-    let is_graph_embed = req.read_only && req.grants.len() == 1;
+    // Eine Freigabeklasse ist nie ein Embed: sie oeffnet eine ganze Stufe, nicht
+    // genau einen Graphen.
+    let is_graph_embed = req.read_only && req.grants.len() == 1 && req.class_scope_level_id.is_none();
     if kb_scoped && !is_graph_embed {
         let tier: Option<String> = sqlx::query_scalar(
             "SELECT tier FROM licenses
@@ -304,8 +341,8 @@ async fn create_key(
 
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys
-           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only, embed, code_access)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           (user_id, key_hash, key_prefix, name, max_clearance_rank, max_clearance_level, max_clearance_level_id, expires_at, kb_scoped, read_only, embed, code_access, class_scope_level_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          RETURNING id"
     )
     .bind(claims.sub)
@@ -320,6 +357,7 @@ async fn create_key(
     .bind(req.read_only)
     .bind(embed)
     .bind(req.code_access)
+    .bind(req.class_scope_level_id)
     .fetch_one(&state.db).await?;
 
     // Per-graph grants — only for compilations the caller actually owns.
@@ -347,6 +385,7 @@ async fn create_key(
         "kbScoped":         kb_scoped,
         "readOnly":         req.read_only,
         "codeAccess":       req.code_access,
+        "classScopeLevelId": req.class_scope_level_id,
         "grants":           grants_for_keys(&state.db, &[id]).await.remove(&id).unwrap_or_default(),
     })))
 }
@@ -383,13 +422,32 @@ async fn update_key(
             (None, None, None, false)
         };
 
+    // Dieselbe Pruefung wie beim Anlegen: eine Klasse, die dem Konto nicht gehoert,
+    // wird nicht gesetzt (sonst stuende auf dem Token eine Klasse, die niemand aufloest).
+    let class_scope = match req.class_scope_level_id {
+        Some(cls) => {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM classification_levels
+                  WHERE id = $1 AND (user_id IS NULL OR user_id = $2))"
+            ).bind(cls).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(false);
+            if !exists {
+                return Err(AppError::BadRequest("classScopeLevelId is not a classification level of this account".into()));
+            }
+            Some(cls)
+        }
+        None => None,
+    };
+
     let rows = sqlx::query(
         "UPDATE api_keys SET
             name = COALESCE($1, name),
             max_clearance_rank = COALESCE($2, max_clearance_rank),
             max_clearance_level = COALESCE($3, max_clearance_level),
             max_clearance_level_id = CASE WHEN $4 THEN $5 ELSE max_clearance_level_id END,
-            code_access = COALESCE($6, code_access)
+            code_access = COALESCE($6, code_access),
+            class_scope_level_id = CASE WHEN $9 THEN NULL
+                                        ELSE COALESCE($10, class_scope_level_id) END,
+            kb_scoped = CASE WHEN $10::uuid IS NOT NULL THEN true ELSE kb_scoped END
           WHERE id = $7 AND user_id = $8"
     )
     .bind(req.name)
@@ -400,6 +458,8 @@ async fn update_key(
     .bind(req.code_access)
     .bind(id)
     .bind(claims.sub)
+    .bind(req.clear_class_scope)
+    .bind(class_scope)
     .execute(&state.db).await?.rows_affected();
     if rows == 0 { return Err(AppError::NotFound); }
     Ok(Json(json!({ "ok": true })))

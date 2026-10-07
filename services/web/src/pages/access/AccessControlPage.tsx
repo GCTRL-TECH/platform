@@ -26,10 +26,19 @@ interface ApiKey {
   kbScoped?: boolean
   /** Capability switch (server: api_keys.code_access). Undefined = on. */
   codeAccess?: boolean
+  /** Release class (server: api_keys.class_scope_level_id, migration 089): the token
+   *  additionally READS every non-personal knowledge base up to this classification,
+   *  including ones created later. Null = no class. */
+  classScopeLevelId?: string | null
+  classScopeLevel?: string | null
   grants: Grant[]
 }
 interface Level { id: string; name: string; display_name: string; rank: number; color: string; is_system?: boolean }
-interface Compilation { id: string; name: string; classification: string; type?: string }
+interface Compilation {
+  id: string; name: string; classification: string; type?: string
+  /** Where it is filed — the only thing that tells two same-named graphs apart. */
+  folderId?: string | null
+}
 
 const CLEARANCE_BADGE: Record<string, string> = {
   PUBLIC: 'badge-green', INTERNAL: 'badge-blue',
@@ -80,7 +89,11 @@ function TokensSection() {
   const qc = useQueryClient()
   const { data: keysData, isLoading } = useApiQuery<{ apiKeys: ApiKey[] }>(['users', 'api-keys'], '/users/api-keys')
   const { data: levelsData } = useApiQuery<{ levels: Level[] }>(['classification', 'levels'], '/classification/levels')
-  const { data: compsData } = useApiQuery<{ compilations: Compilation[] }>(['kg', 'compilations'], '/kg/compilations')
+  // limit=500: ohne Angabe liefert der Server die 100 neuesten - auf einer geteilten
+  // Instanz fehlen im Picker dann die aelteren Wissensbasen, ausgerechnet die
+  // etablierten. (500 ist die Obergrenze des Servers.)
+  const { data: compsData } = useApiQuery<{ compilations: Compilation[] }>(
+    ['kg', 'compilations', 'all'], '/kg/compilations?limit=500')
 
   const keys = keysData?.apiKeys ?? []
   const levels = (levelsData?.levels ?? []).slice().sort((a, b) => a.rank - b.rank)
@@ -95,6 +108,8 @@ function TokensSection() {
   const [grantRw, setGrantRw] = useState<Map<string, boolean>>(new Map())
   const [tokenSearch, setTokenSearch] = useState('')
   const [kbScoped, setKbScoped] = useState(false)
+  // Freigabeklasse (Migration 089): '' = keine.
+  const [classScopeLevelId, setClassScopeLevelId] = useState('')
   // Codebase access defaults ON - a new token behaves exactly like before.
   const [codeAccess, setCodeAccess] = useState(true)
   const [creating, setCreating] = useState(false)
@@ -103,19 +118,24 @@ function TokensSection() {
   const [copied, setCopied] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editLevelId, setEditLevelId] = useState('')
+  // Release class in the inline edit; '' = none (sent as clearClassScope).
+  const [editClassScopeId, setEditClassScopeId] = useState('')
 
   // Default selection = lowest-rank (most permissive) level once levels load.
   const defaultLevelId = levels[0]?.id ?? ''
 
   async function handleSaveEdit(id: string) {
-    await api.put(`/users/api-keys/${id}`, { maxClearanceLevelId: editLevelId || defaultLevelId })
+    await api.put(`/users/api-keys/${id}`, {
+      maxClearanceLevelId: editLevelId || defaultLevelId,
+      ...(editClassScopeId ? { classScopeLevelId: editClassScopeId } : { clearClassScope: true }),
+    })
     setEditingId(null)
     qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
   }
 
   function reset() {
     setName(''); setLevelId(''); setExpiryDays(null); setGrantIds(new Set()); setGrantRw(new Map()); setKbScoped(false)
-    setCodeAccess(true); setError(null)
+    setCodeAccess(true); setError(null); setClassScopeLevelId('')
   }
 
   async function handleCreate() {
@@ -133,8 +153,12 @@ function TokensSection() {
       // otherwise-full token anymore.
       const { data } = await api.post<{ key: string }>('/users/api-keys', {
         name: name.trim(), maxClearanceLevelId: levelId || defaultLevelId, expiresAt, grants,
-        kbScoped: kbScoped || grants.length > 0,
+        // A release class also makes the token a scoped one (the server enforces it):
+        // "sees everything internal" is a limit, and only means something on a
+        // token that is limited in the first place.
+        kbScoped: kbScoped || grants.length > 0 || classScopeLevelId !== '',
         codeAccess,
+        classScopeLevelId: classScopeLevelId || undefined,
       })
       setFreshKey(data.key)
       setShowForm(false); reset()
@@ -290,12 +314,34 @@ function TokensSection() {
             </span>
           </label>
 
+          {/* Release class - the rule-based half of the scope (migration 089).
+              An explicit list is a snapshot: a colleague with "internal" clearance saw
+              only the knowledge bases that existed when the token was minted. A class
+              keeps up: every graph classified at or below it, including future ones. */}
+          <div>
+            <label className="label">Release class (optional)</label>
+            <select value={classScopeLevelId} onChange={(e) => setClassScopeLevelId(e.target.value)}
+              className="input-field">
+              <option value="">No class - only the graphs selected below</option>
+              {levels.map((l) => (
+                <option key={l.id} value={l.id}>{l.display_name}{l.is_system === false ? ' (custom)' : ''}</option>
+              ))}
+            </select>
+            <p className="mt-1.5 text-[11px] text-slate-600">
+              In addition to the selection, this token READS every knowledge base of the account
+              classified at or below this class, including ones created later. Two limits always
+              hold: personal knowledge bases (folder <span className="font-mono text-slate-500">Users/…</span>)
+              are never included, and a class never grants writing - writing still needs a graph
+              selected below. The token's base clearance caps the class.
+            </p>
+          </div>
+
           <div>
             <label className="label">Knowledge bases this token may access (exclusive)</label>
             <p className="mb-2 text-[11px] text-slate-600">
               A token with a selection reaches ONLY the selected graphs (regardless of their
-              classification). Each selected knowledge base is readable; turn off Write to let the
-              token read it but never store into it.
+              classification) plus, if set, the release class above. Each selected knowledge base
+              is readable; turn off Write to let the token read it but never store into it.
             </p>
             <KbPicker
               mode="multi"
@@ -363,6 +409,12 @@ function TokensSection() {
                             className="rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-200 focus:border-indigo-500 focus:outline-none">
                             {levels.map((l) => <option key={l.id} value={l.id}>{l.display_name}{l.is_system === false ? ' (custom)' : ''}</option>)}
                           </select>
+                          <select value={editClassScopeId} onChange={(e) => setEditClassScopeId(e.target.value)}
+                            title="Release class: reads every non-personal knowledge base classified at or below it"
+                            className="rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-200 focus:border-indigo-500 focus:outline-none">
+                            <option value="">No class</option>
+                            {levels.map((l) => <option key={l.id} value={l.id}>Class {l.display_name}</option>)}
+                          </select>
                           <button onClick={() => void handleSaveEdit(k.id)} className="rounded p-0.5 text-emerald-400 hover:bg-slate-700"><Check size={12} /></button>
                           <button onClick={() => setEditingId(null)} className="rounded p-0.5 text-slate-500 hover:bg-slate-700"><X size={12} /></button>
                         </span>
@@ -380,11 +432,17 @@ function TokensSection() {
                               </span>
                             )
                           })()}
-                          <button onClick={() => { setEditingId(k.id); setEditLevelId(k.maxClearanceLevelId ?? '') }}
+                          <button onClick={() => { setEditingId(k.id); setEditLevelId(k.maxClearanceLevelId ?? ''); setEditClassScopeId(k.classScopeLevelId ?? '') }}
                             className="rounded p-0.5 text-slate-600 hover:bg-slate-700 hover:text-slate-300" title="Edit clearance">
                             <Pencil size={11} />
                           </button>
                         </>
+                      )}
+                      {k.classScopeLevel && (
+                        <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-emerald-300 ring-1 ring-emerald-500/30"
+                          title={`Release class: reads every non-personal knowledge base classified at or below ${k.classScopeLevel}, including future ones`}>
+                          Class {k.classScopeLevel}
+                        </span>
                       )}
                       {k.kbScoped && (
                         <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-violet-300 ring-1 ring-violet-500/30" title="Scoped to specific knowledge bases only">
@@ -415,7 +473,14 @@ function TokensSection() {
                     {/* Grants */}
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
                       <span className="text-[10px] uppercase tracking-wide text-slate-600">Graph access:</span>
-                      {k.grants.length === 0 && <span className="text-[11px] text-slate-600">base clearance only</span>}
+                      {k.grants.length === 0 && !k.classScopeLevel && (
+                        <span className="text-[11px] text-slate-600">base clearance only</span>
+                      )}
+                      {k.grants.length === 0 && k.classScopeLevel && (
+                        <span className="text-[11px] text-slate-600">
+                          read-only via class {k.classScopeLevel}, no writable graph
+                        </span>
+                      )}
                       {k.grants.map((g) => (
                         <span key={g.compilationId} className="inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300">
                           {g.source === 'manual' && (
