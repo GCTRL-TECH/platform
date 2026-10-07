@@ -105,7 +105,7 @@ services:
     restart: unless-stopped
     profiles: [bundled-fusion]
     environment:
-      - JAVA_OPTS=-Xmx2G
+      - JDK_JAVA_OPTIONS=-Xmx2G
     command: ["-s"]
     networks:
       - gctrl

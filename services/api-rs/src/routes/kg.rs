@@ -413,6 +413,10 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/node",                                 axum::routing::delete(delete_node))
         .route("/corrections",                          get(list_corrections))
         .route("/conflicts/:id/resolve",                post(resolve_fact_conflict))
+        .route("/merge-reviews/:id/resolve",            post(resolve_merge_review))
+        .route("/merge-rules",                          get(list_merge_rules).post(create_merge_rule))
+        .route("/merge-rules/:id/apply",                post(apply_merge_rule))
+        .route("/merge-rules/:id/retire",               post(retire_merge_rule))
         .route("/graph/search",                         get(graph_search))
         .route("/graph/entity/:name/neighbors",         get(entity_neighbors))
         .route("/graph/entity/:name/lineage",           get(entity_lineage))
@@ -1504,14 +1508,35 @@ async fn refresh(
     enforce_kb_write_scope(&state.db, &claims, id).await?;
     enforce_code_capability(&state.db, &claims, id).await?;
     sqlx::query("UPDATE users SET tokens_balance=tokens_balance-3 WHERE id=$1").bind(claims.sub).execute(&state.db).await?;
-    let source_ids: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT unnest(source_job_ids) FROM compilations WHERE id=$1").bind(id).fetch_all(&state.db).await?;
+    let job_id = enqueue_fuse_refresh(&state, claims.sub, id).await?;
+    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+}
+
+/// Queue a full re-merge of a compilation over its current source jobs (the
+/// refresh path). Used by the refresh endpoint, by a "not the same" merge-review
+/// answer and by the decision memory when it replays such an answer.
+pub(crate) async fn enqueue_fuse_refresh(
+    state: &crate::models::AppState,
+    user_id: Uuid,
+    compilation_id: Uuid,
+) -> Result<Uuid> {
+    let (source_ids, classification, name): (Vec<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids, '{}'::uuid[]), classification::text, name FROM compilations WHERE id=$1",
+    )
+        .bind(compilation_id).fetch_optional(&state.db).await?
+        .ok_or(AppError::NotFound)?;
     let job_id = Uuid::new_v4();
     sqlx::query("INSERT INTO jobs (id,user_id,type,status,input) VALUES ($1,$2,'fuse_merge','pending',$3)")
-        .bind(job_id).bind(claims.sub).bind(json!({ "compilationId": id, "sourceJobIds": source_ids }))
+        .bind(job_id).bind(user_id).bind(json!({ "compilationId": compilation_id, "sourceJobIds": source_ids, "name": name }))
         .execute(&state.db).await?;
-    crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({ "job_id": job_id, "compilation_id": id, "source_job_ids": source_ids }).to_string())
+    // The worker needs the same payload a fresh merge gets (routes::fuse):
+    // user, classification and name — a refresh used to send none of them.
+    crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({
+        "job_id": job_id, "compilation_id": compilation_id, "source_job_ids": source_ids,
+        "user_id": user_id, "classification": classification, "name": name,
+    }).to_string())
         .await.map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+    Ok(job_id)
 }
 
 // ── WIKI distillation ──────────────────────────────────────────────────────────
@@ -3776,6 +3801,467 @@ async fn resolve_fact_conflict(
     })))
 }
 
+#[derive(Deserialize)]
+struct ResolveMergeReviewReq {
+    /// "same" (keep the merge, confirmed), "not_same" (split: the pair never
+    /// merges again; the compilation is re-merged), or "dismiss" (no opinion).
+    action: String,
+    reason: Option<String>,
+}
+
+/// Pure: what a merge-review answer does to the row. Err = unknown action.
+pub(crate) fn decide_merge_review(action: &str) -> std::result::Result<(&'static str, Option<&'static str>), String> {
+    match action.trim() {
+        "same" => Ok(("resolved", Some("same"))),
+        "not_same" => Ok(("resolved", Some("not_same"))),
+        "dismiss" => Ok(("dismissed", None)),
+        other => Err(format!("unknown action '{other}' (same | not_same | dismiss)")),
+    }
+}
+
+/// POST /api/kg/merge-reviews/:id/resolve — answer one doubtful entity merge.
+/// The merge already happened; "same" confirms it, "not_same" records a
+/// cannot-link and queues a re-merge that splits the node, "dismiss" drops the
+/// card. Every answer feeds the decision memory. Same access policy as fact
+/// conflicts: the owner within the conflict visibility rule, or an admin session.
+async fn resolve_merge_review(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ResolveMergeReviewReq>,
+) -> Result<Json<Value>> {
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>, Vec<String>, Option<f32>, String)>(
+        "SELECT user_id, compilation_id, entity_a_type, methods, score, status
+         FROM review_queue WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let (owner, comp_id, entity_type, methods, score, status) = row;
+
+    let admin_session = claims.role == "admin" && claims.api_key_id.is_none();
+    if !(admin_session && owner != claims.sub) {
+        crate::routes::classification::conflict_access(&state.db, &claims, owner, comp_id).await?;
+    }
+    if status != "pending" {
+        return Err(AppError::BadRequest(format!("merge review is already {status}")));
+    }
+    let (new_status, decision) = decide_merge_review(&req.action).map_err(AppError::BadRequest)?;
+
+    sqlx::query(
+        "UPDATE review_queue
+         SET status = $1, decision = $2, decision_reason = $3, decided_by = $4,
+             decided_at = NOW(), updated_at = NOW()
+         WHERE id = $5 AND status = 'pending'",
+    )
+    .bind(new_status)
+    .bind(decision)
+    .bind(req.reason.as_deref())
+    .bind(claims.sub)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    let signature = crate::services::conflict_memory::entity_merge_signature(
+        entity_type.as_deref().unwrap_or(""),
+        methods.first().map(String::as_str).unwrap_or(""),
+        score.unwrap_or(0.0) as f64,
+    );
+    let chosen = crate::services::conflict_memory::entity_merge_choice(req.action.trim())
+        .unwrap_or_else(|| "dismiss".into());
+    crate::services::conflict_memory::record(
+        &state.db, "entity_merge", &signature, &chosen,
+        json!({ "entityType": entity_type, "methods": methods, "score": score }),
+        claims.sub, comp_id,
+    ).await;
+    crate::services::audit::log_access(&state.db, &claims, "kg.resolve_merge_review",
+        "merge_review", &id.to_string(), 0, None, true, None).await;
+
+    // A split only takes effect through a re-merge; queue it for the owner so
+    // the person clicks once and the graph follows.
+    let refresh_job = match (decision, comp_id) {
+        (Some("not_same"), Some(cid)) => Some(enqueue_fuse_refresh(&state, owner, cid).await?),
+        _ => None,
+    };
+
+    // Learning, stage A: enough answers for this type → propose the threshold
+    // that separates them best (a proposal, applied only by a click).
+    if decision.is_some() {
+        if let Some(t) = entity_type.as_deref() {
+            maybe_propose_learned_threshold(&state, owner, comp_id, t).await;
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "status": new_status,
+        "decision": decision,
+        "refreshJobId": refresh_job,
+    })))
+}
+
+// ── Merge rules (migration 097) ───────────────────────────────────────────────
+
+use crate::services::merge_rules::{self as rules, Rule};
+
+/// Reviews with a LIMES score needed before the threshold learner speaks.
+const LEARN_MIN_DECISIONS: usize = 10;
+/// A learned threshold must move at least this much to be worth a proposal.
+const LEARN_MIN_DELTA: f64 = 0.05;
+/// The floor the worker applies when no rule exists (short names).
+const DEFAULT_NAME_FLOOR: f64 = 0.40;
+
+#[derive(Deserialize)]
+struct MergeRulesQuery {
+    #[serde(rename = "compilationId")]
+    compilation_id: Option<Uuid>,
+}
+
+fn rule_json(row: &MergeRuleRow) -> Value {
+    let parsed = Rule::parse(&row.rule).ok();
+    json!({
+        "id": row.id,
+        "compilationId": row.compilation_id,
+        "entityType": row.entity_type,
+        "rule": row.rule,
+        "ls": row.ls,
+        "sentence": parsed.as_ref().map(|r| r.sentence(&row.entity_type)),
+        "origin": row.origin,
+        "status": row.status,
+        "evidence": row.evidence,
+        "sourceText": row.source_text,
+        "version": row.version,
+        "createdAt": row.created_at,
+        "decidedAt": row.decided_at,
+    })
+}
+
+#[derive(sqlx::FromRow)]
+struct MergeRuleRow {
+    id: Uuid,
+    user_id: Uuid,
+    compilation_id: Option<Uuid>,
+    entity_type: String,
+    rule: Value,
+    ls: String,
+    origin: String,
+    status: String,
+    evidence: Value,
+    source_text: Option<String>,
+    version: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+    decided_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+const RULE_COLS: &str = "id, user_id, compilation_id, entity_type, rule, ls, origin, status, evidence, source_text, version, created_at, decided_at";
+
+async fn load_rule(db: &sqlx::PgPool, id: Uuid) -> Result<MergeRuleRow> {
+    sqlx::query_as::<_, MergeRuleRow>(&format!("SELECT {RULE_COLS} FROM merge_rules WHERE id = $1"))
+        .bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)
+}
+
+/// The owner's active rule for a type: the compilation's own first, else global.
+async fn active_rule(db: &sqlx::PgPool, owner: Uuid, comp: Option<Uuid>, entity_type: &str) -> Option<MergeRuleRow> {
+    sqlx::query_as::<_, MergeRuleRow>(&format!(
+        "SELECT {RULE_COLS} FROM merge_rules
+         WHERE user_id = $1 AND entity_type = $2 AND status = 'active'
+           AND (compilation_id = $3 OR compilation_id IS NULL)
+         ORDER BY compilation_id NULLS LAST LIMIT 1"))
+        .bind(owner).bind(entity_type).bind(comp)
+        .fetch_optional(db).await.ok().flatten()
+}
+
+/// GET /api/kg/merge-rules?compilationId= — the caller's rules: active and
+/// proposed rows, plus the built-in default for every type the trail has seen
+/// without a rule of its own, each with its sentence.
+async fn list_merge_rules(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Query(q): Query<MergeRulesQuery>,
+) -> Result<Json<Value>> {
+    if let Some(cid) = q.compilation_id {
+        crate::routes::classification::conflict_access(&state.db, &claims, claims.sub, Some(cid)).await?;
+    }
+    let rows = sqlx::query_as::<_, MergeRuleRow>(&format!(
+        "SELECT {RULE_COLS} FROM merge_rules
+         WHERE user_id = $1 AND status IN ('active', 'proposed')
+           AND ($2::uuid IS NULL OR compilation_id = $2 OR compilation_id IS NULL)
+         ORDER BY entity_type, status, created_at DESC"))
+        .bind(claims.sub).bind(q.compilation_id)
+        .fetch_all(&state.db).await?;
+    let mut out: Vec<Value> = rows.iter().map(rule_json).collect();
+
+    // Types seen in the merge trail without an active rule → the default, so
+    // the panel can show what applies today.
+    let seen: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT entity_type FROM merge_links
+         WHERE user_id = $1 AND ($2::uuid IS NULL OR compilation_id = $2) AND entity_type <> ''")
+        .bind(claims.sub).bind(q.compilation_id)
+        .fetch_all(&state.db).await.unwrap_or_default();
+    for t in seen {
+        if rows.iter().any(|r| r.entity_type == t && r.status == "active") { continue; }
+        let r = Rule::default_name_rule(DEFAULT_NAME_FLOOR);
+        out.push(json!({
+            "id": Value::Null, "compilationId": Value::Null, "entityType": t,
+            "rule": serde_json::to_value(&r).unwrap_or(Value::Null), "ls": r.to_ls(),
+            "sentence": format!("{} (built-in default; 55 % for long names)", r.sentence(&t).trim_end_matches('.')),
+            "origin": "default", "status": "active", "evidence": {}, "sourceText": Value::Null,
+            "version": 0, "createdAt": Value::Null, "decidedAt": Value::Null,
+        }));
+    }
+    Ok(Json(json!({ "rules": out })))
+}
+
+#[derive(Deserialize)]
+struct CreateMergeRuleReq {
+    #[serde(rename = "compilationId")]
+    compilation_id: Option<Uuid>,
+    #[serde(rename = "entityType")]
+    entity_type: String,
+    /// A structured rule, or
+    rule: Option<Value>,
+    /// a person's own words, translated by the configured local model.
+    text: Option<String>,
+}
+
+/// POST /api/kg/merge-rules — a new PROPOSED rule from a structured rule or
+/// from plain words. Returns the proposal with its sentence and an estimate of
+/// what it would do to the last merge; nothing is applied until /apply.
+async fn create_merge_rule(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Json(req): Json<CreateMergeRuleReq>,
+) -> Result<Json<Value>> {
+    let entity_type = req.entity_type.trim().to_lowercase();
+    if entity_type.is_empty() {
+        return Err(AppError::BadRequest("entityType is required".into()));
+    }
+    if let Some(cid) = req.compilation_id {
+        crate::routes::classification::conflict_access(&state.db, &claims, claims.sub, Some(cid)).await?;
+    }
+    let (rule, origin, source_text) = match (&req.rule, req.text.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
+        (Some(v), _) => (Rule::parse(v).map_err(AppError::BadRequest)?, "human", req.text.clone()),
+        (None, Some(text)) => (translate_rule_text(&state, claims.sub, text).await?, "human", Some(text.to_string())),
+        (None, None) => return Err(AppError::BadRequest("send a rule or a text".into())),
+    };
+    let preview = rule_preview(&state.db, claims.sub, req.compilation_id, &entity_type, &rule).await;
+    let row = insert_rule(&state.db, claims.sub, req.compilation_id, &entity_type, &rule, origin,
+                          json!({ "preview": preview }), source_text.as_deref()).await?;
+    Ok(Json(json!({ "rule": rule_json(&row), "preview": preview })))
+}
+
+async fn insert_rule(
+    db: &sqlx::PgPool, owner: Uuid, comp: Option<Uuid>, entity_type: &str, rule: &Rule,
+    origin: &str, evidence: Value, source_text: Option<&str>,
+) -> Result<MergeRuleRow> {
+    let version: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM merge_rules
+         WHERE user_id = $1 AND entity_type = $2 AND compilation_id IS NOT DISTINCT FROM $3")
+        .bind(owner).bind(entity_type).bind(comp).fetch_one(db).await?;
+    let row = sqlx::query_as::<_, MergeRuleRow>(&format!(
+        "INSERT INTO merge_rules (user_id, compilation_id, entity_type, rule, ls, origin, status, evidence, source_text, version)
+         VALUES ($1, $2, $3, $4, $5, $6, 'proposed', $7, $8, $9)
+         RETURNING {RULE_COLS}"))
+        .bind(owner).bind(comp).bind(entity_type)
+        .bind(serde_json::to_value(rule).unwrap_or(Value::Null)).bind(rule.to_ls())
+        .bind(origin).bind(evidence).bind(source_text).bind(version)
+        .fetch_one(db).await?;
+    Ok(row)
+}
+
+/// Turn a person's words into a rule with the caller's configured chat model.
+async fn translate_rule_text(state: &crate::models::AppState, user_id: Uuid, text: &str) -> Result<Rule> {
+    let target = crate::services::llm::resolve_purpose(&state.db, user_id, "agent").await;
+    let _slot = crate::services::llm::acquire_slot(state, &target).await;
+    let client = reqwest::Client::new();
+    let answer = crate::services::llm::chat_once(&client, &target, &rules::translation_system_prompt(), text)
+        .await
+        .map_err(|e| AppError::BadGateway(format!("the model ({}/{}) did not answer: {e}", target.provider, target.model)))?;
+    let v = rules::extract_json(&answer)
+        .ok_or_else(|| AppError::BadRequest("could not turn that into a rule; try e.g. 'names at least 60 % similar and same type'".into()))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(AppError::BadRequest(format!("could not express that as a rule: {err}")));
+    }
+    Rule::parse(&v).map_err(|e| AppError::BadRequest(format!("the model proposed an invalid rule: {e}")))
+}
+
+/// What a rule would have done to the last merge, judged on the trail's LIMES
+/// scores for this type (threshold changes only; a changed measure needs a run).
+async fn rule_preview(db: &sqlx::PgPool, owner: Uuid, comp: Option<Uuid>, entity_type: &str, rule: &Rule) -> Value {
+    let current = active_rule(db, owner, comp, entity_type).await
+        .and_then(|r| Rule::parse(&r.rule).ok())
+        .and_then(|r| r.similarity_threshold())
+        .unwrap_or(DEFAULT_NAME_FLOOR);
+    let Some(new_t) = rule.similarity_threshold() else {
+        return json!({ "note": "This rule has no similarity threshold; its effect shows after the next merge." });
+    };
+    let scores: Vec<f32> = sqlx::query_scalar(
+        "SELECT limes_score FROM merge_links
+         WHERE user_id = $1 AND entity_type = $2 AND limes_score IS NOT NULL
+           AND ($3::uuid IS NULL OR compilation_id = $3)")
+        .bind(owner).bind(entity_type).bind(comp)
+        .fetch_all(db).await.unwrap_or_default();
+    let scores: Vec<f64> = scores.into_iter().map(|s| s as f64).collect();
+    let mut preview = rules::preview_from_scores(&scores, current, new_t);
+    if new_t > current {
+        let examples: Vec<(String, String, f32)> = sqlx::query_as(
+            "SELECT source_name, target_name, limes_score FROM merge_links
+             WHERE user_id = $1 AND entity_type = $2 AND limes_score >= $3 AND limes_score < $4
+               AND ($5::uuid IS NULL OR compilation_id = $5)
+             ORDER BY limes_score LIMIT 5")
+            .bind(owner).bind(entity_type).bind(current as f32).bind(new_t as f32).bind(comp)
+            .fetch_all(db).await.unwrap_or_default();
+        preview["examples"] = json!(examples.iter().map(|(a, b, s)| json!({ "a": a, "b": b, "score": s })).collect::<Vec<_>>());
+    }
+    preview
+}
+
+/// POST /api/kg/merge-rules/:id/apply — the one click: the proposal becomes
+/// the active rule of its scope and type (the previous one retires) and the
+/// compilation(s) it covers are re-merged.
+async fn apply_merge_rule(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let row = load_rule(&state.db, id).await?;
+    if row.user_id != claims.sub {
+        return Err(AppError::NotFound);
+    }
+    if row.status == "active" {
+        return Ok(Json(json!({ "ok": true, "status": "active", "refreshJobs": [] })));
+    }
+    if row.status != "proposed" {
+        return Err(AppError::BadRequest(format!("rule is {}", row.status)));
+    }
+    let jobs = activate_rule(&state, claims.sub, &row).await?;
+    sqlx::query("UPDATE merge_rules SET decided_by = $1 WHERE id = $2")
+        .bind(claims.sub).bind(id).execute(&state.db).await?;
+    crate::services::audit::log_access(&state.db, &claims, "kg.apply_merge_rule",
+        "merge_rule", &id.to_string(), 0, None, true, None).await;
+    Ok(Json(json!({ "ok": true, "status": "active", "refreshJobs": jobs })))
+}
+
+/// POST /api/kg/merge-rules/:id/retire — drop a proposal, or take an active
+/// rule out of service (the built-in default applies again after a re-merge).
+async fn retire_merge_rule(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let row = load_rule(&state.db, id).await?;
+    if row.user_id != claims.sub {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query("UPDATE merge_rules SET status = 'retired', decided_at = NOW(), decided_by = $1 WHERE id = $2")
+        .bind(claims.sub).bind(id).execute(&state.db).await?;
+    crate::services::audit::log_access(&state.db, &claims, "kg.retire_merge_rule",
+        "merge_rule", &id.to_string(), 0, None, true, None).await;
+    Ok(Json(json!({ "ok": true, "status": "retired" })))
+}
+
+/// Learning, stage A. Once the owner has answered enough reviews of one type
+/// (with a LIMES score each), the threshold that separates "same" from "not
+/// the same" best becomes a rule, if it differs enough from the rule in force
+/// and no learned proposal is already waiting. It applies on its own when it
+/// passes the gate (F1 >= 0.8 on those decisions and better than the rule in
+/// force), unless a person set the rule in force or GCTRL_LEARN_AUTO_APPLY is
+/// off; otherwise it stays a proposal.
+pub(crate) async fn maybe_propose_learned_threshold(
+    state: &crate::models::AppState, owner: Uuid, comp: Option<Uuid>, entity_type: &str,
+) {
+    let entity_type = entity_type.trim().to_lowercase();
+    let rows: Vec<(f32, String)> = sqlx::query_as(
+        "SELECT limes_score, decision FROM review_queue
+         WHERE user_id = $1 AND entity_a_type = $2 AND limes_score IS NOT NULL
+           AND decision IN ('same', 'not_same')")
+        .bind(owner).bind(&entity_type)
+        .fetch_all(&state.db).await.unwrap_or_default();
+    let samples: Vec<(f64, bool)> = rows.iter().map(|(s, d)| (*s as f64, d == "same")).collect();
+    let Some(learned) = rules::learn_threshold(&samples, LEARN_MIN_DECISIONS) else { return };
+
+    let current_row = active_rule(&state.db, owner, comp, &entity_type).await;
+    let current_rule = current_row.as_ref().and_then(|r| Rule::parse(&r.rule).ok())
+        .unwrap_or_else(|| Rule::default_name_rule(DEFAULT_NAME_FLOOR));
+    let current_t = current_rule.similarity_threshold().unwrap_or(DEFAULT_NAME_FLOOR);
+    if (learned - current_t).abs() < LEARN_MIN_DELTA {
+        return;
+    }
+    let scope = current_row.as_ref().and_then(|r| r.compilation_id);
+    let waiting: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM merge_rules
+         WHERE user_id = $1 AND entity_type = $2 AND status = 'proposed' AND origin = 'learned'
+           AND compilation_id IS NOT DISTINCT FROM $3")
+        .bind(owner).bind(&entity_type).bind(scope)
+        .fetch_one(&state.db).await.unwrap_or(0);
+    if waiting > 0 {
+        return;
+    }
+    let proposal = current_rule.with_similarity_threshold(learned);
+    let preview = rule_preview(&state.db, owner, scope, &entity_type, &proposal).await;
+    let learned_f1 = rules::f1_at(&samples, learned);
+    let current_f1 = rules::f1_at(&samples, current_t);
+    let human_in_force = current_row.as_ref().is_some_and(|r| r.origin == "human");
+    let auto = rules::auto_apply_enabled(std::env::var("GCTRL_LEARN_AUTO_APPLY").ok().as_deref())
+        && rules::passes_gate(learned_f1, current_f1)
+        && !human_in_force;
+    let evidence = json!({
+        "source": "review_decisions", "decisions": samples.len(),
+        "same": samples.iter().filter(|(_, s)| *s).count(),
+        "previousThreshold": current_t, "learnedThreshold": learned,
+        "learnedF1": learned_f1, "currentF1": current_f1,
+        "gate": if auto { "passed" } else if human_in_force { "kept as proposal: a person set the rule in force" } else { "not passed: proposed" },
+        "preview": preview,
+    });
+    let row = match insert_rule(&state.db, owner, scope, &entity_type, &proposal, "learned", evidence, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("merge rules: could not store learned rule for {entity_type}: {e:?}");
+            return;
+        }
+    };
+    if auto {
+        match activate_rule(state, owner, &row).await {
+            Ok(jobs) => tracing::info!(
+                "merge rules: learned {entity_type} threshold {learned} applied for {owner} (F1 {learned_f1:.2} vs {current_f1:.2}), {} re-merge(s) queued", jobs.len()
+            ),
+            Err(e) => tracing::warn!("merge rules: learned rule {} not activated: {e:?}", row.id),
+        }
+    }
+}
+
+/// Make a stored rule the active one of its scope and type (the previous one
+/// retires) and queue a re-merge of what it covers. Shared by the click and
+/// by the learner's auto-apply.
+async fn activate_rule(state: &crate::models::AppState, owner: Uuid, row: &MergeRuleRow) -> Result<Vec<Uuid>> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "UPDATE merge_rules SET status = 'retired', decided_at = NOW()
+         WHERE user_id = $1 AND entity_type = $2 AND status = 'active'
+           AND compilation_id IS NOT DISTINCT FROM $3 AND id <> $4")
+        .bind(owner).bind(&row.entity_type).bind(row.compilation_id).bind(row.id)
+        .execute(&mut *tx).await?;
+    sqlx::query("UPDATE merge_rules SET status = 'active', decided_at = NOW() WHERE id = $1")
+        .bind(row.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let comps: Vec<Uuid> = match row.compilation_id {
+        Some(c) => vec![c],
+        None => sqlx::query_scalar(
+            "SELECT DISTINCT compilation_id FROM merge_links WHERE user_id = $1 AND entity_type = $2")
+            .bind(owner).bind(&row.entity_type).fetch_all(&state.db).await.unwrap_or_default(),
+    };
+    let mut jobs = Vec::new();
+    for c in comps {
+        match enqueue_fuse_refresh(state, owner, c).await {
+            Ok(j) => jobs.push(j),
+            Err(e) => tracing::warn!("merge rule {}: re-merge of {c} not queued: {e:?}", row.id),
+        }
+    }
+    Ok(jobs)
+}
+
 /// Apply a fact resolution: delete the losing edges (source AND merged graphs),
 /// block them in knowledge_corrections, stamp the winner current and close the
 /// row with `final_status` ('resolved' by a human, 'auto_resolved' by the
@@ -4228,7 +4714,7 @@ mod grounded_nodes_tests {
 
 #[cfg(test)]
 mod fact_conflict_tests {
-    use super::{conflict_edge_names, conflict_tail_values, decide_fact_resolution, neo4j_rel_type};
+    use super::{conflict_edge_names, conflict_tail_values, decide_fact_resolution, decide_merge_review, neo4j_rel_type};
     use serde_json::json;
 
     // neo4j_rel_type must mirror the Python safe_rel_type exactly, so that the
@@ -4289,6 +4775,15 @@ mod fact_conflict_tests {
         );
         assert!(decide_fact_resolution("pick", false, Some("Nobody"), Some("Petra"), &vals).is_err());
         assert!(decide_fact_resolution("pick", false, None, Some("Petra"), &vals).is_err());
+    }
+
+    #[test]
+    fn merge_review_answers_map_to_status_and_decision() {
+        assert_eq!(decide_merge_review("same"), Ok(("resolved", Some("same"))));
+        assert_eq!(decide_merge_review(" not_same "), Ok(("resolved", Some("not_same"))));
+        assert_eq!(decide_merge_review("dismiss"), Ok(("dismissed", None)));
+        assert!(decide_merge_review("merge").is_err());
+        assert!(decide_merge_review("").is_err());
     }
 
     #[test]

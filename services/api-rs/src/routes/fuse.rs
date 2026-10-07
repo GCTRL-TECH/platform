@@ -81,13 +81,22 @@ async fn merge(
         None => (None, "PUBLIC"),
     };
 
+    // The ontology's match rules travel with the job. The UI has offered an
+    // ontology on this form since the beginning, and the worker has read
+    // `match_rules` just as long — but nothing ever carried them from one to
+    // the other, so every merge ran on the generic rule.
+    let match_rules = match req.ontology_id {
+        Some(oid) => load_match_rules(&state.db, oid, claims.sub).await?,
+        None => vec![],
+    };
+
     // source_job_ids column is UUID[] — bind Vec<Uuid> directly (NOT jsonb).
     sqlx::query(
-        "INSERT INTO compilations (id, user_id, name, description, source_job_ids, classification, classification_level_id, version)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 1)"
+        "INSERT INTO compilations (id, user_id, name, description, source_job_ids, classification, classification_level_id, version, ontology_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)"
     )
     .bind(comp_id).bind(claims.sub).bind(&req.name).bind(&req.description)
-    .bind(&source_job_ids).bind(legacy).bind(level_id)
+    .bind(&source_job_ids).bind(legacy).bind(level_id).bind(req.ontology_id)
     .execute(&state.db).await?;
 
     let job_id = Uuid::new_v4();
@@ -102,9 +111,32 @@ async fn merge(
         "job_id": job_id, "user_id": claims.sub,
         "compilation_id": comp_id, "source_job_ids": source_job_ids, "name": req.name,
         "classification": legacy,
+        "match_rules": match_rules,
     }).to_string()).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(json!({ "jobId": job_id, "compilationId": comp_id, "status": "pending" })))
+}
+
+/// The match rules of one of the caller's ontologies, in the shape the fuse
+/// worker reads (`match_rules` in the job payload). An ontology the caller
+/// does not own yields no rules rather than an error: the ontology was never
+/// more than a hint on this form.
+pub(crate) async fn load_match_rules(db: &sqlx::PgPool, ontology_id: Uuid, user_id: Uuid) -> Result<Vec<Value>> {
+    let rows = sqlx::query_as::<_, (String, String, bool, Option<String>, Option<f64>, Option<String>, Option<Vec<String>>)>(
+        "SELECT r.entity_type_a, r.entity_type_b, coalesce(r.can_match, true),
+                r.similarity_metric, r.threshold, r.blocking_strategy, r.properties_to_match
+         FROM ontology_match_rules r
+         JOIN ontologies o ON o.id = r.ontology_id
+         WHERE r.ontology_id = $1 AND o.user_id = $2
+         ORDER BY r.entity_type_a, r.entity_type_b"
+    )
+    .bind(ontology_id).bind(user_id)
+    .fetch_all(db).await?;
+    Ok(rows.into_iter().map(|(a, b, can_match, metric, threshold, blocking, props)| json!({
+        "entity_type_a": a, "entity_type_b": b, "can_match": can_match,
+        "similarity_metric": metric, "threshold": threshold,
+        "blocking_strategy": blocking, "properties_to_match": props.unwrap_or_default(),
+    })).collect())
 }
 
 async fn list_jobs(

@@ -1153,6 +1153,27 @@ async fn execute_tool_inner(
                 "entity": key_name, "keySide": key_side,
                 "competingValues": tails, "authorityWinner": winner,
             })));
+            // Merge reviews: doubtful entity merges the fusion made on its own
+            // (answered on the conflicts tab; not resolvable through the agent).
+            let review_rows = sqlx::query_as::<_, (
+                uuid::Uuid, Option<uuid::Uuid>, Option<String>, Option<String>, Option<String>,
+                Option<String>, Option<f32>, Vec<String>,
+            )>(
+                "SELECT id, compilation_id, entity_a_name, entity_a_type, entity_b_name, entity_b_type,
+                        score, methods
+                 FROM review_queue WHERE user_id = $1 AND status = 'pending'
+                   AND ($2::uuid[] IS NULL OR compilation_id = ANY($2))
+                 ORDER BY score ASC NULLS LAST LIMIT 50"
+            ).bind(claims.sub).bind(&scoped_comps).fetch_all(&state.db).await.unwrap_or_default();
+            conflicts.extend(review_rows.iter().map(|(id, cid, a_name, a_type, b_name, b_type, score, methods)| json!({
+                "id": id, "kind": "entity_merge",
+                "compilationId": cid,
+                "a": { "name": a_name, "type": a_type }, "b": { "name": b_name, "type": b_type },
+                "score": score, "methods": methods,
+                "question": format!("Are '{}' and '{}' the same {}?",
+                    a_name.as_deref().unwrap_or("?"), b_name.as_deref().unwrap_or("?"),
+                    a_type.as_deref().unwrap_or("entity")),
+            })));
             json!({ "conflicts": conflicts })
         }
 

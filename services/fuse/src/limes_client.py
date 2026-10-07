@@ -4,7 +4,7 @@ Semantic Resolver REST Client — communicates with the GCTRL Fusion Engine:
   POST /submit          — submit config → returns requestId
   GET  /status/{id}     — poll job status (code: 0=queued, 1=running, 2=done, -1=error)
   GET  /results/{id}    — list result files
-  GET  /result/{id}/{f} — download result file
+  GET  /result/{id}/{f} — download result file (TAB: source, target, score)
 """
 
 import io
@@ -25,6 +25,11 @@ RESOLVER_TIMEOUT = 60
 class ResolverClient:
     def __init__(self, base_url: str = "http://resolver:8080") -> None:
         self.base_url = base_url.rstrip("/")
+        # Why the last discover_links() call yielded nothing, or None when it
+        # produced result files. The resolver reports a job that threw inside
+        # LIMES as "done" with no files, so an empty link list alone cannot tell
+        # "no matches" from "engine failed" — callers read this to say which.
+        self.last_error: Optional[str] = None
 
     def is_healthy(self) -> bool:
         try:
@@ -111,10 +116,10 @@ class ResolverClient:
         return False
 
     def get_results(self, request_id: str, accepted_only: bool = True) -> list[dict]:
-        """Download result files and parse N3 triples.
+        """Download result files and parse the scored links.
 
-        LIMES writes TWO files: ``accepted.nt`` (similarity ≥ acceptance
-        threshold — confident auto-matches) and ``review.nt`` (similarity in the
+        LIMES writes TWO files: ``accepted.tsv`` (similarity ≥ acceptance
+        threshold — confident auto-matches) and ``review.tsv`` (similarity in the
         [review, acceptance) band — flagged for HUMAN verification, NOT confident
         matches). Treating both as confident sameAs is what produced the
         false-positive merges on DBLP-ACM. By default we return ONLY the accepted
@@ -125,11 +130,15 @@ class ResolverClient:
         try:
             resp = requests.get(f"{self.base_url}/results/{request_id}", timeout=10)
             if resp.status_code != 200:
+                self.last_error = f"results listing HTTP {resp.status_code}"
                 return []
             data = resp.json()
             files = data.get("availableFiles", [])
             if not files:
-                logger.info(f"resolver job {request_id}: no result files")
+                # LIMES writes both files even for an empty mapping, so a "done"
+                # job without files is a job that failed inside the engine.
+                self.last_error = "resolver job finished without result files"
+                logger.warning(f"resolver job {request_id}: no result files (engine failure)")
                 return []
 
             links = []
@@ -143,11 +152,12 @@ class ResolverClient:
                         f"{self.base_url}/result/{request_id}/{filename}", timeout=30
                     )
                     if file_resp.status_code == 200:
-                        links.extend(self._parse_n3(file_resp.text, method=method))
+                        links.extend(self._parse_links(file_resp.text, method=method))
                 except Exception as exc:
                     logger.warning(f"resolver result download failed for {filename}: {exc}")
             return links
         except Exception as exc:
+            self.last_error = f"results fetch error: {exc}"
             logger.warning(f"resolver results fetch error: {exc}")
             return []
 
@@ -177,11 +187,12 @@ class ResolverClient:
         gates, so for an unsupervised string metric the two bands are NOT
         well-separated — most genuine co-references land in the review band when
         acceptance is set conservatively (0.85). We therefore include BOTH bands
-        by default (review links tagged ``method='resolver_review'``,
-        confidence 0.75, so the merger's highest-confidence dedup still prefers an
-        accepted link on the same pair). Callers wanting a precision-first,
-        human-in-the-loop merge can pass ``accepted_only=True``.
+        by default (review links tagged ``method='resolver_review'`` and
+        ``band='review'``; every link carries the REAL LIMES similarity as its
+        confidence). Callers wanting a precision-first, human-in-the-loop merge
+        can pass ``accepted_only=True``.
         """
+        self.last_error = None
         props = properties if properties else ["name", "type", "label"]
 
         source_csv = self._entities_to_csv(source_entities, props)
@@ -190,6 +201,7 @@ class ResolverClient:
         source_id = self.upload_csv(source_csv, "source.csv")
         target_id = self.upload_csv(target_csv, "target.csv")
         if not source_id or not target_id:
+            self.last_error = "CSV upload to resolver failed"
             return []
 
         config_xml = self._build_config(
@@ -199,9 +211,11 @@ class ResolverClient:
 
         request_id = self.submit_config(config_xml)
         if not request_id:
+            self.last_error = "resolver rejected the config"
             return []
 
         if not self.wait_for_completion(request_id):
+            self.last_error = "resolver job failed or timed out"
             return []
 
         return self.get_results(request_id, accepted_only=accepted_only)
@@ -271,12 +285,12 @@ class ResolverClient:
   <METRIC>{metric}</METRIC>
   <ACCEPTANCE>
     <THRESHOLD>{acceptance_threshold}</THRESHOLD>
-    <FILE>accepted.nt</FILE>
+    <FILE>accepted.tsv</FILE>
     <RELATION>owl:sameAs</RELATION>
   </ACCEPTANCE>
   <REVIEW>
     <THRESHOLD>{review_threshold}</THRESHOLD>
-    <FILE>review.nt</FILE>
+    <FILE>review.tsv</FILE>
     <RELATION>owl:sameAs</RELATION>
   </REVIEW>
   <EXECUTION>
@@ -284,25 +298,56 @@ class ResolverClient:
     <PLANNER>default</PLANNER>
     <ENGINE>default</ENGINE>
   </EXECUTION>
-  <OUTPUT>N3</OUTPUT>
+  <OUTPUT>TAB</OUTPUT>
 </LIMES>"""
 
-    def _parse_n3(self, text: str, method: str = "resolver") -> list[dict]:
+    # TAB output: `<source>\t<target>\t<similarity>` — the only LIMES
+    # serialisation that carries the score (NT/N3/TTL write bare triples).
+    _TSV_LINE = re.compile(r"^<([^>]+)>\t<([^>]+)>\t([0-9.eE+-]+)$")
+    _N3_LINE = re.compile(r"<([^>]+)>\s+<([^>]+)>\s+<([^>]+)>\s*\.")
+
+    def _parse_links(self, text: str, method: str = "resolver") -> list[dict]:
+        """Parse a LIMES result file into link dicts carrying the real score.
+
+        ``band`` is the LIMES output band the link came from ('accepted' or
+        'review'); ``limes_score`` repeats the similarity so it survives the
+        merger's dedup when another matcher wins the pair on confidence. A bare
+        N3 triple (a resolver still configured for N3) is accepted with the old
+        fixed confidence so a format mismatch degrades instead of silently
+        yielding zero links.
+        """
+        band = "review" if method == "resolver_review" else "accepted"
         links = []
         for line in text.strip().split("\n"):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            match = re.match(r"<([^>]+)>\s+<([^>]+)>\s+<([^>]+)>\s*\.", line)
+            match = self._TSV_LINE.match(line)
+            if match:
+                try:
+                    score = float(match.group(3))
+                except ValueError:
+                    continue
+                links.append({
+                    "source": match.group(1),
+                    "target": match.group(2),
+                    "confidence": score,
+                    "limes_score": score,
+                    "band": band,
+                    "method": method,
+                })
+                continue
+            match = self._N3_LINE.match(line)
             if match:
                 links.append({
                     "source": match.group(1),
                     "target": match.group(3),
                     "predicate": match.group(2),
                     "confidence": 1.0 if method == "resolver" else 0.75,
+                    "band": band,
                     "method": method,
                 })
-        logger.info(f"resolver: parsed {len(links)} {method} links from N3")
+        logger.info(f"resolver: parsed {len(links)} {method} links")
         return links
 
 
