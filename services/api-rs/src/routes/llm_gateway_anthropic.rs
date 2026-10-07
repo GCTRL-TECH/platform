@@ -1423,8 +1423,15 @@ mod tests {
         assert_eq!(&texts[2..], &want_leaves[..]);
         assert!(slots[2..].iter().all(|s| *s == AnthropicSlot::ToolUseInput(1, 1)));
         assert!(!texts.iter().any(|t| t.contains("row 1")), "tool_result stays in clear");
-        let cloaked: Vec<String> =
-            texts.iter().map(|t| t.replace("Tom Arenstam", "Person-27").replace("ScanModule", "Term-274")).collect();
+        // the production substitution (pure tail of cloak_batch), no Postgres
+        let mut key_map = HashMap::new();
+        let mut bs = privacy::CloakSession::empty();
+        for (p, name) in session().map {
+            key_map.insert(privacy::match_key(&name), p.clone());
+            bs.map.insert(p, name);
+        }
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let cloaked = privacy::apply_batch(&refs, &key_map, &mut bs);
         write_anthropic_cloaked_texts(&mut body, &slots, &cloaked);
         let input = &body["messages"][1]["content"][1]["input"];
         assert_eq!(input["pattern"], "Person-27");

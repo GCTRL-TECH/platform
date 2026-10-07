@@ -28,6 +28,20 @@
 //! compaction items, item references, shell / web search / MCP items, images,
 //! files, and the keys `tools`, `tool_choice`, `text`, `reasoning`, `metadata`,
 //! `prompt_cache_key`, `client_metadata`, `include`, `model`, `store`, `stream`.
+//! `local_shell_call.action.command[]` and `local_shell_call_output.output` are
+//! treated like function calls and their outputs; `web_search_call` stays untouched
+//! (its query keeps the model's pseudonyms both ways).
+//!
+//! Path policy (privacy.rs `apply_pseudonyms_recording`): a name that contains a
+//! space (`Max Müller`, `Nexovar GmbH`) is cloaked inside paths too
+//! (`crm/Max Müller.md` -> `crm/Person-3.md`, restored byte for byte on the way
+//! down), so tool calls, patches and `rg` hits replay without the real name. A
+//! single-token entity inside a path, slug, host or env var (`/asgard_prod/anvil/`)
+//! is left alone, and a slug spelling (`Max_Mueller.md`) is not the entity's name,
+//! so it stays in clear: name files neutrally when that matters.
+//! Known channels that stay in clear: JSON object keys in replayed `arguments`
+//! (never cloaked), and tool outputs when the caller opts out.
+//!
 //! The Codex headers (`x-codex-turn-metadata`: cwd, git remote, branch) and
 //! `client_metadata` are workspace metadata, not knowledge-base entities, and are
 //! forwarded as they are on purpose.
@@ -93,6 +107,8 @@ pub(super) enum ResponsesSlot {
     ItemOutputString(usize),
     /// `input[i].output[j].text` of a tool output item (`input_text`/`output_text` part).
     ItemOutputPart(usize, usize),
+    /// `input[i].action.command[j]` of a replayed `local_shell_call`.
+    ItemShellCommand(usize, usize),
 }
 
 /// Request header that turns tool-output cloaking off (`0|off|false|no`); never
@@ -180,8 +196,12 @@ pub(super) fn collect_responses_cloak_texts(
     (slots, texts)
 }
 
-/// Tool items of `input[]`: replayed calls always, outputs when enabled. Reasoning,
-/// compaction, item references, shell/web/MCP items are never collected.
+/// Tool items of `input[]`: replayed calls (`function_call`, `custom_tool_call`,
+/// `local_shell_call`) always, outputs (`function_call_output`,
+/// `custom_tool_call_output`, `local_shell_call_output`) when enabled. Reasoning,
+/// compaction, item references, web search and MCP items are never collected
+/// (`web_search_call.action.query` is the model's own query, neither de-cloaked nor
+/// re-cloaked, so it round-trips with its pseudonyms).
 fn collect_tool_item(
     i: usize,
     item: &Value,
@@ -213,7 +233,20 @@ fn collect_tool_item(
                 texts.push(s.to_string());
             }
         }
-        Some("function_call_output") | Some("custom_tool_call_output") if cloak_tool_outputs => match item.get("output") {
+        Some("local_shell_call") => {
+            if let Some(cmd) = item.pointer("/action/command").and_then(Value::as_array) {
+                for (j, c) in cmd.iter().enumerate() {
+                    if let Some(t) = c.as_str().filter(|t| !t.is_empty()) {
+                        slots.push(ResponsesSlot::ItemShellCommand(i, j));
+                        texts.push(t.to_string());
+                    }
+                }
+            }
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") | Some("local_shell_call_output")
+            if cloak_tool_outputs =>
+        {
+            match item.get("output") {
             Some(Value::String(s)) if !s.is_empty() => {
                 slots.push(ResponsesSlot::ItemOutputString(i));
                 texts.push(s.clone());
@@ -227,8 +260,80 @@ fn collect_tool_item(
                 }
             }
             _ => {}
-        },
+            }
+        }
         _ => {}
+    }
+}
+
+/// Does this JSON text contain an object with a repeated key? (serde keeps only the
+/// last one, so an earlier duplicate would be invisible to the leaf walk.)
+fn has_duplicate_keys(raw: &str) -> bool {
+    use serde::de::{Deserialize, Deserializer, Error, MapAccess, SeqAccess, Visitor};
+    struct NoDup;
+    struct V;
+    impl<'de> Deserialize<'de> for NoDup {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(V)
+        }
+    }
+    impl<'de> Visitor<'de> for V {
+        type Value = NoDup;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<NoDup, E> {
+            Ok(NoDup)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<NoDup, E> {
+            Ok(NoDup)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<NoDup, E> {
+            Ok(NoDup)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<NoDup, E> {
+            Ok(NoDup)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<NoDup, E> {
+            Ok(NoDup)
+        }
+        fn visit_unit<E>(self) -> Result<NoDup, E> {
+            Ok(NoDup)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<NoDup, A::Error> {
+            while a.next_element::<NoDup>()?.is_some() {}
+            Ok(NoDup)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<NoDup, A::Error> {
+            let mut seen = std::collections::HashSet::new();
+            while let Some(k) = a.next_key::<String>()? {
+                if !seen.insert(k) {
+                    return Err(A::Error::custom("duplicate key"));
+                }
+                a.next_value::<NoDup>()?;
+            }
+            Ok(NoDup)
+        }
+    }
+    serde_json::from_str::<NoDup>(raw).is_err() && serde_json::from_str::<Value>(raw).is_ok()
+}
+
+/// Re-serialize every replayed `function_call.arguments` that holds a duplicate key,
+/// so the value an earlier duplicate carried (invisible to the leaf walk) never
+/// travels upstream. Runs before collection; serde's last-wins value is kept.
+pub(super) fn normalize_duplicate_argument_keys(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else { return };
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        if let Some(Value::String(raw)) = item.get_mut("arguments") {
+            if has_duplicate_keys(raw) {
+                if let Ok(v) = serde_json::from_str::<Value>(raw) {
+                    *raw = v.to_string();
+                }
+            }
+        }
     }
 }
 
@@ -240,6 +345,13 @@ fn collect_tool_item(
 /// cloaked leaves; if it does not (an original written with `\u` escapes, a case
 /// variant, an original inside a key), the parsed value is re-serialized instead.
 /// Invalid JSON: the single slot holds the plainly cloaked raw string.
+///
+/// Known limits: object KEYS are never cloaked, so a key the de-cloaker turned from a
+/// pseudonym into a real name goes back in clear (Codex and Claude Code tools use
+/// fixed keys); duplicate keys are removed beforehand by
+/// [`normalize_duplicate_argument_keys`]; on the re-serialize path an integer beyond
+/// i64/u64 or a float with more digits than f64 holds comes back rounded (the model no
+/// longer acts on a replayed call).
 fn write_cloaked_arguments(raw: &str, cloaked: &[String], session: &privacy::CloakSession) -> String {
     let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
         return cloaked.first().cloned().unwrap_or_else(|| raw.to_string());
@@ -314,6 +426,9 @@ pub(super) fn write_responses_cloaked_texts(
                 .and_then(|m| m.get_mut("output"))
                 .and_then(|c| c.get_mut(j))
                 .and_then(|p| p.get_mut("text")),
+            ResponsesSlot::ItemShellCommand(i, j) => item(body, i)
+                .and_then(|m| m.pointer_mut("/action/command"))
+                .and_then(|c| c.get_mut(j)),
             ResponsesSlot::ItemArguments(_) => None, // handled above
         };
         if let Some(t) = target {
@@ -325,8 +440,9 @@ pub(super) fn write_responses_cloaked_texts(
 // ── response walker (non-stream, output_item.done, response.completed) ─────
 
 /// De-cloak one output item: `message` -> `output_text` parts, `function_call` ->
-/// `arguments` (raw JSON text, JSON-escaped session), `custom_tool_call` -> `input`.
-/// Everything else (reasoning, web search, ...) is left untouched.
+/// `arguments` (raw JSON text, JSON-escaped session), `custom_tool_call` -> `input`,
+/// `local_shell_call` -> `action.command[]`. Everything else (reasoning, web search,
+/// ...) is left untouched.
 pub(super) fn decloak_responses_item(
     session: &privacy::CloakSession,
     json_session: &privacy::CloakSession,
@@ -352,6 +468,15 @@ pub(super) fn decloak_responses_item(
         Some("custom_tool_call") => {
             if let Some(Value::String(a)) = item.get_mut("input") {
                 *a = privacy::decloak(session, a);
+            }
+        }
+        Some("local_shell_call") => {
+            if let Some(cmd) = item.pointer_mut("/action/command").and_then(Value::as_array_mut) {
+                for c in cmd {
+                    if let Value::String(t) = c {
+                        *t = privacy::decloak(session, t);
+                    }
+                }
             }
         }
         _ => {}
@@ -830,6 +955,7 @@ async fn cloak_responses_request(
         ));
     };
     let candidates = privacy::user_entity_candidates(&state.db, user_id).await;
+    normalize_duplicate_argument_keys(&mut body);
     let (slots, plain) = collect_responses_cloak_texts(&body, cloak_tool_outputs);
     let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
     let (cloaked, session) = privacy::cloak_batch(&state.db, &[namespace], &candidates, &refs).await;
@@ -1191,7 +1317,10 @@ mod tests {
             ]}
         ]});
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
-        assert_eq!(texts, vec!["secret", "secret string", "nested secret", "secret patch", "secret", "keep me"]);
+        assert_eq!(
+            texts,
+            vec!["secret", "secret string", "nested secret", "secret patch", "secret", "ls", "secret", "keep me"]
+        );
         assert_eq!(
             slots,
             vec![
@@ -1200,21 +1329,23 @@ mod tests {
                 ResponsesSlot::ItemOutputPart(2, 0),
                 ResponsesSlot::ItemCustomInput(3),
                 ResponsesSlot::ItemOutputString(4),
+                ResponsesSlot::ItemShellCommand(5, 0),
+                ResponsesSlot::ItemOutputString(6),
                 ResponsesSlot::ItemPart(14, 2)
             ]
         );
-        // shell, web search, MCP, item references, reasoning: never collected
-        assert!(!slots.iter().any(|s| matches!(
-            s,
-            ResponsesSlot::ItemArguments(i) | ResponsesSlot::ItemOutputString(i) | ResponsesSlot::ItemCustomInput(i)
-                if (5..=13).contains(i)
-        )));
+        // web search, MCP, item references, reasoning: never collected (items 7..=13)
         // opt-out: tool outputs stay, replayed calls are still cloaked
         let (slots, texts) = collect_responses_cloak_texts(&body, false);
-        assert_eq!(texts, vec!["secret", "secret patch", "keep me"]);
+        assert_eq!(texts, vec!["secret", "secret patch", "ls", "keep me"]);
         assert_eq!(
             slots,
-            vec![ResponsesSlot::ItemArguments(0), ResponsesSlot::ItemCustomInput(3), ResponsesSlot::ItemPart(14, 2)]
+            vec![
+                ResponsesSlot::ItemArguments(0),
+                ResponsesSlot::ItemCustomInput(3),
+                ResponsesSlot::ItemShellCommand(5, 0),
+                ResponsesSlot::ItemPart(14, 2)
+            ]
         );
     }
 
@@ -1768,21 +1899,27 @@ mod tests {
         ]})
     }
 
-    /// Simulated `cloak_batch`: replace each original by its pseudonym (longest first).
-    fn fake_cloak(texts: &[String], s: &privacy::CloakSession) -> Vec<String> {
-        let mut pairs: Vec<(&String, &String)> = s.map.iter().map(|(p, o)| (o, p)).collect();
-        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-        texts
-            .iter()
-            .map(|t| pairs.iter().fold(t.clone(), |acc, (o, p)| acc.replace(o.as_str(), p.as_str())))
-            .collect()
+    /// The PRODUCTION substitution without Postgres: `privacy::apply_batch` (the pure
+    /// tail of `cloak_batch`) with the entities of `s` (pseudonym -> canonical name)
+    /// as the resolved registry. Returns the cloaked texts and the batch session
+    /// (surfaces as recorded by the real cloaker).
+    fn real_cloak(texts: &[String], s: &privacy::CloakSession) -> (Vec<String>, privacy::CloakSession) {
+        let mut key_map = HashMap::new();
+        let mut session = privacy::CloakSession::empty();
+        for (p, name) in &s.map {
+            key_map.insert(privacy::match_key(name), p.clone());
+            session.map.insert(p.clone(), name.clone());
+        }
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let out = privacy::apply_batch(&refs, &key_map, &mut session);
+        (out, session)
     }
 
     fn cloak_args(raw: &str, s: &privacy::CloakSession) -> (Vec<String>, String) {
         let mut body = fc_body(raw);
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
-        let cloaked = fake_cloak(&texts, s);
-        write_responses_cloaked_texts(&mut body, &slots, &cloaked, s);
+        let (cloaked, bs) = real_cloak(&texts, s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         (texts, body["input"][1]["arguments"].as_str().unwrap().to_string())
     }
 
@@ -1836,8 +1973,8 @@ mod tests {
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
         assert_eq!(slots[1..], [ResponsesSlot::ItemArguments(1)]);
         assert_eq!(texts[1], raw);
-        let cloaked = fake_cloak(&texts, &s);
-        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &s);
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         assert_eq!(body["input"][1]["arguments"], r#"{"cmd": "echo Person-3"#);
         // empty / non-string arguments are skipped
         let (slots, _) = collect_responses_cloak_texts(&fc_body(""), true);
@@ -1878,8 +2015,8 @@ mod tests {
         let s = one("Person-3", "Max Müller");
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
         assert_eq!(slots, vec![ResponsesSlot::ItemOutputString(0), ResponsesSlot::ItemOutputPart(1, 0)]);
-        let cloaked = fake_cloak(&texts, &s);
-        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &s);
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         assert_eq!(body["input"][0]["output"], "Person-3, row 1");
         assert_eq!(body["input"][1]["output"][0]["text"], "patched Person-3.md");
         assert_eq!(body["input"][1]["output"][1], before["input"][1]["output"][1]);
@@ -1911,12 +2048,98 @@ mod tests {
         ]});
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
         assert_eq!(slots, vec![ResponsesSlot::ItemCustomInput(0)]);
-        let cloaked = fake_cloak(&texts, &s);
-        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &s);
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         assert_eq!(
             body["input"][0]["input"],
             "*** Begin Patch\n*** Update File: crm/Person-3.md\n-Person-3\n+Person-3 (CEO)\n*** End Patch"
         );
         assert_eq!(body["input"][0]["name"], "apply_patch");
+    }
+
+    // 28
+    #[test]
+    fn names_in_paths_cloak_with_the_real_cloaker_slugs_stay() {
+        let mut map = HashMap::new();
+        map.insert("Person-3".to_string(), "Max Müller".to_string());
+        map.insert("Org-2".to_string(), "Nexovar GmbH".to_string());
+        map.insert("Term-1".to_string(), "anvil".to_string());
+        let s = privacy::CloakSession { map };
+        let args = r#"{"cmd":"cat crm/Max Müller.md notes/Nexovar GmbH/2026.txt Max_Mueller.md ~/asgard_prod/anvil/x"}"#;
+        let mut body = json!({"input": [
+            {"type": "function_call", "call_id": "c1", "name": "exec_command", "arguments": args},
+            {"type": "function_call_output", "call_id": "c1", "output": "crm/Max Müller.md:12: Max Müller, CEO of Nexovar GmbH"}
+        ]});
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
+        assert_eq!(
+            body["input"][0]["arguments"],
+            r#"{"cmd":"cat crm/Person-3.md notes/Org-2/2026.txt Max_Mueller.md ~/asgard_prod/anvil/x"}"#,
+            "byte-faithful write-back; slug and single-token path segment stay"
+        );
+        assert_eq!(body["input"][1]["output"], "crm/Person-3.md:12: Person-3, CEO of Org-2");
+        // and the de-cloaker restores the path exactly
+        let mut item = fc_item(0, body["input"][0]["arguments"].as_str().unwrap());
+        decloak_responses_item(&bs, &json_escaped_session(&bs), &mut item);
+        assert_eq!(item["arguments"], args);
+    }
+
+    // 29
+    #[test]
+    fn local_shell_call_command_and_output_cloaked_and_decloaked() {
+        let s = one("Person-3", "Max Müller");
+        let mut body = json!({"input": [
+            {"type": "local_shell_call", "call_id": "c", "action": {"type": "exec", "command": ["grep", "-rn", "Max Müller", "crm/"], "env": {}}},
+            {"type": "local_shell_call_output", "call_id": "c", "output": "crm/a.md: Max Müller"},
+            {"type": "web_search_call", "action": {"type": "search", "query": "Max Müller"}}
+        ]});
+        let before = body.clone();
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        assert_eq!(
+            slots,
+            vec![
+                ResponsesSlot::ItemShellCommand(0, 0),
+                ResponsesSlot::ItemShellCommand(0, 1),
+                ResponsesSlot::ItemShellCommand(0, 2),
+                ResponsesSlot::ItemShellCommand(0, 3),
+                ResponsesSlot::ItemOutputString(1)
+            ]
+        );
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
+        assert_eq!(body["input"][0]["action"]["command"], json!(["grep", "-rn", "Person-3", "crm/"]));
+        assert_eq!(body["input"][1]["output"], "crm/a.md: Person-3");
+        assert_eq!(body["input"][2], before["input"][2], "web_search_call untouched");
+        // opt-out keeps the shell output, still cloaks the command
+        let (slots, _) = collect_responses_cloak_texts(&before, false);
+        assert_eq!(slots.len(), 4);
+        // response side
+        let mut item = body["input"][0].clone();
+        decloak_responses_item(&bs, &json_escaped_session(&bs), &mut item);
+        assert_eq!(item["action"]["command"], json!(["grep", "-rn", "Max Müller", "crm/"]));
+    }
+
+    // 30
+    #[test]
+    fn duplicate_keys_in_arguments_are_normalized_before_cloaking() {
+        assert!(has_duplicate_keys(r#"{"q":"Max Müller","q":5}"#));
+        assert!(has_duplicate_keys(r#"[{"a":{"b":1,"b":2}}]"#));
+        assert!(!has_duplicate_keys(r#"{"q":"Max Müller","r":[{"q":1}]}"#));
+        assert!(!has_duplicate_keys("not json"));
+        let mut body = json!({"input": [
+            {"type": "function_call", "call_id": "c1", "name": "n", "arguments": r#"{"q":"Max Müller","q":5}"#},
+            {"type": "function_call", "call_id": "c2", "name": "n", "arguments": r#"{"q": "Max Müller", "q": "x Max Müller"}"#},
+            {"type": "function_call", "call_id": "c3", "name": "n", "arguments": r#"{"q": "keep  spacing"}"#}
+        ]});
+        normalize_duplicate_argument_keys(&mut body);
+        assert_eq!(body["input"][0]["arguments"], r#"{"q":5}"#, "the hidden earlier value is gone");
+        assert_eq!(body["input"][2]["arguments"], r#"{"q": "keep  spacing"}"#, "no duplicates: untouched");
+        let s = one("Person-3", "Max Müller");
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
+        assert_eq!(body["input"][1]["arguments"], r#"{"q":"x Person-3"}"#);
+        assert!(!body.to_string().contains("Müller"));
     }
 }
