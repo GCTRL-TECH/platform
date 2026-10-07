@@ -221,9 +221,6 @@ pub(crate) async fn enforce_classification_ceiling(
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct Pagination { limit: Option<i64>, offset: Option<i64> }
-
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
         .route("/extract",         post(extract))
@@ -235,6 +232,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/jobs",            get(list_jobs))
         .route("/jobs/:id",        get(get_job).delete(delete_job))
         .route("/jobs/:id/result", get(get_result))
+        .route("/jobs/:id/unlink", post(unlink_job))
         .route("/jobs/:id/cancel", post(cancel_job))
         .route("/jobs/:id/retry",  post(retry_job))
         .route("/jobs/retry-failed", post(retry_failed))
@@ -1005,39 +1003,192 @@ async fn retry_failed(
 async fn list_jobs(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
-    Query(q): Query<Pagination>,
+    Query(q): Query<JobsQuery>,
 ) -> Result<Json<Value>> {
-    let limit  = q.limit.unwrap_or(20).min(100);
-    let offset = q.offset.unwrap_or(0);
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs
-         WHERE user_id = $1 AND type IN ('kex_extract','kex_upload','kex_connector')
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3"
-    )
-    .bind(claims.sub).bind(limit).bind(offset)
+    let limit  = q.limit.unwrap_or(20).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let scope = job_read_scope(&state.db, &claims, truthy(q.all.as_deref())).await;
+    let (token_id, token_web) = match q.token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None        => (None, false),
+        Some("web") => (None, true),
+        Some(s)     => (
+            Some(s.parse::<Uuid>().map_err(|_| AppError::BadRequest(
+                "token must be an access-token id or 'web'".into()))?),
+            false,
+        ),
+    };
+    let pattern = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(like_pattern);
+
+    let rows: Vec<JobRow> = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} {JOB_JOINS} WHERE {JOB_LIST_WHERE}
+         ORDER BY j.created_at DESC LIMIT $7 OFFSET $8"
+    ))
+    .bind(scope.user_id).bind(scope.api_key_id)
+    .bind(token_id).bind(token_web).bind(q.kb).bind(&pattern)
+    .bind(limit).bind(offset)
     .fetch_all(&state.db).await?;
 
-    let jobs: Vec<Value> = rows.into_iter().map(|(id, t, status, input, result, error, created, completed)| {
-        let (status, degraded_reason) = presented_status(&status, result.as_ref());
-        json!({
-            "id": id, "type": t, "status": status,
-            "degradedReason": degraded_reason,
-            "input": input, "result": result, "error": error,
-            "createdAt": created, "completedAt": completed,
-        })
-    }).collect();
-
-    // Real totals across ALL of the user's jobs — the dashboard was counting the
-    // returned page (jobs.length, capped at the default limit of 20) and showed
-    // "20 extractions" forever. Same WHERE clause as the page query above.
-    let (total, completed_total): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'completed') FROM jobs
-         WHERE user_id = $1 AND type IN ('kex_extract','kex_upload','kex_connector')"
-    )
-    .bind(claims.sub)
+    // Real totals over the SAME filter, not the page: the dashboard used to count
+    // the returned page (capped at the default limit of 20) and showed "20
+    // extractions" forever.
+    let (total, completed_total): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE j.status = 'completed')
+         {JOB_JOINS} WHERE {JOB_LIST_WHERE}"
+    ))
+    .bind(scope.user_id).bind(scope.api_key_id)
+    .bind(token_id).bind(token_web).bind(q.kb).bind(&pattern)
     .fetch_one(&state.db).await?;
 
-    Ok(Json(json!({ "jobs": jobs, "total": total, "completed": completed_total })))
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let mut comps = compilations_of_jobs(&state.db, &ids).await;
+    let jobs: Vec<Value> = rows.into_iter().map(|r| {
+        let c = comps.remove(&r.0).unwrap_or_default();
+        job_json(r, c)
+    }).collect();
+    let has_more = (offset + jobs.len() as i64) < total;
+
+    Ok(Json(json!({ "jobs": jobs, "total": total, "completed": completed_total, "hasMore": has_more })))
+}
+
+#[derive(Deserialize)]
+struct JobsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// ILIKE over token name, user e-mail and the input's file name / source ref.
+    search: Option<String>,
+    /// An access-token id, or the literal `web` for jobs triggered from a
+    /// signed-in session (`api_key_id IS NULL`).
+    token: Option<String>,
+    /// Only jobs that are part of this compilation's `source_job_ids`.
+    kb: Option<Uuid>,
+    /// `1` / `true`: every user's jobs. Honoured for an admin SESSION only; a
+    /// delegated token never crosses the account boundary, whatever it asks for.
+    all: Option<String>,
+}
+
+/// An admin signed in with a session (not a delegated token) may look at and
+/// remove any user's jobs.
+pub(crate) fn is_admin_session(claims: &JwtClaims) -> bool {
+    claims.role == "admin" && claims.api_key_id.is_none()
+}
+
+fn truthy(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1") | Some("true") | Some("yes"))
+}
+
+/// `%term%` with the LIKE wildcards of the term itself escaped, so a search for
+/// `report_2026` does not match `reportX2026`. Postgres' default escape is `\`.
+pub(crate) fn like_pattern(term: &str) -> String {
+    let mut s = String::with_capacity(term.len() + 2);
+    s.push('%');
+    for ch in term.chars() {
+        if matches!(ch, '\\' | '%' | '_') { s.push('\\'); }
+        s.push(ch);
+    }
+    s.push('%');
+    s
+}
+
+/// Who the job list / job detail shows. `user_id = None` only for an admin
+/// session that asked for `all`; `api_key_id = Some` confines a KB-scoped token
+/// to the jobs it triggered itself (a full-owner token sees the whole account,
+/// like the owner's session).
+struct JobReadScope { user_id: Option<Uuid>, api_key_id: Option<Uuid> }
+
+async fn job_read_scope(db: &sqlx::PgPool, claims: &JwtClaims, want_all: bool) -> JobReadScope {
+    if want_all && is_admin_session(claims) {
+        return JobReadScope { user_id: None, api_key_id: None };
+    }
+    let key = if crate::routes::kg::api_key_scope(db, claims).await.is_some() {
+        claims.api_key_id
+    } else {
+        None
+    };
+    JobReadScope { user_id: Some(claims.sub), api_key_id: key }
+}
+
+/// Row shape shared by the job list and the job detail: the job, plus the
+/// token that triggered it and the account it belongs to.
+type JobRow = (
+    Uuid, String, String, Value, Option<Value>, Option<String>,
+    chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>,
+    Option<Uuid>, Option<String>, Option<String>, Uuid,
+);
+
+const JOB_COLUMNS: &str =
+    "j.id, j.type, j.status, j.input, j.result, j.error, j.created_at, j.completed_at,
+     j.api_key_id, ak.name, u.email, j.user_id";
+
+const JOB_JOINS: &str =
+    "FROM jobs j
+     LEFT JOIN api_keys ak ON ak.id = j.api_key_id
+     LEFT JOIN users u ON u.id = j.user_id";
+
+/// Filter of the job list; bound as $1 user (NULL = every user), $2 own token
+/// (NULL = unrestricted), $3 token filter, $4 "web only", $5 compilation,
+/// $6 ILIKE pattern. The list query and its count query share it so the totals
+/// can never drift from the page.
+const JOB_LIST_WHERE: &str =
+    "j.type IN ('kex_extract','kex_upload','kex_connector')
+     AND ($1::uuid IS NULL OR j.user_id = $1)
+     AND ($2::uuid IS NULL OR j.api_key_id = $2)
+     AND ($3::uuid IS NULL OR j.api_key_id = $3)
+     AND (NOT $4::bool OR j.api_key_id IS NULL)
+     AND ($5::uuid IS NULL OR EXISTS (
+           SELECT 1 FROM compilations c WHERE c.id = $5 AND j.id = ANY(c.source_job_ids)))
+     AND ($6::text IS NULL
+          OR ak.name ILIKE $6 OR u.email ILIKE $6
+          OR j.input->>'fileName' ILIKE $6 OR j.input->>'originalFilename' ILIKE $6
+          OR j.input->>'sourceRef' ILIKE $6 OR j.input->>'source' ILIKE $6)";
+
+/// Best-effort display name of what a job ingested, from the keys the ingest
+/// paths write: `fileName` (upload / extract / agent store), `originalFilename`
+/// (KEX payload), `sourceRef` (where it came from). `source` is a kind
+/// ("agent_store", "repo"), not a name, so it is not a candidate.
+pub(crate) fn job_file_name(input: &Value) -> Option<String> {
+    ["fileName", "originalFilename", "sourceRef"].iter()
+        .filter_map(|k| input.get(*k).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `{id, name}` of every compilation whose `source_job_ids` carries each of the
+/// jobs — one query for a whole page.
+pub(crate) async fn compilations_of_jobs(
+    db: &sqlx::PgPool,
+    job_ids: &[Uuid],
+) -> std::collections::HashMap<Uuid, Vec<Value>> {
+    let mut out: std::collections::HashMap<Uuid, Vec<Value>> = Default::default();
+    if job_ids.is_empty() { return out; }
+    let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT x.job_id, c.id, c.name
+           FROM compilations c, unnest(c.source_job_ids) AS x(job_id)
+          WHERE x.job_id = ANY($1)
+          ORDER BY c.name"
+    ).bind(job_ids).fetch_all(db).await.unwrap_or_default();
+    for (job, cid, name) in rows {
+        out.entry(job).or_default().push(json!({ "id": cid, "name": name }));
+    }
+    out
+}
+
+fn job_json(row: JobRow, compilations: Vec<Value>) -> Value {
+    let (id, t, status, input, result, error, created, completed,
+         api_key_id, token_name, user_email, _owner) = row;
+    let (status, degraded_reason) = presented_status(&status, result.as_ref());
+    let file_name = job_file_name(&input);
+    json!({
+        "id": id, "type": t, "status": status,
+        "degradedReason": degraded_reason,
+        "input": input, "result": result, "error": error,
+        "createdAt": created, "completedAt": completed,
+        "apiKeyId": api_key_id,
+        "tokenName": token_name,
+        "userEmail": user_email,
+        "fileName": file_name,
+        "compilationIds": compilations,
+    })
 }
 
 // Frontend KexJobDetail expects `{ job: ... }` wrapper.
@@ -1046,20 +1197,77 @@ async fn get_job(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let row = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs WHERE id = $1 AND user_id = $2"
+    // An admin session may open any user's job; everyone else is confined like
+    // the list (own account; a KB-scoped token to its own jobs).
+    let scope = job_read_scope(&state.db, &claims, true).await;
+    let row: Option<JobRow> = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} {JOB_JOINS}
+         WHERE j.id = $1
+           AND ($2::uuid IS NULL OR j.user_id = $2)
+           AND ($3::uuid IS NULL OR j.api_key_id = $3)"
+    ))
+    .bind(id).bind(scope.user_id).bind(scope.api_key_id)
+    .fetch_optional(&state.db).await?;
+    let row = row.ok_or(AppError::NotFound)?;
+
+    let comps = compilations_of_jobs(&state.db, &[id]).await.remove(&id).unwrap_or_default();
+    let mut job = job_json(row, comps);
+
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM text_chunks WHERE job_id = $1")
+        .bind(id).fetch_one(&state.db).await.unwrap_or(0);
+    let sample: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, left(content, 160), source_document_id FROM text_chunks
+          WHERE job_id = $1
+          ORDER BY chunk_sequence NULLS LAST, created_at
+          LIMIT 50"
+    ).bind(id).fetch_all(&state.db).await.unwrap_or_default();
+    job["chunks"] = json!({
+        "count": chunk_count,
+        "sample": sample.into_iter().map(|(cid, preview, doc)| json!({
+            "id": cid, "preview": preview, "sourceDocumentId": doc,
+        })).collect::<Vec<_>>(),
+    });
+    job["graphFootprint"] = graph_footprint(&state.neo, id).await;
+
+    Ok(Json(json!({ "job": job })))
+}
+
+/// How much of the graph a job accounts for: elements it is a member of, and
+/// those it is the ONLY member of (what a removal would actually delete).
+pub(crate) fn footprint_cypher(pattern: &str, alias: &str) -> String {
+    format!(
+        "MATCH {pattern} WHERE {scope} \
+         RETURN count({alias}) AS total, \
+                count(CASE WHEN size({expr}) = 1 THEN 1 END) AS exclusive",
+        scope = crate::services::neo4j::job_scope(alias, "jobs"),
+        expr = crate::services::neo4j::source_jobs_expr(alias),
     )
-    .bind(id).bind(claims.sub)
-    .fetch_optional(&state.db).await?
-    .ok_or(AppError::NotFound)?;
-    let (id, t, status, input, result, error, created, completed) = row;
-    let (status, degraded_reason) = presented_status(&status, result.as_ref());
-    Ok(Json(json!({ "job": {
-        "id": id, "type": t, "status": status,
-        "degradedReason": degraded_reason,
-        "input": input, "result": result, "error": error,
-        "createdAt": created, "completedAt": completed,
-    } })))
+}
+
+async fn footprint_counts(neo: &neo4rs::Graph, cypher: &str, jobs: &[String]) -> (i64, i64) {
+    match neo.execute(neo4rs::query(cypher).param("jobs", jobs.to_vec())).await {
+        Ok(mut stream) => match stream.next().await {
+            Ok(Some(row)) => (
+                row.get::<i64>("total").unwrap_or(0),
+                row.get::<i64>("exclusive").unwrap_or(0),
+            ),
+            _ => (0, 0),
+        },
+        Err(e) => {
+            tracing::warn!("graph footprint query failed: {e}");
+            (0, 0)
+        }
+    }
+}
+
+async fn graph_footprint(neo: &neo4rs::Graph, job_id: Uuid) -> Value {
+    let jobs = vec![job_id.to_string()];
+    let (nodes, nodes_exclusive) = footprint_counts(neo, &footprint_cypher("(n)", "n"), &jobs).await;
+    let (rels, rels_exclusive)   = footprint_counts(neo, &footprint_cypher("()-[r]->()", "r"), &jobs).await;
+    json!({
+        "nodes": nodes, "nodesExclusive": nodes_exclusive,
+        "rels": rels, "relsExclusive": rels_exclusive,
+    })
 }
 
 // Frontend KexJobDetail expects shape `{ jobId, status, completedAt, result }`.
@@ -1095,74 +1303,325 @@ async fn cancel_job(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Delete an extraction job AND its cross-store footprint: its chunks (Postgres
-/// + best-effort Qdrant points, same pattern as delete_chunk_core) and its
-/// membership in every compilation's `source_job_ids` (otherwise the graph view
-/// keeps referencing a job that no longer exists). token_usage / sync-history
-/// rows survive via ON DELETE SET NULL (migration 070) — they are billing/audit
-/// history, not job data.
-///
-/// Neo4j entities included: every element drops this job from its `_source_jobs`
-/// membership, and whatever ends up with an empty list is deleted. Nodes are
-/// URI-merged across jobs, so this is precise — what other jobs also produced
-/// survives, minus one contributor. (Until the membership list existed there was
-/// only `_source_job`, the LATEST contributor, which could not tell the two apart;
-/// deletion was skipped here and never happened anywhere else either.)
+/// DELETE /api/kex/jobs/:id — remove the extraction and everything it put into
+/// the stores. See `remove_job_everywhere`.
 async fn delete_job(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    // Owner check up front so a foreign id can't trigger any cleanup.
-    let owned: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM jobs WHERE id = $1 AND user_id = $2"
-    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
-    if owned.is_none() { return Err(AppError::NotFound); }
+    Ok(Json(remove_job_everywhere(&state, &claims, id).await?))
+}
 
-    // Collect the job's Qdrant point ids, then drop its chunks from Postgres.
-    let point_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT qdrant_point_id FROM text_chunks
-         WHERE job_id = $1 AND user_id = $2 AND qdrant_point_id IS NOT NULL"
-    ).bind(id).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
-    sqlx::query("DELETE FROM text_chunks WHERE job_id = $1 AND user_id = $2")
-        .bind(id).bind(claims.sub).execute(&state.db).await?;
+#[derive(Deserialize)]
+struct UnlinkReq {
+    #[serde(rename = "compilationId")] compilation_id: Uuid,
+}
 
-    // Unlink from every owning compilation so the graph stops referencing it.
-    sqlx::query(
+/// POST /api/kex/jobs/:id/unlink { compilationId } — take the extraction out of
+/// ONE knowledge base. See `unlink_job_from_compilation`.
+async fn unlink_job(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UnlinkReq>,
+) -> Result<Json<Value>> {
+    Ok(Json(unlink_job_from_compilation(&state, &claims, id, req.compilation_id).await?))
+}
+
+/// What a mutation needs to know about a job once the caller is allowed to touch it.
+struct JobRef {
+    user_id: Uuid,
+    api_key_id: Option<Uuid>,
+    file_name: Option<String>,
+    source_document_id: Option<Uuid>,
+}
+
+/// Load a job for a mutation and settle who may touch it:
+///   * an admin session: any user's job;
+///   * otherwise the caller's own job (a foreign id reads as not found, so the
+///     id's existence is never confirmed);
+///   * a KB-scoped token: only the jobs it triggered itself.
+/// Then every compilation that still references the job must be writable for
+/// the caller — `enforce_kb_write_scope` (grant set + read-only grants) and the
+/// Codebase-access capability for CODE knowledge bases.
+async fn load_job_for_mutation(db: &sqlx::PgPool, claims: &JwtClaims, job_id: Uuid) -> Result<JobRef> {
+    let row: Option<(Uuid, Option<Uuid>, Value, Option<Uuid>)> = sqlx::query_as(
+        "SELECT user_id, api_key_id, input, source_document_id FROM jobs WHERE id = $1"
+    ).bind(job_id).fetch_optional(db).await?;
+    let Some((user_id, api_key_id, input, source_document_id)) = row else {
+        return Err(AppError::NotFound);
+    };
+    if !is_admin_session(claims) {
+        if user_id != claims.sub { return Err(AppError::NotFound); }
+        if crate::routes::kg::api_key_scope(db, claims).await.is_some()
+            && api_key_id != claims.api_key_id
+        {
+            return Err(AppError::Forbidden(
+                "This access token may only remove extractions it triggered itself".into()));
+        }
+    }
+    let cids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM compilations WHERE $1 = ANY(source_job_ids)"
+    ).bind(job_id).fetch_all(db).await?;
+    for cid in cids {
+        crate::routes::kg::enforce_kb_write_scope(db, claims, cid).await?;
+        crate::routes::kg::enforce_code_capability(db, claims, cid).await?;
+    }
+    Ok(JobRef { user_id, api_key_id, file_name: job_file_name(&input), source_document_id })
+}
+
+/// Names of the nodes ONLY this job produced. Read before the purge — afterwards
+/// nothing maps them back to the job. Capped; a dossier that slips through the
+/// cap is still caught by the `origin_files` match on the file name.
+async fn exclusive_node_names(neo: &neo4rs::Graph, job_id: Uuid) -> Vec<String> {
+    let cypher = format!(
+        "MATCH (n) WHERE {scope} AND size({expr}) = 1 AND n.name IS NOT NULL \
+         RETURN DISTINCT n.name AS name LIMIT 5000",
+        scope = crate::services::neo4j::job_scope("n", "jobs"),
+        expr = crate::services::neo4j::source_jobs_expr("n"),
+    );
+    let mut names = Vec::new();
+    match neo.execute(neo4rs::query(&cypher).param("jobs", vec![job_id.to_string()])).await {
+        Ok(mut stream) => {
+            while let Ok(Some(row)) = stream.next().await {
+                if let Ok(name) = row.get::<String>("name") { names.push(name); }
+            }
+        }
+        Err(e) => tracing::warn!("job {job_id}: exclusive node names query failed: {e}"),
+    }
+    names
+}
+
+/// Best-effort Qdrant cleanup for a whole job: the explicit point ids (the chunk
+/// rows we just deleted) AND a filter delete on the payload's `job_id`, which
+/// also catches points whose row was already gone. Returns how many explicit
+/// points were acknowledged.
+async fn delete_job_vectors(state: &Arc<crate::models::AppState>, job_id: Uuid, point_ids: &[String]) -> usize {
+    let collection = qdrant_collection(state).await;
+    let url = format!(
+        "{}/collections/{}/points/delete?wait=true",
+        state.cfg.qdrant_url.trim_end_matches('/'),
+        collection
+    );
+    let client = reqwest::Client::new();
+    let mut deleted = 0usize;
+    if !point_ids.is_empty() {
+        match client.post(&url).json(&json!({ "points": point_ids })).send().await {
+            Ok(r) if r.status().is_success() => deleted = point_ids.len(),
+            Ok(r) => tracing::warn!("job {job_id}: qdrant points/delete returned {}", r.status()),
+            Err(e) => tracing::warn!("job {job_id}: qdrant points/delete failed: {e}"),
+        }
+    }
+    let by_job = json!({ "filter": { "must": [
+        { "key": "job_id", "match": { "value": job_id.to_string() } }
+    ]}});
+    match client.post(&url).json(&by_job).send().await {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => tracing::warn!("job {job_id}: qdrant delete-by-job_id returned {}", r.status()),
+        Err(e) => tracing::warn!("job {job_id}: qdrant delete-by-job_id failed: {e}"),
+    }
+    deleted
+}
+
+/// Remove an extraction job AND its cross-store footprint. Shared by
+/// `DELETE /kex/jobs/:id`, by `unlink` when the last knowledge base lets go of
+/// the job, and by the agent's `delete_extraction`.
+///
+/// In order:
+///   1. names of the nodes only this job produced (before the purge);
+///   2. its chunks — Postgres rows, point ids collected first;
+///   3. its membership in every compilation's `source_job_ids`;
+///   4. the graph: every element drops this job from `_source_jobs`, and
+///      whatever ends up with an empty list is deleted (`neo4j::purge_jobs`) —
+///      nodes are URI-merged across jobs, so what other jobs also produced
+///      survives, minus one contributor;
+///   5. dossiers compiled from those nodes (by name, or by the file in
+///      `origin_files`) are marked `stale`, not deleted;
+///   6. a `knowledge_corrections` row remembers the removal;
+///   7. the job row, then the source document if nothing references it any more;
+///   8. Qdrant, best-effort, after the authoritative Postgres deletes.
+/// token_usage / sync-history rows survive via ON DELETE SET NULL (migration
+/// 070) — they are billing/audit history, not job data.
+pub async fn remove_job_everywhere(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    job_id: Uuid,
+) -> Result<Value> {
+    let job = load_job_for_mutation(&state.db, claims, job_id).await?;
+    let owner = job.user_id;
+
+    let exclusive_names = exclusive_node_names(&state.neo, job_id).await;
+
+    let chunk_rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, qdrant_point_id FROM text_chunks WHERE job_id = $1 AND user_id = $2"
+    ).bind(job_id).bind(owner).fetch_all(&state.db).await.unwrap_or_default();
+    let point_ids: Vec<String> = chunk_rows.into_iter()
+        .map(|(cid, point)| chunk_point_id(point, cid))
+        .collect();
+    let chunks_deleted = sqlx::query("DELETE FROM text_chunks WHERE job_id = $1 AND user_id = $2")
+        .bind(job_id).bind(owner).execute(&state.db).await?.rows_affected();
+
+    let compilations_unlinked = sqlx::query(
         "UPDATE compilations SET source_job_ids = array_remove(source_job_ids, $1), updated_at = NOW()
-         WHERE user_id = $2 AND $1 = ANY(source_job_ids)"
-    ).bind(id).bind(claims.sub).execute(&state.db).await?;
+         WHERE $1 = ANY(source_job_ids)"
+    ).bind(job_id).execute(&state.db).await?.rows_affected();
 
     // Graph footprint before the row: after the DELETE nothing maps a node back
     // to this job.
-    let purged = crate::services::neo4j::purge_jobs(&state.neo, &[id]).await;
+    let purged = crate::services::neo4j::purge_jobs(&state.neo, &[job_id]).await;
 
-    sqlx::query("DELETE FROM jobs WHERE id=$1 AND user_id=$2")
-        .bind(id).bind(claims.sub).execute(&state.db).await?;
+    let names_lower: Vec<String> = exclusive_names.iter().map(|n| n.to_lowercase()).collect();
+    let dossiers_staled = sqlx::query(
+        "UPDATE entity_dossiers SET stale = true
+          WHERE user_id = $1 AND stale = false
+            AND (lower(entity_name) = ANY($2)
+                 OR ($3::text IS NOT NULL AND $3 = ANY(origin_files)))"
+    ).bind(owner).bind(&names_lower).bind(&job.file_name)
+     .execute(&state.db).await
+     .map(|r| r.rows_affected())
+     .unwrap_or_else(|e| { tracing::warn!("job {job_id}: dossiers not marked stale: {e}"); 0 });
 
-    // Best-effort Qdrant cleanup (after the authoritative PG deletes).
-    let mut vectors_deleted = 0usize;
-    if !point_ids.is_empty() {
-        let collection = qdrant_collection(&state).await;
-        let url = format!(
-            "{}/collections/{}/points/delete?wait=true",
-            state.cfg.qdrant_url.trim_end_matches('/'),
-            collection
-        );
-        match reqwest::Client::new().post(&url).json(&json!({ "points": point_ids.clone() })).send().await {
-            Ok(r) if r.status().is_success() => vectors_deleted = point_ids.len(),
-            Ok(r) => tracing::warn!("delete_job {id}: qdrant points/delete returned {}", r.status()),
-            Err(e) => tracing::warn!("delete_job {id}: qdrant points/delete failed: {e}"),
-        }
+    let reason = format!(
+        "removed by {}{}",
+        claims.email,
+        job.file_name.as_deref().map(|f| format!("; file {f}")).unwrap_or_default(),
+    );
+    let _ = sqlx::query(
+        "INSERT INTO knowledge_corrections
+            (user_id, compilation_id, element_kind, head, rel_type, tail, action, reason)
+         VALUES ($1, NULL, 'job', $2, NULL, $3, 'job_removed', $4)"
+    ).bind(owner).bind(job_id.to_string()).bind(job.api_key_id.map(|k| k.to_string())).bind(&reason)
+     .execute(&state.db).await
+     .map_err(|e| tracing::warn!("job {job_id}: removal not remembered: {e}"));
+
+    sqlx::query("DELETE FROM jobs WHERE id = $1").bind(job_id).execute(&state.db).await?;
+
+    // The document identity goes with its last job; a version another job or
+    // chunk still points at stays.
+    let mut source_documents_deleted = 0u64;
+    if let Some(doc) = job.source_document_id {
+        source_documents_deleted = sqlx::query(
+            "DELETE FROM source_documents sd
+              WHERE sd.id = $1
+                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.source_document_id = sd.id)
+                AND NOT EXISTS (SELECT 1 FROM text_chunks tc WHERE tc.source_document_id = sd.id)"
+        ).bind(doc).execute(&state.db).await
+         .map(|r| r.rows_affected())
+         .unwrap_or_else(|e| { tracing::warn!("job {job_id}: source document not deleted: {e}"); 0 });
     }
 
-    Ok(Json(json!({
+    let vectors_deleted = delete_job_vectors(state, job_id, &point_ids).await;
+
+    let eff = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
+    crate::services::audit::log_access(&state.db, claims, "job.delete",
+        "job", &job_id.to_string(), eff, None, true, None).await;
+
+    Ok(json!({
         "ok": true,
-        "chunksDeleted": point_ids.len(),
+        "chunksDeleted": chunks_deleted,
         "vectorsDeleted": vectors_deleted,
         "nodesDeleted": purged.nodes_deleted,
         "relationshipsDeleted": purged.rels_deleted,
-    })))
+        "sourceDocumentsDeleted": source_documents_deleted,
+        "dossiersStaled": dossiers_staled,
+        "compilationsUnlinked": compilations_unlinked,
+    }))
+}
+
+/// Does the compilation hold FUSE-merged entities? Then a membership change
+/// leaves the merged layer behind until FUSE runs again.
+async fn has_merged_nodes(neo: &neo4rs::Graph, compilation_id: Uuid) -> bool {
+    let q = neo4rs::query(
+        "MATCH (e:Entity:Merged {_compilation: $cid}) RETURN count(e) > 0 AS has"
+    ).param("cid", compilation_id.to_string());
+    match neo.execute(q).await {
+        Ok(mut stream) => match stream.next().await {
+            Ok(Some(row)) => row.get::<bool>("has").unwrap_or(false),
+            _ => false,
+        },
+        Err(e) => { tracing::warn!("compilation {compilation_id}: merged-node check failed: {e}"); false }
+    }
+}
+
+/// Queue a FUSE re-run for a compilation over its CURRENT source jobs — what the
+/// agent's `refresh_compilation` does. `None` when the compilation is not the
+/// user's. Returns the fuse job id.
+pub(crate) async fn enqueue_fuse_refresh(
+    state: &Arc<crate::models::AppState>,
+    user_id: Uuid,
+    api_key_id: Option<Uuid>,
+    compilation_id: Uuid,
+) -> Option<Uuid> {
+    let source_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
+    ).bind(compilation_id).bind(user_id).fetch_optional(&state.db).await.ok().flatten()?;
+    let job_id = Uuid::new_v4();
+    let _ = sqlx::query("INSERT INTO jobs (id,user_id,type,status,input,api_key_id) VALUES ($1,$2,'fuse_merge','pending',$3,$4)")
+        .bind(job_id).bind(user_id)
+        .bind(json!({ "compilationId": compilation_id, "sourceJobIds": source_ids }))
+        .bind(api_key_id)
+        .execute(&state.db).await;
+    let _ = lpush(&state.redis, "fuse:jobs", &json!({
+        "job_id": job_id, "compilation_id": compilation_id, "source_job_ids": source_ids
+    }).to_string()).await;
+    Some(job_id)
+}
+
+/// Take a job out of ONE knowledge base. Shared by `POST /kex/jobs/:id/unlink`,
+/// by `PUT /kg/compilations/:id` (a shrunken `sourceJobIds`) and by the agent's
+/// `delete_extraction` with a `compilationId`.
+///
+/// If no other compilation references the job afterwards, the job is removed
+/// everywhere (`remove_job_everywhere`) — an extraction nobody can reach is
+/// garbage, not an archive. Otherwise only the membership changes; the raw nodes
+/// stay for the other knowledge bases, and a compilation that holds FUSE-merged
+/// entities gets a fusion re-run queued so its merged layer follows.
+pub(crate) async fn unlink_job_from_compilation(
+    state: &Arc<crate::models::AppState>,
+    claims: &JwtClaims,
+    job_id: Uuid,
+    compilation_id: Uuid,
+) -> Result<Value> {
+    let job = load_job_for_mutation(&state.db, claims, job_id).await?;
+    crate::routes::kg::enforce_kb_write_scope(&state.db, claims, compilation_id).await?;
+    crate::routes::kg::enforce_code_capability(&state.db, claims, compilation_id).await?;
+
+    let removed = sqlx::query(
+        "UPDATE compilations SET source_job_ids = array_remove(source_job_ids, $1), updated_at = NOW()
+         WHERE id = $2 AND user_id = $3 AND $1 = ANY(source_job_ids)"
+    ).bind(job_id).bind(compilation_id).bind(job.user_id)
+     .execute(&state.db).await?.rows_affected();
+    if removed == 0 { return Err(AppError::NotFound); }
+
+    let still_referenced: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM compilations WHERE $1 = ANY(source_job_ids))"
+    ).bind(job_id).fetch_one(&state.db).await?;
+
+    if !still_referenced {
+        let mut out = remove_job_everywhere(state, claims, job_id).await?;
+        out["purged"] = json!(true);
+        out["refreshQueued"] = json!(false);
+        out["compilationsUnlinked"] = json!(1);
+        return Ok(out);
+    }
+
+    let refresh_queued = has_merged_nodes(&state.neo, compilation_id).await
+        && enqueue_fuse_refresh(state, job.user_id, claims.api_key_id, compilation_id).await.is_some();
+
+    let eff = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
+    crate::services::audit::log_access(&state.db, claims, "job.unlink",
+        "job", &job_id.to_string(), eff, Some("compilation"), true, None).await;
+
+    Ok(json!({
+        "ok": true,
+        "purged": false,
+        "refreshQueued": refresh_queued,
+        "nodesDeleted": 0,
+        "relationshipsDeleted": 0,
+        "chunksDeleted": 0,
+        "vectorsDeleted": 0,
+    }))
 }
 
 /// Redis key the KEX worker's config-watcher polls to scale its thread pool.
@@ -1683,5 +2142,79 @@ mod mime_tests {
         assert_eq!(mime_for_filename("blob.dwg"), "application/octet-stream");
         assert_eq!(mime_for_filename("noext"), "application/octet-stream");
         assert_eq!(mime_for_filename("report.pdf"), "application/pdf");
+    }
+}
+
+#[cfg(test)]
+mod job_overview_tests {
+    use super::*;
+
+    #[test]
+    fn like_pattern_escapes_wildcards() {
+        assert_eq!(like_pattern("report_2026"), "%report\\_2026%");
+        assert_eq!(like_pattern("100%"), "%100\\%%");
+        assert_eq!(like_pattern("plain"), "%plain%");
+    }
+
+    #[test]
+    fn file_name_prefers_the_upload_name_and_ignores_the_source_kind() {
+        assert_eq!(job_file_name(&json!({"fileName": "deck.pptx", "sourceRef": "/x/deck.pptx"})).as_deref(), Some("deck.pptx"));
+        assert_eq!(job_file_name(&json!({"fileName": null, "sourceRef": "vault/Note.md"})).as_deref(), Some("vault/Note.md"));
+        assert_eq!(job_file_name(&json!({"originalFilename": " a.pdf "})).as_deref(), Some("a.pdf"));
+        // "source" is a kind (agent_store, repo), never a name.
+        assert_eq!(job_file_name(&json!({"source": "agent_store", "text": "..."})), None);
+    }
+
+    #[test]
+    fn footprint_counts_membership_and_exclusive_membership() {
+        let c = footprint_cypher("(n)", "n");
+        assert!(c.contains(&crate::services::neo4j::job_scope("n", "jobs")));
+        assert!(c.contains(") = 1 THEN 1 END) AS exclusive"));
+        let r = footprint_cypher("()-[r]->()", "r");
+        assert!(r.contains("r._source_jobs"));
+    }
+
+    #[test]
+    fn only_an_admin_session_crosses_the_account_boundary() {
+        let mut c = JwtClaims {
+            sub: Uuid::nil(), email: "a@b".into(), role: "admin".into(), clearance: None, exp: 0,
+            api_key_rank: None, api_key_id: None, read_only: false, code_access: true,
+            agent_override_rank: None,
+        };
+        assert!(is_admin_session(&c));
+        c.api_key_id = Some(Uuid::nil());
+        assert!(!is_admin_session(&c), "a delegated admin token is not a session");
+        c.api_key_id = None;
+        c.role = "editor".into();
+        assert!(!is_admin_session(&c));
+        assert!(truthy(Some("1")) && truthy(Some("true")));
+        assert!(!truthy(Some("0")) && !truthy(None));
+    }
+
+    #[test]
+    fn list_filter_binds_every_parameter_in_both_queries() {
+        // The page query and the count query share the WHERE; a parameter that
+        // one of them stops binding would be a runtime error, not a compile error.
+        for n in 1..=6 {
+            assert!(JOB_LIST_WHERE.contains(&format!("${n}")), "missing ${n}");
+        }
+        assert!(!JOB_LIST_WHERE.contains("$7"));
+    }
+
+    /// The removal surfaces share one implementation: HTTP delete, unlink's
+    /// last-reference purge, the compilation update and the agent's
+    /// delete_extraction all go through it.
+    #[test]
+    fn every_removal_surface_shares_the_core() {
+        let kex = include_str!("kex.rs");
+        let agent = include_str!("agent.rs");
+        let kg = include_str!("kg.rs");
+        let delete_body = &kex[kex.find("async fn delete_job(").unwrap()..];
+        let delete_body = &delete_body[..delete_body.find("\n}\n").unwrap()];
+        assert!(delete_body.contains("remove_job_everywhere("));
+        assert!(agent.contains("remove_job_everywhere(") && agent.contains("unlink_job_from_compilation("),
+            "agent delete_extraction must use the shared removal functions");
+        assert!(kg.contains("unlink_job_from_compilation("),
+            "PUT /kg/compilations/:id must unlink removed sourceJobIds through the shared path");
     }
 }

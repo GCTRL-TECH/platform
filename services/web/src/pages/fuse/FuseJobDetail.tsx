@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft,
@@ -12,6 +13,8 @@ import {
   AlertCircle,
   Database,
   Layers,
+  Trash2,
+  Check,
   XCircle as CancelIcon,
 } from 'lucide-react'
 import { format } from 'date-fns'
@@ -19,7 +22,8 @@ import { useApiQuery } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
-import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+import { UnlinkDialog, describeUnlink } from '@/pages/kex/components/JobRemovalDialogs'
+import { SourceJobLabel, resolveSourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
 
 interface KexJobsResponse {
   jobs: SourceJobInfo[]
@@ -32,6 +36,9 @@ interface FuseJobData {
   createdAt: string
   updatedAt?: string
   completedAt?: string | null
+  apiKeyId?: string | null
+  tokenName?: string | null
+  userEmail?: string | null
   error?: string | null
   input?: {
     name?: string
@@ -98,6 +105,8 @@ export function FuseJobDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { neo4jBrowser } = usePublicConfig()
+  const [unlinkJobId, setUnlinkJobId] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
   const { data: jobResponse, isLoading, error } = useApiQuery<FuseJobResponse>(
     ['fuse', 'jobs', id],
@@ -174,6 +183,9 @@ export function FuseJobDetail() {
             {duration && <span className="text-xs text-slate-500 font-mono">{duration}</span>}
           </div>
           <p className="mt-1 font-mono text-xs text-slate-600">{job.id}</p>
+          <p className="mt-1 text-xs text-slate-500">
+            Provenance: {job.tokenName ?? 'Web login'}{job.userEmail ? ` · ${job.userEmail}` : ''}
+          </p>
         </div>
         <div className="flex gap-2">
           {isRunning && (
@@ -337,19 +349,51 @@ export function FuseJobDetail() {
           {job.input?.sourceJobIds && job.input.sourceJobIds.length > 0 && (
             <div className="card">
               <h3 className="mb-3 text-sm font-semibold text-slate-200">Source Extractions</h3>
+              {notice && (
+                <div className="mb-3 flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                  <Check size={14} className="mt-0.5 shrink-0" />
+                  <span>{notice}</span>
+                </div>
+              )}
               <div className="space-y-2">
                 {job.input.sourceJobIds.map((jobId) => (
-                  <button
+                  <div
                     key={jobId}
-                    onClick={() => navigate(`/kex/${jobId}`)}
-                    className="flex w-full items-center gap-3 rounded-lg border border-slate-800 bg-slate-800/30 px-4 py-2.5 text-left hover:bg-slate-800/60 transition-colors"
+                    className="flex w-full items-center gap-3 rounded-lg border border-slate-800 bg-slate-800/30 px-4 py-2.5 hover:bg-slate-800/60 transition-colors"
                   >
-                    <Database size={14} className="text-slate-500 shrink-0" />
-                    <SourceJobLabel jobId={jobId} jobs={kexJobs} />
-                    <span className="ml-auto text-xs text-slate-600 shrink-0">View →</span>
-                  </button>
+                    <button
+                      onClick={() => navigate(`/kex/${jobId}`)}
+                      className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                    >
+                      <Database size={14} className="text-slate-500 shrink-0" />
+                      <SourceJobLabel jobId={jobId} jobs={kexJobs} />
+                    </button>
+                    {compilationId && (
+                      <button
+                        onClick={() => setUnlinkJobId(jobId)}
+                        className="flex shrink-0 items-center gap-1 text-xs text-slate-600 transition-colors hover:text-red-400"
+                      >
+                        <Trash2 size={12} />Remove from this graph
+                      </button>
+                    )}
+                    <button
+                      onClick={() => navigate(`/kex/${jobId}`)}
+                      className="shrink-0 text-xs text-slate-600 hover:text-blue-400"
+                    >
+                      View
+                    </button>
+                  </div>
                 ))}
               </div>
+              <UnlinkDialog
+                open={!!unlinkJobId}
+                jobId={unlinkJobId ?? ''}
+                jobLabel={unlinkJobId ? resolveSourceJobLabel(unlinkJobId, kexJobs).label : undefined}
+                compilationId={compilationId ?? ''}
+                compilationName={jobName}
+                onClose={() => setUnlinkJobId(null)}
+                onDone={(r) => setNotice(describeUnlink(r))}
+              />
             </div>
           )}
         </>

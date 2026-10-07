@@ -100,9 +100,10 @@ async fn merge(
     .execute(&state.db).await?;
 
     let job_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO jobs (id, user_id, type, status, input) VALUES ($1, $2, 'fuse_merge', 'pending', $3)")
+    sqlx::query("INSERT INTO jobs (id, user_id, type, status, input, api_key_id) VALUES ($1, $2, 'fuse_merge', 'pending', $3, $4)")
         .bind(job_id).bind(claims.sub)
         .bind(json!({ "compilationId": comp_id, "sourceJobIds": source_job_ids, "name": req.name }))
+        .bind(claims.api_key_id)
         .execute(&state.db).await?;
 
     record_usage(&state.db, claims.sub, "fuse_merge", 10, Some(job_id)).await;
@@ -143,16 +144,39 @@ async fn list_jobs(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
 ) -> Result<Json<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs
-         WHERE user_id=$1 AND type='fuse_merge' ORDER BY created_at DESC LIMIT 50"
-    )
+    let rows: Vec<FuseJobRow> = sqlx::query_as(&format!(
+        "SELECT {FUSE_JOB_COLUMNS} {FUSE_JOB_JOINS}
+         WHERE j.user_id=$1 AND j.type='fuse_merge' ORDER BY j.created_at DESC LIMIT 50"
+    ))
     .bind(claims.sub).fetch_all(&state.db).await?;
-    let jobs: Vec<Value> = rows.into_iter().map(|(id, t, s, inp, r, e, c, cmp)| json!({
+    let jobs: Vec<Value> = rows.into_iter().map(fuse_job_json).collect();
+    Ok(Json(json!({ "jobs": jobs })))
+}
+
+/// A fuse job plus the token that triggered it and the account it belongs to —
+/// the same provenance the KEX job list shows.
+type FuseJobRow = (
+    Uuid, String, String, Value, Option<Value>, Option<String>,
+    chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>,
+    Option<Uuid>, Option<String>, Option<String>,
+);
+
+const FUSE_JOB_COLUMNS: &str =
+    "j.id, j.type, j.status, j.input, j.result, j.error, j.created_at, j.completed_at,
+     j.api_key_id, ak.name, u.email";
+
+const FUSE_JOB_JOINS: &str =
+    "FROM jobs j
+     LEFT JOIN api_keys ak ON ak.id = j.api_key_id
+     LEFT JOIN users u ON u.id = j.user_id";
+
+fn fuse_job_json(row: FuseJobRow) -> Value {
+    let (id, t, s, inp, r, e, c, cmp, api_key_id, token_name, user_email) = row;
+    json!({
         "id": id, "type": t, "status": s, "input": inp, "result": r, "error": e,
         "createdAt": c, "completedAt": cmp,
-    })).collect();
-    Ok(Json(json!({ "jobs": jobs })))
+        "apiKeyId": api_key_id, "tokenName": token_name, "userEmail": user_email,
+    })
 }
 
 async fn get_job(
@@ -160,15 +184,12 @@ async fn get_job(
     State(state): State<Arc<crate::models::AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let row = sqlx::query_as::<_, (Uuid, String, String, Value, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT id, type, status, input, result, error, created_at, completed_at FROM jobs WHERE id=$1 AND user_id=$2"
-    ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
-    let (id, t, s, inp, r, e, c, cmp) = row;
+    let row: Option<FuseJobRow> = sqlx::query_as(&format!(
+        "SELECT {FUSE_JOB_COLUMNS} {FUSE_JOB_JOINS} WHERE j.id=$1 AND j.user_id=$2"
+    )).bind(id).bind(claims.sub).fetch_optional(&state.db).await?;
+    let row = row.ok_or(AppError::NotFound)?;
     // Frontend FuseJobDetail expects `{ job: ... }` wrapper.
-    Ok(Json(json!({ "job": {
-        "id": id, "type": t, "status": s, "input": inp, "result": r, "error": e,
-        "createdAt": c, "completedAt": cmp,
-    } })))
+    Ok(Json(json!({ "job": fuse_job_json(row) })))
 }
 
 async fn cancel_job(

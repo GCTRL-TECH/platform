@@ -285,6 +285,7 @@ Action tools:
 - create_compilation : Create a new (empty) knowledge graph. Args: { name: string, description?: string }
 - delete_compilation : Delete a compilation the caller owns. Args: { compilationId: string }
 - refresh_compilation: Re-run fusion to refresh a compilation. Args: { compilationId: string }
+- delete_extraction  : Remove an extraction's knowledge: from ONE knowledge base (pass compilationId; the job is purged once no knowledge base references it) or everywhere (no compilationId: chunks, vectors, graph nodes only this job produced, its source document). Args: { jobId: string, compilationId?: string }
 
 Graph-edit / correction tools (use to FIX wrong knowledge — the deletion is
 remembered so re-extraction never re-introduces it):
@@ -387,6 +388,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "create_compilation", "description": "Create a new empty knowledge graph. ALWAYS pass folderPath so the graph is filed where it belongs (find-or-create): personal graphs under [\"Users\",\"<name>\"], project graphs under [\"Projects\",\"<Kunde>\"]; a graph created without folderPath lands unfiled at the tree root. type 'CODE' creates a Codebase KB (one per repository, default folder Users/<name>/Code) - the only kind a KB-scoped token may create; it is granted onto that token automatically.", "args": { "name": "string", "description": "string?", "folderPath": "string[]?", "type": "string?" } },
             { "name": "delete_compilation", "description": "Delete a compilation the caller owns", "args": { "compilationId": "string" } },
             { "name": "refresh_compilation","description": "Re-run fusion to refresh a compilation", "args": { "compilationId": "string" } },
+            { "name": "delete_extraction",  "description": "Remove an extraction's knowledge: from one knowledge base, or everywhere. With compilationId the job leaves only that knowledge base (and is purged once no knowledge base references it any more); without it the job is removed everywhere — its chunks, vectors, the graph nodes only it produced, its source document — and dossiers built on them are marked stale. Find jobIds via list_extractions", "args": { "jobId": "string", "compilationId": "string?" } },
             { "name": "set_privacy_mode",   "description": "Raise a knowledge graph's privacy for cloud LLMs: 'cloaked' (entities/PII pseudonymized before any cloud model sees them) or 'local_only' (never sent to a cloud model). Can only INCREASE privacy (open->cloaked->local_only); loosening it back requires a signed-in user session.", "args": { "compilationId": "string", "mode": "string (cloaked|local_only)" } },
             { "name": "add_relationship",   "description": "Add an edge between two existing entities", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string" } },
             { "name": "correct_relationship","description": "Delete a wrong edge and remember the correction", "args": { "compilationId": "string", "head": "string", "relType": "string", "tail": "string", "reason": "string?" } },
@@ -1497,6 +1499,22 @@ async fn execute_tool_inner(
                     return json!({ "error": "classification exceeds this access token's clearance" });
                 }
             }
+            // Resolve and authorize the target BEFORE the charge and the insert: a
+            // refused write (scope, read-only grant, CODE graph) used to leave a
+            // paid-for, orphaned job behind.
+            let target_cid = match compilation_id {
+                Some(cid) => Some(cid),
+                None => crate::routes::kex::resolve_default_compilation(&state.db, claims.sub).await,
+            };
+            if let Some(cid) = target_cid {
+                if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
+                    return json!({ "error": e.to_string() });
+                }
+                // 078: writing knowledge INTO a CODE graph is a code-KB mutation.
+                if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
+                    return json!({ "error": e.to_string() });
+                }
+            }
             let job_id = uuid::Uuid::new_v4();
             let prov = resolve_ingest_provenance(state, claims.sub, text, args).await;
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
@@ -1533,19 +1551,9 @@ async fn execute_tool_inner(
             let _ = crate::services::redis::lpush(&state.redis, "kex:jobs", &payload.to_string()).await;
             // Link to compilation: explicit target, else the caller's default
             // knowledge base, so nothing is orphaned (mirrors the kex.rs paths).
+            // The target was authorized above, before anything was written.
             let mut linked = false;
-            let target_cid = match compilation_id {
-                Some(cid) => Some(cid),
-                None => crate::routes::kex::resolve_default_compilation(&state.db, claims.sub).await,
-            };
             if let Some(cid) = target_cid {
-                if let Err(e) = crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await {
-                    return json!({ "error": e.to_string() });
-                }
-                // 078: writing knowledge INTO a CODE graph is a code-KB mutation.
-                if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
-                    return json!({ "error": e.to_string() });
-                }
                 crate::routes::kex::link_job_to_compilation(&state.db, claims.sub, cid, job_id).await;
                 linked = true;
             }
@@ -1603,17 +1611,23 @@ async fn execute_tool_inner(
 
         // ── Read: KEX extraction jobs ─────────────────────────────────────────
         "list_extractions" => {
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<Value>, chrono::DateTime<chrono::Utc>)>(
-                "SELECT id, type, status, result, created_at FROM jobs \
-                 WHERE user_id = $1 AND type LIKE 'kex_%' ORDER BY created_at DESC LIMIT 50"
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Value, Option<Value>, chrono::DateTime<chrono::Utc>, Option<String>)>(
+                "SELECT j.id, j.type, j.status, j.input, j.result, j.created_at, ak.name \
+                 FROM jobs j LEFT JOIN api_keys ak ON ak.id = j.api_key_id \
+                 WHERE j.user_id = $1 AND j.type LIKE 'kex_%' ORDER BY j.created_at DESC LIMIT 50"
             ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
-            json!({ "extractions": rows.iter().map(|(id, ty, st, res, ts)| {
+            let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.0).collect();
+            let mut comps = crate::routes::kex::compilations_of_jobs(&state.db, &ids).await;
+            json!({ "extractions": rows.iter().map(|(id, ty, st, input, res, ts, token_name)| {
                 // `completed_degraded` + reason when a phase was skipped, so an agent
                 // never reports "extraction done" over a graph that has no edges.
                 let (status, reason) = crate::routes::kex::presented_status(st, res.as_ref());
                 json!({
                     "jobId": id, "type": ty, "status": status,
-                    "degradedReason": reason, "createdAt": ts
+                    "degradedReason": reason, "createdAt": ts,
+                    "tokenName": token_name,
+                    "fileName": crate::routes::kex::job_file_name(input),
+                    "compilationIds": comps.remove(id).unwrap_or_default(),
                 })
             }).collect::<Vec<_>>() })
         }
@@ -1785,20 +1799,30 @@ async fn execute_tool_inner(
             if let Err(e) = crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await {
                 return json!({ "error": e.to_string() });
             }
-            // Owner check + source jobs.
-            let row: Option<(Vec<uuid::Uuid>,)> = sqlx::query_as(
-                "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
-            ).bind(cid).bind(claims.sub).fetch_optional(&state.db).await.ok().flatten();
-            let Some((source_ids,)) = row else { return json!({ "error": "compilation not found or not yours" }); };
-            let job_id = uuid::Uuid::new_v4();
-            let _ = sqlx::query("INSERT INTO jobs (id,user_id,type,status,input) VALUES ($1,$2,'fuse_merge','pending',$3)")
-                .bind(job_id).bind(claims.sub)
-                .bind(json!({ "compilationId": cid, "sourceJobIds": source_ids }))
-                .execute(&state.db).await;
-            let _ = crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({
-                "job_id": job_id, "compilation_id": cid, "source_job_ids": source_ids
-            }).to_string()).await;
-            json!({ "jobId": job_id, "status": "pending" })
+            // Owner check + source jobs + enqueue, shared with the unlink path.
+            match crate::routes::kex::enqueue_fuse_refresh(state, claims.sub, claims.api_key_id, cid).await {
+                Some(job_id) => json!({ "jobId": job_id, "status": "pending" }),
+                None => json!({ "error": "compilation not found or not yours" }),
+            }
+        }
+
+        // ── Action: remove an extraction from one knowledge base, or everywhere ─
+        // Same functions and the same auth as DELETE /kex/jobs/:id and
+        // POST /kex/jobs/:id/unlink (owner / own-token for a scoped key / write
+        // scope on every referencing knowledge base).
+        "delete_extraction" => {
+            let Some(job_id) = args["jobId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
+                return json!({ "error": "jobId is required" });
+            };
+            let compilation_id = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
+            let res = match compilation_id {
+                Some(cid) => crate::routes::kex::unlink_job_from_compilation(state, claims, job_id, cid).await,
+                None => crate::routes::kex::remove_job_everywhere(state, claims, job_id).await,
+            };
+            match res {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
+            }
         }
 
         // ── Action: raise a graph's privacy mode (increase-only) ──────────────
@@ -2862,6 +2886,21 @@ mod agent_tool_registration_tests {
     fn tool_schema_contains_store() {
         assert!(tool_names().contains(&"store".to_string()),
             "tool_schema() must include 'store' (write-back, mirrors stdio gctrl_store)");
+    }
+
+    #[test]
+    fn tool_schema_contains_delete_extraction_as_a_write_tool() {
+        assert!(tool_names().contains(&"delete_extraction".to_string()),
+            "tool_schema() must include 'delete_extraction' (remove an extraction's knowledge)");
+        assert!(!READ_TOOLS.contains(&"delete_extraction"),
+            "delete_extraction removes knowledge — never a read tool");
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"] == "delete_extraction").expect("delete_extraction descriptor");
+        assert_eq!(tool["args"]["jobId"], json!("string"));
+        assert_eq!(tool["args"]["compilationId"], json!("string?"));
+        // The system prompt documents it too, so an in-process agent can find it.
+        assert!(super::SYSTEM_PROMPT.contains("- delete_extraction"));
     }
 
     #[test]

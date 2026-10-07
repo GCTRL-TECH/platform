@@ -91,6 +91,25 @@ struct GrantInput {
     /// itself is read-write. Default false keeps the previous "a grant is read-write"
     /// meaning for every existing client.
     #[serde(rename = "readOnly", default)] read_only: bool,
+    /// Migration 095 - who sets this grant. Exactly `"manual"` marks it as set by a
+    /// person in the GCTRL UI; anything else, including absent, is `"managed"` (a
+    /// sync such as Anvil's personal-key sweep, a script, an older client). A managed
+    /// post never changes a manual grant; a manual post always wins. See `grant_source`.
+    #[serde(default)] source: Option<String>,
+}
+
+impl GrantInput {
+    /// Normalized `source` for the DB: `"manual"` only on an exact match, else `"managed"`.
+    fn grant_source(&self) -> &'static str {
+        grant_source(self.source.as_deref())
+    }
+}
+
+/// `"manual"` only when the client said exactly that (the UI does); every other
+/// value, absent, empty or misspelt, is `"managed"`, so clients that predate the
+/// field keep behaving like a sync and the sweep can still revoke what they set.
+fn grant_source(raw: Option<&str>) -> &'static str {
+    match raw { Some("manual") => "manual", _ => "managed" }
 }
 
 #[derive(Deserialize)]
@@ -130,14 +149,15 @@ async fn grants_for_keys(
 ) -> std::collections::HashMap<Uuid, Vec<Value>> {
     let mut map: std::collections::HashMap<Uuid, Vec<Value>> = std::collections::HashMap::new();
     if key_ids.is_empty() { return map; }
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<i32>, bool)>(
-        "SELECT g.api_key_id, g.compilation_id, c.name, g.granted_rank, g.read_only
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Option<i32>, bool, String)>(
+        "SELECT g.api_key_id, g.compilation_id, c.name, g.granted_rank, g.read_only, g.source
          FROM api_key_grants g JOIN compilations c ON c.id = g.compilation_id
          WHERE g.api_key_id = ANY($1) ORDER BY c.name"
     ).bind(key_ids).fetch_all(db).await.unwrap_or_default();
-    for (kid, cid, name, rank, read_only) in rows {
+    for (kid, cid, name, rank, read_only, source) in rows {
         map.entry(kid).or_default().push(json!({
-            "compilationId": cid, "compilationName": name, "grantedRank": rank, "readOnly": read_only,
+            "compilationId": cid, "compilationName": name, "grantedRank": rank,
+            "readOnly": read_only, "source": source,
         }));
     }
     map
@@ -309,9 +329,10 @@ async fn create_key(
         ).bind(g.compilation_id).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(false);
         if !owns { continue; }
         let _ = sqlx::query(
-            "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank, read_only)
-             VALUES ($1, $2, $3, $4) ON CONFLICT (api_key_id, compilation_id) DO NOTHING"
-        ).bind(id).bind(g.compilation_id).bind(g.granted_rank).bind(g.read_only).execute(&state.db).await;
+            "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank, read_only, source)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (api_key_id, compilation_id) DO NOTHING"
+        ).bind(id).bind(g.compilation_id).bind(g.granted_rank).bind(g.read_only).bind(g.grant_source())
+         .execute(&state.db).await;
     }
 
     Ok(Json(json!({
@@ -384,9 +405,10 @@ async fn update_key(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// POST /api/users/api-keys/:id/grants  { compilationId, grantedRank? }
+/// POST /api/users/api-keys/:id/grants  { compilationId, grantedRank?, readOnly?, source? }
 /// Grant an existing token access to one compilation. Both the key and the
-/// compilation must belong to the caller.
+/// compilation must belong to the caller. Returns `{ok:true}`; or
+/// `{ok:true, kept:"manual"}` when a managed post hit a manual grant and left it alone.
 async fn add_grant(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -405,27 +427,78 @@ async fn add_grant(
 
     // Upsert: re-posting a grant is how a caller flips it between read-only and
     // read-write (Anvil's personal-key reconcile does exactly that on a role change).
-    sqlx::query(
-        "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank, read_only)
-         VALUES ($1, $2, $3, $4)
+    // Migration 095: the WHERE on the conflict arm is the protection — a managed
+    // (sync) post only updates a grant that is itself managed; a manual post always
+    // applies and stamps the grant manual. 0 rows affected = manual grant kept.
+    let rows = sqlx::query(
+        "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank, read_only, source)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (api_key_id, compilation_id)
-         DO UPDATE SET granted_rank = EXCLUDED.granted_rank, read_only = EXCLUDED.read_only"
-    ).bind(id).bind(g.compilation_id).bind(g.granted_rank).bind(g.read_only).execute(&state.db).await?;
+         DO UPDATE SET granted_rank = EXCLUDED.granted_rank,
+                       read_only    = EXCLUDED.read_only,
+                       source       = EXCLUDED.source
+         WHERE api_key_grants.source <> 'manual' OR EXCLUDED.source = 'manual'"
+    ).bind(id).bind(g.compilation_id).bind(g.granted_rank).bind(g.read_only).bind(g.grant_source())
+     .execute(&state.db).await?.rows_affected();
 
+    if rows == 0 {
+        return Ok(Json(json!({ "ok": true, "kept": "manual" })));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
-/// DELETE /api/users/api-keys/:id/grants/:compilation_id — revoke a grant.
+#[derive(Deserialize)]
+struct RemoveGrantQuery {
+    /// `?source=managed`: only revoke the grant if a sync owns it. A manual grant
+    /// is left in place and the call still succeeds with `kept:"manual"`, so
+    /// Anvil's best-effort sweep does not log an error for every protected grant.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// DELETE /api/users/api-keys/:id/grants/:compilation_id[?source=managed] — revoke a grant.
 async fn remove_grant(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
     Path((id, compilation_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<RemoveGrantQuery>,
 ) -> Result<Json<Value>> {
+    let managed_only = q.source.as_deref() == Some("managed");
     let rows = sqlx::query(
         "DELETE FROM api_key_grants g USING api_keys k
          WHERE g.api_key_id = k.id AND k.user_id = $1
-           AND g.api_key_id = $2 AND g.compilation_id = $3"
-    ).bind(claims.sub).bind(id).bind(compilation_id).execute(&state.db).await?.rows_affected();
-    if rows == 0 { return Err(AppError::NotFound); }
+           AND g.api_key_id = $2 AND g.compilation_id = $3
+           AND (NOT $4 OR g.source = 'managed')"
+    ).bind(claims.sub).bind(id).bind(compilation_id).bind(managed_only)
+     .execute(&state.db).await?.rows_affected();
+    if rows == 0 {
+        // Managed-only revoke that found nothing: distinguish "protected manual
+        // grant" (200, kept) from "no such grant" (404).
+        if managed_only {
+            let is_manual: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM api_key_grants g JOIN api_keys k ON k.id = g.api_key_id
+                               WHERE k.user_id = $1 AND g.api_key_id = $2 AND g.compilation_id = $3
+                                 AND g.source = 'manual')"
+            ).bind(claims.sub).bind(id).bind(compilation_id).fetch_one(&state.db).await?;
+            if is_manual {
+                return Ok(Json(json!({ "ok": true, "kept": "manual" })));
+            }
+        }
+        return Err(AppError::NotFound);
+    }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grant_source;
+
+    #[test]
+    fn source_is_manual_only_on_exact_match() {
+        assert_eq!(grant_source(Some("managed")), "managed");
+        assert_eq!(grant_source(Some("manual")), "manual");
+        assert_eq!(grant_source(Some("Manual")), "managed");
+        assert_eq!(grant_source(Some("")), "managed");
+        assert_eq!(grant_source(None), "managed");
+    }
 }

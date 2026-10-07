@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft,
   CheckCircle2,
@@ -14,11 +14,21 @@ import {
   ThumbsUp,
   ThumbsDown,
   Shield,
+  Trash2,
+  ChevronDown,
+  ChevronRight,
+  Fingerprint,
+  Check,
 } from 'lucide-react'
 import { format } from 'date-fns'
 import { useApiQuery } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { cn } from '@/lib/utils'
+import {
+  UnlinkDialog,
+  DeleteEverywhereDialog,
+  describeUnlink,
+} from './components/JobRemovalDialogs'
 import { isCompleted, isDegraded, type JobStatus } from '@/lib/jobStatus'
 
 interface Entity {
@@ -45,6 +55,13 @@ interface JobData {
   completedAt?: string
   input?: Record<string, unknown>
   error?: string
+  apiKeyId?: string | null
+  tokenName?: string | null
+  userEmail?: string | null
+  fileName?: string | null
+  compilationIds?: { id: string; name: string }[]
+  chunks?: { count: number; sample: { id: string; preview: string; sourceDocumentId?: string | null }[] }
+  graphFootprint?: { nodes: number; nodesExclusive: number; rels: number; relsExclusive: number }
 }
 
 interface JobResultData {
@@ -122,6 +139,10 @@ export function KexJobDetail() {
   const navigate = useNavigate()
   const [feedback, setFeedback] = useState<Record<number, 'up' | 'down'>>({})
   const { neo4jBrowser } = usePublicConfig()
+  const [showChunks, setShowChunks] = useState(false)
+  const [unlinkKb, setUnlinkKb] = useState<{ id: string; name: string } | null>(null)
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
 
   // Fetch job status
   const { data: jobResponse, isLoading, error } = useApiQuery<{ job: JobData }>(
@@ -177,6 +198,7 @@ export function KexJobDetail() {
   const graphStats = resultData?.result?.raw?.graph_stats
 
   const inputText = (job.input?.['text'] as string) ?? ''
+  const kbs = job.compilationIds ?? []
 
   return (
     <div className="space-y-6 animate-slide-up">
@@ -205,6 +227,136 @@ export function KexJobDetail() {
           View in Neo4j
         </a>
       </div>
+
+      {/* Provenance */}
+      <div className="card">
+        <h3 className="mb-4 text-sm font-semibold text-slate-200">Provenance</h3>
+        <dl className="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
+          <div>
+            <dt className="text-xs text-slate-500">Access token</dt>
+            <dd className="mt-0.5 text-slate-200">
+              {job.tokenName ? (
+                <Link to="/access" className="inline-flex items-center gap-1.5 text-blue-400 hover:text-blue-300">
+                  <Fingerprint size={13} />{job.tokenName}
+                </Link>
+              ) : 'Web login'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-slate-500">User</dt>
+            <dd className="mt-0.5 text-slate-200">{job.userEmail ?? '-'}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-slate-500">File / source</dt>
+            <dd className="mt-0.5 break-all text-slate-200">
+              {job.fileName ?? (job.input?.['sourceDocumentId'] as string | undefined) ?? '-'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-slate-500">Created / completed</dt>
+            <dd className="mt-0.5 font-mono text-xs text-slate-300">
+              {format(new Date(job.createdAt), 'MMM d, yyyy HH:mm:ss')}
+              {job.completedAt ? ` / ${format(new Date(job.completedAt), 'MMM d, yyyy HH:mm:ss')}` : ''}
+            </dd>
+          </div>
+        </dl>
+        <div className="mt-4">
+          <p className="mb-1.5 text-xs text-slate-500">Knowledge bases</p>
+          {kbs.length === 0 ? (
+            <p className="text-xs text-slate-600">Not linked to any knowledge base.</p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {kbs.map((kb) => (
+                <Link
+                  key={kb.id}
+                  to={`/graphs/${kb.id}`}
+                  className="rounded-md bg-slate-800 px-2.5 py-1 text-xs text-slate-200 ring-1 ring-inset ring-slate-700 hover:text-blue-400"
+                >
+                  {kb.name}
+                </Link>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Footprint */}
+      <div className="card">
+        <h3 className="mb-4 text-sm font-semibold text-slate-200">Footprint</h3>
+        {notice && (
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+            <Check size={14} className="mt-0.5 shrink-0" />
+            <span>{notice}</span>
+          </div>
+        )}
+        {job.graphFootprint || job.chunks ? (
+          <div className="space-y-3 text-sm text-slate-300">
+            {job.chunks && (
+              <div>
+                <button
+                  onClick={() => setShowChunks((v) => !v)}
+                  disabled={job.chunks.sample.length === 0}
+                  className="flex items-center gap-1.5 text-slate-200 disabled:cursor-default"
+                >
+                  {job.chunks.sample.length > 0 && (showChunks ? <ChevronDown size={14} /> : <ChevronRight size={14} />)}
+                  Chunks: <span className="font-mono">{job.chunks.count}</span>
+                </button>
+                {showChunks && (
+                  <ul className="mt-2 space-y-1.5">
+                    {job.chunks.sample.map((c) => (
+                      <li key={c.id} className="rounded-lg bg-slate-800/50 px-3 py-2 text-xs text-slate-400">{c.preview}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            {job.graphFootprint && (
+              <>
+                <p>Nodes: <span className="font-mono text-slate-100">{job.graphFootprint.nodes}</span> <span className="text-slate-500">({job.graphFootprint.nodesExclusive} exclusive)</span></p>
+                <p>Relationships: <span className="font-mono text-slate-100">{job.graphFootprint.rels}</span> <span className="text-slate-500">({job.graphFootprint.relsExclusive} exclusive)</span></p>
+              </>
+            )}
+            <p className="text-xs text-slate-500">Exclusive = only this extraction produced it; shared elements stay.</p>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-600">No footprint recorded.</p>
+        )}
+        <div className="mt-5 flex flex-wrap justify-end gap-2 border-t border-slate-800 pt-4">
+          {kbs.map((kb) => (
+            <button
+              key={kb.id}
+              onClick={() => setUnlinkKb(kb)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 px-3 py-1.5 text-xs text-red-400 transition-colors hover:bg-red-500/10"
+            >
+              <Trash2 size={12} />Remove from {kb.name}
+            </button>
+          ))}
+          <button
+            onClick={() => setDeleteOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-500"
+          >
+            <Trash2 size={12} />Delete everywhere
+          </button>
+        </div>
+      </div>
+
+      <UnlinkDialog
+        open={!!unlinkKb}
+        jobId={job.id}
+        jobLabel={job.fileName ?? job.id.slice(0, 8)}
+        compilationId={unlinkKb?.id ?? ''}
+        compilationName={unlinkKb?.name}
+        isLastKb={kbs.length <= 1}
+        onClose={() => setUnlinkKb(null)}
+        onDone={(r) => setNotice(describeUnlink(r))}
+      />
+      <DeleteEverywhereDialog
+        open={deleteOpen}
+        jobId={job.id}
+        jobLabel={job.fileName ?? job.id.slice(0, 8)}
+        onClose={() => setDeleteOpen(false)}
+        onDone={() => navigate('/kex')}
+      />
 
       {/* Timeline */}
       <div className="card">

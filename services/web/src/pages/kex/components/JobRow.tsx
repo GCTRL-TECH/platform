@@ -28,6 +28,10 @@ export interface KexJob {
   tokenName?: string | null
   /** Email of the user who owns the job. */
   userEmail?: string | null
+  /** Access token (api key) uuid; null for web-login jobs. */
+  apiKeyId?: string | null
+  fileName?: string | null
+  compilationIds?: { id: string; name: string }[]
 }
 
 const STATUS_BADGE: Record<string, { className: string; label: string; dot: string }> = {
@@ -92,9 +96,13 @@ interface JobRowProps {
   onCancel?: (jobId: string) => void
   onDelete?: (jobId: string, name: string) => void
   onRetry?: (jobId: string) => void
+  /** Show the owner email (admin "All users" view). */
+  showUser?: boolean
+  /** Click on the token name: filter the list by this token. */
+  onTokenClick?: (token: string) => void
 }
 
-export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProps) {
+export function JobRow({ job, compact, onCancel, onDelete, onRetry, showUser, onTokenClick }: JobRowProps) {
   const navigate = useNavigate()
   const badge = STATUS_BADGE[job.status] || STATUS_BADGE.pending
   const isRunning = job.status === 'pending' || job.status === 'processing'
@@ -102,7 +110,9 @@ export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProp
   const duration = getJobDuration(job)
   const name = getJobName(job)
   // Provenance sub-line: who triggered it (token name, else Web-Login) · source kind.
-  const trigger = job.tokenName || 'Web-Login'
+  const trigger = job.tokenName ?? 'Web login'
+  const tokenFilterValue = job.apiKeyId ?? 'web'
+  const fileLabel = job.fileName && job.fileName !== name ? job.fileName : null
   const sourceKind = getSourceKind(job)
 
   return (
@@ -118,7 +128,21 @@ export function JobRow({ job, compact, onCancel, onDelete, onRetry }: JobRowProp
         <div className={cn('h-2 w-2 shrink-0 rounded-full', badge.dot, isRunning && 'animate-pulse')} />
         <div className="flex min-w-0 flex-col">
           <span className="truncate text-xs text-slate-300 font-medium">{name}</span>
-          <span className="truncate text-[10px] text-slate-500">{trigger} · {sourceKind}</span>
+          <span className="truncate text-[10px] text-slate-500">
+            {onTokenClick ? (
+              <button
+                type="button"
+                onClick={(e: MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); onTokenClick(tokenFilterValue) }}
+                className="hover:text-indigo-400 hover:underline"
+                title="Filter by this token"
+              >
+                {trigger}
+              </button>
+            ) : trigger}
+            {showUser && job.userEmail ? ` · ${job.userEmail}` : ''}
+            {` · ${sourceKind}`}
+            {fileLabel ? ` · ${fileLabel}` : ''}
+          </span>
         </div>
       </div>
 

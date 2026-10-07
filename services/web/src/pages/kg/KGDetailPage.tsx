@@ -1,3 +1,4 @@
+import { KbPicker } from '@/components/kb/KbPicker'
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
@@ -18,7 +19,6 @@ import {
   UserCheck,
   ScrollText,
   GitMerge,
-  ChevronDown,
   CheckCircle,
   Workflow,
   GitFork,
@@ -28,7 +28,8 @@ import { useApiQuery, useApiMutation } from '@/hooks/useApi'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
-import { SourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
+import { UnlinkDialog, describeUnlink } from '@/pages/kex/components/JobRemovalDialogs'
+import { SourceJobLabel, resolveSourceJobLabel, type SourceJobInfo } from '@/components/SourceJobLabel'
 
 interface KexJobsResponse {
   jobs: SourceJobInfo[]
@@ -137,100 +138,64 @@ function SourceJobsList({
 }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [removing, setRemoving] = useState<string | null>(null)
-  const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+  const [unlinkJobId, setUnlinkJobId] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
   // Resolve UUIDs → friendly file names. Cached against the same query key
   // used elsewhere (FusePage, FuseJobDetail) so this is essentially free.
   const { data: kexData } = useApiQuery<KexJobsResponse>(['kex', 'jobs'], '/kex/jobs')
   const kexJobs = kexData?.jobs ?? []
 
-  async function handleRemove(jobId: string) {
-    if (confirmRemove !== jobId) {
-      setConfirmRemove(jobId)
-      return
-    }
-    // Second click = confirmed
-    setRemoving(jobId)
-    try {
-      const { apiPut } = await import('@/lib/api')
-      const updated = sourceJobIds.filter((id) => id !== jobId)
-      await apiPut(`/kg/compilations/${compilationId}`, { sourceJobIds: updated })
-      queryClient.invalidateQueries({ queryKey: ['kg', 'compilations', compilationId] })
-      setConfirmRemove(null)
-    } catch {
-      // silent
-    } finally {
-      setRemoving(null)
-    }
-  }
-
   return (
     <div className="card p-0 overflow-hidden">
-      <div className="border-b border-slate-800 px-5 py-4 flex items-center justify-between">
+      <div className="border-b border-slate-800 px-5 py-4">
         <h4 className="text-sm font-semibold text-slate-200">
           Source Jobs{' '}
           <span className="text-slate-600">({sourceJobIds.length})</span>
         </h4>
-        {confirmRemove && (
-          <button
-            onClick={() => setConfirmRemove(null)}
-            className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
-          >
-            Cancel
-          </button>
+        {notice && (
+          <p className="mt-2 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">{notice}</p>
         )}
       </div>
       <div className="divide-y divide-slate-800">
-        {sourceJobIds.map((jobId) => {
-          const isConfirming = confirmRemove === jobId
-          const isRemoving = removing === jobId
-          return (
-            <div
-              key={jobId}
-              className={cn(
-                'flex items-center justify-between px-5 py-3 transition-colors',
-                isConfirming && 'bg-red-500/5'
-              )}
-            >
-              <div className="flex min-w-0 flex-1 items-center gap-3">
-                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-800">
-                  <Hash size={11} className="text-blue-400" />
-                </div>
-                <SourceJobLabel jobId={jobId} jobs={kexJobs} />
+        {sourceJobIds.map((jobId) => (
+          <div key={jobId} className="flex items-center justify-between px-5 py-3 transition-colors">
+            <div className="flex min-w-0 flex-1 items-center gap-3">
+              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-800">
+                <Hash size={11} className="text-blue-400" />
               </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {sourceJobIds.length > 1 && (
-                  <button
-                    onClick={() => handleRemove(jobId)}
-                    disabled={isRemoving}
-                    className={cn(
-                      'flex items-center gap-1 text-xs transition-colors',
-                      isConfirming
-                        ? 'text-red-400 hover:text-red-300 font-medium'
-                        : 'text-slate-600 hover:text-red-400'
-                    )}
-                    title={isConfirming ? 'Click again to confirm removal' : 'Remove from compilation'}
-                  >
-                    {isRemoving ? (
-                      <span className="h-3 w-3 animate-spin rounded-full border border-red-400/30 border-t-red-400" />
-                    ) : (
-                      <Trash2 size={12} />
-                    )}
-                    {isConfirming ? 'Confirm remove' : 'Remove'}
-                  </button>
-                )}
-                <button
-                  onClick={() => navigate(`/kex/${jobId}`)}
-                  className="text-xs text-slate-600 hover:text-blue-400 transition-colors"
-                >
-                  View
-                </button>
-              </div>
+              <SourceJobLabel jobId={jobId} jobs={kexJobs} />
             </div>
-          )
-        })}
+            <div className="flex shrink-0 items-center gap-2">
+              <button
+                onClick={() => setUnlinkJobId(jobId)}
+                className="flex items-center gap-1 text-xs text-slate-600 transition-colors hover:text-red-400"
+                title="Remove from compilation"
+              >
+                <Trash2 size={12} />
+                Remove
+              </button>
+              <button
+                onClick={() => navigate(`/kex/${jobId}`)}
+                className="text-xs text-slate-600 hover:text-blue-400 transition-colors"
+              >
+                View
+              </button>
+            </div>
+          </div>
+        ))}
       </div>
+      <UnlinkDialog
+        open={!!unlinkJobId}
+        jobId={unlinkJobId ?? ''}
+        jobLabel={unlinkJobId ? resolveSourceJobLabel(unlinkJobId, kexJobs).label : undefined}
+        compilationId={compilationId}
+        onClose={() => setUnlinkJobId(null)}
+        onDone={(r) => {
+          setNotice(describeUnlink(r))
+          void queryClient.invalidateQueries({ queryKey: ['kg', 'compilations', compilationId] })
+        }}
+      />
     </div>
   )
 }
@@ -243,7 +208,7 @@ function MergeAnotherPanel({ compilation }: { compilation: Compilation }) {
   const [mergeSuccess, setMergeSuccess] = useState(false)
 
   const { data: compilationsData, isLoading: compilationsLoading } =
-    useApiQuery<CompilationsResponse>(['kg', 'compilations'], '/kg/compilations', {
+    useApiQuery<CompilationsResponse>(['kg', 'compilations', 'merge-all'], '/kg/compilations?limit=500', {
       enabled: open,
     })
 
@@ -314,24 +279,12 @@ function MergeAnotherPanel({ compilation }: { compilation: Compilation }) {
           ) : (
             <div>
               <label className="label">Source Graph to Merge In</label>
-              <div className="relative">
-                <select
-                  value={selectedId}
-                  onChange={(e) => setSelectedId(e.target.value)}
-                  className="input-field appearance-none pr-8"
-                >
-                  <option value="">Select a graph...</option>
-                  {others.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} — {c.nodeCount.toLocaleString()} nodes
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown
-                  size={13}
-                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
-                />
-              </div>
+              <KbPicker
+                mode="single"
+                value={selectedId || null}
+                onChange={(id) => setSelectedId(id ?? '')}
+                placeholder="Select a graph..."
+              />
               {selectedCompilation && (
                 <p className="mt-1.5 text-xs text-slate-600">
                   This will add {selectedCompilation.sourceJobIds.length} source job(s) from{' '}

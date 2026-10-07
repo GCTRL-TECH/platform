@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { KbPicker } from '@/components/kb/KbPicker'
 import { useNavigate } from 'react-router-dom'
 import {
   Database,
@@ -19,6 +20,7 @@ import {
   Lock,
   ShieldCheck,
   ShieldOff,
+  X,
 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { useApiQuery, useApiMutation } from '@/hooks/useApi'
@@ -130,7 +132,7 @@ interface CreateModalProps {
 
 type GraphType = 'RAW' | 'WIKI'
 
-function CreateModal({ onClose, onCreated, rawCompilations, currentFolderId }: CreateModalProps) {
+function CreateModal({ onClose, onCreated, currentFolderId }: CreateModalProps) {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [classification, setClassification] = useState<Classification>('INTERNAL')
@@ -235,24 +237,13 @@ function CreateModal({ onClose, onCreated, rawCompilations, currentFolderId }: C
               <label className="label">
                 Source graph <span className="text-red-400">*</span>
               </label>
-              {rawCompilations.length === 0 ? (
-                <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
-                  No RAW graphs available. Create or extract a RAW graph first.
-                </p>
-              ) : (
-                <select
-                  value={wikiSourceId}
-                  onChange={(e) => setWikiSourceId(e.target.value)}
-                  className="input-field"
-                >
-                  <option value="">Select a RAW graph…</option>
-                  {rawCompilations.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
-              )}
+              <KbPicker
+                mode="single"
+                types={['RAW']}
+                value={wikiSourceId || null}
+                onChange={(id) => setWikiSourceId(id ?? '')}
+                placeholder="Select a RAW graph..."
+              />
             </div>
           )}
 
@@ -525,6 +516,69 @@ export function KGListPage() {
   )
   const compilations = data?.compilations ?? []
 
+  // Search spans ALL folders (server side, by name); debounced so typing does not hammer the API.
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedQuery(searchQuery.trim()), 250)
+    return () => window.clearTimeout(t)
+  }, [searchQuery])
+  const isSearching = searchQuery.trim() !== ''
+  const searchReady = isSearching && debouncedQuery !== ''
+  const { data: searchData, isLoading: searchLoading } = useApiQuery<CompilationsResponse>(
+    ['kg', 'compilations', 'search', debouncedQuery],
+    `/kg/compilations?q=${encodeURIComponent(debouncedQuery)}&limit=500`,
+    { enabled: searchReady }
+  )
+  const searchResults = (searchData?.compilations ?? []).filter(
+    (c) => filterClassification === 'ALL' || c.classification === filterClassification
+  )
+  const searchFolders = searchReady
+    ? allFolders.filter((f) => f.name.toLowerCase().includes(debouncedQuery.toLowerCase()))
+    : []
+
+  /** Folder chain root -> folderId, from the already loaded folder list. */
+  function folderChain(folderId: string | null): KgFolder[] {
+    const chain: KgFolder[] = []
+    const seen = new Set<string>()
+    let cur = folderId
+    while (cur && !seen.has(cur)) {
+      seen.add(cur)
+      const f = allFolders.find((x) => x.id === cur)
+      if (!f) break
+      chain.unshift(f)
+      cur = f.parentFolderId ?? null
+    }
+    return chain
+  }
+
+  function openFolderById(folderId: string | null) {
+    const chain = folderChain(folderId)
+    setFolderPath(chain)
+    setCurrentFolderId(chain.length > 0 ? chain[chain.length - 1]!.id : null)
+    setSearchQuery('')
+  }
+
+  /** Muted breadcrumb: Root / A / B, each segment jumps into that folder. */
+  function renderPathLine(folderId: string | null) {
+    const chain = folderChain(folderId)
+    return (
+      <div className="mb-1 flex flex-wrap items-center gap-1 px-1 text-[11px] text-slate-500">
+        <Folder size={11} className="shrink-0 text-slate-600" />
+        <button type="button" onClick={() => openFolderById(null)} className="hover:text-slate-300 hover:underline">
+          Root
+        </button>
+        {chain.map((f) => (
+          <span key={f.id} className="flex items-center gap-1">
+            <ChevronRight size={10} className="text-slate-700" />
+            <button type="button" onClick={() => openFolderById(f.id)} className="hover:text-slate-300 hover:underline">
+              {f.name}
+            </button>
+          </span>
+        ))}
+      </div>
+    )
+  }
+
   const filtered = compilations.filter((c) => {
     const q = searchQuery.toLowerCase()
     const name = (c.name ?? '').toLowerCase()
@@ -661,9 +715,19 @@ export function KGListPage() {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="input-field pl-9"
+            className="input-field pl-9 pr-8"
             placeholder="Search knowledge graphs..."
           />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              aria-label="Clear search"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200"
+            >
+              <X size={13} />
+            </button>
+          )}
         </div>
         {/* isExpert STAYS: the classification filter is an Easy-lens
             simplification unrelated to folders. */}
@@ -693,7 +757,7 @@ export function KGListPage() {
           item count. It stays a drop target for moving a graph one level up.
           Rendered in ALL modes (navigation); the drop handlers are inert in
           Easy because nothing is draggable there. */}
-      {folderPath.length > 0 && (
+      {!isSearching && folderPath.length > 0 && (
         <div className="flex items-center gap-3 text-sm">
           {currentFolderId && (
             <button
@@ -751,7 +815,58 @@ export function KGListPage() {
       )}
 
       {/* Content */}
-      {isLoading ? (
+      {isSearching ? (
+        searchLoading || !searchReady || debouncedQuery !== searchQuery.trim() ? (
+          <div className="flex items-center justify-center py-24">
+            <span className="h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-blue-500" />
+          </div>
+        ) : searchResults.length === 0 && searchFolders.length === 0 ? (
+          <div className="flex flex-col items-center gap-3 py-24 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-800">
+              <Search size={24} className="text-slate-600" />
+            </div>
+            <p className="text-sm font-medium text-slate-400">No results for &lsquo;{searchQuery.trim()}&rsquo;</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Search results</p>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {searchFolders.map((folder) => (
+                <div key={folder.id}>
+                  {renderPathLine(folder.parentFolderId ?? null)}
+                  <button
+                    onClick={() => openFolderById(folder.id)}
+                    className="group flex w-full items-center gap-3 rounded-xl border border-slate-700/50 bg-slate-900 p-4 text-left transition-all hover:border-slate-600 hover:bg-slate-800/60"
+                  >
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800">
+                      <Folder size={17} className="text-amber-400/80 group-hover:text-amber-300 transition-colors" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <h4 className="truncate text-sm font-semibold text-slate-200">{folder.name}</h4>
+                      <p className="text-xs text-slate-600">Folder</p>
+                    </div>
+                    <ChevronRight size={14} className="text-slate-700 opacity-0 transition-opacity group-hover:opacity-100" />
+                  </button>
+                </div>
+              ))}
+              {searchResults.map((compilation) => (
+                <div key={compilation.id} className="flex flex-col">
+                  {renderPathLine(compilation.folderId ?? null)}
+                  <CompilationCard
+                    compilation={compilation}
+                    onClick={() =>
+                      compilation.type === 'WIKI' && compilation.isSystem
+                        ? navigate('/wiki')
+                        : navigate(`/graphs/${compilation.id}/workspace`)
+                    }
+                    onDelete={(id, name) => setDeleteTarget({ id, name })}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      ) : isLoading ? (
         <div className="flex items-center justify-center py-24">
           <span className="h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-blue-500" />
         </div>
