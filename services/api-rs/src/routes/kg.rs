@@ -413,6 +413,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/node",                                 axum::routing::delete(delete_node))
         .route("/corrections",                          get(list_corrections))
         .route("/conflicts/:id/resolve",                post(resolve_fact_conflict))
+        .route("/merge-reviews/:id/resolve",            post(resolve_merge_review))
         .route("/graph/search",                         get(graph_search))
         .route("/graph/entity/:name/neighbors",         get(entity_neighbors))
         .route("/graph/entity/:name/lineage",           get(entity_lineage))
@@ -1504,14 +1505,35 @@ async fn refresh(
     enforce_kb_write_scope(&state.db, &claims, id).await?;
     enforce_code_capability(&state.db, &claims, id).await?;
     sqlx::query("UPDATE users SET tokens_balance=tokens_balance-3 WHERE id=$1").bind(claims.sub).execute(&state.db).await?;
-    let source_ids: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT unnest(source_job_ids) FROM compilations WHERE id=$1").bind(id).fetch_all(&state.db).await?;
+    let job_id = enqueue_fuse_refresh(&state, claims.sub, id).await?;
+    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+}
+
+/// Queue a full re-merge of a compilation over its current source jobs (the
+/// refresh path). Used by the refresh endpoint, by a "not the same" merge-review
+/// answer and by the decision memory when it replays such an answer.
+pub(crate) async fn enqueue_fuse_refresh(
+    state: &crate::models::AppState,
+    user_id: Uuid,
+    compilation_id: Uuid,
+) -> Result<Uuid> {
+    let (source_ids, classification, name): (Vec<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids, '{}'::uuid[]), classification::text, name FROM compilations WHERE id=$1",
+    )
+        .bind(compilation_id).fetch_optional(&state.db).await?
+        .ok_or(AppError::NotFound)?;
     let job_id = Uuid::new_v4();
     sqlx::query("INSERT INTO jobs (id,user_id,type,status,input) VALUES ($1,$2,'fuse_merge','pending',$3)")
-        .bind(job_id).bind(claims.sub).bind(json!({ "compilationId": id, "sourceJobIds": source_ids }))
+        .bind(job_id).bind(user_id).bind(json!({ "compilationId": compilation_id, "sourceJobIds": source_ids, "name": name }))
         .execute(&state.db).await?;
-    crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({ "job_id": job_id, "compilation_id": id, "source_job_ids": source_ids }).to_string())
+    // The worker needs the same payload a fresh merge gets (routes::fuse):
+    // user, classification and name — a refresh used to send none of them.
+    crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({
+        "job_id": job_id, "compilation_id": compilation_id, "source_job_ids": source_ids,
+        "user_id": user_id, "classification": classification, "name": name,
+    }).to_string())
         .await.map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+    Ok(job_id)
 }
 
 // ── WIKI distillation ──────────────────────────────────────────────────────────
@@ -3776,6 +3798,98 @@ async fn resolve_fact_conflict(
     })))
 }
 
+#[derive(Deserialize)]
+struct ResolveMergeReviewReq {
+    /// "same" (keep the merge, confirmed), "not_same" (split: the pair never
+    /// merges again; the compilation is re-merged), or "dismiss" (no opinion).
+    action: String,
+    reason: Option<String>,
+}
+
+/// Pure: what a merge-review answer does to the row. Err = unknown action.
+pub(crate) fn decide_merge_review(action: &str) -> std::result::Result<(&'static str, Option<&'static str>), String> {
+    match action.trim() {
+        "same" => Ok(("resolved", Some("same"))),
+        "not_same" => Ok(("resolved", Some("not_same"))),
+        "dismiss" => Ok(("dismissed", None)),
+        other => Err(format!("unknown action '{other}' (same | not_same | dismiss)")),
+    }
+}
+
+/// POST /api/kg/merge-reviews/:id/resolve — answer one doubtful entity merge.
+/// The merge already happened; "same" confirms it, "not_same" records a
+/// cannot-link and queues a re-merge that splits the node, "dismiss" drops the
+/// card. Every answer feeds the decision memory. Same access policy as fact
+/// conflicts: the owner within the conflict visibility rule, or an admin session.
+async fn resolve_merge_review(
+    Extension(claims): Extension<JwtClaims>,
+    State(state): State<Arc<crate::models::AppState>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ResolveMergeReviewReq>,
+) -> Result<Json<Value>> {
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>, Vec<String>, Option<f32>, String)>(
+        "SELECT user_id, compilation_id, entity_a_type, methods, score, status
+         FROM review_queue WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let (owner, comp_id, entity_type, methods, score, status) = row;
+
+    let admin_session = claims.role == "admin" && claims.api_key_id.is_none();
+    if !(admin_session && owner != claims.sub) {
+        crate::routes::classification::conflict_access(&state.db, &claims, owner, comp_id).await?;
+    }
+    if status != "pending" {
+        return Err(AppError::BadRequest(format!("merge review is already {status}")));
+    }
+    let (new_status, decision) = decide_merge_review(&req.action).map_err(AppError::BadRequest)?;
+
+    sqlx::query(
+        "UPDATE review_queue
+         SET status = $1, decision = $2, decision_reason = $3, decided_by = $4,
+             decided_at = NOW(), updated_at = NOW()
+         WHERE id = $5 AND status = 'pending'",
+    )
+    .bind(new_status)
+    .bind(decision)
+    .bind(req.reason.as_deref())
+    .bind(claims.sub)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    let signature = crate::services::conflict_memory::entity_merge_signature(
+        entity_type.as_deref().unwrap_or(""),
+        methods.first().map(String::as_str).unwrap_or(""),
+        score.unwrap_or(0.0) as f64,
+    );
+    let chosen = crate::services::conflict_memory::entity_merge_choice(req.action.trim())
+        .unwrap_or_else(|| "dismiss".into());
+    crate::services::conflict_memory::record(
+        &state.db, "entity_merge", &signature, &chosen,
+        json!({ "entityType": entity_type, "methods": methods, "score": score }),
+        claims.sub, comp_id,
+    ).await;
+    crate::services::audit::log_access(&state.db, &claims, "kg.resolve_merge_review",
+        "merge_review", &id.to_string(), 0, None, true, None).await;
+
+    // A split only takes effect through a re-merge; queue it for the owner so
+    // the person clicks once and the graph follows.
+    let refresh_job = match (decision, comp_id) {
+        (Some("not_same"), Some(cid)) => Some(enqueue_fuse_refresh(&state, owner, cid).await?),
+        _ => None,
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "status": new_status,
+        "decision": decision,
+        "refreshJobId": refresh_job,
+    })))
+}
+
 /// Apply a fact resolution: delete the losing edges (source AND merged graphs),
 /// block them in knowledge_corrections, stamp the winner current and close the
 /// row with `final_status` ('resolved' by a human, 'auto_resolved' by the
@@ -4228,7 +4342,7 @@ mod grounded_nodes_tests {
 
 #[cfg(test)]
 mod fact_conflict_tests {
-    use super::{conflict_edge_names, conflict_tail_values, decide_fact_resolution, neo4j_rel_type};
+    use super::{conflict_edge_names, conflict_tail_values, decide_fact_resolution, decide_merge_review, neo4j_rel_type};
     use serde_json::json;
 
     // neo4j_rel_type must mirror the Python safe_rel_type exactly, so that the
@@ -4289,6 +4403,15 @@ mod fact_conflict_tests {
         );
         assert!(decide_fact_resolution("pick", false, Some("Nobody"), Some("Petra"), &vals).is_err());
         assert!(decide_fact_resolution("pick", false, None, Some("Petra"), &vals).is_err());
+    }
+
+    #[test]
+    fn merge_review_answers_map_to_status_and_decision() {
+        assert_eq!(decide_merge_review("same"), Ok(("resolved", Some("same"))));
+        assert_eq!(decide_merge_review(" not_same "), Ok(("resolved", Some("not_same"))));
+        assert_eq!(decide_merge_review("dismiss"), Ok(("dismissed", None)));
+        assert!(decide_merge_review("merge").is_err());
+        assert!(decide_merge_review("").is_err());
     }
 
     #[test]

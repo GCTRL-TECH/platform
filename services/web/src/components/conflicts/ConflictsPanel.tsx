@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { AlertTriangle, Check, Loader2, FileText } from 'lucide-react'
+import { AlertTriangle, Check, Loader2, FileText, GitMerge } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
@@ -44,7 +44,40 @@ interface FactConflict {
   status: string
 }
 
-type Conflict = ClassificationConflict | FactConflict
+interface MergeSide {
+  uri: string
+  name: string | null
+  type: string | null
+}
+
+interface MergeNeighbour {
+  rel: string
+  name: string
+  outgoing: boolean
+}
+
+/** A doubtful entity merge the fusion made on its own (merge review). */
+interface EntityMergeReview {
+  id: string
+  kind: 'entity_merge'
+  compilationId: string | null
+  a: MergeSide
+  b: MergeSide
+  score: number | null
+  limesScore: number | null
+  band: string | null
+  methods: string[]
+  mergedUri: string | null
+  context: {
+    rule?: string
+    a?: { neighbours?: MergeNeighbour[]; sourceJob?: string | null }
+    b?: { neighbours?: MergeNeighbour[]; sourceJob?: string | null }
+  }
+  status: string
+  history: { chosen: string; votes: number; support: number; confidence: number } | null
+}
+
+type Conflict = ClassificationConflict | FactConflict | EntityMergeReview
 
 function fmtEpochMs(ms: number | null): string | null {
   if (!ms) return null
@@ -80,6 +113,11 @@ export function ConflictsPanel() {
     try { await api.post(`/kg/conflicts/${id}/resolve`, { action, pickedTail }); qc.invalidateQueries({ queryKey: ['classification', 'conflicts'] }) }
     finally { setBusy(null) }
   }
+  async function resolveMerge(id: string, action: 'same' | 'not_same' | 'dismiss') {
+    setBusy(id)
+    try { await api.post(`/kg/merge-reviews/${id}/resolve`, { action }); qc.invalidateQueries({ queryKey: ['classification', 'conflicts'] }) }
+    finally { setBusy(null) }
+  }
 
   if (isLoading) return <div className="flex justify-center py-10"><Loader2 size={18} className="animate-spin text-slate-500" /></div>
   if (conflicts.length === 0) {
@@ -89,7 +127,8 @@ export function ConflictsPanel() {
         <p className="text-sm text-slate-400">No open conflicts.</p>
         <p className="text-[11px] text-slate-600">
           Conflicts appear when two sources disagree on a fact (e.g. two different CEOs
-          for one company), or a merge produces two classifications for one element.
+          for one company), a merge produces two classifications for one element, or the
+          fusion joined two entities it was not sure about.
         </p>
       </div>
     )
@@ -100,7 +139,9 @@ export function ConflictsPanel() {
       {conflicts.map((c) =>
         c.kind === 'fact'
           ? <FactConflictCard key={c.id} conflict={c} busy={busy === c.id} onResolve={resolveFact} />
-          : <ClassificationConflictCard key={c.id} conflict={c} busy={busy === c.id} onSuggest={suggest} onResolve={resolve} />
+          : c.kind === 'entity_merge'
+            ? <EntityMergeCard key={c.id} review={c} busy={busy === c.id} onResolve={resolveMerge} />
+            : <ClassificationConflictCard key={c.id} conflict={c} busy={busy === c.id} onSuggest={suggest} onResolve={resolve} />
       )}
     </div>
   )
@@ -224,6 +265,112 @@ function FactConflictCard({ conflict: c, busy, onResolve }: {
       </div>
       <p className="text-[10px] text-slate-600">
         Accepting a value deletes the losing relationships and blocks them from re-extraction.
+      </p>
+    </div>
+  )
+}
+
+// ─── Merge review ────────────────────────────────────────────────────────────
+
+const METHOD_LABEL: Record<string, string> = {
+  resolver: 'name similarity (LIMES)',
+  resolver_review: 'name similarity (LIMES, review band)',
+  resolver_fallback: 'name similarity (fallback matcher)',
+  apoc: 'identical name',
+  smart: 'acronym / word order',
+  canonical: 'context embedding',
+  'embedding-name': 'name embedding',
+  'embedding-desc': 'description embedding',
+  'embedding-model': 'model number',
+  conex: 'link prediction',
+  human: 'confirmed by a person',
+}
+
+function MergeSideBox({ side, ctx }: {
+  side: MergeSide
+  ctx?: { neighbours?: MergeNeighbour[]; sourceJob?: string | null }
+}) {
+  const neighbours = ctx?.neighbours ?? []
+  return (
+    <div className="min-w-0 flex-1 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+      <p className="truncate text-xs font-medium text-slate-200" title={side.uri}>{side.name ?? side.uri}</p>
+      <p className="mt-0.5 text-[10px] uppercase tracking-wide text-slate-500">{side.type ?? 'entity'}</p>
+      {neighbours.length > 0 ? (
+        <ul className="mt-1.5 space-y-0.5">
+          {neighbours.map((n, i) => (
+            <li key={i} className="truncate text-[10px] text-slate-400">
+              <span className="text-slate-600">{n.outgoing ? '→' : '←'} {n.rel.replace(/_/g, ' ').toLowerCase()} </span>
+              {n.name}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-1.5 text-[10px] text-slate-600">no relations</p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * A doubtful entity merge: the fusion already joined these two nodes on one
+ * weak signal. Nothing waits on the answer — "same" confirms it, "not the same"
+ * records a cannot-link and re-merges the graph so the node splits, "skip"
+ * drops the card. Every answer teaches the decision memory.
+ */
+function EntityMergeCard({ review: r, busy, onResolve }: {
+  review: EntityMergeReview
+  busy: boolean
+  onResolve: (id: string, action: 'same' | 'not_same' | 'dismiss') => Promise<void>
+}) {
+  const pct = r.score != null ? `${Math.round(r.score * 100)} %` : '?'
+  const method = r.methods.map((m) => METHOD_LABEL[m] ?? m).join(', ')
+  const typeLabel = r.a.type ?? 'entity'
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-slate-200">
+            <span className="text-slate-400">Are </span>“{r.a.name ?? '?'}”
+            <span className="text-slate-400"> and </span>“{r.b.name ?? '?'}”
+            <span className="text-slate-400"> the same {typeLabel}?</span>
+            <span className="ml-1.5 rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-sky-300">merge</span>
+          </p>
+          <p className="mt-0.5 text-xs text-amber-400">
+            Merged automatically at {pct} similarity by {method}. Confirm or split to improve future merges.
+          </p>
+        </div>
+        <GitMerge size={14} className="mt-0.5 shrink-0 text-sky-400" />
+      </div>
+
+      <div className="flex gap-2">
+        <MergeSideBox side={r.a} ctx={r.context?.a} />
+        <MergeSideBox side={r.b} ctx={r.context?.b} />
+      </div>
+
+      {r.history && r.history.support > 0 && (
+        <p className="text-[10px] text-slate-500">
+          Similar pairs were answered “{r.history.chosen.replace('_', ' ')}” {r.history.votes} of {r.history.support} times.
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button onClick={() => void onResolve(r.id, 'same')} disabled={busy}
+          className="rounded-md border border-emerald-700/40 bg-emerald-900/20 px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-900/40">
+          {busy ? <Loader2 size={12} className="mr-1 inline animate-spin" /> : null}
+          Yes, the same
+        </button>
+        <button onClick={() => void onResolve(r.id, 'not_same')} disabled={busy}
+          className="rounded-md border border-amber-700/40 bg-amber-900/20 px-3 py-1.5 text-xs text-amber-300 hover:bg-amber-900/40">
+          No, split them
+        </button>
+        <button onClick={() => void onResolve(r.id, 'dismiss')} disabled={busy}
+          className="rounded-md px-3 py-1.5 text-xs text-slate-500 hover:text-slate-300">
+          Skip
+        </button>
+      </div>
+      <p className="text-[10px] text-slate-600">
+        {r.context?.rule ? <>Rule: <code className="text-slate-500">{r.context.rule}</code>. </> : null}
+        Splitting re-merges the knowledge base in the background; the pair never merges again.
       </p>
     </div>
   )

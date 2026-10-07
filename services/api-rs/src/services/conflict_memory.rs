@@ -78,6 +78,28 @@ pub fn fact_signature(relation: &str, key_side: &str) -> String {
     )
 }
 
+/// `entity_merge:<coarse type>:<matcher>:<score bucket>` — an entity-merge
+/// review is "two <type> nodes that <matcher> linked at about <score>". The
+/// names never enter the signature; the score is bucketed to one decimal so
+/// 0.61 and 0.68 count as the same kind of doubt.
+pub fn entity_merge_signature(entity_type: &str, method: &str, score: f64) -> String {
+    let bucket = (score.clamp(0.0, 1.0) * 10.0).floor() / 10.0;
+    format!(
+        "entity_merge:{}:{}:{bucket:.1}",
+        entity_type.trim().to_lowercase(),
+        method.trim().to_lowercase()
+    )
+}
+
+/// The remembered form of a merge-review decision; every one of them can be
+/// replayed on a new pair of the same signature.
+pub fn entity_merge_choice(action: &str) -> Option<String> {
+    match action {
+        "same" | "not_same" | "dismiss" => Some(action.to_string()),
+        _ => None,
+    }
+}
+
 // ── Chosen (pure) ─────────────────────────────────────────────────────────────
 
 /// The remembered form of a classification decision. None = not a decision
@@ -278,11 +300,91 @@ pub async fn auto_resolve_for_user(state: &AppState, user_id: Uuid) {
     }
     let n_class = auto_resolve_classification(state, user_id, min_support).await;
     let n_fact = auto_resolve_facts(state, user_id, min_support).await;
-    if n_class + n_fact > 0 {
+    let n_merge = auto_resolve_entity_merges(state, user_id, min_support).await;
+    if n_class + n_fact + n_merge > 0 {
         tracing::info!(
-            "conflict memory: auto-resolved {n_class} classification + {n_fact} fact conflict(s) for user {user_id}"
+            "conflict memory: auto-resolved {n_class} classification + {n_fact} fact + {n_merge} merge review(s) for user {user_id}"
         );
     }
+}
+
+/// Pending merge reviews whose signature the memory has decided often enough
+/// are answered the same way. A replayed "not_same" splits a merged node, so
+/// the compilation is re-merged once afterwards (the decided pair can never
+/// become a candidate again, so this converges).
+async fn auto_resolve_entity_merges(state: &AppState, user_id: Uuid, min_support: i64) -> usize {
+    let rows: Vec<(Uuid, Option<Uuid>, Option<String>, Vec<String>, Option<f32>)> = sqlx::query_as(
+        "SELECT id, compilation_id, entity_a_type, methods, score
+         FROM review_queue
+         WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    if rows.is_empty() {
+        return 0;
+    }
+    let sigs: Vec<String> = rows
+        .iter()
+        .map(|r| entity_merge_signature(
+            r.2.as_deref().unwrap_or(""),
+            r.3.first().map(String::as_str).unwrap_or(""),
+            r.4.unwrap_or(0.0) as f64,
+        ))
+        .collect();
+    let verdicts = verdicts(&state.db, "entity_merge", &sigs).await;
+
+    let mut done = 0usize;
+    let mut split_comps: Vec<Uuid> = Vec::new();
+    for ((id, comp_id, _t, _m, _s), sig) in rows.into_iter().zip(sigs) {
+        let Some(v) = verdicts.get(&sig) else { continue };
+        if !v.auto_allowed(min_support) {
+            continue;
+        }
+        let (status, decision) = match v.chosen.as_str() {
+            "same" => ("auto_resolved", Some("same")),
+            "not_same" => ("auto_resolved", Some("not_same")),
+            "dismiss" => ("dismissed", None),
+            _ => continue,
+        };
+        let reason = format!(
+            "auto-resolved from decision memory: {} of {} reviews with this signature were answered '{}'",
+            v.votes, v.support, v.chosen
+        );
+        let ok = sqlx::query(
+            "UPDATE review_queue
+             SET status = $1, decision = $2, decision_reason = $3, decided_by = NULL,
+                 decided_at = NOW(), updated_at = NOW()
+             WHERE id = $4 AND status = 'pending'",
+        )
+        .bind(status)
+        .bind(decision)
+        .bind(&reason)
+        .bind(id)
+        .execute(&state.db)
+        .await;
+        match ok {
+            Ok(r) if r.rows_affected() > 0 => {
+                done += 1;
+                if decision == Some("not_same") {
+                    if let Some(c) = comp_id {
+                        if !split_comps.contains(&c) {
+                            split_comps.push(c);
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("conflict memory: could not auto-resolve merge review {id}: {e}"),
+        }
+    }
+    for cid in split_comps {
+        if let Err(e) = crate::routes::kg::enqueue_fuse_refresh(state, user_id, cid).await {
+            tracing::warn!("conflict memory: re-merge of {cid} after auto split not queued: {e:?}");
+        }
+    }
+    done
 }
 
 fn auto_suggestion(v: &Verdict, action: &str, rank: Option<i32>) -> Value {
@@ -433,6 +535,34 @@ mod tests {
     const MIGRATION: &str = include_str!("../../migrations/086_conflict_resolutions.sql");
 
     // signatures ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn entity_merge_signature_buckets_the_score_and_normalises_text() {
+        assert_eq!(entity_merge_signature("Organization", "resolver_review", 0.61),
+                   "entity_merge:organization:resolver_review:0.6");
+        assert_eq!(entity_merge_signature("organization", "resolver_review", 0.68),
+                   "entity_merge:organization:resolver_review:0.6");
+        assert_eq!(entity_merge_signature("person", "smart", 0.95),
+                   "entity_merge:person:smart:0.9");
+        assert_eq!(entity_merge_signature("", "", 1.4), "entity_merge:::1.0");
+    }
+
+    #[test]
+    fn entity_merge_choices_are_the_three_answers_and_all_replayable() {
+        for a in ["same", "not_same", "dismiss"] {
+            let c = entity_merge_choice(a).unwrap();
+            assert_eq!(c, a);
+            assert!(is_generalizable(&c));
+        }
+        assert_eq!(entity_merge_choice("merge"), None);
+    }
+
+    #[test]
+    fn migration_092_lets_the_memory_store_merge_decisions() {
+        let m = include_str!("../../migrations/092_merge_reviews.sql");
+        assert!(m.contains("CHECK (conflict_kind IN ('classification', 'fact', 'entity_merge'))"));
+        assert!(m.contains("uq_review_queue_pair"));
+    }
 
     #[test]
     fn classification_signature_is_order_case_and_duplicate_insensitive() {

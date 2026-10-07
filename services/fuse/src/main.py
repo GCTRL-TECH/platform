@@ -119,12 +119,17 @@ def run_merge(
                 merger.threshold_accept = max(merger.threshold_accept, float(threshold))
                 merger.threshold_review = min(merger.threshold_review, float(threshold) - 0.15)
 
+    # Human merge decisions from the review queue (same / not the same) bind
+    # every merge of this compilation, whatever the matchers say.
+    must_link, cannot_link = _load_merge_decisions(compilation_id)
+
     stats = merger.merge(
         compilation_id, source_job_ids, user_id, classification,
         enable_conex=enable_conex, enable_smart_match=enable_smart_match,
         enable_canonical_link=enable_canonical_link,
         enable_embedding_match=enable_embedding_match,
         field_mode_config=field_mode_config,
+        must_link=must_link, cannot_link=cannot_link,
     )
 
     # Persist classification conflicts (don't ship the bulky list in the result).
@@ -136,6 +141,12 @@ def run_merge(
     links = stats.pop("_links", None)
     if links is not None:
         _write_merge_links(compilation_id, user_id, links)
+
+    # The few doubtful merges a human may want to confirm or split. Everything
+    # is merged already; this only fills the optional review queue.
+    candidates = stats.pop("_review_candidates", None)
+    if candidates is not None:
+        _write_merge_reviews(compilation_id, user_id, candidates)
 
     logger.info(f"[{compilation_id}] Merge complete: {stats}")
     return {
@@ -182,6 +193,133 @@ def _as_uuid_or_none(value: str) -> str | None:
         return None
 
 
+def _compilation_owner(cur, cid: str, user_id: str) -> str | None:
+    """The compilation's owner. A refresh job carries no user ("system"), and
+    both review and trail rows must belong to the person who owns the graph."""
+    cur.execute("SELECT user_id FROM compilations WHERE id = %s", (cid,))
+    row = cur.fetchone()
+    if row and row[0]:
+        return str(row[0])
+    return _as_uuid_or_none(user_id)
+
+
+def _compilation_defaults(compilation_id: str) -> dict:
+    """Owner and classification of a compilation, for jobs whose payload lacks
+    them. Best-effort: an unknown or unreachable compilation yields {}."""
+    cid = _as_uuid_or_none(compilation_id)
+    if cid is None:
+        return {}
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id::text, classification::text FROM compilations WHERE id = %s", (cid,)
+            )
+            row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"[{compilation_id}] Could not read compilation defaults: {exc}")
+        return {}
+    if not row:
+        return {}
+    return {"user_id": row[0], "classification": row[1]}
+
+
+def _load_merge_decisions(compilation_id: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Decided review rows of this compilation as (must_link, cannot_link) URI
+    pairs. Best-effort: without a database the merge runs on matchers alone."""
+    cid = _as_uuid_or_none(compilation_id)
+    if cid is None:
+        return [], []
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entity_a_uri, entity_b_uri, decision FROM review_queue
+                WHERE compilation_id = %s AND decision IN ('same', 'not_same')
+                """,
+                (cid,),
+            )
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"[{compilation_id}] Could not load merge decisions: {exc}")
+        return [], []
+    must = [(a, b) for a, b, d in rows if d == "same"]
+    cannot = [(a, b) for a, b, d in rows if d == "not_same"]
+    if must or cannot:
+        logger.info(f"[{compilation_id}] Merge decisions: {len(must)} same, {len(cannot)} not same")
+    return must, cannot
+
+
+def _write_merge_reviews(compilation_id: str, user_id: str, candidates: list[dict]) -> None:
+    """Refresh the compilation's PENDING review rows to this run's candidates.
+
+    A decided row (same / not_same / dismissed) is never touched: the decision
+    outlives every re-merge. A pending pair that is no longer a candidate (the
+    rule changed, a stronger matcher confirmed it) disappears from the queue.
+    """
+    cid = _as_uuid_or_none(compilation_id)
+    if cid is None:
+        return
+    try:
+        import json as _json
+        import psycopg2
+        from psycopg2.extras import execute_values
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            owner = _compilation_owner(cur, cid, user_id)
+            if owner is None:
+                logger.info(f"[{compilation_id}] Merge review skipped: no owner")
+                return
+            keep_a = [c["source_uri"] for c in candidates]
+            keep_b = [c["target_uri"] for c in candidates]
+            cur.execute(
+                """
+                DELETE FROM review_queue
+                WHERE compilation_id = %s AND status = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM unnest(%s::text[], %s::text[]) AS keep(a, b)
+                      WHERE keep.a = review_queue.entity_a_uri AND keep.b = review_queue.entity_b_uri
+                  )
+                """,
+                (cid, keep_a, keep_b),
+            )
+            if candidates:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO review_queue
+                        (user_id, compilation_id, entity_a_uri, entity_a_name, entity_a_type,
+                         entity_b_uri, entity_b_name, entity_b_type, confidence, discovery_method,
+                         score, limes_score, band, methods, merged_uri, context, status)
+                    VALUES %s
+                    ON CONFLICT (user_id, compilation_id, entity_a_uri, entity_b_uri)
+                    DO UPDATE SET
+                        confidence = EXCLUDED.confidence, score = EXCLUDED.score,
+                        limes_score = EXCLUDED.limes_score, band = EXCLUDED.band,
+                        methods = EXCLUDED.methods, merged_uri = EXCLUDED.merged_uri,
+                        context = EXCLUDED.context, updated_at = NOW()
+                    WHERE review_queue.status = 'pending'
+                    """,
+                    [
+                        (owner, cid, c["source_uri"], c["source_name"], c["entity_type"],
+                         c["target_uri"], c["target_name"], c["entity_type"],
+                         c["score"], (c["methods"] or [""])[0],
+                         c["score"], c["limes_score"], c["band"], list(c["methods"]),
+                         c["merged_uri"], _json.dumps(c.get("context") or {}), "pending")
+                        for c in candidates
+                    ],
+                )
+        conn.close()
+        logger.info(f"[{compilation_id}] Merge review queue: {len(candidates)} candidate(s)")
+    except Exception as exc:
+        logger.warning(f"[{compilation_id}] Failed to write merge review queue: {exc}")
+
+
 def _write_merge_links(compilation_id: str, user_id: str, links: list[dict]) -> None:
     """Replace the compilation's merge trail with this run's links.
 
@@ -198,6 +336,7 @@ def _write_merge_links(compilation_id: str, user_id: str, links: list[dict]) -> 
         from psycopg2.extras import execute_values
         conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
         with conn, conn.cursor() as cur:
+            owner = _compilation_owner(cur, cid, user_id)
             cur.execute("DELETE FROM merge_links WHERE compilation_id = %s", (cid,))
             if links:
                 execute_values(
@@ -211,7 +350,7 @@ def _write_merge_links(compilation_id: str, user_id: str, links: list[dict]) -> 
                     ON CONFLICT (compilation_id, source_uri, target_uri) DO NOTHING
                     """,
                     [
-                        (cid, _as_uuid_or_none(user_id), l["source_uri"], l["target_uri"],
+                        (cid, owner, l["source_uri"], l["target_uri"],
                          l["source_name"], l["target_name"], l["entity_type"],
                          list(l["methods"]), l["score"], l["limes_score"], l["band"],
                          l["merged_uri"])
@@ -272,10 +411,14 @@ def _worker_loop() -> None:
             payload = json.loads(raw_payload)
             job_id = payload.get("job_id", "unknown")
             compilation_id = payload.get("compilation_id", "unknown")
-            user_id = payload.get("user_id", "system")
             source_job_ids = payload.get("source_job_ids", [])
-            classification = payload.get("classification", "PUBLIC")
             match_rules = payload.get("match_rules")
+            # A refresh job used to carry neither user nor classification, so
+            # merged nodes belonged to "system" and the conflict scan found
+            # nothing. The compilation row is the authority for both.
+            defaults = _compilation_defaults(compilation_id)
+            user_id = payload.get("user_id") or defaults.get("user_id") or "system"
+            classification = payload.get("classification") or defaults.get("classification") or "PUBLIC"
 
             # Authoritative state: mark job as 'processing' in Postgres
             # before doing the heavy merge work.

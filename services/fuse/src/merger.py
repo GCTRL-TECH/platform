@@ -696,6 +696,59 @@ def _link_records(
     return records
 
 
+def _pair_key(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _fold_allowed(
+    members_a: list[str], members_b: list[str], cannot_link: set[tuple[str, str]]
+) -> bool:
+    """May two clusters become one? Not when a pair a human marked "not the
+    same" would end up together. The check runs per fold, not per link, so a
+    forbidden pair is kept apart even through a chain of other links."""
+    if not cannot_link:
+        return True
+    small, large = (members_a, set(members_b)) if len(members_a) <= len(members_b) else (members_b, set(members_a))
+    for uri in small:
+        for other in large:
+            if _pair_key(uri, other) in cannot_link:
+                return False
+    return True
+
+
+REVIEW_MAX_OPEN = 20
+# Matchers that all read the same signal, the name string. LIMES and its
+# difflib complement agreeing is not two opinions; an acronym rule, an
+# embedding, a link prediction or a person is.
+NAME_ONLY_METHODS = frozenset({"resolver", "resolver_review", "resolver_fallback"})
+
+
+def _review_candidates(
+    records: list[dict], threshold_accept: float, limit: int = REVIEW_MAX_OPEN
+) -> list[dict]:
+    """The few merges worth a human glance: below the acceptance threshold,
+    resting on name similarity alone (no independent matcher agreed), and the
+    only thing holding their cluster together (``bridge``). Ranked least
+    certain first, capped so a large graph never floods the reviewer. Pairs a
+    human already decided are not records here (confirmed ones are ``human``
+    links, forbidden ones never link)."""
+    def doubt(r: dict) -> float:
+        # LIMES's own similarity is the honest measure of doubt; the difflib
+        # complement scores the same name pair more generously.
+        value = r.get("limes_score")
+        return float(value if value is not None else (r.get("score") or 0.0))
+
+    picked = [
+        r for r in records
+        if r.get("bridge")
+        and (r.get("methods") or [])
+        and all(m in NAME_ONLY_METHODS for m in (r.get("methods") or []))
+        and doubt(r) < threshold_accept
+    ]
+    picked.sort(key=lambda r: (doubt(r), r["source_uri"], r["target_uri"]))
+    return picked[:limit]
+
+
 def _group_relations_onto_canonical(
     relations: list[dict], canonical_by_uri: dict[str, tuple[str, str]]
 ) -> dict[tuple, list[dict]]:
@@ -792,9 +845,15 @@ class ThreeStageEntityMerger:
         enable_canonical_link: bool = False,
         enable_embedding_match: bool = False,
         field_mode_config: dict | None = None,
+        must_link: list[tuple[str, str]] | None = None,
+        cannot_link: list[tuple[str, str]] | None = None,
     ) -> dict:
         """
         Run three-stage merge pipeline.
+
+        ``must_link`` / ``cannot_link`` are human decisions on entity pairs
+        (URIs) from the merge review: a must-link pair joins as a ``human``
+        link, a cannot-link pair never shares a cluster, whatever the matchers say.
 
         Returns stats dict with breakdown by stage.
 
@@ -820,6 +879,14 @@ class ThreeStageEntityMerger:
         self._enable_smart_match = bool(enable_smart_match)
         self._enable_canonical_link = bool(enable_canonical_link)
         self._enable_embedding_match = bool(enable_embedding_match)
+        self._cannot_link: set[tuple[str, str]] = {
+            _pair_key(a, b) for a, b in (cannot_link or []) if a and b and a != b
+        }
+        human_links = [
+            {"source": a, "target": b, "confidence": 1.0, "method": "human"}
+            for a, b in (must_link or []) if a and b and a != b
+        ]
+        self._last_metric = ""
         # Apply per-merge field-mode overrides (blocking key + authors filter).
         # Defaults stay in place when a key is absent, so an empty/omitted block
         # preserves the documented field-mode behaviour.
@@ -909,9 +976,13 @@ class ThreeStageEntityMerger:
         # ── Merge Results ──────────────────────────────────────────────
         all_links = (
             stage1_links + stage2_links + stage3_links
-            + smart_links + canonical_links + embedding_links
+            + smart_links + canonical_links + embedding_links + human_links
         )
         all_links = self._deduplicate_links(all_links)
+        all_links = [
+            l for l in all_links
+            if _pair_key(l["source"], l["target"]) not in self._cannot_link
+        ]
         links_by_method: dict[str, int] = {}
         for link in all_links:
             for method in link["methods"]:
@@ -967,6 +1038,8 @@ class ThreeStageEntityMerger:
             # failed or returned nothing and the python string matcher ran instead.
             "stage2_engine": "fallback" if self._stage2_fell_back else "resolver",
             "links_by_method": links_by_method,
+            "human_links": len(human_links),
+            "review_candidates": len(stats.get("_review_candidates") or []),
             "_conflicts": conflicts,
             "conflicts_found": len(conflicts),
             "fact_conflicts_found": fact_conflicts_found,
@@ -1181,6 +1254,9 @@ class ThreeStageEntityMerger:
                 metric = overrides[only_type]
             elif "*" in overrides:
                 metric = overrides["*"]
+
+        # The rule that decided this batch, shown with every review card.
+        self._last_metric = metric
 
         # The resolver matches on the entity `type` property when the metric
         # contains exactmatch(x.type, y.type) (DEFAULT_METRICS presets / "*"
@@ -2146,6 +2222,11 @@ class ThreeStageEntityMerger:
             c1 = uri_to_cluster[src]
             c2 = uri_to_cluster[tgt]
             if c1 != c2:
+                if not _fold_allowed(
+                    clusters.get(c1, []), clusters.get(c2, []),
+                    getattr(self, "_cannot_link", set()),
+                ):
+                    continue
                 # Merge smaller into larger
                 if len(clusters.get(c1, [])) < len(clusters.get(c2, [])):
                     c1, c2 = c2, c1
@@ -2278,16 +2359,64 @@ class ThreeStageEntityMerger:
 
         duplicates_found = sum(1 for c in unique_clusters if len(clusters.get(c, [])) > 1)
 
+        links = _link_records(all_links, entity_by_uri, canonical_by_uri, compilation_id)
+        # A link is a bridge when its cluster is held together by exactly
+        # (members - 1) links: remove any one and the cluster falls apart.
+        links_in_cluster: dict[int, int] = {}
+        for rec in links:
+            cluster = uri_to_cluster.get(rec["source_uri"])
+            if cluster is not None and cluster == uri_to_cluster.get(rec["target_uri"]):
+                links_in_cluster[cluster] = links_in_cluster.get(cluster, 0) + 1
+        for rec in links:
+            cluster = uri_to_cluster.get(rec["source_uri"])
+            size = len(clusters.get(cluster, [])) if cluster is not None else 0
+            rec["cluster_size"] = size
+            rec["bridge"] = bool(cluster is not None and links_in_cluster.get(cluster, 0) == size - 1)
+
+        candidates = _review_candidates(links, self.threshold_accept)
+        if candidates:
+            uris = sorted({u for r in candidates for u in (r["source_uri"], r["target_uri"])})
+            with self.driver.session() as session:
+                neighbours = self._neighbours(session, uris)
+            for rec in candidates:
+                rec["context"] = {
+                    "rule": getattr(self, "_last_metric", ""),
+                    "a": {"neighbours": neighbours.get(rec["source_uri"], []),
+                          "sourceJob": entity_by_uri[rec["source_uri"]].get("source_job")},
+                    "b": {"neighbours": neighbours.get(rec["target_uri"], []),
+                          "sourceJob": entity_by_uri[rec["target_uri"]].get("source_job")},
+                }
+
         return {
             "entities_merged": entities_created,
             "duplicates_found": duplicates_found,
             "nodes_total": entities_created,
             "_conflicts": conflicts,
             "_canonical_by_uri": canonical_by_uri,
-            "_links": _link_records(
-                all_links, entity_by_uri, canonical_by_uri, compilation_id
-            ),
+            "_links": links,
+            "_review_candidates": candidates,
         }
+
+    def _neighbours(self, session, uris: list[str], per_uri: int = 3) -> dict[str, list[dict]]:
+        """Up to ``per_uri`` raw-graph neighbours per URI, as the context a
+        reviewer needs to tell two same-named entities apart."""
+        out: dict[str, list[dict]] = {}
+        if not uris:
+            return out
+        result = session.run(
+            """
+            UNWIND $uris AS uri
+            MATCH (e:Entity {uri: uri})-[r]-(n:Entity)
+            WHERE NOT n:Merged AND NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
+            WITH uri, type(r) AS rel, n.name AS name, startNode(r) = e AS outgoing
+            ORDER BY uri, rel, name
+            RETURN uri, collect({rel: rel, name: name, outgoing: outgoing})[0..$per_uri] AS neighbours
+            """,
+            uris=uris, per_uri=per_uri,
+        )
+        for record in result:
+            out[record["uri"]] = list(record["neighbours"])
+        return out
 
     def _merge_relations(
         self,

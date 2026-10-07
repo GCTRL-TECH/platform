@@ -637,6 +637,44 @@ async fn list_conflicts(
         }
     ));
 
+    // Merge reviews (migration 092): doubtful entity merges the fusion made on
+    // its own. Owner-scoped like fact conflicts; same visibility rule.
+    let review_rows_all = sqlx::query_as::<_, (
+        Uuid, Option<Uuid>, String, Option<String>, Option<String>, String, Option<String>, Option<String>,
+        Option<f32>, Option<f32>, Option<String>, Vec<String>, Option<String>, Value,
+        chrono::DateTime<chrono::Utc>,
+    )>(
+        "SELECT id, compilation_id, entity_a_uri, entity_a_name, entity_a_type,
+                entity_b_uri, entity_b_name, entity_b_type,
+                score, limes_score, band, methods, merged_uri, context, created_at
+         FROM review_queue
+         WHERE user_id = $1 AND status = 'pending'
+         ORDER BY score ASC NULLS LAST, created_at DESC LIMIT 1000",
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db)
+    .await?;
+    let review_rows: Vec<_> = review_rows_all.into_iter().filter(|r| visible(r.1)).take(PAGE).collect();
+    let review_sigs: Vec<String> = review_rows.iter().map(|r| memory::entity_merge_signature(
+        r.4.as_deref().unwrap_or(""),
+        r.11.first().map(String::as_str).unwrap_or(""),
+        r.8.unwrap_or(0.0) as f64,
+    )).collect();
+    let review_verdicts = memory::verdicts(&state.db, "entity_merge", &review_sigs).await;
+    conflicts.extend(review_rows.into_iter().zip(review_sigs).map(
+        |((id, cid, a_uri, a_name, a_type, b_uri, b_name, b_type, score, limes_score, band,
+           methods, merged_uri, context, created), sig)| json!({
+            "id": id, "kind": "entity_merge",
+            "compilationId": cid,
+            "a": { "uri": a_uri, "name": a_name, "type": a_type },
+            "b": { "uri": b_uri, "name": b_name, "type": b_type },
+            "score": score, "limesScore": limes_score, "band": band,
+            "methods": methods, "mergedUri": merged_uri, "context": context,
+            "status": "pending", "createdAt": created,
+            "history": memory::verdict_json(review_verdicts.get(&sig)),
+        })
+    ));
+
     Ok(Json(json!({ "conflicts": conflicts })))
 }
 
