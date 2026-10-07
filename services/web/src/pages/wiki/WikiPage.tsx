@@ -11,7 +11,6 @@ import {
   Settings2,
   Check,
   Clock,
-  Search,
   ArrowLeft,
   ShieldCheck,
   Lock,
@@ -21,6 +20,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useApiQuery } from '@/hooks/useApi'
 import { apiGet, apiPost, apiPut } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { KbPicker } from '@/components/kb/KbPicker'
 import { WikiGraph, rankColor } from './WikiGraph'
 
 const MarkdownView = lazy(
@@ -269,19 +269,6 @@ function WikiSelector({
   wikis: Compilation[]
   onSelect: (id: string) => void
 }) {
-  const [q, setQ] = useState('')
-  const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase()
-    const list = needle
-      ? wikis.filter((w) => w.name.toLowerCase().includes(needle))
-      : wikis
-    // System wiki(s) pinned first, then alphabetical.
-    return [...list].sort((a, b) => {
-      if (!!a.isSystem !== !!b.isSystem) return a.isSystem ? -1 : 1
-      return a.name.localeCompare(b.name)
-    })
-  }, [wikis, q])
-
   return (
     <div className="animate-slide-up space-y-6">
       <div className="flex items-start gap-3">
@@ -297,52 +284,17 @@ function WikiSelector({
         </div>
       </div>
 
-      <div className="relative max-w-md">
-        <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-        <input
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="Search wikis…"
-          className="w-full rounded-lg border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-sm text-slate-200 placeholder:text-slate-600 focus:border-blue-500/50 focus:outline-none"
+      <div className="max-w-md">
+        <KbPicker
+          mode="single"
+          types={['WIKI']}
+          value={null}
+          onChange={(id) => {
+            if (id) onSelect(id)
+          }}
+          placeholder={wikis.length === 0 ? 'No wikis yet' : 'Choose a wiki...'}
         />
       </div>
-
-      {filtered.length === 0 ? (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-12 text-center">
-          <BookOpenText size={28} className="mx-auto text-slate-700" />
-          <p className="mt-2 text-sm text-slate-400">
-            {wikis.length === 0 ? 'No wikis yet.' : 'No wikis match your search.'}
-          </p>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {filtered.map((w) => (
-            <button
-              key={w.id}
-              onClick={() => onSelect(w.id)}
-              className="group flex flex-col gap-2 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-left transition-colors hover:border-violet-500/40 hover:bg-slate-900"
-            >
-              <div className="flex items-center justify-between">
-                <BookOpenText size={18} className="text-violet-300" />
-                {w.isSystem && (
-                  <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-violet-300 ring-1 ring-violet-500/30">
-                    System
-                  </span>
-                )}
-              </div>
-              <p className="font-semibold text-slate-100 group-hover:text-white">{w.name}</p>
-              <p className="flex items-center gap-1.5 text-xs text-slate-500">
-                <Clock size={12} />
-                {w.lastDistillAt
-                  ? `Updated ${formatDistanceToNow(new Date(w.lastDistillAt), { addSuffix: true })}`
-                  : 'Not yet distilled'}
-                <span className="text-slate-700">·</span>
-                {w.pageCount ?? 0} pages
-              </p>
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   )
 }
@@ -351,7 +303,6 @@ function WikiSelector({
 
 function WikiExplorer({
   wiki,
-  rawCompilations,
   multiWiki,
   onBack,
   onDistilled,
@@ -511,7 +462,7 @@ function WikiExplorer({
       )}
 
       {showSources && (
-        <SourceSelectionPanel wikiId={wikiId} rawCompilations={rawCompilations} />
+        <SourceSelectionPanel wikiId={wikiId} />
       )}
 
       {/* 3-pane explorer: index | graph | content */}
@@ -678,10 +629,8 @@ function Citations({ citations }: { citations: unknown }) {
 
 function SourceSelectionPanel({
   wikiId,
-  rawCompilations,
 }: {
   wikiId: string
-  rawCompilations: Compilation[]
 }) {
   const queryClient = useQueryClient()
   const [selected, setSelected] = useState<Set<string> | null>(null)
@@ -700,16 +649,6 @@ function SourceSelectionPanel({
   }, [data, selected])
 
   const sel = selected ?? new Set<string>()
-
-  function toggle(id: string) {
-    setSelected((prev) => {
-      const next = new Set(prev ?? [])
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-    setSaveMsg(null)
-  }
 
   async function save() {
     setSaving(true)
@@ -765,35 +704,17 @@ function SourceSelectionPanel({
         <div className="flex items-center justify-center py-6">
           <span className="h-5 w-5 animate-spin rounded-full border-2 border-slate-700 border-t-blue-500" />
         </div>
-      ) : rawCompilations.length === 0 ? (
-        <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
-          No RAW graphs available. Create or extract a RAW graph first.
-        </p>
       ) : (
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-          {rawCompilations.map((c) => {
-            const checked = sel.has(c.id)
-            return (
-              <label
-                key={c.id}
-                className={cn(
-                  'flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 transition-colors',
-                  checked
-                    ? 'border-blue-500/50 bg-blue-500/10'
-                    : 'border-slate-700 bg-slate-900 hover:border-slate-600'
-                )}
-              >
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => toggle(c.id)}
-                  className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-blue-500"
-                />
-                <span className="truncate text-sm text-slate-200">{c.name}</span>
-              </label>
-            )
-          })}
-        </div>
+        <KbPicker
+          mode="multi"
+          types={['RAW']}
+          value={sel}
+          onChange={(ids) => {
+            setSelected(new Set(ids))
+            setSaveMsg(null)
+          }}
+          maxHeight="max-h-80"
+        />
       )}
     </div>
   )

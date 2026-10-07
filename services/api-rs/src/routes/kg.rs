@@ -388,6 +388,16 @@ struct ListQuery {
     /// pick WIKIs out of the N newest graphs client-side, so on an instance with
     /// more graphs than the limit an older wiki vanished ("No wikis yet").
     #[serde(rename = "type")] comp_type: Option<String>,
+    /// Case-insensitive substring match on the name. Search is always GLOBAL:
+    /// when `q` is non-blank, `folderId` is ignored so a hit in another folder
+    /// is found; rows carry `folderId` so the UI can show where it lives.
+    q: Option<String>,
+}
+
+/// Escape the LIKE metacharacters in user input so `%`/`_` match literally
+/// (the query uses the default `\` escape character).
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
@@ -987,8 +997,12 @@ async fn list(
     // list_graphs - read the 20 newest and silently dropped the rest.
     let limit  = q.limit.unwrap_or(100).min(500);
     let offset = q.offset.unwrap_or(0);
-    let folder_filter: Option<String> = q.folder_id.as_ref()
-        .map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+    // Global KB search: a non-blank `q` overrides the folder filter entirely.
+    let name_filter: Option<String> = q.q.as_ref()
+        .map(|s| s.trim()).filter(|s| !s.is_empty()).map(escape_like);
+    let folder_filter: Option<String> = if name_filter.is_some() { None } else {
+        q.folder_id.as_ref().map(|f| f.trim().to_string()).filter(|f| !f.is_empty())
+    };
     let type_filter: Option<String> = q.comp_type.as_ref()
         .map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty());
     // Visibility, per row:
@@ -1026,10 +1040,12 @@ async fn list(
                 OR ($8::text = 'root' AND c.folder_id IS NULL)
                 OR c.folder_id::text = $8::text)
            AND ($9::text IS NULL OR c.type::text = $9::text)
+           AND ($10::text IS NULL OR c.name ILIKE '%' || $10::text || '%')
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
      .bind(rank_capped).bind(claims.api_key_id).bind(claims.code_access)
      .bind(folder_filter.as_deref()).bind(type_filter.as_deref())
+     .bind(name_filter.as_deref())
      .fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
@@ -1093,9 +1109,11 @@ async fn list(
                AND ($6::text IS NULL
                     OR ($6::text = 'root' AND c.folder_id IS NULL)
                     OR c.folder_id::text = $6::text)
-               AND ($7::text IS NULL OR c.type::text = $7::text)"
+               AND ($7::text IS NULL OR c.type::text = $7::text)
+               AND ($8::text IS NULL OR c.name ILIKE '%' || $8::text || '%')"
         ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
          .bind(claims.code_access).bind(folder_filter.as_deref()).bind(type_filter.as_deref())
+         .bind(name_filter.as_deref())
          .fetch_one(&state.db).await?
     };
 
@@ -1416,7 +1434,25 @@ async fn update(
         sqlx::query("UPDATE compilations SET privacy_mode=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3")
             .bind(mode).bind(id).bind(claims.sub).execute(&state.db).await?;
     }
-    Ok(Json(json!({ "ok": true })))
+    // Membership: a `sourceJobIds` SMALLER than the current list takes the
+    // missing jobs out of this knowledge base through the shared unlink path
+    // (last reference -> the job is removed everywhere; merged layer -> fusion
+    // re-run). Ids that are NOT in the current list are ignored — linking
+    // happens at ingest time, never by editing the list.
+    let mut unlinked = 0usize;
+    if let Some(ids) = req.get("sourceJobIds").and_then(|v| v.as_array()) {
+        let wanted: std::collections::HashSet<Uuid> = ids.iter()
+            .filter_map(|v| v.as_str().and_then(|s| s.parse::<Uuid>().ok()))
+            .collect();
+        let current: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT COALESCE(source_job_ids, '{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
+        ).bind(id).bind(claims.sub).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
+        for job_id in current.into_iter().filter(|j| !wanted.contains(j)) {
+            crate::routes::kex::unlink_job_from_compilation(&state, &claims, job_id, id).await?;
+            unlinked += 1;
+        }
+    }
+    Ok(Json(json!({ "ok": true, "unlinked": unlinked })))
 }
 
 /// The jobs a compilation would take to the grave: its own `source_job_ids`

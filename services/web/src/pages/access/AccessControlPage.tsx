@@ -1,19 +1,19 @@
-import { useState, useRef } from 'react'
-import { createPortal } from 'react-dom'
+import { useState } from 'react'
 import {
   Shield, KeyRound, ScrollText, Plus, Trash2, X, Copy, Check,
-  Loader2, Coins, Pencil, Bot, ChevronDown, ChevronUp, Code2,
+  Loader2, Coins, Pencil, Bot, ChevronDown, ChevronUp, Code2, Search, Lock, PenLine, Eye,
 } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Tabs } from '@/components/ui/Tabs'
+import { KbPicker } from '@/components/kb/KbPicker'
 import ClassificationPage from '@/pages/admin/ClassificationPage'
 
 // ─── Shared types ──────────────────────────────────────────────────────────────
 
-interface Grant { compilationId: string; compilationName: string; grantedRank: number | null; readOnly?: boolean }
+interface Grant { compilationId: string; compilationName: string; grantedRank: number | null; readOnly?: boolean; source?: 'manual' | 'managed' }
 interface ApiKey {
   id: string
   name: string
@@ -91,6 +91,9 @@ function TokensSection() {
   const [levelId, setLevelId] = useState('')
   const [expiryDays, setExpiryDays] = useState<number | null>(null)
   const [grantIds, setGrantIds] = useState<Set<string>>(new Set())
+  // Per-KB write switch for the create form; a missing entry means write ON.
+  const [grantRw, setGrantRw] = useState<Map<string, boolean>>(new Map())
+  const [tokenSearch, setTokenSearch] = useState('')
   const [kbScoped, setKbScoped] = useState(false)
   // Codebase access defaults ON - a new token behaves exactly like before.
   const [codeAccess, setCodeAccess] = useState(true)
@@ -111,7 +114,7 @@ function TokensSection() {
   }
 
   function reset() {
-    setName(''); setLevelId(''); setExpiryDays(null); setGrantIds(new Set()); setKbScoped(false)
+    setName(''); setLevelId(''); setExpiryDays(null); setGrantIds(new Set()); setGrantRw(new Map()); setKbScoped(false)
     setCodeAccess(true); setError(null)
   }
 
@@ -122,7 +125,9 @@ function TokensSection() {
       const expiresAt = expiryDays
         ? new Date(Date.now() + expiryDays * 86400_000).toISOString()
         : null
-      const grants = Array.from(grantIds).map((compilationId) => ({ compilationId, grantedRank: null }))
+      const grants = Array.from(grantIds).map((compilationId) => ({
+        compilationId, grantedRank: null, readOnly: !(grantRw.get(compilationId) ?? true), source: 'manual' as const,
+      }))
       // Selecting specific graphs makes the token KB-scoped by policy (the server
       // enforces this too): "limited" must actually limit — grants never widen an
       // otherwise-full token anymore.
@@ -156,11 +161,30 @@ function TokensSection() {
     }
   }
 
-  async function toggleGrant(keyId: string, compId: string, has: boolean) {
+  async function toggleGrant(keyId: string, compId: string, has: boolean, readOnly = false) {
     if (has) await api.delete(`/users/api-keys/${keyId}/grants/${compId}`)
-    else await api.post(`/users/api-keys/${keyId}/grants`, { compilationId: compId, grantedRank: null })
+    else await api.post(`/users/api-keys/${keyId}/grants`, { compilationId: compId, grantedRank: null, readOnly, source: 'manual' })
     qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
   }
+
+  /** Upsert flips readOnly; posting also marks the grant as set by hand. */
+  async function setGrantReadOnly(keyId: string, compId: string, readOnly: boolean) {
+    setError(null)
+    try {
+      await api.post(`/users/api-keys/${keyId}/grants`, { compilationId: compId, grantedRank: null, readOnly, source: 'manual' })
+      qc.invalidateQueries({ queryKey: ['users', 'api-keys'] })
+    } catch (e: unknown) {
+      setError((e as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Failed to change the grant')
+    }
+  }
+
+  const tq = tokenSearch.trim().toLowerCase()
+  const visibleKeys = tq
+    ? keys.filter((k) =>
+        k.name.toLowerCase().includes(tq) ||
+        (k.keyPrefix ?? '').toLowerCase().includes(tq) ||
+        k.grants.some((g) => (g.compilationName ?? '').toLowerCase().includes(tq)))
+    : keys
 
   return (
     <div className="space-y-4">
@@ -269,33 +293,22 @@ function TokensSection() {
           <div>
             <label className="label">Knowledge bases this token may access (exclusive)</label>
             <p className="mb-2 text-[11px] text-slate-600">
-              A token with a selection can read &amp; write ONLY the selected graphs (full access to each
-              selected graph, regardless of its classification). Nothing else is visible.
+              A token with a selection reaches ONLY the selected graphs (regardless of their
+              classification). Each selected knowledge base is readable; turn off Write to let the
+              token read it but never store into it.
             </p>
-            <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-slate-800 p-2">
-              {comps.length === 0 ? (
-                <p className="px-2 py-3 text-center text-[11px] text-slate-600">No graphs yet.</p>
-              ) : comps.map((c) => {
-                const checked = grantIds.has(c.id)
-                const isCode = c.type === 'CODE'
-                // A code graph cannot be granted to a token without Codebase access.
-                const locked = isCode && !codeAccess
-                return (
-                  <label key={c.id} className={cn('flex items-center gap-2 rounded px-2 py-1.5',
-                    locked ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-slate-800/50')}>
-                    <input type="checkbox" checked={checked} disabled={locked}
-                      onChange={() => setGrantIds((prev) => { const n = new Set(prev); checked ? n.delete(c.id) : n.add(c.id); return n })} />
-                    <span className="flex-1 text-xs text-slate-300">{c.name}</span>
-                    {isCode && (
-                      <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
-                        Code
-                      </span>
-                    )}
-                    <span className={cn('text-[10px]', CLEARANCE_BADGE[c.classification] ?? 'badge-slate')}>{c.classification}</span>
-                  </label>
-                )
-              })}
-            </div>
+            <KbPicker
+              mode="multi"
+              value={[...grantIds]}
+              onChange={(ids) => setGrantIds(new Set(ids))}
+              isDisabled={(item) => item.type === 'CODE' && !codeAccess}
+              renderRowExtra={(item, selected) => selected ? (
+                <ReadWriteToggle
+                  write={grantRw.get(item.id) ?? true}
+                  onToggle={() => setGrantRw((prev) => new Map(prev).set(item.id, !(prev.get(item.id) ?? true)))}
+                />
+              ) : null}
+            />
           </div>
 
           <div className="flex items-center justify-end gap-2">
@@ -307,15 +320,38 @@ function TokensSection() {
         </div>
       )}
 
+      {/* Token search */}
+      <div className="flex items-center gap-3">
+        <div className="relative max-w-sm flex-1">
+          <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+          <input
+            type="text"
+            value={tokenSearch}
+            onChange={(e) => setTokenSearch(e.target.value)}
+            className="input-field pl-9 pr-8"
+            placeholder="Search tokens by name, prefix or knowledge base..."
+          />
+          {tokenSearch && (
+            <button type="button" onClick={() => setTokenSearch('')} aria-label="Clear search"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200">
+              <X size={13} />
+            </button>
+          )}
+        </div>
+        {tq && <span className="text-xs text-slate-500">{visibleKeys.length} of {keys.length} tokens</span>}
+      </div>
+
       {/* Token list */}
       <div className="card p-0 overflow-hidden">
         {isLoading ? (
           <div className="flex items-center justify-center py-10"><Loader2 size={18} className="animate-spin text-slate-500" /></div>
         ) : keys.length === 0 ? (
           <p className="py-10 text-center text-sm text-slate-500">No access tokens yet.</p>
+        ) : visibleKeys.length === 0 ? (
+          <p className="py-10 text-center text-sm text-slate-500">No tokens match &lsquo;{tokenSearch.trim()}&rsquo;.</p>
         ) : (
           <div className="divide-y divide-slate-800">
-            {keys.map((k) => (
+            {visibleKeys.map((k) => (
               <div key={k.id} className="px-5 py-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0 flex-1">
@@ -374,7 +410,7 @@ function TokensSection() {
                       <code className="font-mono text-[11px] text-slate-600">{k.keyPrefix}…</code>
                     </div>
                     <p className="mt-0.5 text-[11px] text-slate-600">
-                      {k.expiresAt ? `Expires ${new Date(k.expiresAt).toLocaleDateString()}` : 'Never expires'}
+                      {`Created ${new Date(k.createdAt).toLocaleDateString()} · `}{k.expiresAt ? `Expires ${new Date(k.expiresAt).toLocaleDateString()}` : 'Never expires'}
                     </p>
                     {/* Grants */}
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -382,7 +418,17 @@ function TokensSection() {
                       {k.grants.length === 0 && <span className="text-[11px] text-slate-600">base clearance only</span>}
                       {k.grants.map((g) => (
                         <span key={g.compilationId} className="inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300">
+                          {g.source === 'manual' && (
+                            <span title="Set by hand in GCTRL; Anvil's key sync leaves it alone" className="text-slate-400"><Lock size={9} /></span>
+                          )}
                           {g.compilationName}
+                          <button
+                            onClick={() => void setGrantReadOnly(k.id, g.compilationId, !g.readOnly)}
+                            className="rounded p-0.5 hover:bg-indigo-500/20"
+                            title={g.readOnly ? 'Read-only. Click to allow writing.' : 'Read and write. Click to make read-only.'}
+                            aria-label={g.readOnly ? 'Allow writing' : 'Make read-only'}>
+                            {g.readOnly ? <Eye size={10} /> : <PenLine size={10} />}
+                          </button>
                           {g.readOnly && <span className="rounded bg-slate-700/70 px-1 text-[9px] uppercase tracking-wide text-slate-300" title="Read-only grant: this key can read but not write this graph">ro</span>}
                           <button onClick={() => void toggleGrant(k.id, g.compilationId, true)} className="hover:text-red-300"><X size={9} /></button>
                         </span>
@@ -411,58 +457,44 @@ function GrantAdder({ comps, existing, codeAccess, onAdd }: {
   codeAccess: boolean
   onAdd: (compId: string) => void
 }) {
-  const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
-  const btnRef = useRef<HTMLButtonElement>(null)
-  const available = comps.filter((c) => !existing.has(c.id))
-  if (available.length === 0) return null
-
-  function toggle() {
-    if (!open && btnRef.current) {
-      const r = btnRef.current.getBoundingClientRect()
-      setPos({ top: r.bottom + 4, left: r.left })
-    }
-    setOpen((v) => !v)
-  }
-
-  // Rendered in a portal with fixed positioning so the menu floats on top and
-  // is never clipped by the token card's overflow.
+  // The picker lists every knowledge base; already granted ones are ignored and
+  // code graphs are filtered out via `types` when Codebase access is off.
+  void comps
   return (
-    <>
-      <button ref={btnRef} onClick={toggle}
-        className="inline-flex items-center gap-0.5 rounded-full border border-dashed border-slate-700 px-2 py-0.5 text-[10px] text-slate-500 hover:border-indigo-500/40 hover:text-indigo-300">
-        <Plus size={9} /> grant
+    <div className="w-36">
+      <KbPicker
+        mode="single"
+        compact
+        value={null}
+        placeholder="+ grant"
+        types={codeAccess ? undefined : ['RAW', 'WIKI']}
+        onChange={(id) => { if (id && !existing.has(id)) onAdd(id) }}
+      />
+    </div>
+  )
+}
+
+function ReadWriteToggle({ write, onToggle }: { write: boolean; onToggle: () => void }) {
+  return (
+    <span className="inline-flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+      <span className="inline-flex items-center gap-0.5 rounded-full bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400">
+        <Eye size={10} /> Read
+      </span>
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onToggle() }}
+        aria-pressed={write}
+        title={write ? 'Write on: the token may store into this knowledge base' : 'Write off: read-only'}
+        className={cn(
+          'inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] ring-1 transition-colors',
+          write
+            ? 'bg-indigo-500/15 text-indigo-300 ring-indigo-500/40'
+            : 'bg-transparent text-slate-500 ring-slate-700 line-through',
+        )}
+      >
+        <PenLine size={10} /> Write
       </button>
-      {open && pos && createPortal(
-        <>
-          <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
-          <div className="fixed z-[61] max-h-56 w-56 overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 p-1 shadow-2xl"
-            style={{ top: pos.top, left: pos.left }}>
-            {available.map((c) => {
-              // A code graph cannot be granted to a token whose Codebase access is
-              // off - the server would drop it from the token's scope anyway, so the
-              // entry is shown disabled rather than silently accepted.
-              const locked = c.type === 'CODE' && !codeAccess
-              return (
-                <button key={c.id} disabled={locked}
-                  onClick={() => { if (!locked) { onAdd(c.id); setOpen(false) } }}
-                  title={locked ? 'Codebase access is off for this token' : undefined}
-                  className={cn('flex w-full items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs',
-                    locked ? 'cursor-not-allowed text-slate-600' : 'text-slate-300 hover:bg-slate-800')}>
-                  <span className="flex-1 truncate">{c.name}</span>
-                  {c.type === 'CODE' && (
-                    <span className="rounded bg-cyan-500/15 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30">
-                      Code
-                    </span>
-                  )}
-                </button>
-              )
-            })}
-          </div>
-        </>,
-        document.body,
-      )}
-    </>
+    </span>
   )
 }
 

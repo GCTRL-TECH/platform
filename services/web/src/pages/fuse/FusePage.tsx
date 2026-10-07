@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { KbPicker } from '@/components/kb/KbPicker'
 import { useNavigate } from 'react-router-dom'
 import {
   GitMerge,
@@ -582,7 +583,7 @@ export function FusePage() {
 
   // Fetch compilations for "enrich existing"
   const { data: compilationsData, isLoading: compilationsLoading } =
-    useApiQuery<CompilationsResponse>(['kg', 'compilations'], '/kg/compilations')
+    useApiQuery<CompilationsResponse>(['kg', 'compilations', 'fuse-all'], '/kg/compilations?limit=500')
   const compilations = compilationsData?.compilations ?? []
 
   // Fetch fuse jobs for active jobs section
@@ -995,24 +996,12 @@ export function FusePage() {
                 </p>
               </div>
             ) : (
-              <div className="relative">
-                <select
-                  value={targetCompilationId}
-                  onChange={(e) => setTargetCompilationId(e.target.value)}
-                  className="input-field appearance-none pr-8"
-                >
-                  <option value="">Select a knowledge graph...</option>
-                  {compilations.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} — {c.nodeCount.toLocaleString()} nodes, {c.edgeCount.toLocaleString()} edges
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown
-                  size={14}
-                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
-                />
-              </div>
+              <KbPicker
+                mode="single"
+                value={targetCompilationId || null}
+                onChange={(id) => setTargetCompilationId(id ?? '')}
+                placeholder="Select a knowledge graph..."
+              />
             )}
 
             {/* Selected compilation preview */}

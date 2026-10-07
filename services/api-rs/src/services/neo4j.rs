@@ -10,12 +10,19 @@
 //!   membership list and is what scoping and deletion go by.
 //! * **Merged** `(:Entity:Merged {_compilation})`, written by FUSE, plus the
 //!   `(:Compilation {compilation_id})` container they hang off. These belong to
-//!   exactly one compilation by construction.
+//!   exactly one compilation by construction. Since 2026-10-07 a merged node's
+//!   `_source_jobs` is the UNION of its members' lists and a merged
+//!   relationship carries `_source_jobs` (union of the source edges that
+//!   collapsed into it) plus `_source_job = last(_source_jobs)` — the same
+//!   contract as raw elements, so `purge_jobs` ref-counts them identically.
 //!
 //! A raw node is garbage exactly when its `_source_jobs` list is empty: no job
 //! claims it, so no compilation can reach it (membership resolves
 //! compilation → `source_job_ids` → `_source_jobs`) and no unscoped query
 //! should surface it either. That is the rule both purge paths below encode.
+//! A merged element is additionally garbage when its compilation no longer
+//! lists any of its jobs in `source_job_ids` (`sweep_stale_merged`), which is
+//! what catches elements a FUSE re-run has not rewritten yet.
 
 use std::sync::Arc;
 use uuid::Uuid;
@@ -102,6 +109,11 @@ pub async fn purge_jobs(neo: &neo4rs::Graph, jobs: &[Uuid]) -> PurgeStats {
 
 /// Relationship half of `purge_jobs`, as a pure string so it can be exercised
 /// against a real database without a live service.
+///
+/// Label-agnostic on purpose: `MATCH ()-[r]->()` reaches FUSE-merged
+/// relationships (between `:Merged` nodes) exactly like raw ones, because the
+/// merger now writes `_source_jobs` on them too. No `:Merged` special case is
+/// needed here or in `purge_nodes_cypher`.
 pub fn purge_rels_cypher() -> String {
     format!(
         "MATCH ()-[r]->() WHERE {scope} \
@@ -153,6 +165,67 @@ pub async fn purge_compilation(neo: &neo4rs::Graph, compilation_id: Uuid) -> Pur
     ).await;
 
     stats
+}
+
+/// Merged relationships of `$cid` that none of the compilation's `$jobs` backs.
+///
+/// An edge with its own membership (`_source_jobs`/`_source_job`) is judged on
+/// that. A LEGACY merged edge (written before the merger stamped membership on
+/// edges) has none, so it is judged on its endpoints' membership instead: when
+/// neither end is backed by a job of the compilation, the edge cannot be either.
+/// Runs before the node half for the same reason as in `purge_jobs`.
+pub fn sweep_merged_rels_cypher() -> String {
+    format!(
+        "MATCH (a:Merged {{_compilation: $cid}})-[r]->(b:Merged {{_compilation: $cid}}) \
+         WITH r, CASE WHEN r._source_jobs IS NOT NULL OR r._source_job IS NOT NULL \
+                      THEN {r_expr} ELSE {a_expr} + {b_expr} END AS jobs \
+         WHERE NOT any(__sj IN jobs WHERE __sj IN $jobs) \
+         DELETE r \
+         RETURN count(*) AS deleted",
+        r_expr = source_jobs_expr("r"),
+        a_expr = source_jobs_expr("a"),
+        b_expr = source_jobs_expr("b"),
+    )
+}
+
+/// Merged nodes of `$cid` whose membership has no overlap with the
+/// compilation's `$jobs`. A merged node with no provenance at all is left alone
+/// (conservative; the next FUSE run rewrites the compilation anyway).
+pub fn sweep_merged_nodes_cypher() -> String {
+    format!(
+        "MATCH (n:Merged {{_compilation: $cid}}) \
+         WHERE (n._source_jobs IS NOT NULL OR n._source_job IS NOT NULL) \
+           AND NOT {scope} \
+         DETACH DELETE n \
+         RETURN count(*) AS deleted",
+        scope = job_scope("n", "jobs"),
+    )
+}
+
+/// Delete the merged elements of one compilation that its current
+/// `source_job_ids` no longer back. Best-effort: a failed statement logs and
+/// counts as zero.
+pub async fn sweep_stale_merged(neo: &neo4rs::Graph, compilation_id: Uuid, jobs: &[Uuid]) -> PurgeStats {
+    let cid = compilation_id.to_string();
+    let job_strs: Vec<String> = jobs.iter().map(|j| j.to_string()).collect();
+    let mut stats = PurgeStats::default();
+    stats.rels_deleted = run_count_cid_jobs(neo, &sweep_merged_rels_cypher(), &cid, &job_strs).await;
+    stats.nodes_deleted = run_count_cid_jobs(neo, &sweep_merged_nodes_cypher(), &cid, &job_strs).await;
+    stats
+}
+
+async fn run_count_cid_jobs(neo: &neo4rs::Graph, cypher: &str, cid: &str, jobs: &[String]) -> i64 {
+    let q = neo4rs::query(cypher).param("cid", cid).param("jobs", jobs.to_vec());
+    match neo.execute(q).await {
+        Ok(mut stream) => match stream.next().await {
+            Ok(Some(row)) => row.get::<i64>("deleted").unwrap_or(0),
+            _ => 0,
+        },
+        Err(e) => {
+            tracing::warn!("neo4j merged sweep failed: {e}");
+            0
+        }
+    }
 }
 
 async fn run_count(neo: &neo4rs::Graph, cypher: &str, jobs: &[String]) -> i64 {
@@ -239,6 +312,40 @@ mod tests {
             assert!(cypher.contains("CASE WHEN size(keep) = 0 THEN NULL ELSE last(keep) END"),
                     "got: {cypher}");
         }
+    }
+
+    #[test]
+    fn purge_reaches_merged_elements_without_a_special_case() {
+        // FUSE stamps `_source_jobs` on merged nodes AND merged relationships
+        // (services/fuse/src/merger.py, `_union_source_jobs`), so the purge must
+        // stay label-agnostic: a `:Merged` filter either way would either skip the
+        // compiled graph or double-handle it.
+        let nodes = purge_nodes_cypher();
+        let rels = purge_rels_cypher();
+        assert!(nodes.starts_with("MATCH (n) WHERE"), "got: {nodes}");
+        assert!(rels.starts_with("MATCH ()-[r]->() WHERE"), "got: {rels}");
+        for cypher in [&nodes, &rels] {
+            assert!(!cypher.contains("Merged"), "must not special-case :Merged: {cypher}");
+        }
+    }
+
+    #[test]
+    fn merged_sweep_is_confined_to_one_compilation_and_its_jobs() {
+        let nodes = sweep_merged_nodes_cypher();
+        assert!(nodes.contains("(n:Merged {_compilation: $cid})"));
+        assert!(nodes.contains("AND NOT any(__sj IN"), "must delete the NON-overlap");
+        assert!(nodes.contains("$jobs"));
+        // A node with no provenance at all is not judged.
+        assert!(nodes.contains("n._source_jobs IS NOT NULL OR n._source_job IS NOT NULL"));
+        assert!(nodes.contains("DETACH DELETE n"));
+
+        let rels = sweep_merged_rels_cypher();
+        assert!(rels.contains("(a:Merged {_compilation: $cid})-[r]->(b:Merged {_compilation: $cid})"));
+        // Own membership first, endpoints' membership as the legacy fallback.
+        assert!(rels.contains("CASE WHEN r._source_jobs IS NOT NULL OR r._source_job IS NOT NULL"));
+        assert!(rels.contains("coalesce(a._source_jobs") && rels.contains("coalesce(b._source_jobs"));
+        assert!(rels.contains("WHERE NOT any(__sj IN jobs WHERE __sj IN $jobs)"));
+        assert!(rels.contains("DELETE r") && !rels.contains("DETACH DELETE r"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ import {
   PanelLeftClose, PanelLeftOpen, Share2, ShieldCheck, ShieldOff,
 } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
+import { useKbTree } from '@/hooks/useKbTree'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import { matchFocusNode } from '@/lib/graph-focus'
@@ -123,7 +124,11 @@ export function GraphWorkspace() {
   const pickerResize = useColResize(pickerWidth, setPickerWidth, 'right', 180, () => 420, 'gw.pickerWidth')
   const contextResize = useColResize(contextWidth, setContextWidth, 'left', 280, () => Math.min(window.innerWidth * 0.7, 900), 'gw.contextWidth')
 
-  const filteredComps = comps.filter((c) => c.name.toLowerCase().includes(pickerQuery.toLowerCase()))
+  const { items: kbItems, pathFor } = useKbTree()
+  const filteredComps = kbItems.filter((c) => {
+    const q = pickerQuery.trim().toLowerCase()
+    return !q || c.name.toLowerCase().includes(q) || pathFor(c.id).some((p) => p.toLowerCase().includes(q))
+  })
 
   // Left-column mode: search compilations ("Graphs") or nodes within this graph.
   const [leftTab, setLeftTab] = useState<'graphs' | 'nodes'>('graphs')
@@ -300,10 +305,13 @@ export function GraphWorkspace() {
                       <button key={c.id} onClick={() => { navigate(`/graphs/${c.id}/workspace`); setSelectedName(null) }}
                         className={cn('mb-0.5 flex w-full flex-col items-start gap-0.5 rounded-md px-2.5 py-2 text-left transition-colors',
                           c.id === compilationId ? 'bg-indigo-500/15 ring-1 ring-indigo-500/30' : 'hover:bg-slate-800/60')}>
-                        <span className="truncate text-xs font-medium text-slate-200">{c.name}</span>
+                        <span className="w-full truncate text-xs font-medium text-slate-200">{c.name}</span>
+                        {c.folderId && pathFor(c.id).length > 0 && (
+                          <span className="w-full truncate text-[10px] text-slate-600">{pathFor(c.id).join(' / ')}</span>
+                        )}
                         <span className="flex items-center gap-2 text-[10px] text-slate-500">
-                          <span className={cn(CLS_BADGE[c.classification] ?? 'badge-slate', 'text-[9px]')}>{c.classification}</span>
-                          {c.nodeCount.toLocaleString()} nodes
+                          <span className={cn(CLS_BADGE[c.classification ?? ''] ?? 'badge-slate', 'text-[9px]')}>{c.classification}</span>
+                          {(c.nodeCount ?? 0).toLocaleString()} nodes
                         </span>
                       </button>
                     ))}

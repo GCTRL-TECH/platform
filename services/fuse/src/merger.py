@@ -584,6 +584,46 @@ def _union_labels(members: list[dict]) -> tuple[list[str], list[int], int, bool]
     return class_labels, ranks_sorted, ranks_sorted[0], len(ranks_sorted) > 1
 
 
+def _union_source_jobs(members, allowed=None) -> list[str]:
+    """Job membership of a merged element: the UNION of every member's list,
+    restricted to ``allowed`` (the compilation's ``source_job_ids``) when given.
+
+    Each member carries ``source_jobs`` (the full ``_source_jobs`` list of the raw
+    element) and ``source_job`` (its latest contributor). A member written before
+    the list existed has ``source_jobs = None`` and falls back to
+    ``[source_job]``. Order is first-seen, duplicates dropped, empties skipped.
+
+    This is what makes a KEX job revertable from a FUSED graph: the API's
+    ``purge_jobs`` ref-counts on ``_source_jobs`` and only deletes an element once
+    the list runs empty, so a merged node or edge must list EVERY job that
+    reached it, not just the one that touched its canonical member last.
+    (Before 2026-10-07 merged nodes listed one job per member and merged edges
+    listed none, so a job purge left them behind or deleted them too early.)
+
+    ``allowed`` matters after an unlink: a raw node that two jobs produced keeps
+    both in its list, but once job 1 left THIS compilation its merged copy here
+    must list only the jobs the compilation still draws from. Otherwise a
+    "remove from this knowledge base" leaves the merged node pointing at a job
+    the knowledge base no longer contains, and job 1's footprint keeps counting
+    it.
+    """
+    allow = set(allowed) if allowed is not None else None
+    out: list[str] = []
+    seen: set[str] = set()
+    for rec in members:
+        jobs = rec.get("source_jobs")
+        if not jobs:
+            single = rec.get("source_job")
+            jobs = [single] if single else []
+        for job in jobs:
+            if allow is not None and job not in allow:
+                continue
+            if job and job not in seen:
+                seen.add(job)
+                out.append(job)
+    return out
+
+
 def _canonical_by_uri(
     clusters: dict[int, list[str]], entity_by_uri: dict[str, dict]
 ) -> dict[str, tuple[str, str]]:
@@ -756,6 +796,11 @@ class ThreeStageEntityMerger:
         logger.info(f"[{compilation_id}] Collected {len(all_entities)} entities")
 
         if not all_entities:
+            # Nothing to merge any more — but a previous run may still be in the
+            # graph (every source job left the compilation). Clear it so the
+            # compiled graph matches its sources.
+            with self.driver.session() as session:
+                self._reset_merged_graph(session, compilation_id)
             return self._empty_stats()
 
         # ── Stage 1: Neo4j APOC Pre-filter ────────────────────────────
@@ -1936,6 +1981,7 @@ class ThreeStageEntityMerger:
                e.label AS label,
                {extra},
                e.uri AS uri, e._source_job AS source_job,
+               e._source_jobs AS source_jobs,
                e._classification AS classification,
                e._class_labels AS class_labels, e._label_ranks AS label_ranks
         """
@@ -2008,6 +2054,40 @@ class ThreeStageEntityMerger:
         )[0][0]
         return best, sorted(set(coarses))
 
+    @staticmethod
+    def _reset_merged_graph(session, compilation_id: str) -> tuple[int, int]:
+        """Delete every merged element of ``compilation_id`` before a (re-)merge.
+
+        Only ``(:Entity:Merged {_compilation})`` nodes go, and ``DETACH DELETE``
+        takes their merged relationships and the ``CONTAINS`` edges from the
+        container with them. The ``(:Compilation)`` container node itself stays —
+        it carries owner/classification and is re-MERGEd by the writer anyway.
+        Raw ``(:Entity)`` nodes are never touched here; they are shared across
+        compilations through jobs and belong to ``purge_jobs``.
+
+        Returns ``(nodes_deleted, relationships_deleted)`` and logs them.
+        """
+        rec = session.run(
+            """
+            MATCH (n:Entity:Merged {_compilation: $cid})
+            OPTIONAL MATCH (n)-[r]-()
+            RETURN count(DISTINCT n) AS nodes, count(DISTINCT r) AS rels
+            """,
+            cid=compilation_id,
+        ).single()
+        nodes = int(rec["nodes"]) if rec else 0
+        rels = int(rec["rels"]) if rec else 0
+        if nodes:
+            session.run(
+                "MATCH (n:Entity:Merged {_compilation: $cid}) DETACH DELETE n",
+                cid=compilation_id,
+            )
+            logger.info(
+                f"[{compilation_id}] Cleared previous merge: "
+                f"{nodes} merged nodes, {rels} relationships"
+            )
+        return nodes, rels
+
     def _write_merged_graph(
         self,
         compilation_id: str,
@@ -2068,6 +2148,11 @@ class ThreeStageEntityMerger:
         canonical_by_uri = _canonical_by_uri(clusters, entity_by_uri)
 
         with self.driver.session() as session:
+            # A re-run (refresh) must not keep merged elements of the previous
+            # run: a cluster that split, a job that left the compilation or an
+            # edge that is no longer asserted would otherwise survive forever.
+            self._reset_merged_graph(session, compilation_id)
+
             # Create compilation node
             session.run(
                 """
@@ -2089,8 +2174,9 @@ class ThreeStageEntityMerger:
                 canonical = entity_by_uri.get(canonical_uri, {})
 
                 member_recs = [entity_by_uri.get(uri, {}) for uri in members]
-                source_jobs = list({rec.get("source_job", "") for rec in member_recs})
-                source_jobs = [s for s in source_jobs if s]
+                # Full membership across the cluster; `_source_job` stays the
+                # last of it so display/lineage keep working.
+                source_jobs = _union_source_jobs(member_recs, source_job_ids)
 
                 # Canonical coarse_type for the cluster. For a normal same-bucket
                 # cluster this is just the (single) coarse type. For a CROSS-bucket
@@ -2129,6 +2215,7 @@ class ThreeStageEntityMerger:
                         e._class_conflict = $conflict,
                         e._owner = $user_id,
                         e._source_jobs = $source_jobs,
+                        e._source_job = $source_job,
                         e._coarse_types = $coarse_types,
                         e._merge_count = $merge_count
                     WITH e
@@ -2147,6 +2234,7 @@ class ThreeStageEntityMerger:
                     conflict=conflict,
                     user_id=user_id,
                     source_jobs=source_jobs,
+                    source_job=source_jobs[-1] if source_jobs else None,
                     coarse_types=constituent_coarses,
                     merge_count=len(members),
                 )
@@ -2187,6 +2275,7 @@ class ThreeStageEntityMerger:
                type(r) AS rel_type,
                b.name AS tail_name, b.type AS tail_type,
                r._source_job AS source_job,
+               r._source_jobs AS source_jobs,
                r._class_labels AS class_labels, r._label_ranks AS label_ranks,
                r._classification AS classification,
                coalesce(r.asserted_at, r.created_at, 0) AS asserted_at,
@@ -2230,6 +2319,9 @@ class ThreeStageEntityMerger:
                 confidences = [m.get("confidence") for m in members
                                if m.get("confidence") is not None]
                 max_confidence = max(confidences) if confidences else None
+                # Job membership of the merged edge: the union over every source
+                # edge that collapsed into it, so `purge_jobs` can ref-count it.
+                edge_jobs = _union_source_jobs(members, source_job_ids)
                 if conflict:
                     conflicts.append({
                         "element_kind": "edge",
@@ -2253,10 +2345,14 @@ class ThreeStageEntityMerger:
                         r.asserted_at = $asserted_at,
                         r._source_doc = $source_doc,
                         r._source_doc_modified_at = $source_doc_modified_at,
-                        r.confidence = $confidence
+                        r.confidence = $confidence,
+                        r._source_jobs = $source_jobs,
+                        r._source_job = $source_job
                     RETURN count(r) AS cnt
                     """,
                     cid=compilation_id,
+                    source_jobs=edge_jobs,
+                    source_job=edge_jobs[-1] if edge_jobs else None,
                     asserted_at=max_asserted,
                     source_doc=src_doc,
                     source_doc_modified_at=src_doc_modified,

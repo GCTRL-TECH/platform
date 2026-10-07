@@ -1,3 +1,4 @@
+import { KbPicker } from '@/components/kb/KbPicker'
 import {
   useState,
   useEffect,
@@ -18,7 +19,6 @@ import {
   Plus,
   Trash2,
   File,
-  Database,
   Bot,
   User,
   BarChart3,
@@ -939,7 +939,6 @@ interface DroppedFileCardProps {
 
 function DroppedFileCard({
   file,
-  compilations,
   onExtract,
   onCancel,
   isExtracting,
@@ -957,19 +956,15 @@ function DroppedFileCard({
           <p className="text-xs text-slate-500">{(file.size / 1024).toFixed(1)} KB — Extract knowledge from this file?</p>
 
           <div className="mt-3 flex items-center gap-2">
-            <select
-              value={selectedCompilation}
-              onChange={(e) => setSelectedCompilation(e.target.value)}
-              className="input-field h-8 flex-1 py-0 text-xs"
+            <KbPicker
+              mode="single"
+              compact
+              className="flex-1"
+              value={selectedCompilation || null}
+              onChange={(id) => setSelectedCompilation(id ?? '')}
+              placeholder="Select target graph..."
               disabled={isExtracting}
-            >
-              <option value="">Select target graph...</option>
-              {compilations.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name} ({c.entityCount} entities)
-                </option>
-              ))}
-            </select>
+            />
             <button
               onClick={() => onExtract(selectedCompilation)}
               disabled={isExtracting}
@@ -1938,23 +1933,15 @@ export function TalkToGraphPage() {
               {/* Selectors row — inside the prompt bar, below textarea, subtle/dark */}
               <div className="flex items-center gap-2 flex-wrap border-t border-white/5 px-4 py-2">
               {/* Compilation selector */}
-              <div className="relative flex items-center">
-                <Database size={12} className="absolute left-2.5 text-slate-600 pointer-events-none z-10" />
-                <select
-                  value={selectedCompilation}
-                  onChange={(e) => setSelectedCompilation(e.target.value)}
-                  className="w-auto min-w-[130px] rounded-md border border-slate-700/50 bg-slate-950/60 px-2.5 py-1 pl-7 pr-6 text-[11px] text-slate-200 focus:border-slate-600 focus:outline-none transition-all hover:border-slate-600 hover:text-white cursor-pointer"
-                  style={{ colorScheme: 'dark' }}
-                >
-                  <option value="">All Graphs</option>
-                  {compilations.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.entityCount} entities)
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown size={12} className="absolute right-3 text-slate-400 pointer-events-none" />
-              </div>
+              <KbPicker
+                mode="single"
+                compact
+                allowNone
+                noneLabel="All Graphs"
+                className="w-56"
+                value={selectedCompilation || null}
+                onChange={(id) => setSelectedCompilation(id ?? '')}
+              />
 
               {/* Model selector */}
               <div className="relative flex items-center">

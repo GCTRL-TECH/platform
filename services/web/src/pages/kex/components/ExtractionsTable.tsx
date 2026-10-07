@@ -2,10 +2,13 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { Search, Loader2, Settings2, ChevronDown, ChevronRight, Clock, XCircle, RotateCw } from 'lucide-react'
 // query client not used directly
 import { api } from '@/lib/api'
-// cn utility not needed here
+import { cn } from '@/lib/utils'
 import { JobRow, getJobName, type KexJob } from './JobRow'
 import { BatchRow, type JobBatch } from './BatchRow'
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal'
+import { useApiQuery } from '@/hooks/useApi'
+import { useAuth } from '@/hooks/useAuth'
+import { useKbTree } from '@/hooks/useKbTree'
 
 interface ExtractionsTableProps {
   refetchKey?: number // increment to force refetch
@@ -18,7 +21,21 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [tokenFilter, setTokenFilter] = useState('') // '' = all, 'web' = web login, else api key id
+  const [kbFilter, setKbFilter] = useState('')
+  const [allUsers, setAllUsers] = useState(false)
   const [offset, setOffset] = useState(0)
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
+  const { items: kbItems } = useKbTree()
+  const { data: keysData } = useApiQuery<{ apiKeys: { id: string; name: string }[] }>(['users', 'api-keys'], '/users/api-keys')
+  const apiKeys = keysData?.apiKeys ?? []
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search.trim()), 300)
+    return () => clearTimeout(t)
+  }, [search])
   const [threads, setThreads] = useState(1)
   const [_queueDepth, setQueueDepth] = useState(0)
   const [queueJobs, setQueueJobs] = useState<Array<{ id: string; type: string; status: string; input?: Record<string, unknown>; createdAt: string; batchId?: string | null }>>([])
@@ -36,7 +53,10 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
     else if (showSpinner && !initialLoadDone.current) setLoading(true)
     try {
       const params = new URLSearchParams({ limit: String(LIMIT), offset: String(offsetVal) })
-      if (search) params.set('search', search)
+      if (debouncedSearch) params.set('search', debouncedSearch)
+      if (tokenFilter) params.set('token', tokenFilter)
+      if (kbFilter) params.set('kb', kbFilter)
+      if (allUsers && isAdmin) params.set('all', '1')
       const { data } = await api.get(`/kex/jobs?${params}`)
       if (append) {
         setJobs((prev) => [...prev, ...(data.jobs || [])])
@@ -51,7 +71,7 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
       setLoading(false)
       setLoadingMore(false)
     }
-  }, [search])
+  }, [debouncedSearch, tokenFilter, kbFilter, allUsers, isAdmin])
 
   // Load queue info + pending jobs
   const loadQueue = useCallback(async () => {
@@ -71,7 +91,7 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
     void loadQueue()
     const interval = setInterval(() => { void loadJobs(0, false, false); void loadQueue() }, 5000)
     return () => clearInterval(interval)
-  }, [search, refetchKey, loadJobs, loadQueue])
+  }, [refetchKey, loadJobs, loadQueue])
 
   // Infinite scroll
   useEffect(() => {
@@ -191,6 +211,47 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
         </div>
       </div>
 
+      {/* Filter chips */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 px-4 py-2 text-[10px] text-slate-400">
+        <label className="flex items-center gap-1">
+          Token
+          <select
+            value={tokenFilter}
+            onChange={(e) => setTokenFilter(e.target.value)}
+            className={cn('max-w-[140px] rounded border bg-slate-800 px-1 py-0.5 text-[10px] text-slate-300', tokenFilter ? 'border-indigo-500' : 'border-slate-700')}
+          >
+            <option value="">All</option>
+            <option value="web">Web login</option>
+            {apiKeys.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
+          </select>
+        </label>
+        <label className="flex items-center gap-1">
+          KB
+          <select
+            value={kbFilter}
+            onChange={(e) => setKbFilter(e.target.value)}
+            className={cn('max-w-[160px] rounded border bg-slate-800 px-1 py-0.5 text-[10px] text-slate-300', kbFilter ? 'border-indigo-500' : 'border-slate-700')}
+          >
+            <option value="">All</option>
+            {kbItems.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
+          </select>
+        </label>
+        {isAdmin && (
+          <label className="flex cursor-pointer items-center gap-1">
+            <input type="checkbox" checked={allUsers} onChange={(e) => setAllUsers(e.target.checked)} className="accent-indigo-500" />
+            All users
+          </label>
+        )}
+        {(tokenFilter || kbFilter) && (
+          <button
+            onClick={() => { setTokenFilter(''); setKbFilter('') }}
+            className="rounded border border-slate-700 px-1.5 py-0.5 hover:text-indigo-400"
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
       {/* Queue row (collapsible, shown when standalone pending items exist — batch jobs shown inside batch rows) */}
       {queueJobs.filter((qj) => !qj.batchId).length > 0 && (
         <div className="border-b border-slate-800">
@@ -257,6 +318,8 @@ export function ExtractionsTable({ refetchKey }: ExtractionsTableProps) {
                   onCancel={handleCancel}
                   onDelete={(id, name) => setDeleteTarget({ id, name })}
                   onRetry={handleRetry}
+                  showUser={allUsers && isAdmin}
+                  onTokenClick={setTokenFilter}
                 />
               )
             )}

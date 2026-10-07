@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { KbPicker } from '@/components/kb/KbPicker'
 import {
   Timer, Play, Pause, Trash2, Zap, GitMerge, Database, Clock, Loader2, Save,
   BookOpenText, FolderSync, Plus, Pencil, X, Check,
@@ -312,13 +313,8 @@ function DistillTriggerSection({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-slate-500">Wiki</label>
-              <select value={wikiId} onChange={(e) => setWikiId(e.target.value)}
-                className="w-full rounded border border-slate-700 bg-slate-800 px-2 py-1.5 text-xs text-slate-200 focus:border-violet-500 focus:outline-none">
-                <option value="">Select a wiki…</option>
-                {wikis.map((w) => (
-                  <option key={w.id} value={w.id}>{w.name}{w.isSystem ? ' (system)' : ''}</option>
-                ))}
-              </select>
+              <KbPicker mode="single" compact types={['WIKI']} value={wikiId || null}
+                onChange={(id) => setWikiId(id ?? '')} placeholder="Select a wiki..." />
             </div>
             <div>
               <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-slate-500">Mode</label>

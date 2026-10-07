@@ -1392,11 +1392,51 @@ async fn sweep_orphaned_graph(state: &AppState) {
     let live_comps: std::collections::HashSet<Uuid> = live_comps.into_iter().collect();
 
     let mut merged_removed = 0i64;
-    for cid in parsed_comps.into_iter().filter(|c| !live_comps.contains(c)) {
-        merged_removed += crate::services::neo4j::purge_compilation(&state.neo, cid).await.nodes_deleted;
+    for cid in parsed_comps.iter().filter(|c| !live_comps.contains(c)) {
+        merged_removed += crate::services::neo4j::purge_compilation(&state.neo, *cid).await.nodes_deleted;
     }
     if merged_removed > 0 {
         tracing::info!("sweep: removed {merged_removed} merged nodes of deleted compilations");
+    }
+
+    // Stale merged elements of compilations that still EXIST: a merged node or
+    // edge whose `_source_jobs` no longer overlap the compilation's
+    // `source_job_ids` (the job was removed from the compilation, or purged,
+    // and no FUSE re-run has rewritten the compiled graph since). A FUSE
+    // re-run clears and rewrites the whole compilation itself; this pass only
+    // catches what sits there until that happens. Best-effort per compilation.
+    let live_ids: Vec<Uuid> = parsed_comps.iter().copied().filter(|c| live_comps.contains(c)).collect();
+    if live_ids.is_empty() {
+        return;
+    }
+    let comp_jobs: Vec<(Uuid, Vec<Uuid>)> = sqlx::query_as(
+        "SELECT id, COALESCE(source_job_ids, '{}'::uuid[]) FROM compilations WHERE id = ANY($1)"
+    )
+    .bind(&live_ids)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut stale = crate::services::neo4j::PurgeStats::default();
+    let mut touched = 0usize;
+    for (cid, jobs) in &comp_jobs {
+        let s = crate::services::neo4j::sweep_stale_merged(&state.neo, *cid, jobs).await;
+        if s.total() > 0 {
+            touched += 1;
+            tracing::info!(
+                "sweep: compilation {cid} had {} merged nodes and {} merged relationships \
+                 no longer backed by its source jobs",
+                s.nodes_deleted, s.rels_deleted
+            );
+        }
+        stale.nodes_deleted += s.nodes_deleted;
+        stale.rels_deleted += s.rels_deleted;
+    }
+    if stale.total() > 0 {
+        tracing::info!(
+            "sweep: removed {} stale merged nodes and {} stale merged relationships across {touched} compilations",
+            stale.nodes_deleted, stale.rels_deleted
+        );
     }
 }
 

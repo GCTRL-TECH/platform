@@ -1,8 +1,9 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Bug, X, Loader2, CheckCircle2, AlertCircle } from 'lucide-react'
+import { Bug, Loader2, CheckCircle2, AlertCircle } from 'lucide-react'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
 import { reportBug } from '@/lib/bugs'
 import { cn } from '@/lib/utils'
+import { Modal } from '@/components/ui/Modal'
 
 /**
  * Global "Report bug" entry point for every signed-in user. Lives in the header
@@ -81,14 +82,6 @@ function ReportBugModal({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape' && !submitting) onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose, submitting])
-
   const canSubmit = title.trim().length > 0 && description.trim().length > 0 && !submitting
 
   async function handleSubmit(e: FormEvent) {
@@ -115,33 +108,30 @@ function ReportBugModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm" onClick={() => !submitting && onClose()} />
-
-      <form
-        onSubmit={handleSubmit}
-        className="relative z-10 w-full max-w-lg rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl animate-slide-up"
-      >
-        <button
-          type="button"
-          onClick={onClose}
-          disabled={submitting}
-          aria-label="Close"
-          className="absolute right-4 top-4 text-slate-500 transition-colors hover:text-slate-300"
-        >
-          <X size={18} />
-        </button>
-
+    <Modal
+      open
+      onClose={() => !submitting && onClose()}
+      title="Report a bug"
+      footer={
+        <>
+          <button type="button" onClick={onClose} disabled={submitting} className="btn-secondary">
+            Cancel
+          </button>
+          <button type="submit" form="bug-report-form" disabled={!canSubmit} className="btn-primary">
+            {submitting ? <Loader2 size={14} className="animate-spin" /> : <Bug size={14} />}
+            Send report
+          </button>
+        </>
+      }
+    >
+      <form id="bug-report-form" onSubmit={handleSubmit}>
         <div className="flex items-start gap-4">
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-500/10">
             <Bug size={20} className="text-amber-400" />
           </div>
-          <div>
-            <h3 className="text-base font-semibold text-slate-100">Report a bug</h3>
-            <p className="mt-1 text-sm text-slate-400">
-              Tell us what went wrong. Page, browser and version are attached automatically.
-            </p>
-          </div>
+          <p className="text-sm text-slate-400">
+            Tell us what went wrong. Page, browser and version are attached automatically.
+          </p>
         </div>
 
         <div className="mt-5 space-y-4">
@@ -187,17 +177,7 @@ function ReportBugModal({
             </div>
           )}
         </div>
-
-        <div className="mt-5 flex items-center justify-end gap-2">
-          <button type="button" onClick={onClose} disabled={submitting} className="btn-secondary">
-            Cancel
-          </button>
-          <button type="submit" disabled={!canSubmit} className="btn-primary">
-            {submitting ? <Loader2 size={14} className="animate-spin" /> : <Bug size={14} />}
-            Send report
-          </button>
-        </div>
       </form>
-    </div>
+    </Modal>
   )
 }
