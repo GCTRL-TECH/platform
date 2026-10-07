@@ -245,7 +245,7 @@ fn is_gctrl_credential(value: &axum::http::HeaderValue) -> bool {
 
 /// Build the upstream request headers from the caller's. ALLOWLIST only: anything
 /// not listed (host, content-length, accept-encoding, hop-by-hop, cookie,
-/// x-forwarded-*, x-gctrl-token, x-anvil-cloak, x-upstream-provider, ...) is
+/// x-forwarded-*, x-gctrl-token, x-anvil-cloak, x-cloak-tool-outputs, x-upstream-provider, ...) is
 /// dropped. `authorization` is dropped when it carried the gctrl token.
 pub(super) fn forward_headers(incoming: &HeaderMap, upstream: Upstream, consumed_authorization: bool) -> HeaderMap {
     const ALLOW: [&str; 8] = [
