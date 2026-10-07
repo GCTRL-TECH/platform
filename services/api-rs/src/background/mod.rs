@@ -586,7 +586,30 @@ async fn wiki_has_new_content(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(newer.is_some())
+    if newer.is_some() {
+        return Ok(true);
+    }
+    // A lesson of the source graphs was USED since the last distil: its heat
+    // changed, so the playbook page's order may have changed too.
+    let used: Option<bool> = sqlx::query_scalar(
+        "WITH src AS (
+             SELECT source_compilation_id AS cid FROM wiki_sources WHERE wiki_compilation_id = $1
+             UNION
+             SELECT wiki_source_compilation_id FROM compilations
+               WHERE id = $1 AND wiki_source_compilation_id IS NOT NULL
+         )
+         SELECT true FROM compilations c
+         JOIN src ON src.cid = c.id
+         JOIN text_chunks t ON t.job_id = ANY(COALESCE(c.source_job_ids, '{}'::uuid[]))
+         WHERE t.kind = 'lesson' AND t.last_accessed > $2
+         LIMIT 1",
+    )
+    .bind(wiki_id)
+    .bind(last)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(used.is_some())
 }
 
 /// Compute the next run instant. change_detection → always due next tick (now);
@@ -1521,6 +1544,11 @@ pub async fn run_memory_cycle(state: &AppState, trigger: &str) -> MemoryCycleSum
         crate::services::hebb::decay_coactivation(&state.db, tick_secs, MEM_IDLE_SECS).await;
     let deduped   = dedup_chunks(state).await;          // A5
     let promoted  = promote_hot_entities(state).await;  // A4-refined (degree gate)
+    // Lessons proven in several projects become team lessons (routes/lessons.rs).
+    let promoted_lessons = crate::routes::lessons::promote_recurring_lessons(state).await;
+    if promoted_lessons > 0 {
+        tracing::info!("memory cycle: {promoted_lessons} lesson(s) promoted to team knowledge");
+    }
     let evicted_d = evict_cold_dossiers(state).await;
     let evicted_c = evict_cold_chunks(state).await;
 

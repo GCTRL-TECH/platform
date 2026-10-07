@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod auth;
 pub mod users;
 pub mod kex;
+pub mod lessons;
 pub mod crawler;
 pub mod fuse;
 pub mod kg;

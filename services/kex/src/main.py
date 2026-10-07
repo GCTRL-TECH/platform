@@ -670,6 +670,20 @@ def _worker_loop(worker_id: int, stop_event: threading.Event) -> None:
                 result["duration_ms"] = int((time.monotonic() - _job_start) * 1000)
                 _publish_result(r, job_id, result)
                 continue
+            elif job_type == "note":
+                # Distilled notes and project lessons: embed + store, no NER/RelEx.
+                from .note_job import run_note_job
+                classification = resolve_classification(classification_level_id, classification_name)
+                embedder = build_embedding_client(
+                    embedding_base_url=embedding_base_url,
+                    embedding_provider=embedding_provider,
+                    ollama_base=ollama_base,
+                    embedding_model=embedding_model,
+                )
+                result = run_note_job(payload, get_vector_store(), embedder, classification)
+                result["duration_ms"] = int((time.monotonic() - _job_start) * 1000)
+                _publish_result(r, job_id, result)
+                continue
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -2016,6 +2030,92 @@ class DedupReq(BaseModel):
     user_id: Optional[str] = None
     compilation_id: Optional[str] = None
     dry_run: bool = False
+
+
+class RecurringLessonsReq(BaseModel):
+    """Find lessons proven in several projects (api-rs memory cycle → promotion)."""
+    user_id: str
+    min_heat: float = 5.0
+    threshold: float = 0.9
+    min_projects: int = 3
+    limit: int = 50
+
+
+@app.post("/lessons/recurring")
+async def recurring_lessons_endpoint(req: RecurringLessonsReq):
+    """Hot lessons whose near-duplicates are warm in enough other project
+    knowledge bases. Read-only: the API decides about promotion.
+    Returns {"groups": [{representative, lessonIds, compilationIds, meta}]}."""
+    from .lessons_recurring import group_recurring
+    import psycopg2
+
+    try:
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+    except Exception as exc:
+        logger.warning(f"/lessons/recurring: Postgres unavailable: {exc}")
+        return {"groups": []}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id::text, c.heat, c.meta,
+                       COALESCE(array_agg(k.id::text) FILTER (WHERE k.id IS NOT NULL), '{}')
+                  FROM text_chunks c
+                  LEFT JOIN compilations k ON c.job_id = ANY(k.source_job_ids)
+                 WHERE c.user_id = %s::uuid AND c.kind = 'lesson' AND NOT c.archived
+                 GROUP BY c.id, c.heat, c.meta
+                """,
+                (req.user_id,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    info = {}
+    metas = {}
+    for cid, heat, meta, comps in rows:
+        m = meta or {}
+        info[cid] = {"heat": float(heat or 0.0), "compilations": set(comps or []),
+                     "promoted": bool(m.get("promotedFrom"))}
+        metas[cid] = m
+    hot = sorted((i for i, v in info.items() if v["heat"] >= req.min_heat and not v["promoted"]),
+                 key=lambda i: -info[i]["heat"])[: max(1, req.limit)]
+    if not hot:
+        return {"groups": []}
+
+    qc = get_qdrant_client()
+    if qc is None:
+        return {"groups": []}
+    neighbours = {}
+    try:
+        points = qc.retrieve(collection_name=config.QDRANT_COLLECTION, ids=hot, with_vectors=True)
+        qfilter = Filter(must=[
+            FieldCondition(key="user_id", match=MatchValue(value=req.user_id)),
+            FieldCondition(key="kind", match=MatchValue(value="lesson")),
+        ])
+        for pt in points:
+            vec = pt.vector
+            if isinstance(vec, dict):  # named vectors: take the first
+                vec = next(iter(vec.values()), None)
+            if not vec:
+                continue
+            if hasattr(qc, "query_points"):
+                hits = qc.query_points(collection_name=config.QDRANT_COLLECTION, query=vec, limit=20,
+                                       query_filter=qfilter, score_threshold=req.threshold).points
+            else:
+                hits = qc.search(collection_name=config.QDRANT_COLLECTION, query_vector=vec, limit=20,
+                                 query_filter=qfilter, score_threshold=req.threshold)
+            neighbours[str(pt.id)] = [(str(h.id), float(h.score)) for h in hits if str(h.id) != str(pt.id)]
+    except Exception as exc:
+        logger.warning(f"/lessons/recurring: vector lookup failed: {exc}")
+        return {"groups": []}
+
+    groups = group_recurring(hot, neighbours, info, min_projects=req.min_projects)
+    for g in groups:
+        g["meta"] = metas.get(g["representative"], {})
+    if groups:
+        logger.info(f"/lessons/recurring: {len(groups)} lesson(s) recur across projects (user {req.user_id})")
+    return {"groups": groups}
 
 
 @app.post("/dedup")

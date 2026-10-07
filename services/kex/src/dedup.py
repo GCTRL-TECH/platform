@@ -98,7 +98,10 @@ def run_dedup(
         # 1. Pull the LIVE (non-archived) chunk ids in scope, newest first. We only
         #    ever consider chunks that have a Qdrant vector (qdrant_point_id set).
         with conn.cursor() as cur:
-            clauses = ["archived = false", "qdrant_point_id IS NOT NULL"]
+            # Lessons (kind='lesson') are never deduplicated here: the same lesson in
+            # several projects is the promotion signal for team knowledge
+            # (api routes/lessons.rs), and exact duplicates are refused at store time.
+            clauses = ["archived = false", "qdrant_point_id IS NOT NULL", "kind IS DISTINCT FROM 'lesson'"]
             params: list = []
             if user_id:
                 clauses.append("user_id = %s"); params.append(user_id)
@@ -158,7 +161,9 @@ def run_dedup(
 
         def _nn_filter(uid: str) -> Filter:
             must = [FieldCondition(key="user_id", match=MatchValue(value=uid))]
-            return Filter(must=must)
+            # A document chunk is never merged into a lesson (or the other way round).
+            must_not = [FieldCondition(key="kind", match=MatchValue(value="lesson"))]
+            return Filter(must=must, must_not=must_not)
 
         for pid, meta in by_point.items():
             vec = vectors.get(pid)

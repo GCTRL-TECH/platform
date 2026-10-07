@@ -295,6 +295,11 @@ remembered so re-extraction never re-introduces it):
 - delete_chunk       : Remove a source text chunk from Postgres + Qdrant. Args: { chunkId: string }
 - supersede_chunk    : A chunk carries a statement the user has corrected, but it comes from a reviewed document — keep the document, take the chunk out of every retrieval path (archived 'superseded', vector removed, remembered). Args: { chunkId: string, reason?: string }
 
+Lessons (the project's playbook — what worked, what broke, how we do things here):
+- list_lessons       : Read a knowledge base's lessons, most used first. Args: { compilationId: string, limit?: number }
+- store_lesson       : Store a CONFIRMED convention / recipe / pitfall / decision (user confirmed, test green, fix worked). Args: { compilationId: string, lessonType: string, title: string, text: string, evidence?: string }
+- lesson_applied     : Report the lessons you applied, so they stay hot. Args: { lessonIds: string[] }
+
 To use a tool, respond with ONLY a JSON object on a single line — exactly ONE tool
 call, no prose, no second object. Wait for its result before the next call:
 {"tool": "tool_name", "args": {...}}
@@ -372,6 +377,9 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "list_wiki_pages",    "description": "List the distilled pages of a WIKI compilation (clearance-filtered — you only see pages you're cleared for)", "args": { "compilationId": "string" } },
             { "name": "get_wiki_page",      "description": "Read one distilled wiki page (markdown body + citations) by slug from a WIKI compilation", "args": { "compilationId": "string", "slug": "string" } },
             { "name": "detect_communities", "description": "Run community detection + centrality on a graph (writes community/god-node tags onto nodes); returns the cluster summary + top 'god nodes'", "args": { "compilationId": "string" } },
+            { "name": "store_lesson",       "description": "Store a project LESSON in a knowledge base: a convention (how we do X here), recipe (steps that worked), pitfall (what broke and the fix) or decision (with its reason). Only for things CONFIRMED by the user, a green test or a working fix — never guesses. Lessons are kept warm only while they are used (applied/found) and cool down otherwise. Cheap: no entity extraction.", "args": { "compilationId": "string", "lessonType": "convention|recipe|pitfall|decision", "title": "string", "text": "string", "evidence": "string?", "sourceRef": "string?" } },
+            { "name": "list_lessons",       "description": "List the lessons of a knowledge base, hottest (most used) first — the project's playbook. Listing does not count as use.", "args": { "compilationId": "string", "limit": "number?" } },
+            { "name": "lesson_applied",     "description": "Report that you APPLIED these lessons in your work (ids from list_lessons / the playbook). This is how the system learns which lessons work: applied lessons stay hot, unused ones cool down.", "args": { "lessonIds": "string[]" } },
             { "name": "pin_dossier",        "description": "Pin (or unpin) an entity's dossier so it stays in HOT memory and is always injected. Owner-level memory curation", "args": { "name": "string", "pinned": "boolean?" } },
             { "name": "memory_feedback",    "description": "Reinforce or distrust a fact: vote 'up' raises the entity dossier's trust, 'down' sets it to 0 (and, with a fact triple, deletes that wrong edge + remembers the correction). Owner-level", "args": { "entity": "string", "vote": "string", "compilationId": "string?", "head": "string?", "relType": "string?", "tail": "string?" } },
             { "name": "memory_health",      "description": "Read the memory snapshot: coverage, store sizes, heat/trust distribution, last maintenance cycle. Owner-level", "args": {} },
@@ -434,6 +442,7 @@ const READ_TOOLS: &[&str] = &[
     "get_hardware", "recommend_runtime", "list_runtimes", "get_active_runtime",
     "list_models",
     "code_symbol", "code_trace", "code_impact", "code_architecture",
+    "list_lessons",
 ];
 
 /// Cypher WHERE-fragment that authorizes ONE graph node bound to `alias`, given the
@@ -1932,6 +1941,44 @@ async fn execute_tool_inner(
         }
 
         // ── Action: supersede a chunk (keep the document, drop it from retrieval) ─
+        // ── Lessons: the project's playbook (routes/lessons.rs) ───────────────
+        "store_lesson" => {
+            let req: crate::routes::lessons::StoreLessonReq = match serde_json::from_value(json!({
+                "compilationId": args["compilationId"], "lessonType": args["lessonType"],
+                "title": args["title"], "text": args["text"], "evidence": args["evidence"],
+                "sourceRef": args["sourceRef"], "origin": args["origin"].as_str().unwrap_or("agent"),
+            })) {
+                Ok(r) => r,
+                Err(e) => return json!({ "error": format!("invalid lesson: {e}") }),
+            };
+            match crate::routes::lessons::store_lesson_core(state, claims, &req).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
+        "list_lessons" => {
+            let Some(cid) = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
+                return json!({ "error": "compilationId is required" });
+            };
+            let q = crate::routes::lessons::ListLessonsQuery {
+                compilation_id: cid, limit: args["limit"].as_i64(), include_archived: false,
+            };
+            match crate::routes::lessons::list_lessons_core(state, claims, &q).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
+        "lesson_applied" => {
+            let ids: Vec<uuid::Uuid> = args["lessonIds"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let req = crate::routes::lessons::AppliedReq { lesson_ids: ids };
+            match crate::routes::lessons::applied_core(state, claims, &req).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
+
         "supersede_chunk" => {
             let Some(chunk_id) = args["chunkId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) else {
                 return json!({ "error": "chunkId is required" });

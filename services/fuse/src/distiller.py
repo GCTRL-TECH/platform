@@ -791,6 +791,24 @@ def _distill_impl(
                     class_labels=meta.get("class_labels"),
                 )
 
+        # ── 2b. Playbook page: the source projects' lessons, most used first ─
+        # Lessons are chunks (kind='lesson', api routes/lessons.rs) without
+        # entities, so no entity/concept page ever shows them. This page does —
+        # rendered deterministically (no LLM), ordered by the hot/cold heat, so
+        # the wiki mirrors exactly what the team proved useful.
+        lessons = _fetch_lessons(conn, source_job_ids)
+        if lessons:
+            pb_body = build_playbook_body(lessons, now_iso)
+            with conn:
+                _upsert_page(
+                    conn, compilation_id,
+                    slug=PLAYBOOK_SLUG, kind="playbook", entity_uri=None,
+                    title="Playbook", body_md=pb_body, citations=[],
+                    content_hash=hashlib.sha256(pb_body.encode("utf-8")).hexdigest(),
+                    min_rank=max((l.get("min_rank") or 0) for l in lessons),
+                    class_labels=[],
+                )
+
         # Bookkeeping pages (index/lint/log) enumerate EVERY content page's title,
         # so they leak the existence of classified pages unless gated at the
         # most-restrictive rank across the whole wiki. The per-viewer navigation
@@ -1077,3 +1095,92 @@ def _append_log(
             content_hash=chash,
             min_rank=min_rank, class_labels=class_labels,
         )
+
+
+# ── Playbook (project lessons) ───────────────────────────────────────────────
+
+PLAYBOOK_SLUG = "playbook"
+PLAYBOOK_MAX_LESSONS = 60
+# Heat at which a lesson counts as proven (one "applied" report gives ~5).
+PLAYBOOK_PROVEN_HEAT = 1.0
+
+_PLAYBOOK_SECTIONS = (
+    ("pitfall", "Fallen"),
+    ("convention", "Konventionen"),
+    ("recipe", "Rezepte"),
+    ("decision", "Entscheidungen"),
+)
+
+
+def _fetch_lessons(conn, source_job_ids, limit=PLAYBOOK_MAX_LESSONS):
+    """Live lessons of the source jobs, hottest first."""
+    if not source_job_ids:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id::text, meta, heat, access_count, created_at, min_rank
+                  FROM text_chunks
+                 WHERE kind = 'lesson' AND NOT archived
+                   AND job_id = ANY(%s::uuid[])
+                 ORDER BY heat DESC NULLS LAST, created_at DESC
+                 LIMIT %s
+                """,
+                (list(source_job_ids), limit),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning(f"playbook: could not read lessons: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+    out = []
+    for cid, meta, heat, access, created, min_rank in rows:
+        m = meta or {}
+        out.append({
+            "id": cid, "type": m.get("lessonType") or "convention",
+            "title": (m.get("title") or "").strip(), "text": (m.get("text") or "").strip(),
+            "evidence": (m.get("evidence") or "").strip(), "promoted": bool(m.get("promotedFrom")),
+            "heat": float(heat or 0.0), "access": int(access or 0), "min_rank": int(min_rank or 0),
+        })
+    return out
+
+
+def build_playbook_body(lessons, now_iso):
+    """Markdown of the playbook page. Pure: same lessons in, same page out.
+
+    Proven lessons (heat >= PLAYBOOK_PROVEN_HEAT) are listed per type, hottest
+    first; the rest appear below as candidates — stored, not yet proven by use.
+    `now_iso` is accepted for symmetry with the other builders but deliberately
+    not written: a timestamp would change the content hash on every run.
+    """
+    proven = [l for l in lessons if l["heat"] >= PLAYBOOK_PROVEN_HEAT]
+    candidates = [l for l in lessons if l["heat"] < PLAYBOOK_PROVEN_HEAT]
+
+    def line(l):
+        tag = "L-" + l["id"].replace("-", "")[:6]
+        ev = f" *(Beleg: {l['evidence']})*" if l["evidence"] else ""
+        mark = " · teamweit" if l["promoted"] else ""
+        return f"- **{l['title']}** — {l['text']}{ev} `[{tag}]`{mark}"
+
+    out = [
+        "# Playbook",
+        "",
+        f"_{len(proven)} bewährte Lehren · {len(candidates)} Kandidaten. "
+        "Sortiert nach Nutzung: was angewendet wird, steigt; was keiner braucht, kühlt ab._",
+        "",
+    ]
+    for key, label in _PLAYBOOK_SECTIONS:
+        items = [l for l in proven if l["type"] == key]
+        if items:
+            out.append(f"## {label}")
+            out.extend(line(l) for l in items)
+            out.append("")
+    if candidates:
+        out.append("## Kandidaten (noch nicht durch Nutzung bestätigt)")
+        out.extend(line(l) for l in candidates)
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"

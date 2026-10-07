@@ -280,9 +280,15 @@ class VectorStore:
         entity_mentions: Optional[list[list[dict]]] = None,
         source_document_id: Optional[str] = None,
         classification: Optional[dict] = None,
+        kind: Optional[str] = None,
+        meta: Optional[dict] = None,
     ) -> int:
         """
         Store text chunks in Qdrant (vectors) and PostgreSQL (text).
+
+        ``kind`` / ``meta`` mark special chunks (``kind='lesson'``: a project
+        lesson with its type, title and evidence in ``meta``). Ordinary
+        document chunks pass neither and are stored exactly as before.
 
         Parameters
         ----------
@@ -393,6 +399,8 @@ class VectorStore:
                 "min_rank": cls_rank,                       # vector-search clearance pre-filter
                 "classification_level_id": cls_level_id,
             }
+            if kind:
+                payload["kind"] = kind
             qdrant_points.append(PointStruct(id=pid, vector=vector, payload=payload))
 
         qdrant_stored = self._upsert_batch_to_qdrant(qdrant_points)
@@ -449,10 +457,43 @@ class VectorStore:
                 f"VectorStore: PostgreSQL inserted {pg_stored}/{len(pg_rows)} rows "
                 f"(job={job_id})"
             )
+        if kind and pg_stored:
+            self._mark_chunks(point_ids, kind, meta)
 
         # Return count stored in at least one backend
         total = max(qdrant_stored, pg_stored)
         return total
+
+    def _mark_chunks(self, chunk_ids, kind, meta):
+        """Set kind/meta on freshly inserted chunks (migration 099 columns).
+        A separate statement so the shared bulk insert stays unchanged."""
+        conn = self._get_pg()
+        if conn is None:
+            return
+        # A promoted lesson is proven already (in other projects): it starts warm
+        # instead of cold, so it reaches playbooks before it has to prove itself again.
+        try:
+            seed = float((meta or {}).get("seedHeat") or 0.0)
+        except (TypeError, ValueError):
+            seed = 0.0
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE text_chunks SET kind = %s, meta = %s::jsonb WHERE id = ANY(%s::uuid[])",
+                    (kind, json.dumps(meta or {}), list(chunk_ids)),
+                )
+                if seed > 0:
+                    cur.execute(
+                        "UPDATE text_chunks SET heat = %s, last_accessed = NOW() WHERE id = ANY(%s::uuid[])",
+                        (seed, list(chunk_ids)),
+                    )
+            conn.commit()
+        except Exception as exc:
+            logger.warning(f"VectorStore: marking chunks as {kind} failed: {exc}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
     def delete_chunks_by_source(self, user_id, compilation_id, source_document_ids):
         """Codebase KB: drop every chunk of the given source documents (file paths)
