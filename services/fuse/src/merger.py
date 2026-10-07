@@ -1455,6 +1455,25 @@ class ThreeStageEntityMerger:
                     metric, len(src_export), len(tgt_export),
                 )
                 return []
+            elif resolver.last_error is None:
+                # LIMES ran and found no pair above its floor: that is an answer,
+                # not an outage. Treat it like any other LIMES result: only the
+                # strict short-name complement may add typo-level matches. The
+                # full fallback (review-floor difflib) used to merge whatever
+                # LIMES had just rejected (Asgard, 07.10.2026: "Multiversum" /
+                # "Musterfirma" at 0.55).
+                complement = []
+                if not field_mode and _median_len < 40:
+                    complement = self._stage2_fallback(
+                        source_job_ids, exclude_uris,
+                        min_score=_STAGE2_COMPLEMENT_FLOOR, only_type=only_type,
+                    )
+                logger.info(
+                    "STAGE-2 LIMES (method=resolver): no links with metric %r over %dx%d "
+                    "entities (+%d from difflib complement)",
+                    metric, len(src_export), len(tgt_export), len(complement),
+                )
+                return self._dedup_stage2(complement)
             else:
                 logger.error(
                     "STAGE-2 FALLBACK (resolver_fallback): LIMES resolver returned ZERO "
