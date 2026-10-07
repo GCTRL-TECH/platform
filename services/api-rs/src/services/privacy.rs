@@ -463,9 +463,60 @@ fn bucket_template(kind: Option<&str>) -> (&'static str, bool) {
 static EMAIL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
     regex::Regex::new(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b").unwrap()
 });
+// IBAN compact (`DE02120300000000202051`) or in its printed form, grouped by four
+// with a space, no-break space or narrow no-break space (`DE02 1203 0000 0000 2020 51`).
+// The compact-only pattern let the phone net take the middle of a grouped IBAN and
+// the cloud saw `DE02 [PHONE-286] 2020 51` (E2E 2026-10-04). Length (15..=34) and the
+// trailing-group choice are settled in `iban_hits`.
 static IBAN_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-    regex::Regex::new(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b").unwrap()
+    regex::Regex::new(
+        r"\b[A-Z]{2}\d{2}(?:[ \u{A0}\u{202F}]?[A-Z0-9]{4}){2,7}(?:[ \u{A0}\u{202F}]?[A-Z0-9]{1,4})?\b",
+    )
+    .unwrap()
 });
+
+fn is_iban_separator(c: char) -> bool {
+    matches!(c, ' ' | '\u{A0}' | '\u{202F}')
+}
+
+/// ISO 7064 mod-97 check of an IBAN given without separators.
+fn iban_checksum_ok(compact: &str) -> bool {
+    if compact.len() < 5 {
+        return false;
+    }
+    let (head, tail) = compact.split_at(4);
+    let mut rem: u32 = 0;
+    for c in tail.chars().chain(head.chars()) {
+        let Some(v) = c.to_digit(36) else { return false };
+        rem = if v >= 10 { (rem * 100 + v) % 97 } else { (rem * 10 + v) % 97 };
+    }
+    rem == 1
+}
+
+/// PURE: the IBANs in `text` as byte spans. A grouped match may run on into a short
+/// uppercase word after the IBAN (`... 3201 BIC`): among the match and its prefixes
+/// ending before a separator, the longest one with a valid check digit wins. With
+/// none valid (a typo) the whole structural match still counts, so a mistyped IBAN
+/// is not sent out in parts either.
+fn iban_hits(text: &str) -> Vec<(usize, usize)> {
+    let compact = |s: &str| s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>();
+    let fits = |s: &str| (15..=34).contains(&compact(s).len());
+    let mut out = Vec::new();
+    for m in IBAN_RE.find_iter(text) {
+        let s = m.as_str();
+        let mut ends: Vec<usize> = vec![s.len()];
+        ends.extend(s.char_indices().filter(|(_, c)| is_iban_separator(*c)).map(|(i, _)| i).rev());
+        let end = ends
+            .iter()
+            .copied()
+            .find(|&e| fits(&s[..e]) && iban_checksum_ok(&compact(&s[..e])))
+            .or_else(|| fits(s).then_some(s.len()));
+        if let Some(e) = end {
+            out.push((m.start(), m.start() + e));
+        }
+    }
+    out
+}
 // Loose net for phone-like digit runs; filtered by digit count below so it
 // doesn't fire on every short number. Best-effort — no locale-aware parsing.
 static PHONE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
@@ -477,10 +528,15 @@ fn find_pii(text: &str) -> Vec<(String, &'static str)> {
     for m in EMAIL_RE.find_iter(text) {
         out.push((m.as_str().to_string(), "email"));
     }
-    for m in IBAN_RE.find_iter(text) {
-        out.push((m.as_str().to_string(), "iban"));
+    let ibans = iban_hits(text);
+    for &(start, end) in &ibans {
+        out.push((text[start..end].to_string(), "iban"));
     }
     for m in PHONE_RE.find_iter(text) {
+        // Digits inside an IBAN are the IBAN, not a phone number.
+        if ibans.iter().any(|&(s, e)| m.start() < e && s < m.end()) {
+            continue;
+        }
         let digits = m.as_str().chars().filter(|c| c.is_ascii_digit()).count();
         if digits >= 7 {
             out.push((m.as_str().to_string(), "phone"));
@@ -1905,6 +1961,65 @@ mod tests {
             }
             assert_eq!(collect_prepared(&prepared, text), brute, "index disagrees on {text:?}");
         }
+    }
+
+    // ── IBAN in its printed, grouped form (E2E 2026-10-04, Befund 5) ─────
+
+    #[test]
+    fn grouped_ibans_are_found_whole() {
+        for iban in [
+            "DE02 1203 0000 0000 2020 51",
+            "DE89 3704 0044 0532 0130 00",
+            "AT61 1904 3002 3457 3201",
+            "CH93 0076 2011 6238 5295 7",
+            "NL91 ABNA 0417 1643 00",
+            "DE02\u{a0}1203\u{a0}0000\u{a0}0000\u{a0}2020\u{a0}51",
+            "DE02\u{202f}1203\u{202f}0000\u{202f}0000\u{202f}2020\u{202f}51",
+            "DE02120300000000202051",
+        ] {
+            let text = format!("Bitte auf IBAN {iban}, danke.");
+            let hits = find_pii(&text);
+            assert_eq!(
+                hits,
+                vec![(iban.to_string(), "iban")],
+                "the IBAN must be one hit, nothing of it a phone number: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grouped_iban_never_reaches_the_cloud_in_parts() {
+        let text = "Miete an DE02 1203 0000 0000 2020 51 ueberweisen.";
+        let (cloaked, session) = cloak_pure(&[], text);
+        assert_eq!(cloaked, "Miete an Org-0 ueberweisen.");
+        assert_eq!(decloak(&session, &cloaked), text);
+    }
+
+    #[test]
+    fn number_runs_that_are_not_ibans_stay_out_of_the_iban_net() {
+        for text in [
+            "Ruf an: +49 170 5550123",
+            "Rechnung 2024 0001 2345 6789 bezahlt",
+            "Rechnungsnummer RE24 0001 2345",
+            "Bestellung AB12 3456 7890",
+            "Kundennummer DE 1234 5678 9012 3456",
+            "Version V2 1234 und 5678",
+            "Telefon 0551 123456 78",
+        ] {
+            assert!(
+                !find_pii(text).iter().any(|(_, k)| *k == "iban"),
+                "no IBAN in {text:?}, got {:?}",
+                find_pii(text)
+            );
+        }
+        // Two IBANs side by side stay two.
+        let hits = find_pii("von DE02 1203 0000 0000 2020 51 an AT61 1904 3002 3457 3201.");
+        let ibans: Vec<&str> = hits.iter().filter(|(_, k)| *k == "iban").map(|(v, _)| v.as_str()).collect();
+        assert_eq!(ibans, ["DE02 1203 0000 0000 2020 51", "AT61 1904 3002 3457 3201"]);
+        // A BIC right after the IBAN is not part of it.
+        let hits = find_pii("IBAN AT61 1904 3002 3457 3201 BIC GIBA AT WW");
+        let ibans: Vec<&str> = hits.iter().filter(|(_, k)| *k == "iban").map(|(v, _)| v.as_str()).collect();
+        assert_eq!(ibans, ["AT61 1904 3002 3457 3201"]);
     }
 
     /// A synthetic full-corpus dictionary: `n` distinct entities, mixed types like a
