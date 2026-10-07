@@ -391,7 +391,9 @@ interface MergeRule {
   sentence: string | null
   origin: 'default' | 'human' | 'learned'
   status: 'active' | 'proposed' | 'retired'
-  evidence: { preview?: RulePreview; decisions?: number; source?: string } | null
+  // preview: the estimate object this API writes, or the one-line summary the
+  // LIMES learner (fuse learn.py) writes.
+  evidence: { preview?: RulePreview | string; decisions?: number; source?: string } | null
   sourceText: string | null
 }
 
@@ -507,7 +509,10 @@ function RuleRow({ rule: r, busy, onApply, onRetire, onEdit }: {
             <span> · {isProposal ? 'proposed' : 'in force'} · {r.origin === 'learned' ? 'learned from your answers' : r.origin === 'human' ? 'set by you' : 'built-in default'}</span>
             {r.compilationId ? <span> · this knowledge base only</span> : null}
           </p>
-          {isProposal && preview && (
+          {isProposal && typeof preview === 'string' && (
+            <p className="mt-1 text-[10px] text-amber-400">{preview}</p>
+          )}
+          {isProposal && preview && typeof preview !== 'string' && (
             <p className="mt-1 text-[10px] text-amber-400">
               {preview.wouldSplit != null
                 ? `Would split ${preview.wouldSplit} of ${preview.basedOn ?? 0} existing merges and keep ${preview.wouldKeep ?? 0}.`
