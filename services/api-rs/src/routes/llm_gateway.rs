@@ -20,12 +20,14 @@
 //! just works from inside Docker.
 //!
 //! ## Upstream selection
-//! `X-Upstream-Provider: anthropic|openai` (case-insensitive) picks the upstream;
+//! `X-Upstream-Provider: anthropic|openai|chatgpt` (case-insensitive) picks the upstream;
 //! absent/empty = local Ollama, byte for byte today's behaviour. This module serves
 //! `POST /v1/chat/completions` for Ollama and OpenAI; Anthropic's `/v1/messages`
-//! lives in the sibling module `llm_gateway_anthropic`, which builds on the
+//! lives in the sibling module `llm_gateway_anthropic`, and the OpenAI Responses
+//! API (`/v1/responses`, upstreams `chatgpt` = the ChatGPT subscription via Codex,
+//! and `openai`) in `llm_gateway_responses`; both build on the
 //! `pub(super)` items here (auth, upstream base, header allowlist, cloak helpers).
-//! Bases come from `ANTHROPIC_BASE` / `OPENAI_BASE` (official host pinned via
+//! Bases come from `ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE` (official host pinned via
 //! `validate_llm_base`; dev escape hatch `GCTRL_CLOAK_UPSTREAM_UNPINNED=1`).
 //! `GET /v1/cloak/capabilities` (no auth) lists the supported upstreams.
 //!
@@ -91,9 +93,9 @@ pub(super) static HTTP_NOREDIRECT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("reqwest client builds")
 });
 
-/// Cloud upstream (OpenAI) -> no-redirect client; Ollama keeps the plain one.
+/// Cloud upstream (OpenAI, ChatGPT) -> no-redirect client; Ollama keeps the plain one.
 fn client_for(upstream_name: &str) -> &'static reqwest::Client {
-    if upstream_name == "OpenAI" {
+    if matches!(upstream_name, "OpenAI" | "ChatGPT") {
         &HTTP_NOREDIRECT
     } else {
         &HTTP
@@ -121,6 +123,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/cloak/capabilities", get(capabilities))
         .merge(super::llm_gateway_anthropic::router())
+        .merge(super::llm_gateway_responses::router())
         // Whitelist: every other /v1/* path is a clear 404, never a silent passthrough.
         // Static routes above win over this wildcard; it only claims /v1/* paths.
         .route("/v1/*rest", axum::routing::any(super::llm_gateway_anthropic::not_proxied))
@@ -128,9 +131,9 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
 
 /// Capability probe (no auth): which upstreams this gateway can cloak for.
 /// Anvil polls it to decide what to offer; keep the list stable.
-async fn capabilities() -> Json<Value> {
+pub(super) async fn capabilities() -> Json<Value> {
     Json(json!({
-        "upstreams": ["ollama", "anthropic", "openai"],
+        "upstreams": ["ollama", "anthropic", "openai", "chatgpt"],
         "version": crate::routes::update::current_version(),
     }))
 }
@@ -164,6 +167,8 @@ pub(super) enum Upstream {
     Ollama,
     Anthropic,
     OpenAi,
+    /// The ChatGPT subscription (Codex CLI, Responses API on chatgpt.com).
+    ChatGpt,
 }
 
 /// Read `x-upstream-provider`. Absent/empty -> Ollama; unknown -> 400.
@@ -177,10 +182,11 @@ pub(super) fn upstream_from_headers(headers: &HeaderMap) -> Result<Upstream, Res
         "" => Ok(Upstream::Ollama),
         "anthropic" => Ok(Upstream::Anthropic),
         "openai" => Ok(Upstream::OpenAi),
+        "chatgpt" => Ok(Upstream::ChatGpt),
         other => Err(gateway_error_json(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai; omit for ollama)"),
+            format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai, chatgpt; omit for ollama)"),
         )),
     }
 }
@@ -192,6 +198,8 @@ pub(super) fn upstream_base_from(upstream: Upstream, raw: Option<&str>, unpinned
         Upstream::Ollama => return Ok(ollama_base()),
         Upstream::Anthropic => ("anthropic", "https://api.anthropic.com"),
         Upstream::OpenAi => ("openai", "https://api.openai.com"),
+        // HOST only: the Codex path lives in `llm_gateway_responses::CHATGPT_CODEX_PATH`.
+        Upstream::ChatGpt => ("chatgpt", "https://chatgpt.com"),
     };
     let raw = raw.map(str::trim).filter(|s| !s.is_empty());
     if unpinned {
@@ -205,13 +213,14 @@ pub(super) fn upstream_base_from(upstream: Upstream, raw: Option<&str>, unpinned
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Resolve the upstream base URL from env (`ANTHROPIC_BASE` / `OPENAI_BASE`).
+/// Resolve the upstream base URL from env (`ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE`).
 /// An invalid base is an error (-> 500 api_error), never a silent fallback.
 pub(super) fn upstream_base(upstream: Upstream) -> Result<String, String> {
     let var = match upstream {
         Upstream::Ollama => return Ok(ollama_base()),
         Upstream::Anthropic => "ANTHROPIC_BASE",
         Upstream::OpenAi => "OPENAI_BASE",
+        Upstream::ChatGpt => "CHATGPT_BASE",
     };
     let unpinned = std::env::var("GCTRL_CLOAK_UPSTREAM_UNPINNED")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
@@ -258,19 +267,34 @@ pub(super) fn forward_headers(incoming: &HeaderMap, upstream: Upstream, consumed
         "anthropic-dangerous-direct-browser-access",
         "x-app",
     ];
+    // Codex (ChatGPT subscription) session/routing headers: only ever sent to chatgpt.com.
+    const CHATGPT_ONLY: [&str; 8] = [
+        "chatgpt-account-id",
+        "originator",
+        "session-id",
+        "session_id",
+        "thread-id",
+        "conversation_id",
+        "x-client-request-id",
+        "x-openai-subagent",
+    ];
+    let openai_family = matches!(upstream, Upstream::OpenAi | Upstream::ChatGpt);
     let mut out = HeaderMap::new();
     for (name, value) in incoming.iter() {
         let n = name.as_str();
         if n == "authorization" && consumed_authorization {
             continue;
         }
-        if upstream == Upstream::OpenAi && ANTHROPIC_ONLY.contains(&n) {
+        if openai_family && ANTHROPIC_ONLY.contains(&n) {
             continue;
         }
         if (n == "authorization" || n == "x-api-key") && is_gctrl_credential(value) {
             continue;
         }
-        if ALLOW.contains(&n) || n.starts_with("x-stainless-") {
+        let chatgpt_extra =
+            upstream == Upstream::ChatGpt && (CHATGPT_ONLY.contains(&n) || n.starts_with("x-codex-"));
+        let openai_extra = openai_family && n == "openai-beta";
+        if ALLOW.contains(&n) || n.starts_with("x-stainless-") || chatgpt_extra || openai_extra {
             out.append(name.clone(), value.clone());
         }
     }
@@ -289,7 +313,17 @@ pub(super) fn relay_response_headers(
         .iter()
         .filter(|(n, _)| {
             let n = n.as_str();
-            matches!(n, "content-type" | "request-id" | "retry-after") || n.starts_with("anthropic-ratelimit-")
+            matches!(
+                n,
+                "content-type"
+                    | "request-id"
+                    | "retry-after"
+                    | "x-models-etag"
+                    | "openai-model"
+                    | "x-reasoning-included"
+                    | "x-request-id"
+            ) || n.starts_with("anthropic-ratelimit-")
+                || n.starts_with("x-codex-")
         })
         .filter_map(|(n, v)| {
             Some((
@@ -448,7 +482,7 @@ pub(super) fn has_upstream_credential(headers: &HeaderMap, upstream: Upstream, c
     };
     let auth = !consumed_authorization && usable("authorization");
     match upstream {
-        Upstream::OpenAi => auth,
+        Upstream::OpenAi | Upstream::ChatGpt => auth,
         _ => usable("x-api-key") || auth,
     }
 }
@@ -496,6 +530,9 @@ async fn chat_completions_inner(
     };
     if upstream == Upstream::Anthropic {
         return gateway_error_json(StatusCode::BAD_REQUEST, "invalid_request_error", "use /v1/messages for anthropic");
+    }
+    if upstream == Upstream::ChatGpt {
+        return gateway_error_json(StatusCode::BAD_REQUEST, "invalid_request_error", "use /v1/responses for chatgpt");
     }
     let unauthorized = || {
         gateway_error_json(
@@ -1192,7 +1229,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai"]));
+        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai", "chatgpt"]));
         let res = app
             .oneshot(axum::http::Request::builder().uri("/v1/does-not-exist").body(Body::empty()).unwrap())
             .await

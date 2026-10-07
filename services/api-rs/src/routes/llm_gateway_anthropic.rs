@@ -179,19 +179,25 @@ pub(super) struct AnthropicSseDecloaker {
     out: String,
 }
 
+/// Same pseudonyms, originals JSON-string-escaped (without the surrounding quotes):
+/// for de-cloaking text that lands INSIDE a JSON string literal.
+pub(super) fn json_escaped_session(session: &privacy::CloakSession) -> privacy::CloakSession {
+    privacy::CloakSession {
+        map: session
+            .map
+            .iter()
+            .map(|(k, v)| {
+                let quoted = serde_json::to_string(v).unwrap_or_default();
+                let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
+                (k.clone(), inner.to_string())
+            })
+            .collect(),
+    }
+}
+
 impl AnthropicSseDecloaker {
     pub fn new(session: privacy::CloakSession) -> Self {
-        let json_session = privacy::CloakSession {
-            map: session
-                .map
-                .iter()
-                .map(|(k, v)| {
-                    let quoted = serde_json::to_string(v).unwrap_or_default();
-                    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
-                    (k.clone(), inner.to_string())
-                })
-                .collect(),
-        };
+        let json_session = json_escaped_session(&session);
         Self {
             session,
             json_session,
@@ -419,7 +425,7 @@ const CREDENTIAL_HINT: &str =
 /// Only these paths are proxied under /v1 (everything else is a 404, never a
 /// silent plaintext passthrough).
 const NOT_PROXIED_MESSAGE: &str =
-    "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models are proxied";
+    "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/responses, /v1/models are proxied";
 
 fn messages_url(base: &str) -> String {
     format!("{}/v1/messages", base.trim_end_matches('/'))
@@ -575,8 +581,17 @@ async fn count_tokens_inner(state: Arc<AppState>, headers: HeaderMap, body: Byte
 }
 
 /// Plain proxy for the model list (no prompt content): gctrl auth and an upstream
-/// credential are still required.
+/// credential are still required. `GET /v1/models` is registered once (here); a
+/// `chatgpt` / `openai` provider header hands it to the Responses module.
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    let provider = headers
+        .get("x-upstream-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if provider == "chatgpt" || provider == "openai" {
+        return super::llm_gateway_responses::models_passthrough(state, headers, query).await;
+    }
     let g = match gate(&state, &headers).await {
         Ok(g) => g,
         Err(r) => return r,
@@ -639,7 +654,7 @@ fn unreachable_response(e: reqwest::Error) -> Response {
 
 /// Non-2xx from the upstream: status, relayed headers (content-type included) and
 /// the body bytes verbatim - never decoded.
-async fn relay_error(resp: reqwest::Response) -> Response {
+pub(super) async fn relay_error(resp: reqwest::Response) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let relayed = relay_response_headers(resp.headers());
     let bytes = resp.bytes().await.unwrap_or_default();
@@ -1293,7 +1308,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"type": "error", "error": {"type": "not_found_error",
-                "message": "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models are proxied"}})
+                "message": "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/responses, /v1/models are proxied"}})
         );
     }
 

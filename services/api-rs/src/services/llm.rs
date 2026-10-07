@@ -522,6 +522,8 @@ fn official_cloud_host(provider: &str) -> Option<&'static str> {
         "openai" => Some("api.openai.com"),
         "anthropic" => Some("api.anthropic.com"),
         "openrouter" => Some("openrouter.ai"),
+        // Cloak gateway upstream for the ChatGPT subscription (Codex).
+        "chatgpt" => Some("chatgpt.com"),
         _ => None,
     }
 }
