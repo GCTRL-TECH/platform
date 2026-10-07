@@ -174,9 +174,10 @@ pub fn translation_system_prompt() -> String {
          count as the same entity into JSON. Answer with JSON only, no prose, exactly this shape: \
          {{\"operator\": \"AND\"|\"OR\", \"leaves\": [{{\"measure\": <measure>, \"property\": <property>, \"threshold\": <0..1>}}]}}. \
          Allowed measures: {}. Allowed properties: {}. At most {} leaves. \
-         Use 'exactmatch' with threshold 1 for 'identical' / 'exactly the same'; 'trigrams' for typos and \
-         spelling variants; 'jaccard' or 'cosine' for word-order or word-overlap wording; 'koeln' or 'soundex' \
-         for 'sounds like'. Percentages map to thresholds (80 % = 0.8). The input may be German or English. \
+         Use 'exactmatch' with threshold 1 for 'identical' / 'exactly the same'; 'trigrams' whenever the text \
+         just says similar / aehnlich / uebereinstimmen without naming a method, and for typos and spelling \
+         variants; 'jaccard' or 'cosine' only for word-order or word-overlap wording; 'koeln' or 'soundex' only \
+         for 'sounds like' / 'klingt wie'. Percentages map to thresholds (80 % = 0.8). The input may be German or English. \
          If the request cannot be expressed, answer {{\"error\": \"<one short English sentence why>\"}}.",
         MEASURES.join(", "), PROPERTIES.join(", "), MAX_LEAVES
     )
