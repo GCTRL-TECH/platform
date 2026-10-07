@@ -277,14 +277,32 @@ pub fn candidates_from_entity_mentions(mentions_arrays: &[serde_json::Value]) ->
 // retrieval step — it's a raw chat proxy — so it needs a per-user dictionary of
 // the entities worth hiding: every entity name KEX ever extracted from that
 // user's own documents. We pull those from `text_chunks.entity_mentions` (keyed
-// by `user_id`, which is exactly "the compilations this user owns"), dedup by
-// name, and cap the dictionary so a huge corpus can't make each request O(n).
+// by `user_id`, which is exactly "the compilations this user owns") and dedup by
+// name. The WHOLE corpus goes in: per-request cost no longer depends on the
+// dictionary size (see `PreparedDictionary`), so a frequency cap would only
+// decide which known people leak (E2E 2026-10-04: 2000 of 46 623 names kept,
+// 686 of 755 known people sent to the cloud in clear).
 
-/// PURE: dedup a raw candidate list by (case-folded) name and keep the `cap`
-/// most useful entries — ranked by mention frequency, then by longer name
-/// (longer surface forms are more specific and safer to pseudonymize). First
-/// seen casing + kind wins for each key. No DB, no IO — unit-tested below.
+/// Keep-priority of an entity type when a bound has to bite: named entities and
+/// PII first, then the bracketed value classes, terms/tools/concepts last.
+fn kind_priority(kind: Option<&str>) -> u8 {
+    match bucket_template(kind).0 {
+        "Person" | "Org" | "Place" | "EMAIL" | "PHONE" | "IBAN" => 0,
+        "DATE" | "AMOUNT" | "NUM" => 1,
+        _ => 2,
+    }
+}
+
+/// PURE: dedup a raw candidate list by (case-folded) name and keep at most `cap`
+/// entries. Deterministic whatever order the rows arrive in, so a rebuild never
+/// flips a name between cloaked and clear:
+///   - per name, the spelling with the most uppercase letters wins (ties: the
+///     smallest string), and the highest-priority type any mention gave it
+///     (a name typed both `person` and `concept` is a person);
+///   - ranking for the bound: type priority ([`kind_priority`]), then mention
+///     frequency, then longer name, then the name itself.
 fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCandidate> {
+    let uppers = |n: &str| n.chars().filter(|ch| ch.is_uppercase()).count();
     let mut agg: HashMap<String, (usize, EntityCandidate)> = HashMap::new();
     for c in candidates {
         let key = lower_key(c.name.trim());
@@ -293,20 +311,27 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
         }
         let entry = agg.entry(key).or_insert_with(|| (0, c.clone()));
         entry.0 += 1;
+        let best = &mut entry.1;
         // Keep the spelling with the MOST uppercase letters (ALL-CAPS > Title-case >
-        // lowercase; ties keep the first seen). A lowercase "mit" is dropped later as
-        // identifier-shaped and a Title-case "Mit"/"Sap" as a stop-word or a non-acronym;
-        // keeping either here would silently lose the real entity ("MIT", "SAP").
-        let uppers = |n: &str| n.chars().filter(|ch| ch.is_uppercase()).count();
-        if uppers(&c.name) > uppers(&entry.1.name) {
-            entry.1 = c;
+        // lowercase). A lowercase "mit" is dropped later as identifier-shaped and a
+        // Title-case "Mit"/"Sap" as a stop-word or a non-acronym; keeping either here
+        // would silently lose the real entity ("MIT", "SAP").
+        let (cu, bu) = (uppers(&c.name), uppers(&best.name));
+        if cu > bu || (cu == bu && c.name < best.name) {
+            best.name = c.name;
+        }
+        let (cp, bp) = (kind_priority(c.kind.as_deref()), kind_priority(best.kind.as_deref()));
+        if cp < bp || (cp == bp && c.kind < best.kind) {
+            best.kind = c.kind;
         }
     }
     let mut items: Vec<(usize, EntityCandidate)> = agg.into_values().collect();
     items.sort_by(|a, b| {
-        b.0
-            .cmp(&a.0)
+        kind_priority(a.1.kind.as_deref())
+            .cmp(&kind_priority(b.1.kind.as_deref()))
+            .then_with(|| b.0.cmp(&a.0))
             .then_with(|| b.1.name.chars().count().cmp(&a.1.name.chars().count()))
+            .then_with(|| a.1.name.cmp(&b.1.name))
     });
     items.into_iter().take(cap).map(|(_, c)| c).collect()
 }
@@ -321,9 +346,13 @@ pub fn candidates_from_mentions_capped(
     dedup_and_cap(candidates_from_entity_mentions(mentions_arrays), cap)
 }
 
-/// How many distinct entity names to keep in a user's free-chat cloak dictionary.
-/// Bounds per-request substitution cost regardless of corpus size.
-const CANDIDATE_CAP: usize = 2000;
+/// Memory bound only, NOT a cost bound: per-request cost is proportional to the
+/// prompt, not the dictionary (see [`PreparedDictionary`]). The largest live corpus
+/// (Asgard, 2026-10-04) has 46 623 distinct names; at roughly 100 bytes per entry
+/// a full 200 000-entry dictionary costs about 20 MB per cached user (5 MB at
+/// today's size). If it ever bites, [`dedup_and_cap`] drops terms before people,
+/// organisations and places, deterministically.
+const CANDIDATE_CAP: usize = 200_000;
 /// In-memory TTL for the per-user dictionary — rebuilding it hits Postgres, and a
 /// user's extracted-entity set changes slowly, so a short cache keeps the gateway
 /// hop cheap without going stale for long.
@@ -335,11 +364,12 @@ static CANDIDATE_CACHE: Lazy<Mutex<HashMap<Uuid, (Instant, Arc<Vec<EntityCandida
 
 /// Build the free-chat cloak dictionary for `user_id`: every entity name KEX
 /// extracted from the documents this user owns (`text_chunks.entity_mentions`
-/// scoped by `user_id`), deduped by name and capped at [`CANDIDATE_CAP`]. Cached
-/// in-process per user for [`CANDIDATE_TTL`]. The PII regex fallback baked into
+/// scoped by `user_id`), deduped by name, bounded only by [`CANDIDATE_CAP`]. Cached
+/// in-process per user for [`CANDIDATE_TTL`] and handed out shared (no per-request
+/// copy of a dictionary that can hold tens of thousands of names). The PII regex fallback baked into
 /// `collect_candidates` still runs at cloak time, so emails/IBANs/phones are
 /// covered even when they were never extracted as named entities.
-pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Vec<EntityCandidate> {
+pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Arc<Vec<EntityCandidate>> {
     // Fast path: a fresh cache entry.
     if let Some(hit) = {
         let guard = CANDIDATE_CACHE.lock().unwrap();
@@ -348,7 +378,7 @@ pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Vec<Ent
             .filter(|(t, _)| t.elapsed() < CANDIDATE_TTL)
             .map(|(_, v)| v.clone())
     } {
-        return (*hit).clone();
+        return hit;
     }
 
     let rows: Vec<serde_json::Value> = sqlx::query_scalar(
@@ -365,7 +395,7 @@ pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Vec<Ent
         .lock()
         .unwrap()
         .insert(user_id, (Instant::now(), capped.clone()));
-    (*capped).clone()
+    capped
 }
 
 /// The result of a `cloak()` call: the pseudonym → canonical-original map
@@ -433,9 +463,60 @@ fn bucket_template(kind: Option<&str>) -> (&'static str, bool) {
 static EMAIL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
     regex::Regex::new(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b").unwrap()
 });
+// IBAN compact (`DE02120300000000202051`) or in its printed form, grouped by four
+// with a space, no-break space or narrow no-break space (`DE02 1203 0000 0000 2020 51`).
+// The compact-only pattern let the phone net take the middle of a grouped IBAN and
+// the cloud saw `DE02 [PHONE-286] 2020 51` (E2E 2026-10-04). Length (15..=34) and the
+// trailing-group choice are settled in `iban_hits`.
 static IBAN_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-    regex::Regex::new(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b").unwrap()
+    regex::Regex::new(
+        r"\b[A-Z]{2}\d{2}(?:[ \u{A0}\u{202F}]?[A-Z0-9]{4}){2,7}(?:[ \u{A0}\u{202F}]?[A-Z0-9]{1,4})?\b",
+    )
+    .unwrap()
 });
+
+fn is_iban_separator(c: char) -> bool {
+    matches!(c, ' ' | '\u{A0}' | '\u{202F}')
+}
+
+/// ISO 7064 mod-97 check of an IBAN given without separators.
+fn iban_checksum_ok(compact: &str) -> bool {
+    if compact.len() < 5 {
+        return false;
+    }
+    let (head, tail) = compact.split_at(4);
+    let mut rem: u32 = 0;
+    for c in tail.chars().chain(head.chars()) {
+        let Some(v) = c.to_digit(36) else { return false };
+        rem = if v >= 10 { (rem * 100 + v) % 97 } else { (rem * 10 + v) % 97 };
+    }
+    rem == 1
+}
+
+/// PURE: the IBANs in `text` as byte spans. A grouped match may run on into a short
+/// uppercase word after the IBAN (`... 3201 BIC`): among the match and its prefixes
+/// ending before a separator, the longest one with a valid check digit wins. With
+/// none valid (a typo) the whole structural match still counts, so a mistyped IBAN
+/// is not sent out in parts either.
+fn iban_hits(text: &str) -> Vec<(usize, usize)> {
+    let compact = |s: &str| s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>();
+    let fits = |s: &str| (15..=34).contains(&compact(s).len());
+    let mut out = Vec::new();
+    for m in IBAN_RE.find_iter(text) {
+        let s = m.as_str();
+        let mut ends: Vec<usize> = vec![s.len()];
+        ends.extend(s.char_indices().filter(|(_, c)| is_iban_separator(*c)).map(|(i, _)| i).rev());
+        let end = ends
+            .iter()
+            .copied()
+            .find(|&e| fits(&s[..e]) && iban_checksum_ok(&compact(&s[..e])))
+            .or_else(|| fits(s).then_some(s.len()));
+        if let Some(e) = end {
+            out.push((m.start(), m.start() + e));
+        }
+    }
+    out
+}
 // Loose net for phone-like digit runs; filtered by digit count below so it
 // doesn't fire on every short number. Best-effort — no locale-aware parsing.
 static PHONE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
@@ -447,10 +528,15 @@ fn find_pii(text: &str) -> Vec<(String, &'static str)> {
     for m in EMAIL_RE.find_iter(text) {
         out.push((m.as_str().to_string(), "email"));
     }
-    for m in IBAN_RE.find_iter(text) {
-        out.push((m.as_str().to_string(), "iban"));
+    let ibans = iban_hits(text);
+    for &(start, end) in &ibans {
+        out.push((text[start..end].to_string(), "iban"));
     }
     for m in PHONE_RE.find_iter(text) {
+        // Digits inside an IBAN are the IBAN, not a phone number.
+        if ibans.iter().any(|&(s, e)| m.start() < e && s < m.end()) {
+            continue;
+        }
         let digits = m.as_str().chars().filter(|c| c.is_ascii_digit()).count();
         if digits >= 7 {
             out.push((m.as_str().to_string(), "phone"));
@@ -459,10 +545,40 @@ fn find_pii(text: &str) -> Vec<(String, &'static str)> {
     out
 }
 
-/// A dictionary entry with its match key already folded: `(lower key, kind,
-/// canonical original text)`. Built ONCE per request — `lower_key` allocates,
-/// and a chat request cloaks many messages against the same dictionary.
-type PreparedCandidate = (String, Option<String>, String);
+/// A dictionary entry with its keys already folded. Built ONCE per request:
+/// `lower_key`/`match_key` allocate, and a chat request cloaks many messages
+/// against the same dictionary.
+struct PreparedCandidate {
+    /// [`lower_key`] of the name: the registry key (`cloak_maps.entity_key`).
+    key: String,
+    kind: Option<String>,
+    /// The trimmed dictionary spelling.
+    canonical: String,
+    /// [`match_key`] of the name: what [`key_can_occur`] and the substitution test.
+    match_key: String,
+}
+
+/// A prepared dictionary plus an index from each entry's FIRST alphanumeric run
+/// (folded) to the entries that start with it. [`collect_prepared`] looks up the
+/// tokens of a text instead of walking the dictionary, so narrowing costs
+/// O(tokens of the text), not O(dictionary) per text. Exact: [`key_can_occur`]
+/// requires every run of a key to be a token of the text, the first one included.
+struct PreparedDictionary {
+    entries: Vec<PreparedCandidate>,
+    by_first_run: HashMap<String, Vec<usize>>,
+    /// Entries without any alphanumeric run (`&&`): unfilterable, always checked.
+    no_run: Vec<usize>,
+}
+
+/// The first maximal alphanumeric run of `key`, folded like [`text_tokens`].
+fn first_run(key: &str) -> Option<String> {
+    let run: String = key
+        .chars()
+        .skip_while(|c| !c.is_alphanumeric())
+        .take_while(|c| c.is_alphanumeric())
+        .collect();
+    (!run.is_empty()).then(|| lower_key(&run))
+}
 
 /// PURE: does this candidate name look like an IDENTIFIER rather than a name of a person,
 /// organisation or place? Machine names, file names, hosts, env vars, slugs: `ai_lab_team`,
@@ -575,8 +691,9 @@ fn is_stop_word_entity(name: &str) -> bool {
 
 /// PURE: fold a candidate dictionary into match keys once, dropping entries too
 /// short to be worth hiding (they would match noise), identifier-shaped names
-/// (see [`is_identifier_like`]) and stop-words (see [`STOP_WORDS`]).
-fn prepare_candidates(candidates: &[EntityCandidate]) -> Vec<PreparedCandidate> {
+/// (see [`is_identifier_like`]) and stop-words (see [`STOP_WORDS`]), and index
+/// the survivors by their first run (see [`PreparedDictionary`]).
+fn prepare_candidates(candidates: &[EntityCandidate]) -> PreparedDictionary {
     let mut out = Vec::with_capacity(candidates.len());
     for c in candidates {
         let trimmed = c.name.trim();
@@ -590,9 +707,22 @@ fn prepare_candidates(candidates: &[EntityCandidate]) -> Vec<PreparedCandidate> 
         if is_stop_word_entity(trimmed) {
             continue;
         }
-        out.push((key, c.kind.clone(), trimmed.to_string()));
+        out.push(PreparedCandidate {
+            key,
+            kind: c.kind.clone(),
+            canonical: trimmed.to_string(),
+            match_key: match_key(trimmed),
+        });
     }
-    out
+    let mut by_first_run: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut no_run = Vec::new();
+    for (n, e) in out.iter().enumerate() {
+        match first_run(&e.match_key) {
+            Some(run) => by_first_run.entry(run).or_default().push(n),
+            None => no_run.push(n),
+        }
+    }
+    PreparedDictionary { entries: out, by_first_run, no_run }
 }
 
 /// The alphanumeric word tokens of a text, twice: `folded` with the same per-char
@@ -671,16 +801,24 @@ fn key_can_occur(key: &str, tokens: &TextTokens) -> bool {
 /// text, so they are present by construction) — as a
 /// `lower_key -> (kind, canonical original text)` map. No DB.
 fn collect_prepared(
-    prepared: &[PreparedCandidate],
+    prepared: &PreparedDictionary,
     text: &str,
 ) -> HashMap<String, (Option<String>, String)> {
     let tokens = text_tokens(text);
-    let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
-    for (key, kind, canonical) in prepared {
-        if !key_can_occur(&match_key(canonical), &tokens) {
-            continue;
+    // Only entries whose first run is a token of the text can occur at all. Visit the
+    // survivors in dictionary order, so a duplicate key resolves exactly as a full scan.
+    let mut hits: Vec<usize> = prepared.no_run.clone();
+    for token in &tokens.folded {
+        if let Some(idx) = prepared.by_first_run.get(token) {
+            hits.extend_from_slice(idx);
         }
-        seen.entry(key.clone()).or_insert_with(|| (kind.clone(), canonical.clone()));
+    }
+    hits.retain(|&n| key_can_occur(&prepared.entries[n].match_key, &tokens));
+    hits.sort_unstable();
+    let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+    for n in hits {
+        let e = &prepared.entries[n];
+        seen.entry(e.key.clone()).or_insert_with(|| (e.kind.clone(), e.canonical.clone()));
     }
     for (val, kind) in find_pii(text) {
         let key = lower_key(&val);
@@ -1276,7 +1414,7 @@ mod tests {
             cand("Anvil", Some("search engine")),
         ];
         let prepared = prepare_candidates(&candidates);
-        let names: Vec<&str> = prepared.iter().map(|(_, _, c)| c.as_str()).collect();
+        let names: Vec<&str> = prepared.entries.iter().map(|e| e.canonical.as_str()).collect();
         assert_eq!(names, vec!["Fabio Chiaramonte", "Multiversum GmbH", "Anvil"]);
         assert!(is_identifier_like("ai_lab_team") && is_identifier_like("SKILL.md") && is_identifier_like("gctrl"));
         assert!(!is_identifier_like("Anvil") && !is_identifier_like("Fabio Chiaramonte"));
@@ -1668,7 +1806,8 @@ mod tests {
     /// Build a realistic free-chat cloak workload: a full-size user dictionary
     /// and a long chat prompt that mentions only a handful of its entities.
     fn long_prompt_workload() -> (Vec<EntityCandidate>, String) {
-        let dict: Vec<EntityCandidate> = (0..CANDIDATE_CAP)
+        // 50 000 entries: the whole corpus of the largest live account (46 623 names).
+        let dict: Vec<EntityCandidate> = (0..50_000)
             .map(|i| cand(&format!("Projekt Nordwind {i}"), Some("organization")))
             .collect();
         // ~60k chars ≈ the 8–19k-token prompts a real chat turn carries.
@@ -1678,7 +1817,7 @@ mod tests {
         while text.chars().count() < 60_000 {
             text.push_str(para);
         }
-        // Two dictionary entities genuinely appear, the other 1998 do not.
+        // Two dictionary entities genuinely appear, the other 49 998 do not.
         text.push_str(" Projekt Nordwind 7 arbeitet mit Projekt Nordwind 42 zusammen.");
         (dict, text)
     }
@@ -1725,6 +1864,221 @@ mod tests {
             "cloaking a 60k-char prompt took {elapsed:?} — the per-request cost is \
              back to O(text × dictionary)"
         );
+    }
+
+    // ── full-corpus dictionary (E2E 2026-10-04, Befund 1) ────────────────
+
+    #[test]
+    fn dictionary_keeps_every_entity_of_a_large_corpus() {
+        // Live 2026-10-04: 46 623 names, only the 2000 most mentioned were cloaked and
+        // 686 of 755 known people went to the cloud in clear. Every entity counts.
+        let arrays: Vec<serde_json::Value> = (0..50_000)
+            .map(|i| mentions(&[(&format!("Person Nummer{i}"), "person")]))
+            .collect();
+        let out = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        assert_eq!(out.len(), 50_000, "no entity of the user may fall off the dictionary");
+    }
+
+    #[test]
+    fn a_rarely_mentioned_person_is_cloaked_next_to_frequent_terms() {
+        // Robert Grimm: 11 mentions, rank 2004 -> in clear. Rank must never decide.
+        let mut arrays: Vec<serde_json::Value> = (0..3_000)
+            .map(|i| mentions(&[(&format!("Fachbegriff{i}"), "concept"), (&format!("Fachbegriff{i}"), "concept")]))
+            .collect();
+        arrays.push(mentions(&[("Robert Grimm", "person")]));
+        let dict = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        let (cloaked, _) = cloak_pure(&dict, "Robert Grimm trifft sich mit Marcus.");
+        assert!(!cloaked.contains("Robert Grimm"), "a known person left in clear: {cloaked}");
+    }
+
+    #[test]
+    fn a_cap_keeps_people_orgs_and_places_before_terms() {
+        // If a bound has to bite, it bites terms first, however often they are mentioned.
+        let mut arrays: Vec<serde_json::Value> = (0..5)
+            .map(|_| mentions(&[("Fachbegriff", "concept"), ("Werkzeug", "tool")]))
+            .collect();
+        arrays.push(mentions(&[("Erika Muster", "person"), ("Nexovar GmbH", "organization"), ("Goettingen", "location")]));
+        let out = candidates_from_mentions_capped(&arrays, 3);
+        let mut names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Erika Muster", "Goettingen", "Nexovar GmbH"]);
+    }
+
+    #[test]
+    fn the_dictionary_does_not_depend_on_row_order() {
+        // The 10-minute rebuild reads rows in no defined order; ties at a bound were
+        // decided by HashMap order and names flipped between cloaked and clear.
+        let mut items: Vec<serde_json::Value> = (0..400)
+            .map(|i| mentions(&[(&format!("Name{}", i % 97), if i % 3 == 0 { "person" } else { "concept" })]))
+            .collect();
+        items.push(mentions(&[("sap", "organization"), ("Sap", "organization")]));
+        let snapshot = |rows: &[serde_json::Value]| -> Vec<(String, Option<String>)> {
+            candidates_from_mentions_capped(rows, 40).into_iter().map(|c| (c.name, c.kind)).collect()
+        };
+        let first = snapshot(&items);
+        assert_eq!(first.len(), 40);
+        for rot in [1usize, 7, 133, 250] {
+            let mut shuffled = items.clone();
+            shuffled.rotate_left(rot);
+            assert_eq!(snapshot(&shuffled), first, "rotation {rot} changed the dictionary");
+            shuffled.reverse();
+            assert_eq!(snapshot(&shuffled), first, "reversed rotation {rot} changed the dictionary");
+        }
+    }
+
+    #[test]
+    fn a_name_typed_both_person_and_term_is_kept_as_person() {
+        let arrays = vec![mentions(&[("Julian Fels", "concept")]), mentions(&[("Julian Fels", "person")])];
+        let out = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind.as_deref(), Some("person"), "Person-N, not Term-N");
+    }
+
+    #[test]
+    fn the_token_index_finds_exactly_what_a_full_scan_finds() {
+        // The indexed narrowing must agree with checking every dictionary entry.
+        let mut dict = big_dictionary(5_000);
+        for n in ["LAN", "MIT", "Anna Schmidt-Weber", "12,5 Mio. EUR", "ACME & Co.", "X9", "&&", "Björn Öztürk"] {
+            dict.push(cand(n, Some("organization")));
+        }
+        let prepared = prepare_candidates(&dict);
+        for text in [
+            "Vorname40 Nachname40 trifft Vorname41 in Ortschaft42 und nennt Fachbegriff43.",
+            "Nordwind Logistik 1 GmbH und Nordwind Logistik 5 GmbH, Anna Schmidt-Weber im LAN.",
+            "Am MIT mit 12,5 Mio. EUR, ACME & Co. und X9; && bleibt. BJÖRN ÖZTÜRK kam.",
+            "Nichts davon.",
+            "",
+        ] {
+            let tokens = text_tokens(text);
+            let mut brute: HashMap<String, (Option<String>, String)> = HashMap::new();
+            for e in prepared.entries.iter() {
+                if key_can_occur(&e.match_key, &tokens) {
+                    brute.entry(e.key.clone()).or_insert_with(|| (e.kind.clone(), e.canonical.clone()));
+                }
+            }
+            for (val, kind) in find_pii(text) {
+                brute.entry(lower_key(&val)).or_insert_with(|| (Some(kind.to_string()), val));
+            }
+            assert_eq!(collect_prepared(&prepared, text), brute, "index disagrees on {text:?}");
+        }
+    }
+
+    // ── IBAN in its printed, grouped form (E2E 2026-10-04, Befund 5) ─────
+
+    #[test]
+    fn grouped_ibans_are_found_whole() {
+        for iban in [
+            "DE02 1203 0000 0000 2020 51",
+            "DE89 3704 0044 0532 0130 00",
+            "AT61 1904 3002 3457 3201",
+            "CH93 0076 2011 6238 5295 7",
+            "NL91 ABNA 0417 1643 00",
+            "DE02\u{a0}1203\u{a0}0000\u{a0}0000\u{a0}2020\u{a0}51",
+            "DE02\u{202f}1203\u{202f}0000\u{202f}0000\u{202f}2020\u{202f}51",
+            "DE02120300000000202051",
+        ] {
+            let text = format!("Bitte auf IBAN {iban}, danke.");
+            let hits = find_pii(&text);
+            assert_eq!(
+                hits,
+                vec![(iban.to_string(), "iban")],
+                "the IBAN must be one hit, nothing of it a phone number: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grouped_iban_never_reaches_the_cloud_in_parts() {
+        let text = "Miete an DE02 1203 0000 0000 2020 51 ueberweisen.";
+        let (cloaked, session) = cloak_pure(&[], text);
+        assert_eq!(cloaked, "Miete an Org-0 ueberweisen.");
+        assert_eq!(decloak(&session, &cloaked), text);
+    }
+
+    #[test]
+    fn number_runs_that_are_not_ibans_stay_out_of_the_iban_net() {
+        for text in [
+            "Ruf an: +49 170 5550123",
+            "Rechnung 2024 0001 2345 6789 bezahlt",
+            "Rechnungsnummer RE24 0001 2345",
+            "Bestellung AB12 3456 7890",
+            "Kundennummer DE 1234 5678 9012 3456",
+            "Version V2 1234 und 5678",
+            "Telefon 0551 123456 78",
+        ] {
+            assert!(
+                !find_pii(text).iter().any(|(_, k)| *k == "iban"),
+                "no IBAN in {text:?}, got {:?}",
+                find_pii(text)
+            );
+        }
+        // Two IBANs side by side stay two.
+        let hits = find_pii("von DE02 1203 0000 0000 2020 51 an AT61 1904 3002 3457 3201.");
+        let ibans: Vec<&str> = hits.iter().filter(|(_, k)| *k == "iban").map(|(v, _)| v.as_str()).collect();
+        assert_eq!(ibans, ["DE02 1203 0000 0000 2020 51", "AT61 1904 3002 3457 3201"]);
+        // A BIC right after the IBAN is not part of it.
+        let hits = find_pii("IBAN AT61 1904 3002 3457 3201 BIC GIBA AT WW");
+        let ibans: Vec<&str> = hits.iter().filter(|(_, k)| *k == "iban").map(|(v, _)| v.as_str()).collect();
+        assert_eq!(ibans, ["AT61 1904 3002 3457 3201"]);
+    }
+
+    /// A synthetic full-corpus dictionary: `n` distinct entities, mixed types like a
+    /// real KEX corpus (people, organisations, places, terms).
+    fn big_dictionary(n: usize) -> Vec<EntityCandidate> {
+        (0..n)
+            .map(|i| match i % 4 {
+                0 => cand(&format!("Vorname{i} Nachname{i}"), Some("person")),
+                1 => cand(&format!("Nordwind Logistik {i} GmbH"), Some("organization")),
+                2 => cand(&format!("Ortschaft{i}"), Some("location")),
+                _ => cand(&format!("Fachbegriff{i}"), Some("concept")),
+            })
+            .collect()
+    }
+
+    /// MEASUREMENT (ignored, run explicitly): the whole per-request cloak path of
+    /// the gateway against a 2000- and a 50 000-entry dictionary and a 60k-char
+    /// prompt split into 20 messages: copy the cached dictionary, prepare it,
+    /// narrow it per text, substitute.
+    /// `cargo test --release cloak_cost_by_dictionary_size -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cloak_cost_by_dictionary_size() {
+        let (_, text) = long_prompt_workload();
+        let mut text = text;
+        text.push_str(" Vorname40000 Nachname40000 trifft Vorname4 Nachname4 in Ortschaft39998.");
+        let msgs: Vec<String> = {
+            let chars: Vec<char> = text.chars().collect();
+            chars.chunks(chars.len() / 20 + 1).map(|c| c.iter().collect()).collect()
+        };
+        for n in [2_000usize, 50_000] {
+            let cached = Arc::new(big_dictionary(n));
+            let mut best = Duration::MAX;
+            let mut best_prepare = Duration::MAX;
+            let mut hits = 0;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let dict = cached.clone();
+                let prepared = prepare_candidates(&dict);
+                best_prepare = best_prepare.min(t.elapsed());
+                let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+                for m in &msgs {
+                    for (k, v) in collect_prepared(&prepared, m) {
+                        seen.entry(k).or_insert(v);
+                    }
+                }
+                let map: HashMap<String, String> = seen
+                    .values()
+                    .enumerate()
+                    .map(|(i, (_, c))| (match_key(c), format!("Person-{i}")))
+                    .collect();
+                for m in &msgs {
+                    std::hint::black_box(apply_pseudonyms(m, &map));
+                }
+                best = best.min(t.elapsed());
+                hits = seen.len();
+            }
+            eprintln!("dict {n:>6}: {hits} hits, best of 5 = {best:?} (of which prepare {best_prepare:?})");
+        }
     }
 
     #[test]

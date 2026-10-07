@@ -1200,6 +1200,70 @@ pub(crate) async fn live_counts(
     (nodes, edges)
 }
 
+/// PURE: the parameter of [`live_counts_batch`]: each job id (as the string Neo4j
+/// stores) mapped to the compilations whose `source_job_ids` list it, each once, in
+/// input order. Compilations without jobs map nothing and so stay empty.
+fn job_compilations(comps: &[(Uuid, Vec<Uuid>)]) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (id, jobs) in comps {
+        let cid = id.to_string();
+        for job in jobs {
+            let entry = map.entry(job.to_string()).or_default();
+            if !entry.contains(&cid) {
+                entry.push(cid.clone());
+            }
+        }
+    }
+    map
+}
+
+/// PURE: fold the `(compilation id, nodes, edges)` rows of [`live_counts_batch`] into
+/// a map. A compilation without a row has no node in the graph.
+fn counts_by_compilation(
+    rows: impl IntoIterator<Item = (String, i64, i64)>,
+) -> std::collections::HashMap<Uuid, (i64, i64)> {
+    rows.into_iter()
+        .filter_map(|(cid, n, e)| Uuid::parse_str(&cid).ok().map(|id| (id, (n, e))))
+        .collect()
+}
+
+/// [`live_counts`] for MANY compilations in one round trip and ONE pass over the
+/// graph. Per row, the list endpoint used to run two full-graph counts in series
+/// (about 50 ms per knowledge base: 12 to 15 s for 260 on Asgard, E2E 2026-10-04).
+///
+/// Same numbers, same scoping (`neo4j::job_scope`): a node belongs to a compilation
+/// when any of its jobs is in the compilation's set, counted once however many of
+/// its jobs match; edges are the relationships starting at such a node (its
+/// outgoing degree), as `MATCH (n)-[r]->()` counted them. Compilations missing from
+/// the result have no node. `Err` on any Neo4j failure; the caller then falls back
+/// to the stored counts, as it did per row.
+pub(crate) async fn live_counts_batch(
+    neo: &neo4rs::Graph,
+    comps: &[(Uuid, Vec<Uuid>)],
+) -> std::result::Result<std::collections::HashMap<Uuid, (i64, i64)>, neo4rs::Error> {
+    let job_comps = job_compilations(comps);
+    if job_comps.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let cypher = format!(
+        "MATCH (n) UNWIND {} AS j \
+         UNWIND coalesce($jobComps[toString(j)], []) AS cid \
+         WITH DISTINCT n, cid \
+         RETURN cid, count(n) AS nodes, sum(size([(n)-->() | 1])) AS edges",
+        crate::services::neo4j::source_jobs_expr("n")
+    );
+    let mut stream = neo.execute(neo_query(&cypher).param("jobComps", job_comps)).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await? {
+        rows.push((
+            row.get::<String>("cid").unwrap_or_default(),
+            row.get::<i64>("nodes").unwrap_or(0),
+            row.get::<i64>("edges").unwrap_or(0),
+        ));
+    }
+    Ok(counts_by_compilation(rows))
+}
+
 async fn list(
     Extension(claims): Extension<JwtClaims>,
     State(state): State<Arc<crate::models::AppState>>,
@@ -1282,15 +1346,24 @@ async fn list(
     };
     let privacy_map: std::collections::HashMap<Uuid, String> = privacy_rows.into_iter().collect();
 
+    // Live counts for the whole page in ONE Neo4j query (was two per row, in series).
+    let count_scope: Vec<(Uuid, Vec<Uuid>)> = rows
+        .iter()
+        .filter(|r| scope.as_ref().is_none_or(|set| set.contains(&r.0)))
+        .map(|r| (r.0, r.4.clone()))
+        .collect();
+    let live = live_counts_batch(&state.neo, &count_scope).await.unwrap_or_else(|e| {
+        tracing::warn!("kg list: live counts unavailable, using stored counts: {e}");
+        Default::default()
+    });
+
     let mut comps: Vec<Value> = Vec::with_capacity(rows.len());
     for (id, n, d, cls, sji, nc, ec, fid, c, clid, ctype, wiki_src, last_distill, page_count, is_system, embed_public) in rows {
         if let Some(set) = &scope { if !set.contains(&id) { continue; } }
         let privacy_mode = privacy_map.get(&id).cloned().unwrap_or_else(|| "open".to_string());
         let stored_nc = nc.unwrap_or(0);
         let stored_ec = ec.unwrap_or(0);
-        // N+1 query — acceptable while typical users have <20 compilations.
-        // Batch later if it becomes a hotspot.
-        let (live_nodes, live_edges) = live_counts(&state.neo, &sji).await;
+        let (live_nodes, live_edges) = live.get(&id).copied().unwrap_or((0, 0));
         let final_nodes = if live_nodes > 0 { live_nodes as i32 } else { stored_nc };
         let final_edges = if live_edges > 0 { live_edges as i32 } else { stored_ec };
         comps.push(json!({
@@ -1468,6 +1541,161 @@ pub(crate) fn create_permission(
         return Err("This access token is scoped to specific knowledge bases and cannot create new ones (a scoped token may only create CODE knowledge bases for the repositories it indexes)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod live_counts_batch_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn u(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    /// A fake graph: per node its job membership and its outgoing degree.
+    fn fake_graph() -> Vec<(Vec<Uuid>, i64)> {
+        vec![
+            (vec![u(1)], 2),
+            (vec![u(1), u(2)], 1),       // shared by two jobs
+            (vec![u(2)], 0),
+            (vec![u(3), u(3)], 4),       // duplicate membership entry
+            (vec![u(4)], 3),             // job of nobody's compilation here
+            (vec![], 5),                 // no membership at all
+            (vec![u(2), u(3)], 1),
+        ]
+    }
+
+    /// What `live_counts` returns for one compilation: nodes with any job in the
+    /// set, and the sum of their outgoing degrees (`MATCH (n)-[r]->()`).
+    fn per_row(graph: &[(Vec<Uuid>, i64)], jobs: &[Uuid]) -> (i64, i64) {
+        graph
+            .iter()
+            .filter(|(sj, _)| sj.iter().any(|j| jobs.contains(j)))
+            .fold((0, 0), |(n, e), (_, d)| (n + 1, e + d))
+    }
+
+    /// The batched Cypher, step by step: per node, the distinct compilations its jobs
+    /// map to through `job_compilations`; count the node and its degree once for each.
+    fn batched(graph: &[(Vec<Uuid>, i64)], comps: &[(Uuid, Vec<Uuid>)]) -> HashMap<Uuid, (i64, i64)> {
+        let map = job_compilations(comps);
+        let mut rows: HashMap<String, (i64, i64)> = HashMap::new();
+        for (sj, deg) in graph {
+            let cids: HashSet<&String> = sj
+                .iter()
+                .filter_map(|j| map.get(&j.to_string()))
+                .flatten()
+                .collect();
+            for cid in cids {
+                let r = rows.entry(cid.clone()).or_default();
+                r.0 += 1;
+                r.1 += deg;
+            }
+        }
+        counts_by_compilation(rows.into_iter().map(|(c, (n, e))| (c, n, e)))
+    }
+
+    #[test]
+    fn batched_counts_equal_the_per_row_counts() {
+        let graph = fake_graph();
+        let comps = vec![
+            (u(100), vec![u(1)]),
+            (u(101), vec![u(1), u(2)]),    // overlapping jobs: a node counts once
+            (u(102), vec![u(2), u(3)]),
+            (u(103), vec![]),              // a KB without jobs is empty, never the owner's graph
+            (u(104), vec![u(999)]),        // job without any node
+            (u(105), vec![u(3), u(1), u(2)]),
+        ];
+        let got = batched(&graph, &comps);
+        for (id, jobs) in &comps {
+            let want = per_row(&graph, jobs);
+            assert_eq!(got.get(id).copied().unwrap_or((0, 0)), want, "compilation {id}");
+        }
+    }
+
+    #[test]
+    fn job_map_lists_each_compilation_once_per_job() {
+        let comps = vec![(u(100), vec![u(1), u(1), u(2)]), (u(101), vec![u(2)]), (u(102), vec![])];
+        let map = job_compilations(&comps);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&u(1).to_string()], vec![u(100).to_string()]);
+        assert_eq!(map[&u(2).to_string()], vec![u(100).to_string(), u(101).to_string()]);
+    }
+
+    #[test]
+    fn rows_with_unknown_or_garbled_ids_are_ignored() {
+        let got = counts_by_compilation(vec![
+            (u(7).to_string(), 3, 4),
+            ("not-a-uuid".to_string(), 9, 9),
+        ]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[&u(7)], (3, 4));
+    }
+
+    /// LIVE check against a real Neo4j (read only): the batched query must give every
+    /// compilation exactly the numbers of the per-row `live_counts`, and it is timed.
+    /// Compilations are built from the graph's real job ids (overlapping windows, an
+    /// empty one, an unknown job).
+    /// `GCTRL_TEST_NEO4J_URI=127.0.0.1:7687 GCTRL_TEST_NEO4J_PASSWORD=... cargo test
+    ///  live_counts_batch_matches_live_counts_on_a_real_graph -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_counts_batch_matches_live_counts_on_a_real_graph() {
+        let Ok(uri) = std::env::var("GCTRL_TEST_NEO4J_URI") else {
+            eprintln!("GCTRL_TEST_NEO4J_URI not set, skipped");
+            return;
+        };
+        let user = std::env::var("GCTRL_TEST_NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let pass = std::env::var("GCTRL_TEST_NEO4J_PASSWORD").unwrap_or_default();
+        let neo = neo4rs::Graph::new(&uri, &user, &pass).await.expect("neo4j");
+        let mut s = neo
+            .execute(neo_query(&format!(
+                "MATCH (n) UNWIND {} AS j RETURN DISTINCT j ORDER BY j",
+                crate::services::neo4j::source_jobs_expr("n")
+            )))
+            .await
+            .expect("jobs");
+        let mut jobs: Vec<Uuid> = Vec::new();
+        while let Ok(Some(row)) = s.next().await {
+            if let Some(j) = row.get::<String>("j").ok().and_then(|j| Uuid::parse_str(&j).ok()) {
+                jobs.push(j);
+            }
+        }
+        assert!(!jobs.is_empty(), "graph has no job membership to test with");
+        let n_comps: usize = std::env::var("GCTRL_TEST_COMPILATIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(260);
+        let mut comps: Vec<(Uuid, Vec<Uuid>)> = (0..n_comps.saturating_sub(2))
+            .map(|i| {
+                let start = (i * 7) % jobs.len();
+                let len = 1 + i % 5;
+                (Uuid::from_u128(i as u128 + 1), (0..len).map(|k| jobs[(start + k) % jobs.len()]).collect())
+            })
+            .collect();
+        comps.push((Uuid::from_u128(900_001), vec![]));
+        comps.push((Uuid::from_u128(900_002), vec![Uuid::from_u128(424242)]));
+
+        let t = std::time::Instant::now();
+        let mut serial = HashMap::new();
+        for (id, sji) in &comps {
+            serial.insert(*id, live_counts(&neo, sji).await);
+        }
+        let serial_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let batch = live_counts_batch(&neo, &comps).await.expect("batched query failed");
+        let batch_time = t.elapsed();
+        eprintln!(
+            "{} compilations over {} jobs: serial live_counts {serial_time:?}, batched {batch_time:?}",
+            comps.len(),
+            jobs.len()
+        );
+        let mut nonzero = 0;
+        for (id, _) in &comps {
+            let want = serial[id];
+            assert_eq!(batch.get(id).copied().unwrap_or((0, 0)), want, "compilation {id}");
+            if want.0 > 0 {
+                nonzero += 1;
+            }
+        }
+        assert!(nonzero > 0, "no compilation had any node, the comparison proves nothing");
+    }
 }
 
 #[cfg(test)]
