@@ -787,6 +787,9 @@ class ThreeStageEntityMerger:
         # {"person": "trigrams(x.name,y.name)|0.7"}. Set by run_merge from the
         # /merge request; consulted in stage 2. Empty = use the default metric.
         self.metric_overrides: dict[str, str] = {}
+        # Per-type review floor that accompanies a LEARNED spec (its global
+        # threshold); a batch of that type never merges below it.
+        self.metric_floors: dict[str, float] = {}
         # Set per-merge by merge(); consulted by Stage-2 metric selection.
         self._enable_smart_match: bool = False
         # Set per-merge by merge(); gates the cross-bucket canonical pass.
@@ -1096,21 +1099,48 @@ class ThreeStageEntityMerger:
     # ── Stage 2: Semantic Resolver ──────────────────────────────────
 
     def _stage2_resolver(
-        self, source_job_ids: list[str], exclude_uris: set[str] | None = None
+        self, source_job_ids: list[str], exclude_uris: set[str] | None = None,
+        only_type: str | None = None,
     ) -> list[dict]:
         """
         Fuzzy multi-property matching via semantic resolver.
         Exports entities to CSV, uploads, submits config, parses results.
         Falls back to enhanced string similarity if resolver is unavailable.
+
+        ``only_type`` restricts the batch to one coarse type. A per-type rule
+        (metric_overrides keyed by type) only applies to a single-type batch, so
+        a mixed batch that has such rules is split by type and run once per type.
         """
         resolver = get_limes_client()
 
         entities = self._collect_entities(source_job_ids)
         if exclude_uris:
             entities = [e for e in entities if e.get("uri") not in exclude_uris]
+        if only_type is not None:
+            entities = [e for e in entities if _coarse_of(e) == only_type]
 
         if len(entities) < 2:
             return []
+
+        if only_type is None:
+            types = {_coarse_of(e) for e in entities if _coarse_of(e)}
+            overrides = getattr(self, "metric_overrides", None) or {}
+            if len(types) > 1 and any(str(t).lower() in overrides for t in types):
+                links: list[dict] = []
+                saved_review = self.threshold_review
+                for t in sorted(types):
+                    floor = (getattr(self, "metric_floors", None) or {}).get(str(t).lower())
+                    self.threshold_review = max(saved_review, floor) if floor is not None else saved_review
+                    try:
+                        links.extend(self._stage2_resolver(source_job_ids, exclude_uris, only_type=t))
+                    finally:
+                        self.threshold_review = saved_review
+                return links
+            # A single-type batch with a learned floor honours it too.
+        else:
+            floor = (getattr(self, "metric_floors", None) or {}).get(str(only_type).lower())
+            if floor is not None:
+                self.threshold_review = max(self.threshold_review, floor)
 
         # Split into source/target (different source jobs)
         mid = len(source_job_ids) // 2
@@ -1131,7 +1161,7 @@ class ThreeStageEntityMerger:
                 getattr(config, "RESOLVER_URL", "?"),
             )
             self._stage2_fell_back = True
-            return self._stage2_fallback(source_job_ids, exclude_uris)
+            return self._stage2_fallback(source_job_ids, exclude_uris, only_type=only_type)
 
         # Pick the LIMES metric. Precedence:
         #   1. explicit metric_overrides (benchmark A/B knob) — always honoured.
@@ -1203,6 +1233,10 @@ class ThreeStageEntityMerger:
         }
         export_props = ["name", "type", "label"]
         field_mode = False
+        # True when the batch runs under an explicit rule (a merge rule a person
+        # applied, or a benchmark override). Then LIMES's verdict is final: no
+        # difflib complement, and "no links" means no matches, not a failure.
+        rule_bound = False
         if present_props and len(batch_types) <= 1:
             # Attribute-aware mode applies to SINGLE-coarse-type batches: every
             # record is already in one block (the benchmark's shared coarse_type,
@@ -1252,8 +1286,10 @@ class ThreeStageEntityMerger:
             only_type = next(iter(batch_types)) if len(batch_types) == 1 else None
             if only_type is not None and only_type in overrides:
                 metric = overrides[only_type]
+                rule_bound = True
             elif "*" in overrides:
                 metric = overrides["*"]
+                rule_bound = True
 
         # The rule that decided this batch, shown with every review card.
         self._last_metric = metric
@@ -1345,12 +1381,12 @@ class ThreeStageEntityMerger:
                 # the per-field metric exists to AVOID — re-introducing it via the
                 # complement would re-open the precision hole. The per-field LIMES
                 # metric is the sole Stage-2 signal in field mode.
-                if field_mode:
+                if field_mode or rule_bound:
                     complement = []
                 elif _median_len < 40:
                     complement = self._stage2_fallback(
                         source_job_ids, exclude_uris,
-                        min_score=_STAGE2_COMPLEMENT_FLOOR,
+                        min_score=_STAGE2_COMPLEMENT_FLOOR, only_type=only_type,
                     )
                 else:
                     complement = []
@@ -1362,6 +1398,12 @@ class ThreeStageEntityMerger:
                     f"{len(merged)} total)"
                 )
                 return merged
+            elif rule_bound and resolver.last_error is None:
+                logger.info(
+                    "STAGE-2 LIMES (rule-bound): no links under %r over %dx%d entities",
+                    metric, len(src_export), len(tgt_export),
+                )
+                return []
             else:
                 logger.error(
                     "STAGE-2 FALLBACK (resolver_fallback): LIMES resolver returned ZERO "
@@ -1371,14 +1413,14 @@ class ThreeStageEntityMerger:
                     metric, len(src_export), len(tgt_export),
                 )
                 self._stage2_fell_back = True
-                return self._stage2_fallback(source_job_ids, exclude_uris)
+                return self._stage2_fallback(source_job_ids, exclude_uris, only_type=only_type)
         except Exception as exc:
             logger.error(
                 "STAGE-2 FALLBACK (resolver_fallback): LIMES resolver raised %r — "
                 "falling back to O(n^2) python string matcher.", exc,
             )
             self._stage2_fell_back = True
-            return self._stage2_fallback(source_job_ids, exclude_uris)
+            return self._stage2_fallback(source_job_ids, exclude_uris, only_type=only_type)
 
     def _stage2_field_mode(
         self,
@@ -1699,7 +1741,7 @@ class ThreeStageEntityMerger:
 
     def _stage2_fallback(
         self, source_job_ids: list[str], exclude_uris: set[str] | None = None,
-        min_score: float | None = None,
+        min_score: float | None = None, only_type: str | None = None,
     ) -> list[dict]:
         """
         Enhanced string similarity fallback when resolver is unavailable.
@@ -1722,6 +1764,10 @@ class ThreeStageEntityMerger:
         entities = self._collect_entities(source_job_ids)
         if exclude_uris:
             entities = [e for e in entities if e.get("uri") not in exclude_uris]
+        if only_type is not None:
+            # Stay inside the per-type batch that called us (a rule-bound run of
+            # another type must not be re-linked by this complement).
+            entities = [e for e in entities if _coarse_of(e) == only_type]
 
         links = []
         seen = set()

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { AlertTriangle, Check, Loader2, FileText, GitMerge } from 'lucide-react'
+import { AlertTriangle, Check, Loader2, FileText, GitMerge, SlidersHorizontal } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
@@ -122,20 +122,24 @@ export function ConflictsPanel() {
   if (isLoading) return <div className="flex justify-center py-10"><Loader2 size={18} className="animate-spin text-slate-500" /></div>
   if (conflicts.length === 0) {
     return (
-      <div className="card flex flex-col items-center gap-2 py-12 text-center">
-        <Check size={22} className="text-emerald-400" />
-        <p className="text-sm text-slate-400">No open conflicts.</p>
-        <p className="text-[11px] text-slate-600">
-          Conflicts appear when two sources disagree on a fact (e.g. two different CEOs
-          for one company), a merge produces two classifications for one element, or the
-          fusion joined two entities it was not sure about.
-        </p>
+      <div className="space-y-3">
+        <MergeRulesPanel />
+        <div className="card flex flex-col items-center gap-2 py-12 text-center">
+          <Check size={22} className="text-emerald-400" />
+          <p className="text-sm text-slate-400">No open conflicts.</p>
+          <p className="text-[11px] text-slate-600">
+            Conflicts appear when two sources disagree on a fact (e.g. two different CEOs
+            for one company), a merge produces two classifications for one element, or the
+            fusion joined two entities it was not sure about.
+          </p>
+        </div>
       </div>
     )
   }
 
   return (
     <div className="space-y-3">
+      <MergeRulesPanel />
       {conflicts.map((c) =>
         c.kind === 'fact'
           ? <FactConflictCard key={c.id} conflict={c} busy={busy === c.id} onResolve={resolveFact} />
@@ -372,6 +376,163 @@ function EntityMergeCard({ review: r, busy, onResolve }: {
         {r.context?.rule ? <>Rule: <code className="text-slate-500">{r.context.rule}</code>. </> : null}
         Splitting re-merges the knowledge base in the background; the pair never merges again.
       </p>
+    </div>
+  )
+}
+
+// ─── Merge rules ─────────────────────────────────────────────────────────────
+
+interface MergeRule {
+  id: string | null
+  compilationId: string | null
+  entityType: string
+  rule: unknown
+  ls: string
+  sentence: string | null
+  origin: 'default' | 'human' | 'learned'
+  status: 'active' | 'proposed' | 'retired'
+  evidence: { preview?: RulePreview; decisions?: number; source?: string } | null
+  sourceText: string | null
+}
+
+interface RulePreview {
+  basedOn?: number
+  wouldSplit?: number
+  wouldKeep?: number
+  examples?: { a: string; b: string; score: number }[]
+  note?: string
+}
+
+/**
+ * The rule the fusion applies per entity type, as one sentence. A person can
+ * put a change in their own words; the configured local model turns it into a
+ * rule, the panel shows the sentence and an estimate of its effect, and one
+ * click applies it (the knowledge base re-merges). Learned proposals arrive the
+ * same way. Nothing changes without that click.
+ */
+function MergeRulesPanel() {
+  const qc = useQueryClient()
+  const { data, isLoading } = useApiQuery<{ rules: MergeRule[] }>(['kg', 'merge-rules'], '/kg/merge-rules')
+  const rules = data?.rules ?? []
+  const [open, setOpen] = useState(false)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const refresh = () => qc.invalidateQueries({ queryKey: ['kg', 'merge-rules'] })
+
+  async function propose(entityType: string) {
+    if (!text.trim()) return
+    setBusy(entityType); setError(null)
+    try {
+      await api.post('/kg/merge-rules', { entityType, text: text.trim() })
+      setText(''); setEditing(null); refresh()
+    } catch (e: unknown) {
+      const msg = (e as { response?: { data?: { error?: string; message?: string } } })?.response?.data
+      setError(msg?.error ?? msg?.message ?? 'Could not create the rule.')
+    } finally { setBusy(null) }
+  }
+  async function act(id: string, action: 'apply' | 'retire') {
+    setBusy(id); setError(null)
+    try { await api.post(`/kg/merge-rules/${id}/${action}`, {}); refresh() }
+    finally { setBusy(null) }
+  }
+
+  if (isLoading || rules.length === 0) return null
+  const active = rules.filter((r) => r.status === 'active')
+  const proposed = rules.filter((r) => r.status === 'proposed')
+
+  return (
+    <div className="card space-y-3">
+      <button onClick={() => setOpen((v) => !v)} className="flex w-full items-center justify-between gap-3 text-left">
+        <p className="text-sm font-medium text-slate-200">
+          <SlidersHorizontal size={13} className="mr-1.5 inline text-slate-500" />
+          Merge rules
+          <span className="ml-2 text-[11px] text-slate-500">{active.length} in force{proposed.length ? `, ${proposed.length} proposed` : ''}</span>
+        </p>
+        <span className="text-[11px] text-slate-500">{open ? 'hide' : 'show'}</span>
+      </button>
+
+      {open && (
+        <div className="space-y-2">
+          {proposed.map((r) => (
+            <RuleRow key={r.id ?? r.entityType} rule={r} busy={busy === r.id} onApply={() => r.id && act(r.id, 'apply')} onRetire={() => r.id && act(r.id, 'retire')} />
+          ))}
+          {active.map((r) => (
+            <div key={r.id ?? `default-${r.entityType}`} className="space-y-2">
+              <RuleRow rule={r} busy={busy === r.id} onEdit={() => { setEditing(r.entityType); setText(''); setError(null) }}
+                onRetire={r.id ? () => act(r.id!, 'retire') : undefined} />
+              {editing === r.entityType && (
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+                  <textarea value={text} onChange={(e) => setText(e.target.value)} rows={2}
+                    placeholder="In your own words, e.g. “only merge people when the names are at least 70 % similar” or “Firmen nur bei identischem Namen zusammenführen”"
+                    className="w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 placeholder:text-slate-600" />
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={() => void propose(r.entityType)} disabled={busy === r.entityType || !text.trim()}
+                      className="rounded-md border border-indigo-700/40 bg-indigo-900/20 px-3 py-1.5 text-xs text-indigo-300 hover:bg-indigo-900/40">
+                      {busy === r.entityType ? <Loader2 size={12} className="mr-1 inline animate-spin" /> : null}
+                      Propose rule
+                    </button>
+                    <button onClick={() => setEditing(null)} className="rounded-md px-3 py-1.5 text-xs text-slate-500 hover:text-slate-300">Cancel</button>
+                    {error && <span className="text-[11px] text-rose-400">{error}</span>}
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-slate-600">The proposal is shown with its effect first; nothing changes until you apply it.</p>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RuleRow({ rule: r, busy, onApply, onRetire, onEdit }: {
+  rule: MergeRule
+  busy: boolean
+  onApply?: () => void
+  onRetire?: () => void
+  onEdit?: () => void
+}) {
+  const preview = r.evidence?.preview
+  const isProposal = r.status === 'proposed'
+  return (
+    <div className={cn('rounded-lg border px-3 py-2', isProposal ? 'border-indigo-700/40 bg-indigo-900/10' : 'border-slate-800 bg-slate-900/60')}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs text-slate-200">{r.sentence ?? r.ls}</p>
+          <p className="mt-0.5 text-[10px] text-slate-500">
+            <span className="uppercase tracking-wide">{r.entityType}</span>
+            <span> · {isProposal ? 'proposed' : 'in force'} · {r.origin === 'learned' ? 'learned from your answers' : r.origin === 'human' ? 'set by you' : 'built-in default'}</span>
+            {r.compilationId ? <span> · this knowledge base only</span> : null}
+          </p>
+          {isProposal && preview && (
+            <p className="mt-1 text-[10px] text-amber-400">
+              {preview.wouldSplit != null
+                ? `Would split ${preview.wouldSplit} of ${preview.basedOn ?? 0} existing merges and keep ${preview.wouldKeep ?? 0}.`
+                : preview.note}
+              {preview.examples?.length ? ` E.g. ${preview.examples.slice(0, 2).map((e) => `“${e.a}” / “${e.b}”`).join(', ')}.` : ''}
+            </p>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {isProposal && onApply && (
+            <button onClick={onApply} disabled={busy}
+              className="rounded-md border border-emerald-700/40 bg-emerald-900/20 px-2.5 py-1 text-[11px] text-emerald-300 hover:bg-emerald-900/40">
+              {busy ? <Loader2 size={11} className="mr-1 inline animate-spin" /> : null}Apply
+            </button>
+          )}
+          {!isProposal && onEdit && (
+            <button onClick={onEdit} className="rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-slate-700">Change</button>
+          )}
+          {onRetire && (
+            <button onClick={onRetire} disabled={busy} className="rounded-md px-2 py-1 text-[11px] text-slate-500 hover:text-slate-300">
+              {isProposal ? 'Discard' : 'Reset to default'}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

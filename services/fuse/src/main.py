@@ -107,9 +107,18 @@ def run_merge(
     if threshold_review is not None:
         merger.threshold_review = float(threshold_review)
     # Per-type LIMES metric overrides ({entity_type: "trigrams(x.name,y.name)|0.7"}).
-    # Explicit request overrides win over the profile's; absent → keep the profile's.
+    # Precedence: explicit request overrides (benchmark knob) > the owner's
+    # ACTIVE merge rules (migration 097, applied by a click) > the profile.
+    merger.metric_floors = {}
     if metric_overrides is not None:
         merger.metric_overrides = metric_overrides
+    else:
+        rules = _load_merge_rules(compilation_id)
+        if rules:
+            merger.metric_overrides = {**merger.metric_overrides,
+                                       **{t: r["ls"] for t, r in rules.items()}}
+            merger.metric_floors = {t: r["threshold"] for t, r in rules.items()
+                                    if r.get("threshold") is not None}
 
     # Apply ontology match rules to merger config
     if match_rules:
@@ -224,6 +233,47 @@ def _compilation_defaults(compilation_id: str) -> dict:
     if not row:
         return {}
     return {"user_id": row[0], "classification": row[1]}
+
+
+def _load_merge_rules(compilation_id: str) -> dict[str, dict]:
+    """The owner's ACTIVE merge rules by coarse entity type: the compilation's
+    own rule wins over a global one. Each value: {"ls": <LIMES spec>,
+    "threshold": <global floor of a learned spec or None>}. Best-effort."""
+    cid = _as_uuid_or_none(compilation_id)
+    if cid is None:
+        return {}
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.entity_type, r.ls, r.rule->>'threshold', r.compilation_id IS NOT NULL
+                FROM merge_rules r JOIN compilations c ON c.user_id = r.user_id
+                WHERE c.id = %s AND r.status = 'active'
+                  AND (r.compilation_id = %s OR r.compilation_id IS NULL)
+                ORDER BY r.compilation_id NULLS LAST
+                """,
+                (cid, cid),
+            )
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"[{compilation_id}] Could not load merge rules: {exc}")
+        return {}
+    out: dict[str, dict] = {}
+    for entity_type, ls, threshold, _specific in rows:
+        key = str(entity_type).lower()
+        if key in out:
+            continue  # the compilation-specific row came first
+        try:
+            floor = float(threshold) if threshold is not None else None
+        except (TypeError, ValueError):
+            floor = None
+        out[key] = {"ls": ls, "threshold": floor}
+    if out:
+        logger.info(f"[{compilation_id}] Merge rules in force: {sorted(out)}")
+    return out
 
 
 def _load_merge_decisions(compilation_id: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:

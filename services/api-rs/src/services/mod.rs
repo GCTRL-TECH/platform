@@ -5,6 +5,7 @@ pub mod cron;
 pub mod crypto;
 pub mod hebb;
 pub mod llm;
+pub mod merge_rules;
 pub mod neo4j;
 pub mod obsidian;
 pub mod privacy;
