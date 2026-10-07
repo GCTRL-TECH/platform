@@ -1416,9 +1416,10 @@ async fn delete_job_vectors(state: &Arc<crate::models::AppState>, job_id: Uuid, 
         collection
     );
     let client = reqwest::Client::new();
+    let key = state.cfg.qdrant_api_key.as_str();
     let mut deleted = 0usize;
     if !point_ids.is_empty() {
-        match client.post(&url).json(&json!({ "points": point_ids })).send().await {
+        match qdrant_request(&client, reqwest::Method::POST, &url, key).json(&json!({ "points": point_ids })).send().await {
             Ok(r) if r.status().is_success() => deleted = point_ids.len(),
             Ok(r) => tracing::warn!("job {job_id}: qdrant points/delete returned {}", r.status()),
             Err(e) => tracing::warn!("job {job_id}: qdrant points/delete failed: {e}"),
@@ -1427,7 +1428,7 @@ async fn delete_job_vectors(state: &Arc<crate::models::AppState>, job_id: Uuid, 
     let by_job = json!({ "filter": { "must": [
         { "key": "job_id", "match": { "value": job_id.to_string() } }
     ]}});
-    match client.post(&url).json(&by_job).send().await {
+    match qdrant_request(&client, reqwest::Method::POST, &url, key).json(&by_job).send().await {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => tracing::warn!("job {job_id}: qdrant delete-by-job_id returned {}", r.status()),
         Err(e) => tracing::warn!("job {job_id}: qdrant delete-by-job_id failed: {e}"),
@@ -1886,6 +1887,16 @@ const QDRANT_DEFAULT_COLLECTION: &str = "GCTRL_chunks";
 /// otherwise the one existing collection whose name matches case-insensitively (Qdrant names
 /// ARE case-sensitive — "gctrl_chunks" vs "GCTRL_chunks" are two collections, one of them
 /// empty); otherwise the default. Pure, so the decision is unit-tested.
+/// Request to Qdrant's REST API, carrying the `api-key` header when a key is
+/// configured. Every api-side Qdrant call goes through here.
+pub(crate) fn qdrant_request(client: &reqwest::Client, method: reqwest::Method, url: &str, api_key: &str) -> reqwest::RequestBuilder {
+    let rb = client.request(method, url);
+    match api_key.trim() {
+        "" => rb,
+        key => rb.header("api-key", key),
+    }
+}
+
 pub(crate) fn pick_qdrant_collection(env: Option<&str>, existing: &[String]) -> String {
     let wanted = env.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(QDRANT_DEFAULT_COLLECTION);
     if existing.iter().any(|c| c == wanted) { return wanted.to_string(); }
@@ -1907,7 +1918,7 @@ pub(crate) async fn qdrant_collection(state: &Arc<crate::models::AppState>) -> S
     if let Some(c) = QDRANT_COLLECTION_CACHE.get() { return c.clone(); }
     let env = std::env::var("QDRANT_COLLECTION").ok();
     let url = format!("{}/collections", state.cfg.qdrant_url.trim_end_matches('/'));
-    let existing: Vec<String> = match reqwest::Client::new().get(&url).send().await {
+    let existing: Vec<String> = match qdrant_request(&reqwest::Client::new(), reqwest::Method::GET, &url, &state.cfg.qdrant_api_key).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.ok()
             .and_then(|v| v["result"]["collections"].as_array().map(|a| {
                 a.iter().filter_map(|c| c["name"].as_str().map(str::to_string)).collect()
@@ -1933,8 +1944,7 @@ async fn delete_qdrant_point(state: &Arc<crate::models::AppState>, chunk_id: Uui
         state.cfg.qdrant_url.trim_end_matches('/'),
         collection
     );
-    let res = reqwest::Client::new()
-        .post(&url)
+    let res = qdrant_request(&reqwest::Client::new(), reqwest::Method::POST, &url, &state.cfg.qdrant_api_key)
         .json(&json!({ "points": [point_id] }))
         .send().await;
     match res {
@@ -2055,6 +2065,29 @@ mod qdrant_collection_tests {
         assert_eq!(pick_qdrant_collection(None, &[]), "GCTRL_chunks");
         assert_eq!(pick_qdrant_collection(Some("custom"), &ex(&["gctrl_chunks"])), "custom");
         assert_eq!(pick_qdrant_collection(Some("  "), &ex(&["gctrl_chunks"])), "gctrl_chunks");
+    }
+}
+
+#[cfg(test)]
+mod qdrant_api_key_tests {
+    use super::qdrant_request;
+
+    fn header(key: &str) -> Option<String> {
+        let req = qdrant_request(&reqwest::Client::new(), reqwest::Method::POST, "http://qdrant:6333/collections", key)
+            .build().unwrap();
+        req.headers().get("api-key").map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn key_is_sent_as_api_key_header() {
+        assert_eq!(header("sekret").as_deref(), Some("sekret"));
+    }
+
+    #[test]
+    fn empty_key_sends_no_header() {
+        // Installs without QDRANT_API_KEY must talk to Qdrant exactly as before.
+        assert_eq!(header(""), None);
+        assert_eq!(header("  "), None);
     }
 }
 

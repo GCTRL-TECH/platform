@@ -12,6 +12,10 @@ pub struct Config {
     pub kex_worker_url:     String,
     pub fuse_url:           String,
     pub qdrant_url:         String,
+    /// Optional Qdrant API key (`QDRANT_API_KEY`, matching Qdrant's
+    /// `QDRANT__SERVICE__API_KEY`), sent as the `api-key` header. Empty = no
+    /// header, i.e. unchanged behaviour for installs without a key.
+    pub qdrant_api_key:     String,
     pub upload_dir:         String,
     pub bcrypt_rounds:      u32,
     pub google_client_id:     String,
@@ -53,6 +57,7 @@ impl Config {
             kex_worker_url:     opt_env("KEX_WORKER_URL",     "http://localhost:4010"),
             fuse_url:           opt_env("FUSE_URL",           "http://localhost:4020"),
             qdrant_url:         opt_env("QDRANT_URL",         "http://localhost:6333"),
+            qdrant_api_key:     opt_env("QDRANT_API_KEY",     "").trim().to_string(),
             upload_dir:         opt_env("UPLOAD_DIR",         "/tmp/gctrl-uploads"),
             bcrypt_rounds:      env_u16("BCRYPT_ROUNDS", 12) as u32,
             google_client_id:     opt_env("GOOGLE_CLIENT_ID",     ""),
