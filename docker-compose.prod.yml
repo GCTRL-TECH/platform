@@ -193,7 +193,7 @@ services:
     container_name: gctrl-resolver
     restart: unless-stopped
     environment:
-      - JAVA_OPTS=-Xmx2G
+      - JDK_JAVA_OPTIONS=-Xmx2G
     command: ["-s"]
     networks:
       - GCTRL

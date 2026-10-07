@@ -182,7 +182,7 @@ services:
     ports:
       - "8085:8080"
     environment:
-      - JAVA_OPTS=-Xmx2G
+      - JDK_JAVA_OPTIONS=-Xmx2G
     command: ["-s"]
     networks:
       - GCTRL

@@ -4135,35 +4135,11 @@ async fn apply_merge_rule(
     if row.status != "proposed" {
         return Err(AppError::BadRequest(format!("rule is {}", row.status)));
     }
-    let mut tx = state.db.begin().await?;
-    sqlx::query(
-        "UPDATE merge_rules SET status = 'retired', decided_at = NOW(), decided_by = $1
-         WHERE user_id = $1 AND entity_type = $2 AND status = 'active'
-           AND compilation_id IS NOT DISTINCT FROM $3")
-        .bind(claims.sub).bind(&row.entity_type).bind(row.compilation_id)
-        .execute(&mut *tx).await?;
-    sqlx::query(
-        "UPDATE merge_rules SET status = 'active', decided_at = NOW(), decided_by = $1 WHERE id = $2")
-        .bind(claims.sub).bind(id).execute(&mut *tx).await?;
-    tx.commit().await?;
+    let jobs = activate_rule(&state, claims.sub, &row).await?;
+    sqlx::query("UPDATE merge_rules SET decided_by = $1 WHERE id = $2")
+        .bind(claims.sub).bind(id).execute(&state.db).await?;
     crate::services::audit::log_access(&state.db, &claims, "kg.apply_merge_rule",
         "merge_rule", &id.to_string(), 0, None, true, None).await;
-
-    // Re-merge what the rule covers: one compilation, or every compilation of
-    // the owner whose trail has this type (a global rule).
-    let comps: Vec<Uuid> = match row.compilation_id {
-        Some(c) => vec![c],
-        None => sqlx::query_scalar(
-            "SELECT DISTINCT compilation_id FROM merge_links WHERE user_id = $1 AND entity_type = $2")
-            .bind(claims.sub).bind(&row.entity_type).fetch_all(&state.db).await.unwrap_or_default(),
-    };
-    let mut jobs = Vec::new();
-    for c in comps {
-        match enqueue_fuse_refresh(&state, claims.sub, c).await {
-            Ok(j) => jobs.push(j),
-            Err(e) => tracing::warn!("merge rule {id}: re-merge of {c} not queued: {e:?}"),
-        }
-    }
     Ok(Json(json!({ "ok": true, "status": "active", "refreshJobs": jobs })))
 }
 
@@ -4187,8 +4163,11 @@ async fn retire_merge_rule(
 
 /// Learning, stage A. Once the owner has answered enough reviews of one type
 /// (with a LIMES score each), the threshold that separates "same" from "not
-/// the same" best is proposed, if it differs enough from the rule in force
-/// and no learned proposal is already waiting.
+/// the same" best becomes a rule, if it differs enough from the rule in force
+/// and no learned proposal is already waiting. It applies on its own when it
+/// passes the gate (F1 >= 0.8 on those decisions and better than the rule in
+/// force), unless a person set the rule in force or GCTRL_LEARN_AUTO_APPLY is
+/// off; otherwise it stays a proposal.
 pub(crate) async fn maybe_propose_learned_threshold(
     state: &crate::models::AppState, owner: Uuid, comp: Option<Uuid>, entity_type: &str,
 ) {
@@ -4221,15 +4200,66 @@ pub(crate) async fn maybe_propose_learned_threshold(
     }
     let proposal = current_rule.with_similarity_threshold(learned);
     let preview = rule_preview(&state.db, owner, scope, &entity_type, &proposal).await;
+    let learned_f1 = rules::f1_at(&samples, learned);
+    let current_f1 = rules::f1_at(&samples, current_t);
+    let human_in_force = current_row.as_ref().is_some_and(|r| r.origin == "human");
+    let auto = rules::auto_apply_enabled(std::env::var("GCTRL_LEARN_AUTO_APPLY").ok().as_deref())
+        && rules::passes_gate(learned_f1, current_f1)
+        && !human_in_force;
     let evidence = json!({
         "source": "review_decisions", "decisions": samples.len(),
         "same": samples.iter().filter(|(_, s)| *s).count(),
         "previousThreshold": current_t, "learnedThreshold": learned,
+        "learnedF1": learned_f1, "currentF1": current_f1,
+        "gate": if auto { "passed" } else if human_in_force { "kept as proposal: a person set the rule in force" } else { "not passed: proposed" },
         "preview": preview,
     });
-    if let Err(e) = insert_rule(&state.db, owner, scope, &entity_type, &proposal, "learned", evidence, None).await {
-        tracing::warn!("merge rules: could not store learned proposal for {entity_type}: {e:?}");
+    let row = match insert_rule(&state.db, owner, scope, &entity_type, &proposal, "learned", evidence, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("merge rules: could not store learned rule for {entity_type}: {e:?}");
+            return;
+        }
+    };
+    if auto {
+        match activate_rule(state, owner, &row).await {
+            Ok(jobs) => tracing::info!(
+                "merge rules: learned {entity_type} threshold {learned} applied for {owner} (F1 {learned_f1:.2} vs {current_f1:.2}), {} re-merge(s) queued", jobs.len()
+            ),
+            Err(e) => tracing::warn!("merge rules: learned rule {} not activated: {e:?}", row.id),
+        }
     }
+}
+
+/// Make a stored rule the active one of its scope and type (the previous one
+/// retires) and queue a re-merge of what it covers. Shared by the click and
+/// by the learner's auto-apply.
+async fn activate_rule(state: &crate::models::AppState, owner: Uuid, row: &MergeRuleRow) -> Result<Vec<Uuid>> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "UPDATE merge_rules SET status = 'retired', decided_at = NOW()
+         WHERE user_id = $1 AND entity_type = $2 AND status = 'active'
+           AND compilation_id IS NOT DISTINCT FROM $3 AND id <> $4")
+        .bind(owner).bind(&row.entity_type).bind(row.compilation_id).bind(row.id)
+        .execute(&mut *tx).await?;
+    sqlx::query("UPDATE merge_rules SET status = 'active', decided_at = NOW() WHERE id = $1")
+        .bind(row.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let comps: Vec<Uuid> = match row.compilation_id {
+        Some(c) => vec![c],
+        None => sqlx::query_scalar(
+            "SELECT DISTINCT compilation_id FROM merge_links WHERE user_id = $1 AND entity_type = $2")
+            .bind(owner).bind(&row.entity_type).fetch_all(&state.db).await.unwrap_or_default(),
+    };
+    let mut jobs = Vec::new();
+    for c in comps {
+        match enqueue_fuse_refresh(state, owner, c).await {
+            Ok(j) => jobs.push(j),
+            Err(e) => tracing::warn!("merge rule {}: re-merge of {c} not queued: {e:?}", row.id),
+        }
+    }
+    Ok(jobs)
 }
 
 /// Apply a fact resolution: delete the losing edges (source AND merged graphs),

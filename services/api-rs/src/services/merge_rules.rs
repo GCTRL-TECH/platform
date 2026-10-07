@@ -190,6 +190,36 @@ pub fn extract_json(answer: &str) -> Option<Value> {
     serde_json::from_str(&answer[start..=end]).ok()
 }
 
+/// F1 for "same" when everything at or above `t` counts as the same.
+pub fn f1_at(samples: &[(f64, bool)], t: f64) -> f64 {
+    let (mut tp, mut fp, mut fn_) = (0usize, 0usize, 0usize);
+    for (score, same) in samples {
+        match (*score >= t, *same) {
+            (true, true) => tp += 1,
+            (true, false) => fp += 1,
+            (false, true) => fn_ += 1,
+            (false, false) => {}
+        }
+    }
+    if tp == 0 { 0.0 } else { 2.0 * tp as f64 / (2 * tp + fp + fn_) as f64 }
+}
+
+/// Learned rules go live on their own when `GCTRL_LEARN_AUTO_APPLY` is not
+/// "0"/"false"/"off" (Fabio, 07.10.2026: as little human interaction as
+/// possible; a rule that passes the gate applies, the rest is proposed).
+pub fn auto_apply_enabled(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|s| s.trim().to_lowercase()).as_deref(), Some("0") | Some("false") | Some("off") | Some("no"))
+}
+
+/// The gate a learned threshold must pass to apply without a click: at least
+/// this F1 on the decisions it was learned from, and better than the rule in
+/// force on the same decisions.
+pub const AUTO_APPLY_MIN_F1: f64 = 0.8;
+
+pub fn passes_gate(learned_f1: f64, current_f1: f64) -> bool {
+    learned_f1 >= AUTO_APPLY_MIN_F1 && learned_f1 > current_f1
+}
+
 /// Learn the similarity threshold that separates the review decisions best.
 /// `samples` = (score, same?). Needs at least `min_samples` with both answers
 /// present. Candidates are the observed scores; the one with the highest F1 for
@@ -319,6 +349,20 @@ mod tests {
         assert_eq!(learn_threshold(&[(0.3, false), (0.4, false), (0.7, true), (0.9, true)], 2), Some(0.7));
         assert_eq!(learn_threshold(&samples, 11), None);
         assert_eq!(learn_threshold(&[(0.5, true), (0.6, true)], 2), None);
+    }
+
+    #[test]
+    fn gate_and_switch() {
+        let samples = [(0.5, false), (0.6, false), (0.7, true), (0.9, true)];
+        assert_eq!(f1_at(&samples, 0.7), 1.0);
+        assert!((f1_at(&samples, 0.4) - 2.0 / 3.0).abs() < 1e-9);
+        assert!(passes_gate(1.0, 0.67));
+        assert!(!passes_gate(0.79, 0.5));
+        assert!(!passes_gate(0.9, 0.9));
+        assert!(auto_apply_enabled(None));
+        assert!(auto_apply_enabled(Some("1")));
+        assert!(!auto_apply_enabled(Some("0")));
+        assert!(!auto_apply_enabled(Some(" off ")));
     }
 
     #[test]
