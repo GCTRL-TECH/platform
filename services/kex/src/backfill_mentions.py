@@ -35,6 +35,7 @@ from neo4j import GraphDatabase
 
 from . import config
 from .kg_builder import entity_uri
+from .netutil import redact_url
 from .vector_store import get_vector_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -69,9 +70,9 @@ def main(argv: list[str]) -> int:
     try:
         driver.verify_connectivity()
     except Exception as exc:
-        logger.error(f"Neo4j unavailable at {config.NEO4J_URI}: {exc}")
+        logger.error(f"Neo4j unavailable at {redact_url(config.NEO4J_URI)}: {redact_url(exc)}")
         return 2
-    logger.info(f"Neo4j connected: {config.NEO4J_URI}")
+    logger.info(f"Neo4j connected: {redact_url(config.NEO4J_URI)}")
 
     vs = get_vector_store()
     qc = vs._get_qdrant()
@@ -81,7 +82,7 @@ def main(argv: list[str]) -> int:
             "but existing Qdrant point payloads won't be patched"
         )
     else:
-        logger.info(f"Qdrant connected: {vs.qdrant_url} (collection '{vs.collection}')")
+        logger.info(f"Qdrant connected: {redact_url(vs.qdrant_url)} (collection '{vs.collection}')")
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(

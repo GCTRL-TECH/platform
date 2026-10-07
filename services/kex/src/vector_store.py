@@ -27,6 +27,7 @@ from qdrant_client.models import (
 )
 
 from . import config
+from .netutil import qdrant_client_kwargs, redact_url
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +77,10 @@ class VectorStore:
         qdrant_url: str = "http://qdrant:6333",
         collection: str = "GCTRL_chunks",
         pg_url: Optional[str] = None,
+        qdrant_api_key: str = "",
     ):
         self.qdrant_url = qdrant_url
+        self.qdrant_api_key = qdrant_api_key
         self.collection = collection
         self.pg_url = pg_url or config.PG_URL
         self._qdrant: Optional[QdrantClient] = None
@@ -99,13 +102,14 @@ class VectorStore:
             return self._qdrant
         if self._qdrant is None:
             try:
-                client = QdrantClient(url=self.qdrant_url, timeout=10)
+                client = QdrantClient(url=self.qdrant_url, timeout=10,
+                                      **qdrant_client_kwargs(self.qdrant_api_key))
                 # Verify connectivity with a lightweight collections list call
                 client.get_collections()
                 self._qdrant = client
-                logger.info(f"VectorStore: Qdrant connected at {self.qdrant_url}")
+                logger.info(f"VectorStore: Qdrant connected at {redact_url(self.qdrant_url)}")
             except Exception as exc:
-                logger.warning(f"VectorStore: Qdrant unavailable at {self.qdrant_url}: {exc}")
+                logger.warning(f"VectorStore: Qdrant unavailable at {redact_url(self.qdrant_url)}: {redact_url(exc)}")
                 self._qdrant = None
                 return None
         # Client is up — make sure the collection exists before any upsert.
@@ -529,6 +533,7 @@ def get_vector_store() -> VectorStore:
             qdrant_url=config.QDRANT_URL,
             collection=config.QDRANT_COLLECTION,
             pg_url=config.PG_URL,
+            qdrant_api_key=config.QDRANT_API_KEY,
         )
     return _store
 

@@ -11,6 +11,7 @@ from typing import Optional
 from neo4j import GraphDatabase, Driver
 
 from . import config
+from .netutil import redact_url
 from .classification import make_label, encode_label
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ class KGBuilder:
             )
             # Verify connectivity immediately
             self._driver.verify_connectivity()
-            logger.info(f"Connected to Neo4j at {config.NEO4J_URI}")
+            logger.info(f"Connected to Neo4j at {redact_url(config.NEO4J_URI)}")
 
     def close(self) -> None:
         """Close the driver and release connections."""

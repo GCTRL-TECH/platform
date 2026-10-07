@@ -120,6 +120,9 @@ PORT: int = int(os.environ.get("PORT", "4010"))
 # Qdrant vector store
 QDRANT_URL: str = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 QDRANT_COLLECTION: str = os.environ.get("QDRANT_COLLECTION", "GCTRL_chunks")
+# Optional Qdrant API key (QDRANT__SERVICE__API_KEY on the Qdrant side). Empty =
+# no key sent, exactly as before.
+QDRANT_API_KEY: str = os.environ.get("QDRANT_API_KEY", "").strip()
 
 # Embedding provider: "ollama" | "nim" | "openai"
 EMBEDDING_PROVIDER: str = os.environ.get("EMBEDDING_PROVIDER", "ollama")

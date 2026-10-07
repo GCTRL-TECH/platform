@@ -32,6 +32,7 @@ from qdrant_client.models import (
 
 from . import config
 from . import telemetry
+from .netutil import qdrant_client_kwargs, redact_url, redis_client
 from .chunking import get_chunker
 from .classification import resolve_classification
 from .code_parser import parse_python_repo
@@ -76,15 +77,11 @@ def get_redis() -> Optional[redis_lib.Redis]:
     global _redis_client
     if _redis_client is None:
         try:
-            _redis_client = redis_lib.from_url(
-                config.REDIS_URL,
-                decode_responses=True,
-                socket_connect_timeout=5,
-            )
+            _redis_client = redis_client(config.REDIS_URL)
             _redis_client.ping()
-            logger.info(f"Redis connected: {config.REDIS_URL}")
+            logger.info(f"Redis connected: {redact_url(config.REDIS_URL)}")
         except Exception as exc:
-            logger.warning(f"Redis not available: {exc}")
+            logger.warning(f"Redis not available: {redact_url(exc)}")
             _redis_client = None
     return _redis_client
 
@@ -98,8 +95,8 @@ def get_qdrant_client() -> Optional[QdrantClient]:
     global _qdrant_client
     if _qdrant_client is None:
         try:
-            _qdrant_client = QdrantClient(url=config.QDRANT_URL)
-            logger.info(f"Qdrant client initialized: {config.QDRANT_URL}")
+            _qdrant_client = QdrantClient(url=config.QDRANT_URL, **qdrant_client_kwargs(config.QDRANT_API_KEY))
+            logger.info(f"Qdrant client initialized: {redact_url(config.QDRANT_URL)}")
         except Exception as exc:
             logger.warning(f"Qdrant not available: {exc}")
             _qdrant_client = None
@@ -983,6 +980,7 @@ def _reindex_loop(stop_event: threading.Event) -> None:
                     pg_url=config.PG_URL,
                     qdrant_url=config.QDRANT_URL,
                     collection=config.QDRANT_COLLECTION,
+                    qdrant_api_key=config.QDRANT_API_KEY,
                 )
                 if count > 0:
                     logger.info(f"KEX reindex: processed {count} KB(s) this pass")
@@ -1454,7 +1452,7 @@ async def health_endpoint():
             kg.connect()
         neo4j_ok = True
     except Exception as exc:
-        neo4j_error = str(exc)
+        neo4j_error = redact_url(exc)
 
     # Redis connectivity
     redis_ok = False
@@ -1467,7 +1465,7 @@ async def health_endpoint():
         else:
             redis_error = "not connected"
     except Exception as exc:
-        redis_error = str(exc)
+        redis_error = redact_url(exc)
 
     # Ollama reachability (quick probe, no model load)
     ollama_ok = False
@@ -1489,11 +1487,11 @@ async def health_endpoint():
     qdrant_error: Optional[str] = None
     try:
         from qdrant_client import QdrantClient as _QC
-        _qc = _QC(url=config.QDRANT_URL, timeout=3)
+        _qc = _QC(url=config.QDRANT_URL, timeout=3, **qdrant_client_kwargs(config.QDRANT_API_KEY))
         _qc.get_collections()
         qdrant_ok = True
     except Exception as exc:
-        qdrant_error = str(exc)
+        qdrant_error = redact_url(exc)
 
     # Embedding model availability (check if model is listed in Ollama)
     embed_model_available = config.EMBEDDING_MODEL in " ".join(ollama_tags)
@@ -1512,12 +1510,12 @@ async def health_endpoint():
         "relex_model": config.RELEX_MODEL,
         "neo4j": {
             "ok": neo4j_ok,
-            "uri": config.NEO4J_URI,
+            "uri": redact_url(config.NEO4J_URI),
             **({"error": neo4j_error} if neo4j_error else {}),
         },
         "redis": {
             "ok": redis_ok,
-            "url": config.REDIS_URL,
+            "url": redact_url(config.REDIS_URL),
             **({"error": redis_error} if redis_error else {}),
         },
         "ollama": {
@@ -1529,7 +1527,7 @@ async def health_endpoint():
         },
         "qdrant": {
             "ok": qdrant_ok,
-            "url": config.QDRANT_URL,
+            "url": redact_url(config.QDRANT_URL),
             "collection": config.QDRANT_COLLECTION,
             **({"error": qdrant_error} if qdrant_error else {}),
         },

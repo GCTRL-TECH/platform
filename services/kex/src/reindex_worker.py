@@ -19,6 +19,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, PointVectors, VectorParams
 
 from .embedding import EmbeddingClient
+from .netutil import qdrant_client_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ def _reindex_compilation(
     pg_url,
     qdrant_url,
     collection,
+    qdrant_api_key="",
 ):
     """Re-embed all chunks for one compilation and upsert into Qdrant."""
     logger.info(
@@ -148,7 +150,7 @@ def _reindex_compilation(
     #    (re)created, all payloads are gone and must be rebuilt from Postgres;
     #    when the dimension is unchanged we only swap vectors and leave the
     #    existing payloads untouched.
-    client = QdrantClient(url=qdrant_url, timeout=30)
+    client = QdrantClient(url=qdrant_url, timeout=30, **qdrant_client_kwargs(qdrant_api_key))
     payloads_missing = _ensure_collection(client, collection, dim)
 
     if payloads_missing:
@@ -214,7 +216,7 @@ def _reindex_compilation(
         )
 
 
-def drain_reindex_queue(redis_client, pg_url, qdrant_url, collection):
+def drain_reindex_queue(redis_client, pg_url, qdrant_url, collection, qdrant_api_key=""):
     """Drain the kex:reindex Redis list, processing each job.
 
     Uses LPOP (non-blocking) to drain all current items without blocking.
@@ -246,6 +248,7 @@ def drain_reindex_queue(redis_client, pg_url, qdrant_url, collection):
                 pg_url=pg_url,
                 qdrant_url=qdrant_url,
                 collection=collection,
+                qdrant_api_key=qdrant_api_key,
             )
             processed += 1
 
