@@ -792,10 +792,11 @@ async fn query(
 
     #[derive(Debug)]
     struct GraphTriple {
-        from:     String,
-        relation: String,
-        to:       String,
-        ts:       i64, // when this edge was last asserted (epoch ms) — recency axis
+        from:      String,
+        relation:  String,
+        to:        String,
+        ts:        i64, // when this edge was last asserted (epoch ms) — recency axis
+        authority: String, // `_authority` from the conflict scan: current | superseded | ''
     }
 
     // Bug 2: Scope Neo4j queries to the authenticated user's nodes (plus shared nodes
@@ -815,8 +816,9 @@ async fn query(
              AND coalesce(n._min_rank,0) <= $rank \
              OPTIONAL MATCH (n)-[r]->(m) \
                WHERE coalesce(m._min_rank,0) <= $rank AND coalesce(r._min_rank,0) <= $rank \
-             WITH n, r, m, coalesce(r.asserted_at, r.created_at, 0) AS ts \
-             RETURN n, r, m, ts ORDER BY ts DESC LIMIT 100"
+             WITH n, r, m, coalesce(r.asserted_at, r.created_at, 0) AS ts, \
+                  coalesce(r._authority, '') AS auth \
+             RETURN n, r, m, ts, auth ORDER BY ts DESC LIMIT 100"
         );
         let mut triples: Vec<GraphTriple> = vec![];
 
@@ -849,6 +851,7 @@ async fn query(
                         .and_then(|n| n.get::<String>("name").ok());
 
                     let ts = row.get::<i64>("ts").unwrap_or(0);
+                    let authority = row.get::<String>("auth").unwrap_or_default();
                     if let (Some(rel), Some(to)) = (rel_type, to_name) {
                         if !from_name.is_empty() && !to.is_empty() {
                             triples.push(GraphTriple {
@@ -856,6 +859,7 @@ async fn query(
                                 relation: rel,
                                 to,
                                 ts,
+                                authority,
                             });
                         }
                     }
@@ -1215,37 +1219,26 @@ async fn query(
 
     if !graph_triples.is_empty() {
         use std::collections::HashSet;
-        // Detect CHANGED attributes: a (subject, predicate) that points to more than
-        // one distinct object across edges is a fact that evolved over time. Edges are
-        // ordered newest-first (Cypher ORDER BY ts DESC), so the first object we see for
-        // such a key is the current value; later distinct objects are historical. We
-        // KEEP the history (audit/lineage — compliance value) but label which is current.
-        let mut distinct_to: std::collections::HashMap<(String, String), HashSet<String>> =
-            std::collections::HashMap::new();
-        for t in &graph_triples {
-            distinct_to.entry((t.from.clone(), t.relation.clone()))
-                .or_default().insert(t.to.clone());
-        }
+        // A (subject, predicate) with more than one object is a fact that CHANGED.
+        // We KEEP the history (audit/lineage — compliance value) but label which value
+        // is current: the conflict scan's verdict (`_authority`, ranked by the source
+        // document's own date) where it exists, else the newest assertion.
         context_parts.push(
             "\n--- TRUST TIER 2 · graph relationships (structured facts; a (subject, predicate) \
              shown with multiple values is a fact that CHANGED over time — the one marked (current) \
-             is the latest value, (superseded) are historical; for 'what is the current/latest X' \
-             answer with (current)) ---".to_string());
-        let mut emitted_current: HashSet<(String, String)> = HashSet::new();
+             is the value of the most recent source, (superseded) are historical; for 'what is the \
+             current/latest X' answer with (current)) ---".to_string());
         let mut seen_triple: HashSet<(String, String, String)> = HashSet::new();
+        let mut facts: Vec<(String, String, String, String)> = Vec::new();
         for t in &graph_triples {
             // Drop exact-duplicate re-assertions of the same edge.
             if !seen_triple.insert((t.from.clone(), t.relation.clone(), t.to.clone())) {
                 continue;
             }
-            let key = (t.from.clone(), t.relation.clone());
-            let changed = distinct_to.get(&key).map(|s| s.len() > 1).unwrap_or(false);
-            let tag = if changed {
-                if emitted_current.insert(key) { "  (current)" } else { "  (superseded — earlier value)" }
-            } else {
-                ""
-            };
-            context_parts.push(format!("{} -[{}]-> {}{}", t.from, t.relation, t.to, tag));
+            facts.push((t.from.clone(), t.relation.clone(), t.to.clone(), t.authority.clone()));
+        }
+        for (fact, tag) in facts.iter().zip(fact_tags(&facts)) {
+            context_parts.push(format!("{} -[{}]-> {}{}", fact.0, fact.1, fact.2, tag));
         }
     }
 
@@ -2051,4 +2044,77 @@ async fn list_models(State(_state): State<Arc<crate::models::AppState>>) -> Json
         Err(_) => vec![],
     };
     Json(json!({ "ollama": models, "cloud": [] }))
+}
+
+/// Which value of a fact with several values is current, as a tag per fact.
+///
+/// `facts` are `(subject, predicate, object, authority)` in newest-first order
+/// with exact duplicates already removed. The conflict scan stamps
+/// `_authority` on competing edges after ranking them by the SOURCE DOCUMENT's
+/// own date (not the upload time); where it has spoken, its `current` wins and
+/// every other value of that fact is superseded. Where it has not (relations
+/// outside the registry, data from before the scan), the newest assertion
+/// counts as current — the behaviour this replaced.
+pub(crate) fn fact_tags(facts: &[(String, String, String, String)]) -> Vec<&'static str> {
+    use std::collections::{HashMap, HashSet};
+    const CURRENT: &str = "  (current)";
+    const SUPERSEDED: &str = "  (superseded — earlier value)";
+    let mut values: HashMap<(&str, &str), HashSet<&str>> = HashMap::new();
+    let mut ruled: HashSet<(&str, &str)> = HashSet::new();
+    for (s, p, o, a) in facts {
+        values.entry((s, p)).or_default().insert(o);
+        if a == "current" {
+            ruled.insert((s, p));
+        }
+    }
+    let mut emitted: HashSet<(&str, &str)> = HashSet::new();
+    facts
+        .iter()
+        .map(|(s, p, _, a)| {
+            let key = (s.as_str(), p.as_str());
+            if values.get(&key).map(|v| v.len() < 2).unwrap_or(true) {
+                return "";
+            }
+            let is_current = if ruled.contains(&key) { a == "current" } else { true };
+            if is_current && emitted.insert(key) { CURRENT } else { SUPERSEDED }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod fact_tag_tests {
+    use super::fact_tags;
+
+    fn f(s: &str, p: &str, o: &str, a: &str) -> (String, String, String, String) {
+        (s.into(), p.into(), o.into(), a.into())
+    }
+
+    #[test]
+    fn the_source_dates_verdict_beats_upload_order() {
+        // An OLD file re-uploaded yesterday asserts "A"; the newer document said
+        // "B" months ago. Upload order puts A first; the scan ranked B current.
+        let facts = vec![
+            f("Nordlicht", "CEO_OF", "A", "superseded"),
+            f("Nordlicht", "CEO_OF", "B", "current"),
+        ];
+        assert_eq!(fact_tags(&facts), vec!["  (superseded — earlier value)", "  (current)"]);
+    }
+
+    #[test]
+    fn without_a_verdict_the_newest_assertion_is_current() {
+        let facts = vec![
+            f("Maren", "WORKS_AT", "Nordlicht", ""),
+            f("Maren", "WORKS_AT", "Acme", ""),
+        ];
+        assert_eq!(fact_tags(&facts), vec!["  (current)", "  (superseded — earlier value)"]);
+    }
+
+    #[test]
+    fn single_valued_facts_carry_no_tag_whatever_their_authority() {
+        let facts = vec![
+            f("Maren", "BORN_IN", "Kiel", "current"),
+            f("Maren", "SPEAKS", "German", ""),
+        ];
+        assert_eq!(fact_tags(&facts), vec!["", ""]);
+    }
 }

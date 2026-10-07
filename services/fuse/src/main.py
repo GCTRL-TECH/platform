@@ -23,6 +23,8 @@ from pydantic import BaseModel
 
 from . import config
 from . import communities
+from . import learn
+from . import sources
 from . import distiller
 from . import dossier
 from . import user_profile
@@ -128,6 +130,11 @@ def run_merge(
                 merger.threshold_accept = max(merger.threshold_accept, float(threshold))
                 merger.threshold_review = min(merger.threshold_review, float(threshold) - 0.15)
 
+    # Only the newest version of every file takes part: a job whose source
+    # document was superseded by a re-upload stays in the compilation (history,
+    # retrieval) but no longer feeds the merged graph.
+    source_job_ids, superseded_sources = sources.latest_source_jobs(config.PG_URL, source_job_ids)
+
     # Human merge decisions from the review queue (same / not the same) bind
     # every merge of this compilation, whatever the matchers say.
     must_link, cannot_link = _load_merge_decisions(compilation_id)
@@ -140,6 +147,7 @@ def run_merge(
         field_mode_config=field_mode_config,
         must_link=must_link, cannot_link=cannot_link,
     )
+    stats["superseded_sources"] = superseded_sources
 
     # Persist classification conflicts (don't ship the bulky list in the result).
     conflicts = stats.pop("_conflicts", [])
@@ -484,6 +492,9 @@ def _worker_loop() -> None:
             )
             report_usage("fuse_merge", 0, check_result["credits_spent"])
             _publish_result(r, job_id, compilation_id, result)
+            # The merge is delivered; now let the confirmed pairs teach the
+            # matcher (writes merge_rules, never fails the job).
+            learn.maybe_learn(user_id, compilation_id)
 
         except Exception as exc:
             logger.error(
