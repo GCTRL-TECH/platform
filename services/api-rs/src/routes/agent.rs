@@ -1611,13 +1611,20 @@ async fn execute_tool_inner(
 
         // ── Read: KEX extraction jobs ─────────────────────────────────────────
         "list_extractions" => {
+            // Same rule as GET /kex/jobs: a KB-scoped token lists only the jobs it
+            // triggered itself; the owner's other extractions stay invisible.
+            let scoped_key = if crate::routes::kg::api_key_scope(&state.db, claims).await.is_some() {
+                claims.api_key_id
+            } else { None };
             let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Value, Option<Value>, chrono::DateTime<chrono::Utc>, Option<String>)>(
                 "SELECT j.id, j.type, j.status, j.input, j.result, j.created_at, ak.name \
                  FROM jobs j LEFT JOIN api_keys ak ON ak.id = j.api_key_id \
-                 WHERE j.user_id = $1 AND j.type LIKE 'kex_%' ORDER BY j.created_at DESC LIMIT 50"
-            ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+                 WHERE j.user_id = $1 AND j.type LIKE 'kex_%' \
+                 AND ($2::uuid IS NULL OR j.api_key_id = $2) \
+                 ORDER BY j.created_at DESC LIMIT 50"
+            ).bind(claims.sub).bind(scoped_key).fetch_all(&state.db).await.unwrap_or_default();
             let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.0).collect();
-            let mut comps = crate::routes::kex::compilations_of_jobs(&state.db, &ids).await;
+            let mut comps = crate::routes::kex::compilations_of_jobs(&state.db, claims, &ids).await;
             json!({ "extractions": rows.iter().map(|(id, ty, st, input, res, ts, token_name)| {
                 // `completed_degraded` + reason when a phase was skipped, so an agent
                 // never reports "extraction done" over a graph that has no edges.

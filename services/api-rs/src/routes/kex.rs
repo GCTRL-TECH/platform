@@ -1040,7 +1040,7 @@ async fn list_jobs(
     .fetch_one(&state.db).await?;
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
-    let mut comps = compilations_of_jobs(&state.db, &ids).await;
+    let mut comps = compilations_of_jobs(&state.db, &claims, &ids).await;
     let jobs: Vec<Value> = rows.into_iter().map(|r| {
         let c = comps.remove(&r.0).unwrap_or_default();
         job_json(r, c)
@@ -1157,17 +1157,28 @@ pub(crate) fn job_file_name(input: &Value) -> Option<String> {
 /// jobs — one query for a whole page.
 pub(crate) async fn compilations_of_jobs(
     db: &sqlx::PgPool,
+    claims: &JwtClaims,
     job_ids: &[Uuid],
 ) -> std::collections::HashMap<Uuid, Vec<Value>> {
+    // Only knowledge bases the CALLER may see: an admin session sees every owner's,
+    // everyone else only the account's own, and a KB-scoped token only its granted
+    // ones. Without this a scoped token learned the names of every knowledge base
+    // its owner had filed one of its jobs into.
     let mut out: std::collections::HashMap<Uuid, Vec<Value>> = Default::default();
     if job_ids.is_empty() { return out; }
+    let owner: Option<Uuid> = if is_admin_session(claims) { None } else { Some(claims.sub) };
+    let scope = crate::routes::kg::api_key_scope(db, claims).await;
     let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
         "SELECT x.job_id, c.id, c.name
            FROM compilations c, unnest(c.source_job_ids) AS x(job_id)
           WHERE x.job_id = ANY($1)
+            AND ($2::uuid IS NULL OR c.user_id = $2)
           ORDER BY c.name"
-    ).bind(job_ids).fetch_all(db).await.unwrap_or_default();
+    ).bind(job_ids).bind(owner).fetch_all(db).await.unwrap_or_default();
     for (job, cid, name) in rows {
+        if let Some(set) = &scope {
+            if !set.contains(&cid) { continue; }
+        }
         out.entry(job).or_default().push(json!({ "id": cid, "name": name }));
     }
     out
@@ -1210,7 +1221,7 @@ async fn get_job(
     .fetch_optional(&state.db).await?;
     let row = row.ok_or(AppError::NotFound)?;
 
-    let comps = compilations_of_jobs(&state.db, &[id]).await.remove(&id).unwrap_or_default();
+    let comps = compilations_of_jobs(&state.db, &claims, &[id]).await.remove(&id).unwrap_or_default();
     let mut job = job_json(row, comps);
 
     let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM text_chunks WHERE job_id = $1")
