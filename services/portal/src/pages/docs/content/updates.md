@@ -11,6 +11,16 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 244fb54 -->
 
+## v0.9.20 - Secrets stay out of logs, and GCTRL recovers on its own after a Redis restart
+
+*7 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Passwords no longer appear in logs or status pages.** The extraction and fusion workers printed their Redis address, including the password, into the container log at start, and their health endpoints returned the database addresses in full. Every service now masks credentials in addresses before it writes or returns them (`redis://default:***@...`). The setup status also reads a password-protected Redis address correctly now; before, it showed such a Redis as disconnected.
+- **GCTRL reconnects after a Redis restart.** The API opened one Redis connection at start and never replaced it. After Redis restarted, new jobs waited until someone restarted the API, and the listener for finished jobs stopped silently, so jobs could stay pending. The API now reconnects and retries a failed command, and the listener subscribes again with a growing wait. The workers check idle connections and retry on connection errors.
+- **Qdrant can require an API key.** Set `QDRANT_API_KEY` in your `.env` and every GCTRL service sends it to Qdrant, and the bundled Qdrant starts with that key. Leave it empty and nothing changes: no key is sent and Qdrant stays open as before, so an update never locks your own services out.
+- **Scoped tokens see only their own extractions and their granted knowledge bases.** A token limited to some knowledge bases could list every extraction of its owner, with file names, and the job details named knowledge bases outside its grants. It now sees only the jobs it started and only the knowledge bases it is granted.
+- **An empty result from the entity resolver no longer triggers a looser merge.** When LIMES ran fine but found no matching pair, the merge treated that as a failure and fell back to a looser name comparison, which could merge two different companies with similar names. A successful empty result now counts as an answer; the fallback runs only when the resolver really fails.
+
 ## v0.9.19 - Cloaking covers every known name, and long knowledge base lists load at once
 
 *7 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
