@@ -9,7 +9,14 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 6f3f8c6 -->
+<!-- baseline-sha: c6fe5e9 -->
+
+## v0.9.18 - The cloak gateway covers the ChatGPT subscription (Codex) and OpenAI's Responses API
+
+*7 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Codex on your ChatGPT subscription is pseudonymized, too.** The Codex CLI talks to ChatGPT in OpenAI's Responses API format, and that traffic left the machine in plain text. The gateway now serves `POST /v1/responses` for two upstreams: `chatgpt` (your ChatGPT subscription, the way Codex uses it) and `openai` (the public Responses API). Point Codex at the gateway, keep its ChatGPT login in `Authorization: Bearer`, send your GCTRL token in `X-GCTRL-Token` and `X-Upstream-Provider: chatgpt` or `openai`. The gateway pseudonymizes names and organizations in the instructions and in every message, and translates text, tool arguments and patch input in the streamed answer back before Codex sees them. Tool results, reasoning items and tool definitions travel unchanged on purpose. `GET /v1/models` with the same headers returns the model catalog of your account.
+- **Clients can see the new upstream.** `GET /v1/cloak/capabilities` now lists `chatgpt` next to `ollama`, `anthropic` and `openai`. The ChatGPT host is pinned to `chatgpt.com`, redirects are never followed, and Codex session headers reach only `chatgpt.com`.
 
 ## v0.9.17 - The cloak gateway now covers Anthropic and OpenAI directly
 
