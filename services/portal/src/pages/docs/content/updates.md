@@ -19,6 +19,18 @@ keep improving - so here it is, release by release.
 -->
 <!-- baseline-sha: 0548d16 -->
 
+## v0.9.21 - Your projects learn from their own work, and syncs read only what changed
+
+*7 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Your projects remember what worked.** A knowledge base can now hold lessons: conventions ("how we do X here"), recipes (steps that worked), pitfalls (what broke and the fix) and decisions with their reason. Agents store them with the new `store_lesson` tool, read them with `list_lessons`, and report with `lesson_applied` when a lesson helped. Lessons are stored without entity extraction, so they cost almost nothing and never reach the entity graph unconfirmed.
+- **Only lessons that prove useful stay in front.** A lesson starts cold. Every time an agent reports it applied it, it warms up strongly; when a search finds it, a little. Unused lessons cool down and are archived after a month, and come back when they are found again. Listing lessons does not count as use, so a playbook can never keep itself warm. Each lesson counts how often it was applied.
+- **The wiki gets a playbook page.** Wiki distillation now writes a page "Playbook" with the source projects' lessons, proven ones per type and most used first, new ones below as candidates. The page is rendered without a language model, so it shows exactly what the team proved, and a change in what is used refreshes the wiki on schedule.
+- **What several projects learned becomes team knowledge.** When the same lesson is proven in three projects, GCTRL promotes one copy into the knowledge base "Team-Lehren" in the folder Global/Lessons. It starts warm, names the lessons it came from, and is found by every project. Chunk deduplication no longer merges lessons, because the same lesson in several projects is exactly this signal.
+- **An unchanged file is not extracted again.** Every ingest path (upload, text extraction, the agent tools, Google Drive, SharePoint, Obsidian) now checks whether the same content was already extracted with the same classification, ontology and access token. If so, the existing extraction is linked to the target knowledge base and nothing is queued or charged; the response says `"status": "unchanged"`. A changed file still becomes a new version and is extracted. Send `force=true` to extract unchanged content again, for example after switching models. A failed extraction is never reused, so sending a file again still repairs it.
+- **Drive and SharePoint syncs read only what changed.** A file whose modified time equals the one recorded for its latest version is not even downloaded, and sync results report `unchanged` next to `synced`. Scheduled syncs of a Drive folder or a SharePoint library can now be created as triggers (`google_drive`, `microsoft`); the scheduler ran them already, but the API refused them. A SharePoint sync or trigger can name a target knowledge base.
+- **SharePoint files are extracted at all.** The SharePoint path queued a job type the extraction worker did not know, so every SharePoint file failed. The API now fetches the file through Microsoft Graph itself, like Google Drive, which also keeps the tenant's client secret out of the job queue. Large Drive folders (over 1000 entries) and multi-page SharePoint libraries are now listed completely, and a note synced by hand and the same note re-ingested on a schedule are one document instead of two.
+
 ## v0.9.20 - Secrets stay out of logs, and GCTRL recovers on its own after a Redis restart
 
 *7 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
