@@ -9,6 +9,14 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
+<!-- DRAFT (fix/cloak-tool-consistency)
+## vX - Agents see one consistent set of placeholders, and they look like placeholders
+
+- **Tool results are pseudonymized on `/v1/chat/completions`, too.** Agents such as pi talk to the gateway in the chat-completions format. There the gateway cloaked the conversation but sent tool results and the tool calls the agent sent back in clear. A model then saw `Place-3` in the conversation and "Berlin Hbf" in the browser result, could not connect the two, and typed an invented city into a real form. Tool results and replayed tool calls now go through the same cloak as the conversation, so the model sees one mapping everywhere. Tool definitions stay unchanged. To send tool results in clear, add `X-Cloak-Tool-Outputs: 0`, as on `/v1/responses`.
+- **Placeholders are bracketed.** Every pseudonym now travels as `[Place-3]`, `[Person-7]` or `[Term-12]`, and a cloaked request carries a short system note: bracketed terms are placeholders for real names, pass them to tools unchanged and never replace them with invented values. The stored mapping is unchanged; answers with the old form `Place-3` are still translated back.
+- **No more garbled names in answers.** The translation back replaced `Term-2` inside `Term-27` and produced text like "Ursache7". A placeholder is now restored only when it is complete, also when the stream splits it across chunks.
+- **Tool arguments stay valid JSON.** When a real name contains a quote or a backslash, the restored tool arguments now escape it. Several tool calls in one stream chunk without an index no longer share one buffer.
+-->
 <!-- baseline-sha: 0548d16 -->
 
 ## v0.9.20 - Secrets stay out of logs, and GCTRL recovers on its own after a Redis restart

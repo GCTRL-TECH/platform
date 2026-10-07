@@ -35,7 +35,7 @@ On your FIRST connection to a GCTRL instance, configure how you'll use it, then 
 2. **If not**, run a short interview with the user — one message, all questions at once, with your recommended defaults pre-filled so they can just say "yes":
    - **Which knowledge base should I use?** Call `list_graphs` and propose their default graph (usually "My First Knowledge Base"); note its `privacyMode`.
    - **Cloud or local model?** Tell them which model YOU are (e.g. "I'm running on Claude/GPT — a cloud model" or "…a local model"). This drives the next answer.
-   - **Privacy for cloud models (recommended: Cloaked when you're a cloud model).** Explain plainly: *Cloaked* = GCTRL pseudonymizes every entity and PII in what it sends you (you see "Person-7", never real names/amounts) and un-cloaks the answer locally; *Local-only* = that graph is never sent to a cloud model at all; *Open* = sent as-is. If you're a cloud model, recommend **Cloaked**. Never call it "encrypted".
+   - **Privacy for cloud models (recommended: Cloaked when you're a cloud model).** Explain plainly: *Cloaked* = GCTRL pseudonymizes every entity and PII in what it sends you (you see placeholders like "[Person-7]", never real names/amounts) and un-cloaks the answer locally; *Local-only* = that graph is never sent to a cloud model at all; *Open* = sent as-is. If you're a cloud model, recommend **Cloaked**. Never call it "encrypted".
    - **How eagerly should I remember?** Options: "everything substantive" (default) vs "only when you say 'remember this'".
    - **Auto-ingest dropped files?** If they drop a PDF/doc, should you `ingest_file` it into the KB automatically (default: yes)?
 3. **Apply the answers**:

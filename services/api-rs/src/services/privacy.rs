@@ -945,85 +945,204 @@ pub fn apply_pseudonyms_recording(
     out
 }
 
-/// De-cloak: replace every pseudonym in `text` with its canonical original.
-/// Pure, exact (non-overlapping) string replacement — pseudonyms are unique,
-/// generated tokens so a naive `.replace()` per pseudonym is safe and simple.
-pub fn decloak(session: &CloakSession, text: &str) -> String {
+/// The wire form of a stored pseudonym: always bracketed (`Place-7` -> `[Place-7]`,
+/// `[DATE-4]` stays). `cloak_maps` keeps the stored value; only what goes out to a
+/// model is bracketed, so a placeholder can never be mistaken for a real value.
+pub fn wire_pseudonym(stored: &str) -> String {
+    if stored.starts_with('[') && stored.ends_with(']') {
+        stored.to_string()
+    } else {
+        format!("[{stored}]")
+    }
+}
+
+/// `[Place-7]` -> `Place-7`; a bare form is returned as it is.
+fn pseudonym_core(p: &str) -> &str {
+    p.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(p)
+}
+
+/// `Family-123`: ASCII letters, one hyphen, decimal digits.
+fn is_regular_core(core: &str) -> bool {
+    match core.split_once('-') {
+        Some((f, n)) => {
+            !f.is_empty()
+                && !n.is_empty()
+                && f.bytes().all(|b| b.is_ascii_alphabetic())
+                && n.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+static PSEUDONYM_CORE_RE: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"[A-Za-z]+-[0-9]+").unwrap());
+
+/// Lookup tables for one de-cloak call. Regular cores (`Family-123`) are found by a
+/// boundary-aware scan; irregular keys (the UUID fallback of `next_pseudonym`) by
+/// plain replacement of their bracketed and bare form, longest first.
+struct DecloakIndex<'a> {
+    regular: HashMap<&'a str, &'a str>,
+    /// Longest family name among the regular cores (`Person` = 6).
+    max_family: usize,
+    irregular: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> DecloakIndex<'a> {
+    fn new(session: &'a CloakSession) -> Self {
+        let mut regular = HashMap::new();
+        let mut max_family = 0;
+        let mut irregular = Vec::new();
+        for (key, orig) in &session.map {
+            let core = pseudonym_core(key);
+            if is_regular_core(core) {
+                max_family = max_family.max(core.find('-').unwrap_or(0));
+                regular.insert(core, orig.as_str());
+            } else {
+                irregular.push((key.as_str(), orig.as_str()));
+                if core != key.as_str() {
+                    irregular.push((core, orig.as_str()));
+                }
+            }
+        }
+        irregular.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+        Self { regular, max_family, irregular }
+    }
+}
+
+/// De-cloak `text`; `next` is the char that follows `text` in the full stream (the
+/// streaming path emits a prefix whose follower is still held back).
+///
+/// Boundary rule: a pseudonym is replaced only when it is complete, i.e. the next
+/// char is not an ASCII digit (`Term-2` never matches inside `Term-27`); a bare
+/// form additionally needs a non-alphanumeric follower. Both `[Place-7]` and
+/// `Place-7` are accepted, so history with bare pseudonyms still de-cloaks. One
+/// left-to-right pass: a restored original is never scanned again.
+fn decloak_with_next(session: &CloakSession, text: &str, next: Option<char>) -> String {
     if session.map.is_empty() {
         return text.to_string();
     }
-    let mut keys: Vec<&String> = session.map.keys().collect();
-    // Longest-first: robust even if a future numbering scheme ever produces
-    // one pseudonym as a substring of another (not true today, but cheap to
-    // guarantee).
-    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
-    let mut out = text.to_string();
-    for pseudonym in keys {
-        // `replace` allocates a fresh String even on a total miss, and the
-        // streaming path calls this for every emitted chunk — skip the misses.
-        if !out.contains(pseudonym.as_str()) {
-            continue;
+    let idx = DecloakIndex::new(session);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    if !idx.regular.is_empty() {
+        let bytes = text.as_bytes();
+        for m in PSEUDONYM_CORE_RE.find_iter(text) {
+            let s = m.as_str();
+            let dash = s.find('-').unwrap_or(0);
+            // Longest family suffix of the letter run that is a known core
+            // (`asgard_Term-3` and `xTerm-3` both find `Term-3`).
+            let Some((cs, orig)) = (0..dash).find_map(|off| idx.regular.get(&s[off..]).map(|o| (m.start() + off, *o)))
+            else {
+                continue;
+            };
+            let ce = m.end();
+            let after = if ce < text.len() { text[ce..].chars().next() } else { next };
+            let (start, end) = if cs > 0 && bytes[cs - 1] == b'[' && ce < text.len() && bytes[ce] == b']' {
+                (cs - 1, ce + 1)
+            } else if after.is_some_and(|c| c.is_alphanumeric()) {
+                continue;
+            } else {
+                (cs, ce)
+            };
+            if start < last {
+                continue;
+            }
+            out.push_str(&text[last..start]);
+            out.push_str(orig);
+            last = end;
         }
-        out = out.replace(pseudonym.as_str(), &session.map[pseudonym]);
+    }
+    out.push_str(&text[last..]);
+    for (key, orig) in &idx.irregular {
+        if out.contains(key) {
+            out = out.replace(key, orig);
+        }
     }
     out
 }
 
-/// Streaming-safe decloak for SSE: pseudonyms are opaque tokens that can be
-/// split across two provider chunk boundaries (e.g. `"Person-` then `"7"`).
-/// `buffer` holds text received so far that hasn't been proven safe to emit
-/// yet; call this on every new `chunk`, emit the returned text immediately,
-/// and call [`decloak_stream_finish`] at end-of-stream to flush what's held.
+/// De-cloak: replace every pseudonym in `text` (bracketed or bare) with the
+/// original it stood for. See [`decloak_with_next`] for the boundary rule.
+pub fn decloak(session: &CloakSession, text: &str) -> String {
+    decloak_with_next(session, text, None)
+}
+
+/// Byte offset where the undecidable tail of `buf` starts: a trailing
+/// `[?Letters-Digits`-shaped run (letters capped at `max_family`) could still grow
+/// into, or be closed as, a pseudonym by the next chunk.
+fn regular_hold_start(buf: &str, max_family: usize) -> usize {
+    let b = buf.as_bytes();
+    let len = b.len();
+    if max_family == 0 || len == 0 {
+        return len;
+    }
+    let mut d = len;
+    while d > 0 && b[d - 1].is_ascii_digit() {
+        d -= 1;
+    }
+    let k = if d > 0 && b[d - 1] == b'-' {
+        d - 1
+    } else if d < len {
+        // digits not preceded by '-' cannot end a pseudonym
+        return len;
+    } else {
+        len
+    };
+    let mut l = k;
+    while l > 0 && b[l - 1].is_ascii_alphabetic() && k - l < max_family {
+        l -= 1;
+    }
+    if l > 0 && b[l - 1] == b'[' {
+        l -= 1;
+    }
+    l
+}
+
+/// Streaming-safe decloak for SSE: pseudonyms can be split across provider chunk
+/// boundaries (`"[Person-"` then `"7]"`). `buffer` holds text received so far that
+/// is not yet decidable; call this on every new `chunk`, emit the returned text
+/// immediately, and call [`decloak_stream_finish`] at end-of-stream.
 ///
-/// Strategy: always hold back the last `(max_pseudonym_len - 1)` characters —
-/// long enough that ANY pseudonym starting in that tail could still complete
-/// on the next push — and only decloak/emit the prefix in front of that tail.
+/// Held back: a trailing `[?Letters-Digits` run (until a non-digit arrives, so
+/// `Term-2` is never restored when `Term-27` was coming) and, for irregular keys
+/// only, any prefix of such a key that crosses the cut. The emitted prefix is
+/// de-cloaked knowing the first held char, so it decides exactly like
+/// [`decloak`] on the whole text.
 pub fn decloak_stream_chunk(session: &CloakSession, buffer: &mut String, chunk: &str) -> String {
     buffer.push_str(chunk);
     if session.map.is_empty() {
         return std::mem::take(buffer);
     }
-    let chars: Vec<char> = buffer.chars().collect();
-    let total = chars.len();
-    let max_len = session.map.keys().map(|k| k.chars().count()).max().unwrap_or(0);
-    let hold = max_len.saturating_sub(1);
-    if total <= hold {
-        return String::new();
-    }
-    // Candidate cut: emit everything except the last `hold` chars. That alone
-    // only protects a pseudonym STARTING in the tail — one that starts in the
-    // emitted prefix and crosses the cut gets split ("Term-2|74") and the raw
-    // prefix half leaks to the client (observed live: "Term-274 wird von …").
-    // So: slide the cut LEFT onto the start of any pseudonym(-prefix) that
-    // crosses it; that occurrence is then emitted complete on a later push
-    // (or by decloak_stream_finish).
-    let mut cut = total - hold;
-    let keys: Vec<Vec<char>> = session.map.keys().map(|k| k.chars().collect()).collect();
-    let scan_from = cut.saturating_sub(hold);
-    'scan: for j in scan_from..cut {
-        let avail = total - j;
-        for k in &keys {
-            if k.len() <= cut - j {
-                continue; // liegt vollständig vor dem Cut — decloak(ready) ersetzt es
-            }
-            let take = avail.min(k.len());
-            if take > 0 && chars[j..j + take] == k[..take] {
-                cut = j;
-                break 'scan;
+    let idx = DecloakIndex::new(session);
+    let mut cut = regular_hold_start(buffer, idx.max_family);
+    if !idx.irregular.is_empty() {
+        let b = buffer.as_bytes();
+        let max_len = idx.irregular.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        let mut c = buffer.len().saturating_sub(max_len.saturating_sub(1)).min(cut);
+        while c > 0 && !buffer.is_char_boundary(c) {
+            c -= 1;
+        }
+        // Slide left onto the start of an irregular key (prefix) crossing the cut.
+        'scan: for j in c.saturating_sub(max_len)..c {
+            for (key, _) in &idx.irregular {
+                let kb = key.as_bytes();
+                if kb.len() <= c - j {
+                    continue;
+                }
+                let take = (b.len() - j).min(kb.len());
+                if b[j..j + take] == kb[..take] {
+                    c = j;
+                    break 'scan;
+                }
             }
         }
+        cut = c;
     }
     if cut == 0 {
         return String::new();
     }
-    let split_byte = buffer
-        .char_indices()
-        .nth(cut)
-        .map(|(b, _)| b)
-        .unwrap_or(buffer.len());
-    let ready = buffer[..split_byte].to_string();
-    *buffer = buffer[split_byte..].to_string();
-    decloak(session, &ready)
+    let rest = buffer.split_off(cut);
+    let ready = std::mem::replace(buffer, rest);
+    decloak_with_next(session, &ready, buffer.chars().next())
 }
 
 /// Flush whatever remains in `buffer` at end-of-stream (decloaked).
@@ -1183,6 +1302,9 @@ pub async fn cloak_batch(
             let (prefix, bracketed) = bucket_template(kind.as_deref());
             next_pseudonym(db, primary, key, prefix, bracketed).await
         };
+        // On the wire every pseudonym is bracketed (`[Place-7]`); the stored value
+        // in `cloak_maps` stays as it is.
+        let pseudonym = wire_pseudonym(&pseudonym);
         // Provisional: the canonical spelling, replaced below by the surface form the request
         // actually used (a key narrowed to this request always matches at least once).
         session.map.insert(pseudonym.clone(), canonical.clone());
@@ -1654,6 +1776,97 @@ mod tests {
         }
         out.push_str(&decloak_stream_finish(&session, &mut buffer));
         assert_eq!(out, want, "leak in single-char streaming");
+    }
+
+    // ── boundary-safe decloak, bracketed wire form (E2E 2026-10-07) ──────
+
+    fn boundary_session() -> CloakSession {
+        let mut map = HashMap::new();
+        map.insert("[Term-2]".to_string(), "Ursache".to_string());
+        map.insert("[Term-27]".to_string(), "REST API".to_string());
+        map.insert("[Place-3]".to_string(), "Berlin Hbf".to_string());
+        // a bare stored form (older session merged in) must work too
+        map.insert("Person-7".to_string(), "Tom Arenstam".to_string());
+        CloakSession { map }
+    }
+
+    #[test]
+    fn wire_pseudonym_is_always_bracketed() {
+        assert_eq!(wire_pseudonym("Place-7"), "[Place-7]");
+        assert_eq!(wire_pseudonym("[DATE-4]"), "[DATE-4]");
+        assert_eq!(wire_pseudonym("Term-3f2a"), "[Term-3f2a]");
+    }
+
+    #[test]
+    fn decloak_never_replaces_a_prefix_of_a_longer_index() {
+        let s = boundary_session();
+        assert_eq!(decloak(&s, "[Term-27] und [Term-2]"), "REST API und Ursache");
+        assert_eq!(decloak(&s, "Term-27 und Term-2."), "REST API und Ursache.");
+        // unknown longer index: left alone, never "Ursache7" / "Ursache40"
+        assert_eq!(decloak(&s, "Term-2740 und [Term-200]"), "Term-2740 und [Term-200]");
+        // bare form glued to a letter or digit is not a pseudonym
+        assert_eq!(decloak(&s, "Term-2x Term-2_y"), "Term-2x Ursache_y");
+        // bracketed and bare forms both restore, brackets are consumed
+        assert_eq!(decloak(&s, "Fahrt nach [Place-3] / Place-3, [Person-7]"), "Fahrt nach Berlin Hbf / Berlin Hbf, Tom Arenstam");
+        // a pseudonym glued into a path still restores (model echoes paths)
+        assert_eq!(decloak(&s, "/Users/x/asgard_Term-27/a"), "/Users/x/asgard_REST API/a");
+        // a restored original is never scanned again
+        let mut m = HashMap::new();
+        m.insert("[Term-1]".to_string(), "see Term-2".to_string());
+        m.insert("[Term-2]".to_string(), "WRONG".to_string());
+        assert_eq!(decloak(&CloakSession { map: m }, "[Term-1]"), "see Term-2");
+    }
+
+    #[test]
+    fn decloak_irregular_uuid_fallback_keys_still_restore() {
+        let mut m = HashMap::new();
+        m.insert("[Term-3f2a9c]".to_string(), "Geheim".to_string());
+        m.insert("[Term-2]".to_string(), "Ursache".to_string());
+        let s = CloakSession { map: m };
+        assert_eq!(decloak(&s, "a [Term-3f2a9c] b Term-3f2a9c c [Term-2]"), "a Geheim b Geheim c Ursache");
+        let text = "x [Term-3f2a9c] y [Term-2]z";
+        let want = decloak(&s, text);
+        for split in 0..=text.len() {
+            let mut buf = String::new();
+            let mut out = decloak_stream_chunk(&s, &mut buf, &text[..split]);
+            out += &decloak_stream_chunk(&s, &mut buf, &text[split..]);
+            out += &decloak_stream_finish(&s, &mut buf);
+            assert_eq!(out, want, "split {split}");
+        }
+    }
+
+    #[test]
+    fn decloak_stream_matches_whole_text_at_every_byte_split() {
+        let s = boundary_session();
+        let text = "Grüße [Term-27], [Term-2] und Term-27; Term-2740 [Term-200] nach [Place-3]. Person-7x Person-7 ü[Term-2]";
+        let want = decloak(&s, text);
+        assert_eq!(
+            want,
+            "Grüße REST API, Ursache und REST API; Term-2740 [Term-200] nach Berlin Hbf. Person-7x Tom Arenstam üUrsache"
+        );
+        for split in 0..=text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            for split2 in split..=text.len() {
+                if !text.is_char_boundary(split2) {
+                    continue;
+                }
+                let mut buf = String::new();
+                let mut out = decloak_stream_chunk(&s, &mut buf, &text[..split]);
+                out += &decloak_stream_chunk(&s, &mut buf, &text[split..split2]);
+                out += &decloak_stream_chunk(&s, &mut buf, &text[split2..]);
+                out += &decloak_stream_finish(&s, &mut buf);
+                assert_eq!(out, want, "splits {split}/{split2}");
+            }
+        }
+        let mut buf = String::new();
+        let mut out = String::new();
+        for c in text.chars() {
+            out += &decloak_stream_chunk(&s, &mut buf, &c.to_string());
+        }
+        out += &decloak_stream_finish(&s, &mut buf);
+        assert_eq!(out, want, "single-char streaming");
     }
 
     #[test]

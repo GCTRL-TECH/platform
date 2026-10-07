@@ -271,7 +271,7 @@ fn collect_tool_item(
 
 /// Does this JSON text contain an object with a repeated key? (serde keeps only the
 /// last one, so an earlier duplicate would be invisible to the leaf walk.)
-fn has_duplicate_keys(raw: &str) -> bool {
+pub(super) fn has_duplicate_keys(raw: &str) -> bool {
     use serde::de::{Deserialize, Deserializer, Error, MapAccess, SeqAccess, Visitor};
     struct NoDup;
     struct V;
@@ -355,7 +355,7 @@ pub(super) fn normalize_duplicate_argument_keys(body: &mut Value) {
 /// [`normalize_duplicate_argument_keys`]; on the re-serialize path an integer beyond
 /// i64/u64 or a float with more digits than f64 holds comes back rounded (the model no
 /// longer acts on a replayed call).
-fn write_cloaked_arguments(raw: &str, cloaked: &[String], session: &privacy::CloakSession) -> String {
+pub(super) fn write_cloaked_arguments(raw: &str, cloaked: &[String], session: &privacy::CloakSession) -> String {
     let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
         return cloaked.first().cloned().unwrap_or_else(|| raw.to_string());
     };
