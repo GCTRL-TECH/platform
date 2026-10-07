@@ -10,6 +10,13 @@ keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: e5051ed -->
+<!-- DRAFT (feat/fusion-truth, 7 October 2026) — turn into the next `## vX` section at release:
+- **A re-uploaded file no longer merges twice.** GCTRL already kept a version chain per file (same path, changed content = new version). Fusing a knowledge base still read every version, so an updated CV or org chart contributed its old facts next to its new ones. A merge now takes only the newest version of each file; the older extractions stay in the knowledge base for history and retrieval but no longer shape the merged graph. The job result lists what was left out (`superseded_sources`).
+- **Answers follow the source document's date, not the upload order.** When two documents disagree on a fact the conflict scan ranks them by the document's own modified date. The chat context used the upload order instead, so re-uploading an old file made its value "current". Graph facts in answers now carry the scan's verdict; without one, the newest assertion still wins as before. The registry of single-valued relations gains `works_at`: the extraction vocabulary defines it as the CURRENT employer, so a second value is an update or an error — exactly what the conflict page is for.
+- **The merge learns its matching rule from the merges you confirmed.** Every merge recorded which pairs a person confirmed, or two independent matchers agreed on. Once an owner has enough confirmed pairs of one entity type, the LIMES resolver (WOMBAT) learns a link rule from them after the next merge. A learned rule goes live only if, run exactly as the merge would run it, it reproduces the confirmed pairs better than the default rule (F1), never links a pair marked "not the same", and fits the resolver. Otherwise it is kept as a proposal on the conflicts tab. `GCTRL_LEARN_AUTO_APPLY=false` makes every rule a proposal; `GCTRL_LEARN_ENABLED=false` turns learning off.
+- **An ontology's match rules reach the merge.** The merge form has offered an ontology since the beginning and the worker has read its rules just as long, but the API never passed them on. It does now; the compilation also records which ontology it was merged with.
+-->
+
 
 ## v0.9.16.1 - The cloak gateway also covers agent turns
 
