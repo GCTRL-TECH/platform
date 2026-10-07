@@ -17,7 +17,7 @@ keep improving - so here it is, release by release.
 - **No more garbled names in answers.** The translation back replaced `Term-2` inside `Term-27` and produced text like "Ursache7". A placeholder is now restored only when it is complete, also when the stream splits it across chunks.
 - **Tool arguments stay valid JSON.** When a real name contains a quote or a backslash, the restored tool arguments now escape it. Several tool calls in one stream chunk without an index no longer share one buffer.
 -->
-<!-- baseline-sha: 0548d16 -->
+<!-- baseline-sha: 8845c46 -->
 
 ## v0.9.21 - Your projects learn from their own work, and syncs read only what changed
 
