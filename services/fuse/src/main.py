@@ -29,6 +29,7 @@ from . import distiller
 from . import dossier
 from . import user_profile
 from .merger import get_merger
+from .netutil import redact_url, redis_client
 from .middleware.license_check import check_credits, report_usage
 
 logging.basicConfig(
@@ -44,15 +45,11 @@ def get_redis() -> Optional[redis_lib.Redis]:
     global _redis_client
     if _redis_client is None:
         try:
-            _redis_client = redis_lib.from_url(
-                config.REDIS_URL,
-                decode_responses=True,
-                socket_connect_timeout=5,
-            )
+            _redis_client = redis_client(config.REDIS_URL)
             _redis_client.ping()
-            logger.info(f"Redis connected: {config.REDIS_URL}")
+            logger.info(f"Redis connected: {redact_url(config.REDIS_URL)}")
         except Exception as exc:
-            logger.warning(f"Redis not available: {exc}")
+            logger.warning(f"Redis not available: {redact_url(exc)}")
             _redis_client = None
     return _redis_client
 
@@ -945,8 +942,8 @@ async def health_endpoint():
 
     return {
         "status": "ok" if (neo4j_ok and redis_ok) else "degraded",
-        "neo4j": {"ok": neo4j_ok, "uri": config.NEO4J_URI},
-        "redis": {"ok": redis_ok, "url": config.REDIS_URL},
+        "neo4j": {"ok": neo4j_ok, "uri": redact_url(config.NEO4J_URI)},
+        "redis": {"ok": redis_ok, "url": redact_url(config.REDIS_URL)},
         "worker": {"running": _worker_running},
         "threshold": config.SIMILARITY_THRESHOLD,
     }

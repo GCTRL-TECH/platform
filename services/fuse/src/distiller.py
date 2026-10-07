@@ -52,6 +52,7 @@ from . import telemetry
 from . import config
 from . import llm_client
 from .scope import job_scope
+from .netutil import qdrant_headers
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ DISTILL_MODEL = os.environ.get("GCTRL_DISTILL_MODEL", "llama3.2")
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://ollama:11434")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "GCTRL_chunks")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")  # empty = no api-key header
 
 _LLM_TIMEOUT = 120
 
@@ -316,6 +318,7 @@ def _fetch_grounding_chunks(
         resp = requests.post(
             f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/scroll",
             json=body,
+            headers=qdrant_headers(QDRANT_API_KEY),
             timeout=15,
         )
         resp.raise_for_status()

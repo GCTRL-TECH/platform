@@ -22,6 +22,7 @@ from typing import Optional
 from neo4j import GraphDatabase, Driver
 
 from . import config
+from .netutil import redact_url
 from .scope import job_scope
 from .limes_client import get_limes_client
 from . import config_builder
@@ -859,7 +860,7 @@ class ThreeStageEntityMerger:
             auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
         )
         self._driver.verify_connectivity()
-        logger.info(f"Connected to Neo4j at {config.NEO4J_URI}")
+        logger.info(f"Connected to Neo4j at {redact_url(config.NEO4J_URI)}")
 
     @property
     def driver(self) -> Driver:

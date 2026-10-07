@@ -33,6 +33,8 @@ from typing import Optional
 
 import requests
 
+from .netutil import qdrant_headers
+
 logger = logging.getLogger(__name__)
 
 # ── Tunables (module constants, env-overridable for A/B) ─────────────────────
@@ -51,6 +53,7 @@ OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://ollama:11434")
 EMBED_MODEL = os.environ.get("GCTRL_CANONICAL_EMBED_MODEL", "nomic-embed-text")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "GCTRL_chunks")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")  # empty = no api-key header
 
 _EMBED_TIMEOUT = 30
 _QDRANT_TIMEOUT = 10
@@ -179,6 +182,7 @@ def enrich_with_qdrant(
         resp = requests.post(
             f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/scroll",
             json=body,
+            headers=qdrant_headers(QDRANT_API_KEY),
             timeout=_QDRANT_TIMEOUT,
         )
         resp.raise_for_status()
