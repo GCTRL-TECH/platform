@@ -1544,28 +1544,36 @@ async fn has_merged_nodes(neo: &neo4rs::Graph, compilation_id: Uuid) -> bool {
     }
 }
 
-/// Queue a FUSE re-run for a compilation over its CURRENT source jobs — what the
-/// agent's `refresh_compilation` does. `None` when the compilation is not the
-/// user's. Returns the fuse job id.
+/// Queue a FUSE re-run for a compilation over its CURRENT source jobs (the
+/// refresh path). Used by `POST /kg/compilations/:id/refresh`, by the agent's
+/// `refresh_compilation`, by the unlink path, by a "not the same" merge-review
+/// answer and by the decision memory when it replays such an answer.
+/// `NotFound` when the compilation is not the user's. Returns the fuse job id.
 pub(crate) async fn enqueue_fuse_refresh(
-    state: &Arc<crate::models::AppState>,
+    state: &crate::models::AppState,
     user_id: Uuid,
     api_key_id: Option<Uuid>,
     compilation_id: Uuid,
-) -> Option<Uuid> {
-    let source_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT COALESCE(source_job_ids,'{}'::uuid[]) FROM compilations WHERE id=$1 AND user_id=$2"
-    ).bind(compilation_id).bind(user_id).fetch_optional(&state.db).await.ok().flatten()?;
+) -> Result<Uuid> {
+    let (source_ids, classification, name): (Vec<Uuid>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT COALESCE(source_job_ids,'{}'::uuid[]), classification::text, name FROM compilations WHERE id=$1 AND user_id=$2",
+    )
+        .bind(compilation_id).bind(user_id).fetch_optional(&state.db).await?
+        .ok_or(AppError::NotFound)?;
     let job_id = Uuid::new_v4();
-    let _ = sqlx::query("INSERT INTO jobs (id,user_id,type,status,input,api_key_id) VALUES ($1,$2,'fuse_merge','pending',$3,$4)")
+    sqlx::query("INSERT INTO jobs (id,user_id,type,status,input,api_key_id) VALUES ($1,$2,'fuse_merge','pending',$3,$4)")
         .bind(job_id).bind(user_id)
-        .bind(json!({ "compilationId": compilation_id, "sourceJobIds": source_ids }))
+        .bind(json!({ "compilationId": compilation_id, "sourceJobIds": source_ids, "name": name }))
         .bind(api_key_id)
-        .execute(&state.db).await;
-    let _ = lpush(&state.redis, "fuse:jobs", &json!({
-        "job_id": job_id, "compilation_id": compilation_id, "source_job_ids": source_ids
-    }).to_string()).await;
-    Some(job_id)
+        .execute(&state.db).await?;
+    // The worker needs the same payload a fresh merge gets (routes::fuse):
+    // user, classification and name — a refresh used to send none of them.
+    lpush(&state.redis, "fuse:jobs", &json!({
+        "job_id": job_id, "compilation_id": compilation_id, "source_job_ids": source_ids,
+        "user_id": user_id, "classification": classification, "name": name,
+    }).to_string())
+        .await.map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(job_id)
 }
 
 /// Take a job out of ONE knowledge base. Shared by `POST /kex/jobs/:id/unlink`,
@@ -1607,7 +1615,7 @@ pub(crate) async fn unlink_job_from_compilation(
     }
 
     let refresh_queued = has_merged_nodes(&state.neo, compilation_id).await
-        && enqueue_fuse_refresh(state, job.user_id, claims.api_key_id, compilation_id).await.is_some();
+        && enqueue_fuse_refresh(state, job.user_id, claims.api_key_id, compilation_id).await.is_ok();
 
     let eff = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
     crate::services::audit::log_access(&state.db, claims, "job.unlink",

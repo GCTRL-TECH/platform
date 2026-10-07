@@ -380,7 +380,7 @@ async fn auto_resolve_entity_merges(state: &AppState, user_id: Uuid, min_support
         }
     }
     for cid in split_comps {
-        if let Err(e) = crate::routes::kg::enqueue_fuse_refresh(state, user_id, cid).await {
+        if let Err(e) = crate::routes::kex::enqueue_fuse_refresh(state, user_id, None, cid).await {
             tracing::warn!("conflict memory: re-merge of {cid} after auto split not queued: {e:?}");
         }
     }

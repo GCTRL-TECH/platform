@@ -1544,35 +1544,8 @@ async fn refresh(
     enforce_kb_write_scope(&state.db, &claims, id).await?;
     enforce_code_capability(&state.db, &claims, id).await?;
     sqlx::query("UPDATE users SET tokens_balance=tokens_balance-3 WHERE id=$1").bind(claims.sub).execute(&state.db).await?;
-    let job_id = enqueue_fuse_refresh(&state, claims.sub, id).await?;
+    let job_id = crate::routes::kex::enqueue_fuse_refresh(&state, claims.sub, claims.api_key_id, id).await?;
     Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
-}
-
-/// Queue a full re-merge of a compilation over its current source jobs (the
-/// refresh path). Used by the refresh endpoint, by a "not the same" merge-review
-/// answer and by the decision memory when it replays such an answer.
-pub(crate) async fn enqueue_fuse_refresh(
-    state: &crate::models::AppState,
-    user_id: Uuid,
-    compilation_id: Uuid,
-) -> Result<Uuid> {
-    let (source_ids, classification, name): (Vec<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT COALESCE(source_job_ids, '{}'::uuid[]), classification::text, name FROM compilations WHERE id=$1",
-    )
-        .bind(compilation_id).fetch_optional(&state.db).await?
-        .ok_or(AppError::NotFound)?;
-    let job_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO jobs (id,user_id,type,status,input) VALUES ($1,$2,'fuse_merge','pending',$3)")
-        .bind(job_id).bind(user_id).bind(json!({ "compilationId": compilation_id, "sourceJobIds": source_ids, "name": name }))
-        .execute(&state.db).await?;
-    // The worker needs the same payload a fresh merge gets (routes::fuse):
-    // user, classification and name — a refresh used to send none of them.
-    crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({
-        "job_id": job_id, "compilation_id": compilation_id, "source_job_ids": source_ids,
-        "user_id": user_id, "classification": classification, "name": name,
-    }).to_string())
-        .await.map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(job_id)
 }
 
 // ── WIKI distillation ──────────────────────────────────────────────────────────
@@ -3917,7 +3890,7 @@ async fn resolve_merge_review(
     // A split only takes effect through a re-merge; queue it for the owner so
     // the person clicks once and the graph follows.
     let refresh_job = match (decision, comp_id) {
-        (Some("not_same"), Some(cid)) => Some(enqueue_fuse_refresh(&state, owner, cid).await?),
+        (Some("not_same"), Some(cid)) => Some(crate::routes::kex::enqueue_fuse_refresh(&state, owner, claims.api_key_id, cid).await?),
         _ => None,
     };
 
@@ -4290,7 +4263,7 @@ async fn activate_rule(state: &crate::models::AppState, owner: Uuid, row: &Merge
     };
     let mut jobs = Vec::new();
     for c in comps {
-        match enqueue_fuse_refresh(state, owner, c).await {
+        match crate::routes::kex::enqueue_fuse_refresh(state, owner, None, c).await {
             Ok(j) => jobs.push(j),
             Err(e) => tracing::warn!("merge rule {}: re-merge of {c} not queued: {e:?}", row.id),
         }

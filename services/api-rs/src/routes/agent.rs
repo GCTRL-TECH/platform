@@ -1801,8 +1801,9 @@ async fn execute_tool_inner(
             }
             // Owner check + source jobs + enqueue, shared with the unlink path.
             match crate::routes::kex::enqueue_fuse_refresh(state, claims.sub, claims.api_key_id, cid).await {
-                Some(job_id) => json!({ "jobId": job_id, "status": "pending" }),
-                None => json!({ "error": "compilation not found or not yours" }),
+                Ok(job_id) => json!({ "jobId": job_id, "status": "pending" }),
+                Err(AppError::NotFound) => json!({ "error": "compilation not found or not yours" }),
+                Err(e) => json!({ "error": e.to_string() }),
             }
         }
 
