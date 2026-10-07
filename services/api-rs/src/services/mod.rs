@@ -9,6 +9,7 @@ pub mod merge_rules;
 pub mod neo4j;
 pub mod obsidian;
 pub mod privacy;
+pub mod redact;
 pub mod redis;
 pub mod source_docs;
 pub mod telemetry;

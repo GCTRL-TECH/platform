@@ -877,7 +877,7 @@ async fn list_overrides(
                 // Where the service currently points: the bundled onboard default,
                 // or an external override the operator saved.
                 "source":      if has_override { "override" } else { "default" },
-                "defaultUrl":  default_service_url(&state.cfg, svc),
+                "defaultUrl":  crate::services::redact::redact_url(&default_service_url(&state.cfg, svc)),
                 "note":        apply_note(svc),
             })
         })

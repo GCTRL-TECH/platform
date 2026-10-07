@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
 use crate::middleware::auth::JwtClaims;
+use crate::services::redact::redact_url;
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
     Router::new()
@@ -334,6 +335,19 @@ fn docker_socket_request(
 
 // ─── Status ───────────────────────────────────────────────────────────────────
 
+/// Host and port of a Redis URL for the TCP probe. Handles credentials
+/// (`redis://default:<pw>@host:6379`), which the old prefix-strip parsed as host
+/// "default" and so showed a password-protected Redis as disconnected.
+fn redis_host_port(redis_url: &str) -> (String, u16) {
+    match url::Url::parse(redis_url) {
+        Ok(u) => (
+            u.host_str().unwrap_or("localhost").to_string(),
+            u.port().unwrap_or(6379),
+        ),
+        Err(_) => ("localhost".to_string(), 6379),
+    }
+}
+
 async fn probe_tcp(host: &str, port: u16) -> Option<u128> {
     let start = std::time::Instant::now();
     timeout(Duration::from_millis(2000), TcpStream::connect((host, port)))
@@ -424,12 +438,8 @@ async fn status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value
             }
         },
         async {
-            // Parse redis://host:port
-            let addr = redis_url.trim_start_matches("redis://");
-            let parts: Vec<&str> = addr.splitn(2, ':').collect();
-            let host = parts.first().copied().unwrap_or("localhost");
-            let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(6379);
-            match probe_tcp(host, port).await {
+            let (host, port) = redis_host_port(&redis_url);
+            match probe_tcp(&host, port).await {
                 Some(ms) => json!({ "connected": true,  "latencyMs": ms as i64 }),
                 None     => json!({ "connected": false, "latencyMs": null }),
             }
@@ -439,11 +449,27 @@ async fn status(State(state): State<Arc<crate::models::AppState>>) -> Json<Value
     let src = |svc: &str| if has_override(svc) { "override" } else { "default" };
     Json(json!({
         "services": {
-            "neo4j":    { "url": neo4j_uri, "connected": neo4j_res["connected"],  "latencyMs": neo4j_res["latencyMs"],  "source": src("neo4j"),   "swappable": true },
-            "qdrant":   { "url": qdrant,    "connected": qdrant_res["connected"], "latencyMs": qdrant_res["latencyMs"], "source": src("qdrant"),  "swappable": true },
-            "ollama":   { "url": ollama,    "connected": ollama_res["connected"], "latencyMs": ollama_res["latencyMs"], "source": src("ollama"),  "swappable": true },
+            "neo4j":    { "url": redact_url(&neo4j_uri), "connected": neo4j_res["connected"],  "latencyMs": neo4j_res["latencyMs"],  "source": src("neo4j"),   "swappable": true },
+            "qdrant":   { "url": redact_url(&qdrant), "connected": qdrant_res["connected"], "latencyMs": qdrant_res["latencyMs"], "source": src("qdrant"),  "swappable": true },
+            "ollama":   { "url": redact_url(&ollama), "connected": ollama_res["connected"], "latencyMs": ollama_res["latencyMs"], "source": src("ollama"),  "swappable": true },
             "postgres": { "url": "postgres (bundled)", "connected": pg_res["connected"], "latencyMs": pg_res["latencyMs"], "source": src("postgres"), "swappable": true },
             "redis":    { "url": "redis (bundled)",    "connected": redis_res["connected"], "latencyMs": redis_res["latencyMs"], "source": "default", "swappable": false },
         }
     }))
+}
+
+#[cfg(test)]
+mod redis_probe_tests {
+    use super::redis_host_port;
+
+    #[test]
+    fn parses_url_with_password() {
+        assert_eq!(redis_host_port("redis://default:pw@gctrl-redis:6379"), ("gctrl-redis".into(), 6379));
+    }
+
+    #[test]
+    fn parses_plain_url_and_default_port() {
+        assert_eq!(redis_host_port("redis://redis:6380"), ("redis".into(), 6380));
+        assert_eq!(redis_host_port("redis://redis"), ("redis".into(), 6379));
+    }
 }

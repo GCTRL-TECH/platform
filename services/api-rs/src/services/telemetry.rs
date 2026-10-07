@@ -51,7 +51,7 @@ pub fn init() {
                 .with(tracing_subscriber::fmt::layer())
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
-            tracing::info!("Phoenix tracing enabled → {url}");
+            tracing::info!("Phoenix tracing enabled → {}", crate::services::redact::redact_url(&url));
         }
         Err(e) => {
             tracing_subscriber::registry()
