@@ -553,7 +553,7 @@ fn is_case_sensitive_key(key: &str) -> bool {
 
 /// PURE: the key [`apply_pseudonyms`] matches a candidate by: its exact spelling for a short
 /// acronym-like token (see [`is_case_sensitive_key`]), otherwise the folded [`lower_key`].
-fn match_key(name: &str) -> String {
+pub(crate) fn match_key(name: &str) -> String {
     let t = name.trim();
     if is_case_sensitive_key(t) {
         t.to_string()
@@ -722,6 +722,14 @@ fn is_identifier_glue(c: char) -> bool {
 
 /// Like [`apply_pseudonyms`], additionally recording, per pseudonym, the exact text it
 /// replaced (first occurrence wins) — what [`decloak`] must put back.
+///
+/// Path policy: the identifier guard applies to EVERY key, multi-word names included:
+/// a match glued into a path, slug, host or env var (`crm/Max Müller.md`,
+/// `notes/Nexovar GmbH/2026.txt`) stays in clear. Cloaking it would break tools on the
+/// way back: one recorded surface per pseudonym turns a case variant of the path into
+/// a different file, and an unquoted shell command splits the restored name at its
+/// space. The cost is a residual channel: a vendor can link a pseudonym to a name it
+/// sees in a path, so sensitive data should live under neutral file names.
 pub fn apply_pseudonyms_recording(
     text: &str,
     key_to_pseudonym: &HashMap<String, String>,
@@ -741,6 +749,7 @@ pub fn apply_pseudonyms_recording(
         .collect();
     // Longest first, so a longer entity always wins over one that prefixes it.
     keys.sort_by_key(|(k, _, _)| std::cmp::Reverse(k.len()));
+
     // Bucket by FOLDED first char (the sort order carries into each bucket, keeping
     // longest-match-first intact): a position whose char starts no key costs one
     // hash lookup instead of a full sweep over the dictionary. Case-sensitive keys
@@ -1043,15 +1052,28 @@ pub async fn cloak_batch(
         // map uses the match key so a short acronym matches case-sensitively.
         key_to_pseudonym.insert(match_key(canonical), pseudonym);
     }
+    let cloaked = apply_batch(texts, &key_to_pseudonym, &mut session);
+    (cloaked, session)
+}
+
+/// PURE tail of [`cloak_batch`]: substitute every text with one shared
+/// `match key -> pseudonym` map and record the surface each pseudonym replaced into
+/// `session` (first occurrence across ALL texts wins). No DB, so callers' tests can
+/// run the production substitution.
+pub fn apply_batch(
+    texts: &[&str],
+    key_to_pseudonym: &HashMap<String, String>,
+    session: &mut CloakSession,
+) -> Vec<String> {
     let mut surfaces: HashMap<String, String> = HashMap::with_capacity(key_to_pseudonym.len());
     let cloaked = texts
         .iter()
-        .map(|t| apply_pseudonyms_recording(t, &key_to_pseudonym, &mut surfaces))
+        .map(|t| apply_pseudonyms_recording(t, key_to_pseudonym, &mut surfaces))
         .collect();
     for (pseudonym, surface) in surfaces {
         session.map.insert(pseudonym, surface);
     }
-    (cloaked, session)
+    cloaked
 }
 
 #[cfg(test)]
@@ -1209,6 +1231,26 @@ mod tests {
         assert_eq!(apply_pseudonyms(path, &map), path, "identifier-internal matches must never be cloaked");
         // …while the same words as prose are still cloaked.
         assert_eq!(apply_pseudonyms("Anvil läuft auf prod bei Multiversum.", &map), "Term-1 läuft auf Term-2 bei Org-5.");
+    }
+
+    #[test]
+    fn multi_word_names_inside_paths_stay_in_clear_residual_channel() {
+        // Documented residual (path policy on apply_pseudonyms_recording): names glued
+        // into paths and slugs are NOT cloaked, multi-word names included.
+        let mut map = HashMap::new();
+        for (k, p) in [("Max Müller", "Person-3"), ("Nexovar GmbH", "Org-2"), ("anvil", "Term-1"), ("Anna Schmidt", "Person-4")] {
+            map.insert(match_key(k), p.to_string());
+        }
+        let text = "cat crm/Max Müller.md notes/Nexovar GmbH/2026.txt Max_Mueller.md ~/asgard_prod/anvil/x";
+        assert_eq!(apply_pseudonyms(text, &map), text);
+        // outside a path, next to a space or punctuation, the same names cloak as before
+        assert_eq!(
+            apply_pseudonyms("Max Müller (CEO, Nexovar GmbH): \"Max Müller\".", &map),
+            "Person-3 (CEO, Org-2): \"Person-3\"."
+        );
+        // a hyphenated compound is a different name and stays untouched
+        assert_eq!(apply_pseudonyms("Anna Schmidt-Weber", &map), "Anna Schmidt-Weber");
+        assert_eq!(apply_pseudonyms("XMax Müllers", &map), "XMax Müllers");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Anthropic Messages API adapter for the cloak gateway: the PURE parts.
 //!
 //! * request side: collect the text slots that may be cloaked (and write the
-//!   cloaked texts back), never touching tool results, tool inputs, thinking,
-//!   images, documents, tool definitions or the Claude Code identity block;
+//!   cloaked texts back): text blocks, and the string values of replayed
+//!   `tool_use.input` objects (keys untouched). Never touched: tool results,
+//!   thinking, images, documents, tool definitions, the Claude Code identity block;
 //! * response side: an SSE state machine that de-cloaks `text_delta` and
 //!   `input_json_delta` with per-index rolling buffers, keeps `event:`/`data:`
 //!   pairing intact and passes everything else (thinking, signatures, pings,
@@ -58,6 +59,40 @@ pub(super) enum AnthropicSlot {
     SystemBlock(usize),
     MessageString(usize),
     MessageBlock(usize, usize),
+    /// One non-empty string leaf of `messages[i].content[j].input` (a `tool_use`
+    /// block). Repeated once per leaf, in [`string_leaves`] order.
+    ToolUseInput(usize, usize),
+}
+
+/// Every non-empty string VALUE of `v` (object keys are never included), in a
+/// deterministic walk order shared with [`set_string_leaves`].
+pub(super) fn string_leaves(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| string_leaves(x, out)),
+        Value::Object(o) => o.values().for_each(|x| string_leaves(x, out)),
+        _ => {}
+    }
+}
+
+/// Replace the non-empty string leaves of `v` (same order as [`string_leaves`])
+/// with `new`, in order; surplus leaves stay as they are.
+pub(super) fn set_string_leaves(v: &mut Value, new: &[String]) {
+    fn walk(v: &mut Value, new: &[String], k: &mut usize) {
+        match v {
+            Value::String(s) if !s.is_empty() => {
+                if let Some(n) = new.get(*k) {
+                    *s = n.clone();
+                }
+                *k += 1;
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, new, k)),
+            Value::Object(o) => o.values_mut().for_each(|x| walk(x, new, k)),
+            _ => {}
+        }
+    }
+    let mut k = 0;
+    walk(v, new, &mut k);
 }
 
 /// The Claude Code identity block must reach Anthropic byte-identical. Narrow on
@@ -89,6 +124,13 @@ fn text_block_text(block: &Value, system: bool) -> Option<&str> {
 }
 
 /// Walk the request in order and return every cloakable text with its slot.
+///
+/// Replayed `tool_use.input` is cloaked: the de-cloaker gave the client the real
+/// names, and replaying them in clear next to the pseudonymised text would hand the
+/// vendor the pseudonym mapping. `tool_result` content stays in clear on purpose:
+/// that is what the Anvil UI promises for Claude today (file contents and command
+/// output reach the model unchanged, so tools and patches keep working on exact
+/// text); the Responses module cloaks tool outputs instead, with an opt-out header.
 pub(super) fn collect_anthropic_cloak_texts(body: &Value) -> (Vec<AnthropicSlot>, Vec<String>) {
     let mut slots = Vec::new();
     let mut texts = Vec::new();
@@ -119,6 +161,13 @@ pub(super) fn collect_anthropic_cloak_texts(body: &Value) -> (Vec<AnthropicSlot>
                         if let Some(t) = text_block_text(b, false) {
                             slots.push(AnthropicSlot::MessageBlock(i, j));
                             texts.push(t.to_string());
+                        } else if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                            if let Some(input) = b.get("input") {
+                                let mut leaves = Vec::new();
+                                string_leaves(input, &mut leaves);
+                                slots.extend(std::iter::repeat(AnthropicSlot::ToolUseInput(i, j)).take(leaves.len()));
+                                texts.extend(leaves);
+                            }
                         }
                     }
                 }
@@ -131,8 +180,28 @@ pub(super) fn collect_anthropic_cloak_texts(body: &Value) -> (Vec<AnthropicSlot>
 
 /// Replace only the text of each slot (in order); sibling keys survive.
 pub(super) fn write_anthropic_cloaked_texts(body: &mut Value, slots: &[AnthropicSlot], cloaked: &[String]) {
-    for (slot, text) in slots.iter().zip(cloaked) {
-        let target = match *slot {
+    let n = slots.len().min(cloaked.len());
+    let mut k = 0;
+    while k < n {
+        let slot = slots[k];
+        if let AnthropicSlot::ToolUseInput(i, j) = slot {
+            // a run of identical slots = the leaves of one input object, in order
+            let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
+            if let Some(input) = body
+                .get_mut("messages")
+                .and_then(|m| m.get_mut(i))
+                .and_then(|m| m.get_mut("content"))
+                .and_then(|c| c.get_mut(j))
+                .and_then(|b| b.get_mut("input"))
+            {
+                set_string_leaves(input, &cloaked[k..end]);
+            }
+            k = end;
+            continue;
+        }
+        let text = &cloaked[k];
+        k += 1;
+        let target = match slot {
             AnthropicSlot::SystemString => body.get_mut("system"),
             AnthropicSlot::SystemBlock(i) => body
                 .get_mut("system")
@@ -148,6 +217,7 @@ pub(super) fn write_anthropic_cloaked_texts(body: &mut Value, slots: &[Anthropic
                 .and_then(|m| m.get_mut("content"))
                 .and_then(|c| c.get_mut(j))
                 .and_then(|b| b.get_mut("text")),
+            AnthropicSlot::ToolUseInput(..) => None, // handled above
         };
         if let Some(t) = target {
             *t = Value::String(text.clone());
@@ -179,19 +249,25 @@ pub(super) struct AnthropicSseDecloaker {
     out: String,
 }
 
+/// Same pseudonyms, originals JSON-string-escaped (without the surrounding quotes):
+/// for de-cloaking text that lands INSIDE a JSON string literal.
+pub(super) fn json_escaped_session(session: &privacy::CloakSession) -> privacy::CloakSession {
+    privacy::CloakSession {
+        map: session
+            .map
+            .iter()
+            .map(|(k, v)| {
+                let quoted = serde_json::to_string(v).unwrap_or_default();
+                let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
+                (k.clone(), inner.to_string())
+            })
+            .collect(),
+    }
+}
+
 impl AnthropicSseDecloaker {
     pub fn new(session: privacy::CloakSession) -> Self {
-        let json_session = privacy::CloakSession {
-            map: session
-                .map
-                .iter()
-                .map(|(k, v)| {
-                    let quoted = serde_json::to_string(v).unwrap_or_default();
-                    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
-                    (k.clone(), inner.to_string())
-                })
-                .collect(),
-        };
+        let json_session = json_escaped_session(&session);
         Self {
             session,
             json_session,
@@ -419,7 +495,7 @@ const CREDENTIAL_HINT: &str =
 /// Only these paths are proxied under /v1 (everything else is a 404, never a
 /// silent plaintext passthrough).
 const NOT_PROXIED_MESSAGE: &str =
-    "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models are proxied";
+    "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/responses, /v1/models are proxied";
 
 fn messages_url(base: &str) -> String {
     format!("{}/v1/messages", base.trim_end_matches('/'))
@@ -575,8 +651,17 @@ async fn count_tokens_inner(state: Arc<AppState>, headers: HeaderMap, body: Byte
 }
 
 /// Plain proxy for the model list (no prompt content): gctrl auth and an upstream
-/// credential are still required.
+/// credential are still required. `GET /v1/models` is registered once (here); a
+/// `chatgpt` / `openai` provider header hands it to the Responses module.
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    let provider = headers
+        .get("x-upstream-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if provider == "chatgpt" || provider == "openai" {
+        return super::llm_gateway_responses::models_passthrough(state, headers, query).await;
+    }
     let g = match gate(&state, &headers).await {
         Ok(g) => g,
         Err(r) => return r,
@@ -639,7 +724,7 @@ fn unreachable_response(e: reqwest::Error) -> Response {
 
 /// Non-2xx from the upstream: status, relayed headers (content-type included) and
 /// the body bytes verbatim - never decoded.
-async fn relay_error(resp: reqwest::Response) -> Response {
+pub(super) async fn relay_error(resp: reqwest::Response) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let relayed = relay_response_headers(resp.headers());
     let bytes = resp.bytes().await.unwrap_or_default();
@@ -921,7 +1006,6 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t", "content": "secret string"},
             {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "text", "text": "nested secret"}]},
-            {"type": "tool_use", "id": "t", "name": "n", "input": {"text": "in input", "type": "text"}},
             {"type": "thinking", "thinking": "hmm", "signature": "sig", "text": "no"},
             {"type": "redacted_thinking", "data": "xx", "text": "no"},
             {"type": "image", "source": {"type": "base64", "data": "AAAA"}},
@@ -931,7 +1015,7 @@ mod tests {
         ]}]});
         let (slots, texts) = collect_anthropic_cloak_texts(&body);
         assert_eq!(texts, vec!["keep me"]);
-        assert_eq!(slots, vec![AnthropicSlot::MessageBlock(0, 8)]);
+        assert_eq!(slots, vec![AnthropicSlot::MessageBlock(0, 7)]);
     }
 
     // 4
@@ -1293,7 +1377,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"type": "error", "error": {"type": "not_found_error",
-                "message": "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models are proxied"}})
+                "message": "only /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/responses, /v1/models are proxied"}})
         );
     }
 
@@ -1309,5 +1393,61 @@ mod tests {
     fn routers_build_without_route_conflicts() {
         let _ = router();
         let _ = super::super::llm_gateway::router();
+    }
+
+    // 25
+    #[test]
+    fn replayed_tool_use_input_strings_are_cloaked_keys_and_numbers_untouched() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": "find Tom Arenstam"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "tool_use", "id": "toolu_1", "name": "grep", "input": {
+                    "Tom Arenstam": "key stays",
+                    "pattern": "Tom Arenstam",
+                    "n": 3,
+                    "flag": true,
+                    "empty": "",
+                    "nested": {"paths": ["crm/Tom Arenstam.md", 7, {"deep": "ScanModule"}]}
+                }}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Tom Arenstam, row 1"}
+            ]}
+        ]});
+        let (slots, texts) = collect_anthropic_cloak_texts(&body);
+        // leaves in walk order (serde_json maps iterate in key order)
+        let mut want_leaves = Vec::new();
+        string_leaves(&body["messages"][1]["content"][1]["input"], &mut want_leaves);
+        assert_eq!(want_leaves.len(), 4);
+        assert_eq!(&texts[2..], &want_leaves[..]);
+        assert!(slots[2..].iter().all(|s| *s == AnthropicSlot::ToolUseInput(1, 1)));
+        assert!(!texts.iter().any(|t| t.contains("row 1")), "tool_result stays in clear");
+        // the production substitution (pure tail of cloak_batch), no Postgres
+        let mut key_map = HashMap::new();
+        let mut bs = privacy::CloakSession::empty();
+        for (p, name) in session().map {
+            key_map.insert(privacy::match_key(&name), p.clone());
+            bs.map.insert(p, name);
+        }
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let cloaked = privacy::apply_batch(&refs, &key_map, &mut bs);
+        write_anthropic_cloaked_texts(&mut body, &slots, &cloaked);
+        let input = &body["messages"][1]["content"][1]["input"];
+        assert_eq!(input["pattern"], "Person-27");
+        assert_eq!(input["Tom Arenstam"], "key stays", "keys untouched");
+        assert_eq!(input["n"], 3);
+        assert_eq!(input["flag"], true);
+        assert_eq!(input["empty"], "");
+        // a name inside a path stays in clear (privacy path policy); a standalone value cloaks
+        assert_eq!(input["nested"]["paths"], json!(["crm/Tom Arenstam.md", 7, {"deep": "Term-274"}]));
+        assert_eq!(body["messages"][0]["content"], "find Person-27");
+        assert_eq!(body["messages"][1]["content"][0]["text"], "ok");
+        assert_eq!(body["messages"][2]["content"][0]["content"], "Tom Arenstam, row 1");
+        // round trip with the response-side de-cloaker
+        let mut back = body["messages"][1]["content"][1]["input"].clone();
+        decloak_json_strings(&session(), &mut back);
+        assert_eq!(back["pattern"], "Tom Arenstam");
+        assert_eq!(back["nested"]["paths"][2]["deep"], "ScanModule");
     }
 }
