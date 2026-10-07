@@ -21,7 +21,10 @@ use crate::{
     services::cron::next_run_from_cron,
 };
 
-const VALID_MODULES: [&str; 5] = ["kex", "fuse", "compilation", "obsidian", "distill"];
+// google_drive / microsoft: scheduled re-sync of a Drive folder or a SharePoint
+// library (executor: background::run_cron_tick). Only new or changed files are
+// extracted on each run.
+const VALID_MODULES: [&str; 7] = ["kex", "fuse", "compilation", "obsidian", "distill", "google_drive", "microsoft"];
 const VALID_TYPES: [&str; 2] = ["cron", "change_detection"];
 
 pub fn router() -> Router<Arc<crate::models::AppState>> {
@@ -153,6 +156,10 @@ async fn create_trigger(
             None => return Err(AppError::BadRequest("compilationId is not a wiki you own".into())),
         }
     }
+
+    // A connector sync must name a source the caller owns, or it would fail on
+    // every tick (the executor re-checks ownership; this rejects it up front).
+    validate_connector_config(&state.db, claims.sub, &req.module, &req.config).await?;
 
     let next_run_at: Option<DateTime<Utc>> = req
         .cron_schedule
@@ -398,4 +405,62 @@ async fn tick_heartbeat(
     require_role(&claims, "admin")?;
     let n = crate::background::run_cron_tick(&state).await;
     Ok(Json(json!({ "ok": true, "message": format!("Executed {n} due trigger(s)") })))
+}
+
+
+/// Pure: which config keys a connector-sync trigger needs. `None` for modules
+/// that are not connector syncs.
+pub(crate) fn connector_config_requirements(module: &str) -> Option<&'static [&'static str]> {
+    match module {
+        "google_drive" => Some(&["connectorId"]),
+        "microsoft" => Some(&["tenantConfigId", "siteId", "driveId"]),
+        _ => None,
+    }
+}
+
+/// A connector-sync trigger's config must carry its required keys and point at
+/// a connector the caller owns.
+async fn validate_connector_config(db: &sqlx::PgPool, user_id: Uuid, module: &str, config: &Value) -> Result<()> {
+    let Some(required) = connector_config_requirements(module) else { return Ok(()) };
+    for key in required {
+        if config.get(*key).and_then(|v| v.as_str()).map_or(true, |s| s.trim().is_empty()) {
+            return Err(AppError::BadRequest(format!("{module} triggers need config.{key}")));
+        }
+    }
+    let as_uuid = |key: &str| config.get(key).and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok());
+    let owned: Option<i32> = match module {
+        "google_drive" => {
+            let id = as_uuid("connectorId").ok_or_else(|| AppError::BadRequest("config.connectorId is not a UUID".into()))?;
+            sqlx::query_scalar("SELECT 1 FROM oauth_connectors WHERE id = $1 AND user_id = $2 AND is_active")
+                .bind(id).bind(user_id).fetch_optional(db).await?
+        }
+        "microsoft" => {
+            let id = as_uuid("tenantConfigId").ok_or_else(|| AppError::BadRequest("config.tenantConfigId is not a UUID".into()))?;
+            sqlx::query_scalar("SELECT 1 FROM sharepoint_tenant_configs WHERE id = $1 AND user_id = $2")
+                .bind(id).bind(user_id).fetch_optional(db).await?
+        }
+        _ => Some(1),
+    };
+    if owned.is_none() {
+        return Err(AppError::BadRequest(format!("the {module} source in this trigger is not one of yours")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod connector_trigger_tests {
+    use super::{connector_config_requirements, VALID_MODULES};
+
+    #[test]
+    fn drive_and_sharepoint_syncs_are_valid_modules() {
+        assert!(VALID_MODULES.contains(&"google_drive"));
+        assert!(VALID_MODULES.contains(&"microsoft"));
+    }
+
+    #[test]
+    fn each_connector_sync_names_its_source() {
+        assert_eq!(connector_config_requirements("google_drive"), Some(&["connectorId"][..]));
+        assert_eq!(connector_config_requirements("microsoft"), Some(&["tenantConfigId", "siteId", "driveId"][..]));
+        assert_eq!(connector_config_requirements("kex"), None);
+    }
 }

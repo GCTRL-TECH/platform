@@ -831,6 +831,10 @@ async fn run_one_drive_trigger(
             outcome.failed, outcome.total
         );
     }
+    tracing::info!(
+        "drive trigger: {} new or changed, {} unchanged of {} file(s) (connector {connector_id})",
+        outcome.synced, outcome.unchanged, outcome.total
+    );
     Ok(outcome.synced)
 }
 
@@ -863,8 +867,9 @@ async fn run_one_sharepoint_trigger(
         .unwrap_or(5)
         .min(10) as u32;
     let classification_level_id = get_uuid("classificationLevelId");
+    let compilation_id = get_uuid("compilationId");
 
-    let (synced, failed) = crate::routes::connectors::run_sharepoint_folder_sync(
+    let outcome = crate::routes::connectors::run_sharepoint_folder_sync(
         state,
         user_id,
         tenant_config_id,
@@ -873,14 +878,16 @@ async fn run_one_sharepoint_trigger(
         folder_id,
         max_depth,
         classification_level_id,
+        compilation_id,
     )
     .await
     .map_err(|e| e.to_string())?;
 
-    if failed > 0 {
-        tracing::warn!("sharepoint trigger: {failed} file(s) failed to enqueue for tenant {tenant_config_id}");
-    }
-    Ok(synced)
+    tracing::info!(
+        "sharepoint trigger: {} new or changed, {} unchanged, {} failed (tenant {tenant_config_id})",
+        outcome.synced, outcome.unchanged, outcome.failed
+    );
+    Ok(outcome.synced)
 }
 
 /// Job results from kex/fuse/distill. Resubscribes after a Redis restart (see

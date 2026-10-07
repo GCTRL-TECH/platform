@@ -192,6 +192,8 @@ pub(crate) struct DriveExtractReqOpts {
     #[serde(rename = "compilationId")]         compilation_id:          Option<Uuid>,
     #[serde(rename = "forceSingleGraphs")]     force_single_graphs:     Option<bool>,
     #[serde(rename = "classificationLevelId")] classification_level_id: Option<Uuid>,
+    /// Extract every file again, even those unchanged since their last extraction.
+    #[serde(default)]                          force:                   bool,
 }
 
 /// Resolved extraction options (ontology labels + classification name looked up)
@@ -1104,12 +1106,13 @@ async fn sync_selected(
             &resolved,
             &doc_path,
             doc_modified,
+            req.opts.force,
         )
         .await
         {
-            Ok(job_id) => {
-                kex_job_id = Some(job_id);
-                results.push(json!({ "fileId": file_id, "name": name, "jobId": job_id }));
+            Ok(sub) => {
+                kex_job_id = Some(sub.job_id);
+                results.push(json!({ "fileId": file_id, "name": name, "jobId": sub.job_id, "unchanged": sub.reused }));
             }
             Err(e) => {
                 tracing::warn!("Failed to enqueue drive file {file_id}: {e}");
@@ -1167,6 +1170,7 @@ async fn sync_folder(
         "folder":     outcome.folder,
         "totalFiles": outcome.total,
         "synced":     outcome.synced,
+        "unchanged":  outcome.unchanged,
         "failed":     outcome.failed,
         "results":    outcome.results,
     })))
@@ -1177,7 +1181,11 @@ async fn sync_folder(
 pub(crate) struct DriveFolderSyncOutcome {
     pub folder:  Option<String>,
     pub total:   usize,
+    /// Files queued for extraction (new or changed).
     pub synced:  u32,
+    /// Files whose content had not changed since their last extraction: not
+    /// downloaded (same modified time) or not re-extracted (same content).
+    pub unchanged: u32,
     pub failed:  u32,
     pub results: Vec<Value>,
 }
@@ -1213,6 +1221,7 @@ pub(crate) async fn run_drive_folder_sync(
         crate::routes::connector_configs::index_unsupported_enabled(&state.db, "google").await;
 
     let mut synced = 0u32;
+    let mut unchanged = 0u32;
     let mut failed = 0u32;
     let mut results: Vec<Value> = Vec::new();
 
@@ -1244,13 +1253,14 @@ pub(crate) async fn run_drive_folder_sync(
                 &resolved,
                 &full_path,
                 f.modified,
+                false,
             )
             .await
             {
-                Ok(job_id) => {
-                    synced += 1;
-                    kex_job_id = Some(job_id);
-                    results.push(json!({ "fileId": f.id, "name": f.name, "jobId": job_id }));
+                Ok(sub) => {
+                    if sub.reused { unchanged += 1 } else { synced += 1 }
+                    kex_job_id = Some(sub.job_id);
+                    results.push(json!({ "fileId": f.id, "name": f.name, "jobId": sub.job_id, "unchanged": sub.reused }));
                 }
                 Err(e) => {
                     failed += 1;
@@ -1282,6 +1292,7 @@ pub(crate) async fn run_drive_folder_sync(
         folder: folder_name,
         total: extractable_total,
         synced,
+        unchanged,
         failed,
         results,
     })
@@ -1514,25 +1525,40 @@ async fn collect_folder_tree(
     }
 
     let q = format!("'{folder_id}' in parents and trashed = false");
-    let resp = http
-        .get("https://www.googleapis.com/drive/v3/files")
-        .bearer_auth(token)
-        .query(&[
-            ("q",        q.as_str()),
-            ("fields",   "files(id,name,mimeType,size,modifiedTime)"),
-            ("pageSize", "1000"),
-        ])
-        .send()
-        .await;
-
-    let items = match resp {
-        Ok(r) if r.status().is_success() => {
-            r.json::<Value>().await.ok().and_then(|v| {
-                v.get("files").and_then(|f| f.as_array()).cloned()
-            }).unwrap_or_default()
+    // Drive returns at most 1000 entries per page; a large folder used to be cut
+    // off silently after the first page. Follow `nextPageToken` to the end.
+    let mut items: Vec<Value> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut query: Vec<(&str, String)> = vec![
+            ("q",        q.clone()),
+            ("fields",   "nextPageToken,files(id,name,mimeType,size,modifiedTime)".into()),
+            ("pageSize", "1000".into()),
+        ];
+        if let Some(t) = &page_token {
+            query.push(("pageToken", t.clone()));
         }
-        _ => return,
-    };
+        let resp = http
+            .get("https://www.googleapis.com/drive/v3/files")
+            .bearer_auth(token)
+            .query(&query)
+            .send()
+            .await;
+        let page = match resp {
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok().unwrap_or_default(),
+            _ => break,
+        };
+        if let Some(files) = page.get("files").and_then(|f| f.as_array()) {
+            items.extend(files.iter().cloned());
+        }
+        page_token = page.get("nextPageToken").and_then(|v| v.as_str()).map(String::from);
+        if page_token.is_none() {
+            break;
+        }
+    }
+    if items.is_empty() {
+        return;
+    }
 
     for item in &items {
         let id   = item.get("id")  .and_then(|v| v.as_str()).unwrap_or_default();
@@ -1597,6 +1623,10 @@ struct SyncSharepointReq {
     #[serde(rename = "driveId")]              drive_id:                String,
     #[serde(rename = "fileIds")]              file_ids:                Vec<String>,
     #[serde(rename = "classificationLevelId")] classification_level_id: Option<Uuid>,
+    /// Target knowledge base; without it the files land in the default one.
+    #[serde(rename = "compilationId")]        compilation_id:          Option<Uuid>,
+    /// Extract every file again, even those unchanged since their last extraction.
+    #[serde(default)]                         force:                   bool,
 }
 
 // ─── SharePoint DB row ────────────────────────────────────────────────────────
@@ -1915,20 +1945,20 @@ async fn sync_sharepoint(
     let capture_assets =
         crate::routes::connector_configs::index_unsupported_enabled(&state.db, "microsoft").await;
     let http = reqwest::Client::new();
-    let graph_token = if capture_assets {
-        sharepoint_access_token(&http, &tenant.tenant_id, &tenant.client_id, &tenant.client_secret)
-            .await
-            .ok()
-    } else {
-        None
-    };
+    // The API downloads each file itself now (it needs the bytes for the
+    // document identity), so a Graph token is always needed.
+    let graph_token =
+        sharepoint_access_token(&http, &tenant.tenant_id, &tenant.client_id, &tenant.client_secret).await?;
 
     let mut job_ids: Vec<Uuid> = Vec::new();
+    let mut unchanged: Vec<Uuid> = Vec::new();
 
     for file_id in &req.file_ids {
-        let job_id = enqueue_sharepoint_file(
+        let sub = enqueue_sharepoint_file(
             &state.db,
             &state.redis,
+            &http,
+            &graph_token,
             claims.sub,
             claims.api_key_id,
             req.tenant_config_id,
@@ -1936,30 +1966,42 @@ async fn sync_sharepoint(
             &req.drive_id,
             file_id,
             req.classification_level_id,
+            req.compilation_id,
             true,
+            req.force,
         )
         .await?;
 
-        if let Some(ref token) = graph_token {
+        if capture_assets {
             capture_sharepoint_item_asset(
-                &state.db, &http, token, claims.sub, &req.site_id, &req.drive_id, file_id,
-                Some(job_id),
+                &state.db, &http, &graph_token, claims.sub, &req.site_id, &req.drive_id, file_id,
+                Some(sub.job_id),
             )
             .await;
         }
 
-        job_ids.push(job_id);
+        if sub.reused { unchanged.push(sub.job_id) }
+        job_ids.push(sub.job_id);
     }
 
-    Ok(Json(json!({ "jobIds": job_ids })))
+    Ok(Json(json!({ "jobIds": job_ids, "unchanged": unchanged })))
 }
 
-/// Create the KEX job row + Redis message for one SharePoint file. Shared by
-/// the HTTP sync handler and the scheduled `microsoft` trigger executor.
+/// Queue one SharePoint file for extraction — or, when it has not changed since
+/// its last extraction, hand back that extraction. Shared by the HTTP sync
+/// handler, the scheduled `microsoft` trigger and the retry path.
+///
+/// The API fetches the item itself (metadata, then content) and sends the
+/// worker a plain `file` job, exactly like Drive. Until now it pushed a
+/// `sharepoint` job the worker did not know ("Unknown job type"), so no
+/// SharePoint file was ever extracted; and the worker's own SharePoint path
+/// would have needed the tenant's client secret inside the job queue.
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_sharepoint_file(
     db: &sqlx::PgPool,
     redis: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
+    http: &reqwest::Client,
+    token: &str,
     user_id: Uuid,
     // Access token that triggered this file (provenance). None on the scheduled
     // trigger + retry paths, where there is no calling token (background/cron).
@@ -1969,42 +2011,141 @@ async fn enqueue_sharepoint_file(
     drive_id: &str,
     file_id: &str,
     classification_level_id: Option<Uuid>,
+    compilation_id: Option<Uuid>,
     // Whether to charge the per-file credit. False on retry — the original attempt
     // already recorded the spend, so re-running a failed job must not double-bill.
     charge: bool,
-) -> Result<Uuid> {
-    let job_id = Uuid::new_v4();
+    // Extract even when the file is unchanged (retry, explicit re-sync).
+    force: bool,
+) -> Result<crate::routes::kex::Submitted> {
+    use base64::Engine;
 
+    // 1. Metadata: name, folder, modified time — enough to recognise an
+    //    unchanged file without downloading it.
+    let meta_url = format!(
+        "https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{file_id}\
+         ?$select=id,name,file,lastModifiedDateTime,parentReference"
+    );
+    let meta: Value = http
+        .get(&meta_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph metadata request failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::Internal(format!("Graph metadata for {file_id}: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph metadata parse failed: {e}")))?;
+    let name = meta.get("name").and_then(|v| v.as_str()).unwrap_or(file_id).to_string();
+    let modified_at = meta
+        .get("lastModifiedDateTime")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let folder = meta
+        .get("parentReference")
+        .and_then(|p| p.get("path"))
+        .and_then(|v| v.as_str())
+        .map(sharepoint_folder_from_parent_path)
+        .unwrap_or_default();
+    let full_path = sharepoint_document_path(site_id, &folder, &name);
+
+    if !force {
+        if let Some(existing) = reuse_by_mtime(
+            db, user_id, &full_path, modified_at, classification_level_id, None, api_key_id,
+        ).await {
+            crate::routes::kex::link_owned_job(db, user_id, compilation_id, existing).await;
+            return Ok(crate::routes::kex::Submitted { job_id: existing, reused: true });
+        }
+    }
+
+    // 2. Content.
+    let content_url = format!(
+        "https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{file_id}/content"
+    );
+    let bytes = http
+        .get(&content_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph download failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::Internal(format!("Graph download of {file_id}: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph download read failed: {e}")))?;
+    let mimetype = meta
+        .get("file")
+        .and_then(|f| f.get("mimeType"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| crate::routes::kex::mime_for_filename(&name).to_string());
+
+    let content_hash = crate::services::source_docs::hash_content(&bytes);
+    let source_doc = crate::services::source_docs::resolve_source_document(
+        db, user_id, None, &full_path, Some(&name), &content_hash, modified_at,
+    ).await.ok();
+    let source_document_id = source_doc.as_ref().map(|d| d.id);
+
+    if let Some(existing) = crate::routes::kex::reuse_existing_job(
+        db, user_id, source_doc.as_ref(), classification_level_id, None, api_key_id, force,
+    ).await {
+        crate::routes::kex::link_owned_job(db, user_id, compilation_id, existing).await;
+        return Ok(crate::routes::kex::Submitted { job_id: existing, reused: true });
+    }
+
+    // 3. A new extraction.
+    let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, api_key_id)
-         VALUES ($1, $2, 'kex_sharepoint', 'pending', $3, $4)",
+        "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
+         VALUES ($1, $2, 'kex_sharepoint', 'pending', $3, $4, $5, $6)",
     )
     .bind(job_id)
     .bind(user_id)
     .bind(json!({
-        "tenantConfigId":       tenant_config_id,
-        "siteId":               site_id,
-        "driveId":              drive_id,
-        "fileId":               file_id,
+        "tenantConfigId":        tenant_config_id,
+        "siteId":                site_id,
+        "driveId":               drive_id,
+        "fileId":                file_id,
+        "fileName":              name,
+        "sourceRef":             full_path,
+        "compilationId":         compilation_id,
         "classificationLevelId": classification_level_id,
     }))
+    .bind(classification_level_id)
+    .bind(source_document_id)
     .bind(api_key_id)
     .execute(db)
     .await?;
 
-    // No explicit compilation target on the SharePoint path → link into the owner's
-    // default KB so the entities aren't orphaned (invisible in the graph).
-    crate::routes::kex::link_owned_job(db, user_id, None, job_id).await;
+    crate::routes::kex::link_owned_job(db, user_id, compilation_id, job_id).await;
 
     if charge {
         crate::services::usage::record_usage(db, user_id, "kex_extract", 5, Some(job_id)).await;
     }
 
+    let classification_name: Option<String> = match classification_level_id {
+        Some(c) => sqlx::query_scalar("SELECT name FROM classification_levels WHERE id = $1")
+            .bind(c).fetch_optional(db).await.ok().flatten(),
+        None => None,
+    };
+    let kex_input = json!({
+        "fileBase64":       base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "mimetype":         mimetype,
+        "originalFilename": name,
+    }).to_string();
     let mut payload = json!({
-        "job_id":   job_id,
-        "user_id":  user_id,
-        "type":     "sharepoint",
-        "file_id":  file_id,
+        "job_id":                  job_id,
+        "user_id":                 user_id,
+        "type":                    "file",
+        "input":                   kex_input,
+        "file_name":               name,
+        "classification":          classification_name,
+        "classification_level_id": classification_level_id,
+        "source_document_id":      source_document_id,
+        "source_path":             full_path,
+        "source_modified_at":      modified_at,
     });
     crate::services::llm::inject_ollama_overrides(db, user_id, &mut payload).await;
 
@@ -2012,7 +2153,25 @@ async fn enqueue_sharepoint_file(
         .await
         .map_err(|e| AppError::Internal(format!("Redis push failed: {e}")))?;
 
-    Ok(job_id)
+    Ok(crate::routes::kex::Submitted { job_id, reused: false })
+}
+
+/// Graph's `parentReference.path` ("/drives/{id}/root:/A/B") as the folder
+/// inside the library ("A/B"); "" for the library root.
+fn sharepoint_folder_from_parent_path(path: &str) -> String {
+    match path.split_once("root:") {
+        Some((_, rest)) => rest.trim_matches('/').to_string(),
+        None => String::new(),
+    }
+}
+
+/// The document identity of a SharePoint file: the site's host plus the path
+/// inside the library, e.g. "SharePoint (contoso.sharepoint.com) / Team/Plan.docx".
+/// Stable across syncs (scheduled or manual) and readable as a source.
+fn sharepoint_document_path(site_id: &str, folder: &str, name: &str) -> String {
+    let host = site_id.split(',').next().unwrap_or(site_id);
+    let rel = if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") };
+    format!("SharePoint ({host}) / {rel}")
 }
 
 /// Fetch one drive item's metadata from Graph and upsert its `file_assets` row.
@@ -2121,16 +2280,23 @@ async fn collect_sharepoint_folder_tree(
         ),
     };
 
-    let resp = http.get(&url).bearer_auth(token).send().await;
-    let items = match resp {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v.get("value").and_then(|a| a.as_array()).cloned())
-            .unwrap_or_default(),
-        _ => return,
-    };
+    // Graph pages children (200 per page by default); follow `@odata.nextLink`
+    // so a large library is listed completely, not just its first page.
+    let mut items: Vec<Value> = Vec::new();
+    let mut next: Option<String> = Some(url);
+    while let Some(page_url) = next.take() {
+        let page = match http.get(&page_url).bearer_auth(token).send().await {
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok().unwrap_or_default(),
+            _ => break,
+        };
+        if let Some(arr) = page.get("value").and_then(|a| a.as_array()) {
+            items.extend(arr.iter().cloned());
+        }
+        next = page.get("@odata.nextLink").and_then(|v| v.as_str()).map(String::from);
+    }
+    if items.is_empty() {
+        return;
+    }
 
     for item in &items {
         let id   = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
@@ -2183,7 +2349,8 @@ pub(crate) async fn run_sharepoint_folder_sync(
     folder_id: Option<&str>,
     max_depth: u32,
     classification_level_id: Option<Uuid>,
-) -> Result<(u32, u32)> {
+    compilation_id: Option<Uuid>,
+) -> Result<SharepointSyncOutcome> {
     let tenant = fetch_sharepoint_tenant(&state.db, tenant_config_id, user_id).await?;
     let http = reqwest::Client::new();
     let token = sharepoint_access_token(
@@ -2204,6 +2371,7 @@ pub(crate) async fn run_sharepoint_folder_sync(
         crate::routes::connector_configs::index_unsupported_enabled(&state.db, "microsoft").await;
 
     let mut synced = 0u32;
+    let mut unchanged = 0u32;
     let mut failed = 0u32;
 
     for f in &all_files {
@@ -2212,6 +2380,8 @@ pub(crate) async fn run_sharepoint_folder_sync(
             match enqueue_sharepoint_file(
                 &state.db,
                 &state.redis,
+                &http,
+                &token,
                 user_id,
                 // Scheduled trigger executor — no calling token, so no provenance.
                 None,
@@ -2220,13 +2390,15 @@ pub(crate) async fn run_sharepoint_folder_sync(
                 drive_id,
                 &f.id,
                 classification_level_id,
+                compilation_id,
                 true,
+                false,
             )
             .await
             {
-                Ok(job_id) => {
-                    synced += 1;
-                    kex_job_id = Some(job_id);
+                Ok(sub) => {
+                    if sub.reused { unchanged += 1 } else { synced += 1 }
+                    kex_job_id = Some(sub.job_id);
                 }
                 Err(e) => {
                     failed += 1;
@@ -2258,7 +2430,16 @@ pub(crate) async fn run_sharepoint_folder_sync(
         }
     }
 
-    Ok((synced, failed))
+    Ok(SharepointSyncOutcome { synced, unchanged, failed })
+}
+
+/// What a SharePoint folder sync did.
+pub(crate) struct SharepointSyncOutcome {
+    /// Files queued for extraction (new or changed).
+    pub synced: u32,
+    /// Files unchanged since their last extraction (not downloaded or not re-extracted).
+    pub unchanged: u32,
+    pub failed: u32,
 }
 
 // ─── Obsidian handlers ────────────────────────────────────────────────────────
@@ -2748,6 +2929,7 @@ async fn sync_obsidian_folder(
         req.paths.as_ref().unwrap().iter().map(std::path::PathBuf::from).collect();
 
     let mut synced = 0u32;
+    let mut unchanged = 0u32;
     let mut failed = 0u32;
     let mut results: Vec<Value> = Vec::new();
 
@@ -2800,11 +2982,31 @@ async fn sync_obsidian_folder(
             .ok()
             .and_then(|m| m.modified().ok())
             .map(DateTime::<Utc>::from);
+        // Same identity as the scheduled vault re-ingest (services/obsidian.rs):
+        // "Obsidian (<vault>) / <path>". The two used different strings before,
+        // so one note became two unrelated documents depending on how it came in.
+        let doc_path = format!("Obsidian ({}) / {}", vault.label, rel_str);
         let source_doc = crate::services::source_docs::resolve_source_document(
-            &state.db, claims.sub, None, &rel_str, Some(&note_name),
+            &state.db, claims.sub, None, &doc_path, Some(&note_name),
             &content_hash, modified_at,
         ).await.ok();
         let source_document_id = source_doc.as_ref().map(|d| d.id);
+
+        let target = match resolved.compilation_id {
+            Some(id) => Some(id),
+            None => crate::services::obsidian::resolve_obsidian_compilation(&state.db, claims.sub, &vault.label).await,
+        };
+
+        // Unchanged note: its existing extraction joins the target, nothing is queued.
+        if let Some(existing) = crate::routes::kex::reuse_existing_job(
+            &state.db, claims.sub, source_doc.as_ref(), resolved.classification_level_id,
+            resolved.ontology_id, claims.api_key_id, req.opts.force,
+        ).await {
+            crate::routes::kex::link_owned_job(&state.db, claims.sub, target, existing).await;
+            unchanged += 1;
+            results.push(json!({ "path": rel_str, "name": note_name, "jobId": existing, "unchanged": true }));
+            continue;
+        }
 
         let job_id = Uuid::new_v4();
         let insert = sqlx::query(
@@ -2834,10 +3036,6 @@ async fn sync_obsidian_folder(
 
         // Link into the target compilation (or default KB) so the file's extracted
         // entities appear in the graph (via compilation.source_job_ids).
-        let target = match resolved.compilation_id {
-            Some(id) => Some(id),
-            None => crate::services::obsidian::resolve_obsidian_compilation(&state.db, claims.sub, &vault.label).await,
-        };
         crate::routes::kex::link_owned_job(&state.db, claims.sub, target, job_id).await;
 
         crate::services::usage::record_usage(&state.db, claims.sub, "kex_extract", 5, Some(job_id)).await;
@@ -2853,7 +3051,7 @@ async fn sync_obsidian_folder(
             "classification":          resolved.classification_name,
             "classification_level_id": resolved.classification_level_id,
             "source_document_id":      source_document_id,
-            "source_path":             &rel_str,
+            "source_path":             &doc_path,
             "source_modified_at":      modified_at,
         });
         crate::services::llm::inject_ollama_overrides(&state.db, claims.sub, &mut payload).await;
@@ -2868,7 +3066,7 @@ async fn sync_obsidian_folder(
         results.push(json!({ "path": rel_str, "name": note_name, "jobId": job_id }));
     }
 
-    Ok(Json(json!({ "synced": synced, "failed": failed, "results": results })))
+    Ok(Json(json!({ "synced": synced, "unchanged": unchanged, "failed": failed, "results": results })))
 }
 
 // ─── SharePoint / Obsidian DB helpers ────────────────────────────────────────
@@ -3072,8 +3270,8 @@ pub(crate) async fn retry_connector_job(
             // enqueue_drive_file does not charge, so the retry is free by construction.
             enqueue_drive_file(
                 &state.db, &state.redis, &http, &token, user_id, connector_id,
-                drive_file_id, file_name, &resolved, file_name, None,
-            ).await
+                drive_file_id, file_name, &resolved, file_name, None, true,
+            ).await.map(|sub| sub.job_id)
         }
         "kex_sharepoint" => {
             let tenant_config_id = uuid_field("tenantConfigId")
@@ -3085,15 +3283,43 @@ pub(crate) async fn retry_connector_job(
             let file_id = input["fileId"].as_str()
                 .ok_or_else(|| AppError::BadRequest("job input missing fileId".into()))?;
             let clf = classification_level_id.or_else(|| uuid_field("classificationLevelId"));
+            let tenant = fetch_sharepoint_tenant(&state.db, tenant_config_id, user_id).await?;
+            let http = reqwest::Client::new();
+            let token =
+                sharepoint_access_token(&http, &tenant.tenant_id, &tenant.client_id, &tenant.client_secret).await?;
             enqueue_sharepoint_file(
-                // Retry path — no calling token, so no provenance.
-                &state.db, &state.redis, user_id, None, tenant_config_id, site_id, drive_id, file_id, clf, false,
-            ).await
+                // Retry path — no calling token, so no provenance; always extracts.
+                &state.db, &state.redis, &http, &token, user_id, None, tenant_config_id, site_id, drive_id,
+                file_id, clf, uuid_field("compilationId"), false, true,
+            ).await.map(|sub| sub.job_id)
         }
         other => Err(AppError::BadRequest(format!(
             "job type '{other}' cannot be retried by re-fetch — re-upload or re-sync required"
         ))),
     }
+}
+
+/// A connector file the listing reports with the same modified time as the
+/// latest recorded version of its path: the existing extraction, if one with
+/// the same settings stands. Background syncs carry no calling token.
+async fn reuse_by_mtime(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    path: &str,
+    modified_at: Option<DateTime<Utc>>,
+    classification_level_id: Option<Uuid>,
+    ontology_id: Option<Uuid>,
+    api_key_id: Option<Uuid>,
+) -> Option<Uuid> {
+    let doc_id = crate::services::source_docs::unchanged_by_mtime(db, user_id, path, modified_at).await?;
+    let key = crate::services::source_docs::ReuseKey {
+        user_id,
+        source_document_id: doc_id,
+        classification_level_id,
+        ontology_id,
+        api_key_id,
+    };
+    crate::services::source_docs::reusable_job(db, &key).await
 }
 
 async fn enqueue_drive_file(
@@ -3113,8 +3339,22 @@ async fn enqueue_drive_file(
     // call is made just for this).
     full_path: &str,
     modified_at: Option<DateTime<Utc>>,
-) -> Result<Uuid> {
+    // Extract even when the file is unchanged (retry, explicit re-sync).
+    force: bool,
+) -> Result<crate::routes::kex::Submitted> {
     use base64::Engine;
+
+    // Same path, same remote modified time as the latest recorded version:
+    // the file has not changed, so it is not even downloaded. Its existing
+    // extraction joins the target knowledge base instead.
+    if !force {
+        if let Some(existing) = reuse_by_mtime(
+            db, user_id, full_path, modified_at, opts.classification_level_id, opts.ontology_id, None,
+        ).await {
+            crate::routes::kex::link_owned_job(db, user_id, opts.compilation_id, existing).await;
+            return Ok(crate::routes::kex::Submitted { job_id: existing, reused: true });
+        }
+    }
 
     // Download + base64 the file so the worker's existing `file` handler can
     // extract it (it does `json.loads(input)` → base64-decode → extract_text).
@@ -3136,6 +3376,15 @@ async fn enqueue_drive_file(
         &content_hash, modified_at,
     ).await.ok();
     let source_document_id = source_doc.as_ref().map(|d| d.id);
+
+    // Downloaded after all (no or a different modified time), but the bytes
+    // are the same as last time: no new extraction either.
+    if let Some(existing) = crate::routes::kex::reuse_existing_job(
+        db, user_id, source_doc.as_ref(), opts.classification_level_id, opts.ontology_id, None, force,
+    ).await {
+        crate::routes::kex::link_owned_job(db, user_id, opts.compilation_id, existing).await;
+        return Ok(crate::routes::kex::Submitted { job_id: existing, reused: true });
+    }
 
     let job_id = Uuid::new_v4();
 
@@ -3199,7 +3448,7 @@ async fn enqueue_drive_file(
         .await
         .map_err(|e| AppError::Internal(format!("Redis push failed: {e}")))?;
 
-    Ok(job_id)
+    Ok(crate::routes::kex::Submitted { job_id, reused: false })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -3235,5 +3484,36 @@ mod file_asset_tests {
     fn sharepoint_folder_path_drive_root_is_none() {
         assert_eq!(sharepoint_folder_path("/drives/b!abc123/root:"), None);
         assert_eq!(sharepoint_folder_path("no-root-marker"), None);
+    }
+}
+
+
+#[cfg(test)]
+mod sharepoint_identity_tests {
+    use super::{sharepoint_document_path, sharepoint_folder_from_parent_path};
+
+    #[test]
+    fn the_folder_is_the_path_inside_the_library() {
+        assert_eq!(sharepoint_folder_from_parent_path("/drives/b!abc/root:/Team/Plans"), "Team/Plans");
+        assert_eq!(sharepoint_folder_from_parent_path("/drives/b!abc/root:"), "");
+        assert_eq!(sharepoint_folder_from_parent_path("/drives/b!abc"), "");
+    }
+
+    #[test]
+    fn a_file_is_identified_by_site_host_and_library_path() {
+        let site = "contoso.sharepoint.com,1111-2222,3333-4444";
+        assert_eq!(
+            sharepoint_document_path(site, "Team/Plans", "Q4.docx"),
+            "SharePoint (contoso.sharepoint.com) / Team/Plans/Q4.docx"
+        );
+        assert_eq!(
+            sharepoint_document_path(site, "", "Readme.md"),
+            "SharePoint (contoso.sharepoint.com) / Readme.md"
+        );
+        // The same file seen by a manual and a scheduled sync gets one identity.
+        assert_eq!(
+            sharepoint_document_path(site, "Team/Plans", "Q4.docx"),
+            sharepoint_document_path(site, &sharepoint_folder_from_parent_path("/drives/x/root:/Team/Plans"), "Q4.docx"),
+        );
     }
 }

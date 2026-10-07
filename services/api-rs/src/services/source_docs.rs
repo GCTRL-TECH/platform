@@ -156,6 +156,90 @@ pub async fn resolve_source_document(
     }
 }
 
+// ── Skipping unchanged documents ─────────────────────────────────────────────
+//
+// A document whose content did not change since its last extraction does not
+// need to be extracted again. Every ingest path resolves the document first
+// (above); when that resolution only TOUCHED the existing row, the extraction
+// that row already produced can serve the new request: the caller's knowledge
+// base gets linked to the existing job, nothing is charged, nothing is queued.
+//
+// Connectors can tell even earlier: the remote listing carries a modified time,
+// and when it equals the one recorded for the latest version, the file is not
+// even downloaded (`unchanged_by_mtime`).
+
+/// The settings an extraction was made with. A job is reused only when all of
+/// them match the new request, so a different classification, ontology or
+/// calling token always gets its own extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReuseKey {
+    pub user_id: Uuid,
+    pub source_document_id: Uuid,
+    pub classification_level_id: Option<Uuid>,
+    pub ontology_id: Option<Uuid>,
+    /// The calling access token. A token-scoped caller only sees jobs its own
+    /// token created, so a job made under another token is never handed out.
+    pub api_key_id: Option<Uuid>,
+}
+
+/// Pure: may this resolution be answered from an existing extraction?
+/// Never for a new version or a first sighting, never when the caller forces.
+pub fn may_reuse(resolution: &SourceDocResolution, force: bool) -> bool {
+    !force && !resolution.is_new_version
+}
+
+/// Statuses whose extraction stands or is on its way. A failed job is never
+/// reused: re-sending a file is exactly how a failed extraction gets repaired.
+pub const REUSABLE_STATUSES: [&str; 3] = ["pending", "processing", "completed"];
+
+/// The most recent reusable extraction for this document and these settings.
+pub async fn reusable_job(db: &sqlx::PgPool, key: &ReuseKey) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM jobs
+          WHERE user_id = $1 AND source_document_id = $2
+            AND status::text = ANY($3)
+            AND classification_level_id IS NOT DISTINCT FROM $4
+            AND NULLIF(input->>'ontologyId', '') IS NOT DISTINCT FROM $5::text
+            AND api_key_id IS NOT DISTINCT FROM $6
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(key.user_id)
+    .bind(key.source_document_id)
+    .bind(REUSABLE_STATUSES.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    .bind(key.classification_level_id)
+    .bind(key.ontology_id.map(|u| u.to_string()))
+    .bind(key.api_key_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Before downloading: is the latest version of this path recorded with exactly
+/// this remote modified time? Returns that document's id when it is. Only a
+/// source that reports a real modified time can answer this; `None` in, `None`
+/// out.
+pub async fn unchanged_by_mtime(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    path: &str,
+    modified_at: Option<DateTime<Utc>>,
+) -> Option<Uuid> {
+    let modified_at = modified_at?;
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM source_documents
+          WHERE user_id = $1 AND path = $2 AND latest AND modified_at = $3
+          LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(path)
+    .bind(modified_at)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +280,22 @@ mod tests {
         // Deterministic across calls.
         assert_eq!(h, hash_content(b"hello"));
         assert_ne!(h, hash_content(b"hello!"));
+    }
+    #[test]
+    fn only_an_untouched_document_may_reuse_and_force_always_extracts() {
+        let id = Uuid::nil();
+        let touched = SourceDocResolution { id, version: 3, is_new_version: false };
+        let fresh = SourceDocResolution { id, version: 1, is_new_version: true };
+        let bumped = SourceDocResolution { id, version: 4, is_new_version: true };
+        assert!(may_reuse(&touched, false));
+        assert!(!may_reuse(&touched, true));
+        assert!(!may_reuse(&fresh, false));
+        assert!(!may_reuse(&bumped, false));
+    }
+
+    #[test]
+    fn a_failed_extraction_is_never_reused() {
+        assert!(!REUSABLE_STATUSES.contains(&"failed"));
+        assert!(REUSABLE_STATUSES.contains(&"completed"));
     }
 }

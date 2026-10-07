@@ -191,25 +191,26 @@ async fn reingest_folder_vault(
             }
         };
 
+        // The note's own modified time: recorded on its document identity, and
+        // the cheap first filter of an incremental run.
+        let modified = std::fs::metadata(&canon)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(
+                    d.as_secs() as i64,
+                    d.subsec_nanos(),
+                )
+                .unwrap_or_else(chrono::Utc::now)
+            });
+
         // Incremental: skip notes not modified since the last run.
         if opts.mode == ReingestMode::Incremental {
-            if let Some(since) = opts.since {
-                let modified = std::fs::metadata(&canon)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| {
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(
-                            d.as_secs() as i64,
-                            d.subsec_nanos(),
-                        )
-                        .unwrap_or_else(chrono::Utc::now)
-                    });
-                if let Some(mt) = modified {
-                    if mt < since {
-                        out.skipped += 1;
-                        continue;
-                    }
+            if let (Some(since), Some(mt)) = (opts.since, modified) {
+                if mt < since {
+                    out.skipped += 1;
+                    continue;
                 }
             }
         }
@@ -243,9 +244,27 @@ async fn reingest_folder_vault(
         // the web UI's Obsidian import already writes into sourceRef.
         let source_path = format!("Obsidian ({}) / {}", vault.label, rel_str);
         let content_hash = crate::services::source_docs::hash_content(&bytes);
-        let source_document_id = crate::services::source_docs::resolve_source_document(
-            db, vault.user_id, None, &source_path, Some(&note_name), &content_hash, None,
-        ).await.ok().map(|d| d.id);
+        let source_doc = crate::services::source_docs::resolve_source_document(
+            db, vault.user_id, None, &source_path, Some(&note_name), &content_hash, modified,
+        ).await.ok();
+        let source_document_id = source_doc.as_ref().map(|d| d.id);
+
+        let target = match opts.compilation_id {
+            Some(id) => Some(id),
+            None => resolve_obsidian_compilation(db, vault.user_id, &vault.label).await,
+        };
+
+        // A touched but unchanged note (an editor saving without edits, a
+        // first incremental run without `since`) keeps its extraction. A FULL
+        // re-ingest is the explicit "extract everything again" and skips nothing.
+        if let Some(existing) = crate::routes::kex::reuse_existing_job(
+            db, vault.user_id, source_doc.as_ref(), opts.classification_level_id, opts.ontology_id,
+            None, opts.mode == ReingestMode::Full,
+        ).await {
+            crate::routes::kex::link_owned_job(db, vault.user_id, target, existing).await;
+            out.skipped += 1;
+            continue;
+        }
 
         let job_id = Uuid::new_v4();
         let insert = sqlx::query(
@@ -276,10 +295,6 @@ async fn reingest_folder_vault(
         // entities appear in the graph — membership is via compilation.source_job_ids,
         // not a per-node compilationId. Without this the job completes but its nodes
         // never show up in the chosen graph.
-        let target = match opts.compilation_id {
-            Some(id) => Some(id),
-            None => resolve_obsidian_compilation(db, vault.user_id, &vault.label).await,
-        };
         crate::routes::kex::link_owned_job(db, vault.user_id, target, job_id).await;
 
         crate::services::usage::record_usage(db, vault.user_id, "kex_extract", 5, Some(job_id))
@@ -298,6 +313,7 @@ async fn reingest_folder_vault(
             // Stamped onto every chunk and node the worker creates from this note.
             "source_document_id":      source_document_id,
             "source_path":             source_path,
+            "source_modified_at":      modified,
         });
         crate::services::llm::inject_ollama_overrides(db, vault.user_id, &mut payload).await;
 

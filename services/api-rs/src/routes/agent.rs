@@ -646,6 +646,9 @@ struct IngestProvenance {
     /// Caller-supplied origin, if any — kept separate from `source_path` so
     /// `jobs.input->>'sourceRef'` stays honest about what was actually claimed.
     source_ref: Option<String>,
+    /// Full resolution (incl. whether the content changed), for skipping an
+    /// unchanged document.
+    resolution: Option<crate::services::source_docs::SourceDocResolution>,
 }
 
 /// The caller's claim about origin — pure, so the precedence is testable.
@@ -697,7 +700,7 @@ async fn resolve_ingest_provenance(
     let source_ref = derive_source_ref(args);
     let source_path = source_path_for(source_ref.as_deref(), text);
     let content_hash = crate::services::source_docs::hash_content(text.as_bytes());
-    let source_document_id = crate::services::source_docs::resolve_source_document(
+    let resolution = crate::services::source_docs::resolve_source_document(
         &state.db,
         user_id,
         None,
@@ -707,9 +710,9 @@ async fn resolve_ingest_provenance(
         None,
     )
     .await
-    .ok()
-    .map(|d| d.id);
-    IngestProvenance { source_document_id, source_path, source_ref }
+    .ok();
+    let source_document_id = resolution.as_ref().map(|d| d.id);
+    IngestProvenance { source_document_id, source_path, source_ref, resolution }
 }
 
 async fn execute_tool_inner(
@@ -1212,6 +1215,14 @@ async fn execute_tool_inner(
             }
             let job_id = uuid::Uuid::new_v4();
             let prov = resolve_ingest_provenance(state, claims.sub, text, args).await;
+            // The same text with the same settings was extracted before: reuse it.
+            if let Some(existing) = crate::routes::kex::reuse_existing_job(
+                &state.db, claims.sub, prov.resolution.as_ref(), clf, None, claims.api_key_id,
+                args["force"].as_bool().unwrap_or(false),
+            ).await {
+                crate::routes::kex::link_job_to_target_or_default(&state.db, claims, None, existing).await;
+                return crate::routes::kex::Submitted { job_id: existing, reused: true }.response();
+            }
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
                 .bind(claims.sub).execute(&state.db).await;
             let _ = sqlx::query(
@@ -1526,6 +1537,22 @@ async fn execute_tool_inner(
             }
             let job_id = uuid::Uuid::new_v4();
             let prov = resolve_ingest_provenance(state, claims.sub, text, args).await;
+            // Storing the same note again: the earlier extraction already holds it.
+            if let Some(existing) = crate::routes::kex::reuse_existing_job(
+                &state.db, claims.sub, prov.resolution.as_ref(), None, None, claims.api_key_id,
+                args["force"].as_bool().unwrap_or(false),
+            ).await {
+                let mut linked = false;
+                if let Some(cid) = target_cid {
+                    crate::routes::kex::link_job_to_compilation(&state.db, claims.sub, cid, existing).await;
+                    linked = true;
+                }
+                return json!({
+                    "ok": true, "jobId": existing, "compilationId": target_cid, "linked": linked,
+                    "status": "unchanged", "reused": true,
+                    "note": "This text was stored before; the existing extraction now also belongs to the target knowledge base."
+                });
+            }
             let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
                 .bind(claims.sub).execute(&state.db).await;
             let _ = sqlx::query(
@@ -1611,9 +1638,9 @@ async fn execute_tool_inner(
             let source_ref = derive_source_ref(args);
             match crate::routes::kex::submit_upload(
                 state, claims, &bytes, &file_name, ontology_id, None, compilation_id,
-                source_ref.as_deref(),
+                source_ref.as_deref(), args["force"].as_bool().unwrap_or(false),
             ).await {
-                Ok(job_id) => json!({ "jobId": job_id, "status": "pending" }),
+                Ok(submitted) => submitted.response(),
                 Err(e) => json!({ "error": e.to_string() }),
             }
         }

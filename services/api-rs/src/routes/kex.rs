@@ -30,6 +30,9 @@ struct ExtractReq {
     /// into that compilation's `source_job_ids` so the document is part of the
     /// graph (and scoped RAG can find it) instead of being orphaned.
     #[serde(rename = "compilationId")]       compilation_id:         Option<Uuid>,
+    /// Extract again although this text was extracted before with the same settings.
+    #[serde(default)]
+    force: bool,
 }
 
 /// The status a caller is shown for a finished job.
@@ -262,10 +265,6 @@ async fn extract(
     if let Some(cid) = req.compilation_id {
         crate::routes::kg::enforce_code_capability(&state.db, &claims, cid).await?;
     }
-    // GREATEST(0, ...) prevents negative balances if a prior bug or race left them stuck.
-    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
-        .bind(claims.sub).execute(&state.db).await?;
-
     let (ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, req.ontology_id).await;
 
     // P2b: resolve a stable document identity for (user, path). Re-ingesting
@@ -283,6 +282,20 @@ async fn extract(
         &content_hash, None,
     ).await.ok();
     let source_document_id = source_doc.as_ref().map(|d| d.id);
+
+    // The same text with the same settings was extracted before: link that
+    // extraction to the target knowledge base instead of paying for it again.
+    if let Some(existing) = reuse_existing_job(
+        &state.db, claims.sub, source_doc.as_ref(), req.classification_level_id,
+        ontology_id, claims.api_key_id, req.force,
+    ).await {
+        link_job_to_target_or_default(&state.db, &claims, req.compilation_id, existing).await;
+        return Ok(Json(Submitted { job_id: existing, reused: true }.response()));
+    }
+
+    // GREATEST(0, ...) prevents negative balances if a prior bug or race left them stuck.
+    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
+        .bind(claims.sub).execute(&state.db).await?;
 
     let job_id = Uuid::new_v4();
     sqlx::query(
@@ -660,6 +673,8 @@ async fn upload(
     let mut compilation_id: Option<Uuid> = None;
     // CLI and SDK send the file's real location here; the browser does not.
     let mut source_ref: Option<String> = None;
+    // `force=true`: extract again although the content is unchanged.
+    let mut force = false;
 
     while let Some(field) = multipart.next_field().await
         .map_err(|e| AppError::BadRequest(e.to_string()))? {
@@ -685,17 +700,26 @@ async fn upload(
                 let s = s.trim();
                 if !s.is_empty() { source_ref = Some(s.to_string()); }
             }
+            Some("force") => {
+                let s = field.text().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+                force = is_truthy(&s);
+            }
             _ => {}
         }
     }
 
     let bytes = file_bytes.ok_or(AppError::BadRequest("No file field".into()))?;
-    let job_id = submit_upload(
+    let submitted = submit_upload(
         &state, &claims, &bytes, &file_name, ontology_id, classification_level_id, compilation_id,
-        source_ref.as_deref(),
+        source_ref.as_deref(), force,
     ).await?;
 
-    Ok(Json(json!({ "jobId": job_id, "status": "pending" })))
+    Ok(Json(submitted.response()))
+}
+
+/// "true" / "1" / "yes" / "on" (any case) — how multipart and query flags say yes.
+pub(crate) fn is_truthy(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
 }
 
 /// MIME type KEX should route a file by, from its extension. KEX's
@@ -761,15 +785,17 @@ pub(crate) async fn submit_upload(
     // `notes.md` are ONE document under the bare name and two under their paths,
     // and a reader who only sees "notes.md" cannot tell which one made a claim.
     source_ref: Option<&str>,
-) -> Result<Uuid> {
+    // Extract even when the same content was extracted before (a new model, a
+    // changed ontology the caller knows about). Default: an unchanged file is
+    // answered from its existing extraction.
+    force: bool,
+) -> Result<Submitted> {
     enforce_classification_ceiling(&state.db, claims, classification_level_id).await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
 
     let mimetype = mime_for_filename(file_name);
 
     let job_id = Uuid::new_v4();
-    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
-        .bind(claims.sub).execute(&state.db).await?;
 
     let (resolved_ontology_id, entity_types) = resolve_ontology(&state.db, claims.sub, ontology_id).await;
 
@@ -788,6 +814,19 @@ pub(crate) async fn submit_upload(
         &content_hash, None,
     ).await.ok();
     let source_document_id = source_doc.as_ref().map(|d| d.id);
+
+    // Unchanged content, same settings: the existing extraction serves this
+    // upload. It only gains the caller's knowledge base; nothing is charged.
+    if let Some(existing) = reuse_existing_job(
+        &state.db, claims.sub, source_doc.as_ref(), classification_level_id,
+        resolved_ontology_id, claims.api_key_id, force,
+    ).await {
+        link_job_to_target_or_default(&state.db, claims, compilation_id, existing).await;
+        return Ok(Submitted { job_id: existing, reused: true });
+    }
+
+    sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 5) WHERE id = $1")
+        .bind(claims.sub).execute(&state.db).await?;
 
     sqlx::query(
         "INSERT INTO jobs (id, user_id, type, status, input, classification_level_id, source_document_id, api_key_id)
@@ -840,7 +879,57 @@ pub(crate) async fn submit_upload(
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(job_id)
+    Ok(Submitted { job_id, reused: false })
+}
+
+/// What a submission produced: a new extraction job, or an existing one whose
+/// document has not changed since (`reused`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Submitted {
+    pub job_id: Uuid,
+    pub reused: bool,
+}
+
+impl Submitted {
+    /// The response body every submission route returns.
+    pub fn response(&self) -> Value {
+        if self.reused {
+            json!({ "jobId": self.job_id, "status": "unchanged", "reused": true,
+                    "note": "This content was extracted before with the same settings; the existing extraction now also belongs to the target knowledge base. Send force=true to extract it again." })
+        } else {
+            json!({ "jobId": self.job_id, "status": "pending" })
+        }
+    }
+}
+
+/// The existing extraction an unchanged document can reuse, if any. `None` when
+/// the document is new or changed, when the caller forces, or when no earlier
+/// extraction with the same classification, ontology and token stands.
+pub(crate) async fn reuse_existing_job(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    resolution: Option<&crate::services::source_docs::SourceDocResolution>,
+    classification_level_id: Option<Uuid>,
+    ontology_id: Option<Uuid>,
+    api_key_id: Option<Uuid>,
+    force: bool,
+) -> Option<Uuid> {
+    let resolution = resolution?;
+    if !crate::services::source_docs::may_reuse(resolution, force) {
+        return None;
+    }
+    let key = crate::services::source_docs::ReuseKey {
+        user_id,
+        source_document_id: resolution.id,
+        classification_level_id,
+        ontology_id,
+        api_key_id,
+    };
+    let found = crate::services::source_docs::reusable_job(db, &key).await;
+    if let Some(job) = found {
+        tracing::info!("kex: document {} unchanged, reusing extraction {job}", resolution.id);
+    }
+    found
 }
 
 /// Re-push a FAILED text extraction. The full text is retained in `jobs.input`,
