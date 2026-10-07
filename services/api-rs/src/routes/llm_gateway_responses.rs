@@ -29,18 +29,21 @@
 //! files, and the keys `tools`, `tool_choice`, `text`, `reasoning`, `metadata`,
 //! `prompt_cache_key`, `client_metadata`, `include`, `model`, `store`, `stream`.
 //! `local_shell_call.action.command[]` and `local_shell_call_output.output` are
-//! treated like function calls and their outputs; `web_search_call` stays untouched
-//! (its query keeps the model's pseudonyms both ways).
+//! treated like function calls and their outputs; `local_shell_call.action`'s
+//! `working_directory` and `env` are passed through (neither de-cloaked nor
+//! re-cloaked); `web_search_call` stays untouched (its query keeps the model's
+//! pseudonyms both ways).
 //!
-//! Path policy (privacy.rs `apply_pseudonyms_recording`): a name that contains a
-//! space (`Max Müller`, `Nexovar GmbH`) is cloaked inside paths too
-//! (`crm/Max Müller.md` -> `crm/Person-3.md`, restored byte for byte on the way
-//! down), so tool calls, patches and `rg` hits replay without the real name. A
-//! single-token entity inside a path, slug, host or env var (`/asgard_prod/anvil/`)
-//! is left alone, and a slug spelling (`Max_Mueller.md`) is not the entity's name,
-//! so it stays in clear: name files neutrally when that matters.
-//! Known channels that stay in clear: JSON object keys in replayed `arguments`
-//! (never cloaked), and tool outputs when the caller opts out.
+//! Path policy (privacy.rs `apply_pseudonyms_recording`): a name glued into a file
+//! path or slug is NOT cloaked, multi-word names included (`crm/Max Müller.md`,
+//! `notes/Nexovar GmbH/2026.txt`, `Max_Mueller.md` all travel in clear), while the
+//! same name next to a space or punctuation is cloaked. Cloaking path segments
+//! would break tools on the way back (one recorded surface per pseudonym turns a
+//! case variant into another file; an unquoted shell command splits the restored
+//! name at its space). Residual channel: a vendor can link a pseudonym to a name it
+//! sees in a path, so keep sensitive data under neutral file names.
+//! Other known channels in clear: JSON object keys in replayed `arguments` (never
+//! cloaked), and tool outputs when the caller opts out.
 //!
 //! The Codex headers (`x-codex-turn-metadata`: cwd, git remote, branch) and
 //! `client_metadata` are workspace metadata, not knowledge-base entities, and are
@@ -2003,7 +2006,7 @@ mod tests {
         let mut body = json!({"input": [
             {"type": "function_call_output", "call_id": "c1", "output": "Max Müller, row 1"},
             {"type": "custom_tool_call_output", "call_id": "c2", "output": [
-                {"type": "input_text", "text": "patched Max Müller.md"},
+                {"type": "input_text", "text": "patched Max Müller, see notes"},
                 {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
                 {"type": "output_text", "text": ""}
             ]},
@@ -2018,7 +2021,7 @@ mod tests {
         let (cloaked, bs) = real_cloak(&texts, &s);
         write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         assert_eq!(body["input"][0]["output"], "Person-3, row 1");
-        assert_eq!(body["input"][1]["output"][0]["text"], "patched Person-3.md");
+        assert_eq!(body["input"][1]["output"][0]["text"], "patched Person-3, see notes");
         assert_eq!(body["input"][1]["output"][1], before["input"][1]["output"][1]);
         for i in 2..5 {
             assert_eq!(body["input"][i], before["input"][i]);
@@ -2052,14 +2055,15 @@ mod tests {
         write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         assert_eq!(
             body["input"][0]["input"],
-            "*** Begin Patch\n*** Update File: crm/Person-3.md\n-Person-3\n+Person-3 (CEO)\n*** End Patch"
+            "*** Begin Patch\n*** Update File: crm/Max Müller.md\n-Person-3\n+Person-3 (CEO)\n*** End Patch",
+            "the path keeps the name (path policy), the patch lines are cloaked"
         );
         assert_eq!(body["input"][0]["name"], "apply_patch");
     }
 
     // 28
     #[test]
-    fn names_in_paths_cloak_with_the_real_cloaker_slugs_stay() {
+    fn names_in_paths_stay_in_clear_with_the_real_cloaker_residual() {
         let mut map = HashMap::new();
         map.insert("Person-3".to_string(), "Max Müller".to_string());
         map.insert("Org-2".to_string(), "Nexovar GmbH".to_string());
@@ -2073,16 +2077,10 @@ mod tests {
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
         let (cloaked, bs) = real_cloak(&texts, &s);
         write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
-        assert_eq!(
-            body["input"][0]["arguments"],
-            r#"{"cmd":"cat crm/Person-3.md notes/Org-2/2026.txt Max_Mueller.md ~/asgard_prod/anvil/x"}"#,
-            "byte-faithful write-back; slug and single-token path segment stay"
-        );
-        assert_eq!(body["input"][1]["output"], "crm/Person-3.md:12: Person-3, CEO of Org-2");
-        // and the de-cloaker restores the path exactly
-        let mut item = fc_item(0, body["input"][0]["arguments"].as_str().unwrap());
-        decloak_responses_item(&bs, &json_escaped_session(&bs), &mut item);
-        assert_eq!(item["arguments"], args);
+        // documented residual: names inside paths and slugs travel in clear
+        assert_eq!(body["input"][0]["arguments"], args, "no name outside a path: arguments untouched");
+        // the same names next to a space or punctuation are cloaked
+        assert_eq!(body["input"][1]["output"], "crm/Max Müller.md:12: Person-3, CEO of Org-2");
     }
 
     // 29

@@ -1439,7 +1439,8 @@ mod tests {
         assert_eq!(input["n"], 3);
         assert_eq!(input["flag"], true);
         assert_eq!(input["empty"], "");
-        assert_eq!(input["nested"]["paths"], json!(["crm/Person-27.md", 7, {"deep": "Term-274"}]));
+        // a name inside a path stays in clear (privacy path policy); a standalone value cloaks
+        assert_eq!(input["nested"]["paths"], json!(["crm/Tom Arenstam.md", 7, {"deep": "Term-274"}]));
         assert_eq!(body["messages"][0]["content"], "find Person-27");
         assert_eq!(body["messages"][1]["content"][0]["text"], "ok");
         assert_eq!(body["messages"][2]["content"][0]["content"], "Tom Arenstam, row 1");
