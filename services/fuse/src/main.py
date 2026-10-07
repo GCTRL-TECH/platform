@@ -132,6 +132,11 @@ def run_merge(
     if conflicts:
         _write_conflicts(compilation_id, conflicts)
 
+    # Persist the merge trail (same reason: too bulky for the job result).
+    links = stats.pop("_links", None)
+    if links is not None:
+        _write_merge_links(compilation_id, user_id, links)
+
     logger.info(f"[{compilation_id}] Merge complete: {stats}")
     return {
         "compilation_id": compilation_id,
@@ -167,6 +172,56 @@ def _write_conflicts(compilation_id: str, conflicts: list[dict]) -> None:
         logger.info(f"[{compilation_id}] Recorded {len(conflicts)} classification conflict(s)")
     except Exception as exc:
         logger.warning(f"[{compilation_id}] Failed to record conflicts: {exc}")
+
+
+def _as_uuid_or_none(value: str) -> str | None:
+    import uuid
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _write_merge_links(compilation_id: str, user_id: str, links: list[dict]) -> None:
+    """Replace the compilation's merge trail with this run's links.
+
+    Best-effort, like _write_conflicts: the merged graph is already written; the
+    trail only explains it. A benchmark compilation that has no `compilations`
+    row (or a non-UUID id) is skipped by the foreign key and logged.
+    """
+    cid = _as_uuid_or_none(compilation_id)
+    if cid is None:
+        logger.info(f"[{compilation_id}] Merge trail skipped: not a stored compilation")
+        return
+    try:
+        import psycopg2
+        from psycopg2.extras import execute_values
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM merge_links WHERE compilation_id = %s", (cid,))
+            if links:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO merge_links
+                        (compilation_id, user_id, source_uri, target_uri,
+                         source_name, target_name, entity_type, methods,
+                         score, limes_score, band, merged_uri)
+                    VALUES %s
+                    ON CONFLICT (compilation_id, source_uri, target_uri) DO NOTHING
+                    """,
+                    [
+                        (cid, _as_uuid_or_none(user_id), l["source_uri"], l["target_uri"],
+                         l["source_name"], l["target_name"], l["entity_type"],
+                         list(l["methods"]), l["score"], l["limes_score"], l["band"],
+                         l["merged_uri"])
+                        for l in links
+                    ],
+                )
+        conn.close()
+        logger.info(f"[{compilation_id}] Recorded {len(links)} merge link(s)")
+    except Exception as exc:
+        logger.warning(f"[{compilation_id}] Failed to record merge trail: {exc}")
 
 
 # ── Redis background worker ──────────────────────────────────────────

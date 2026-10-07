@@ -600,6 +600,102 @@ def _canonical_by_uri(
     return out
 
 
+def _link_score(link: dict) -> float:
+    """A link's confidence. ConEx links carry ``score`` instead of ``confidence``."""
+    value = link.get("confidence")
+    if value is None:
+        value = link.get("score")
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dedup_links(links: list[dict]) -> list[dict]:
+    """One link per unordered pair: the highest-confidence reading, plus
+    ``methods`` = every matcher that found the pair. The LIMES ``band`` /
+    ``limes_score`` are carried over even when another matcher wins the pair on
+    confidence, so the merge trail keeps what LIMES itself said."""
+    best: dict[tuple[str, str], dict] = {}
+    for link in links:
+        s = link.get("source", "")
+        t = link.get("target", "")
+        if not s or not t:
+            continue
+        key = (min(s, t), max(s, t))
+        methods = link.get("methods") or [link.get("method", "")]
+        cur = best.get(key)
+        if cur is None:
+            entry = dict(link)
+            entry["methods"] = sorted({m for m in methods if m})
+            best[key] = entry
+            continue
+        merged_methods = sorted(set(cur["methods"]) | {m for m in methods if m})
+        if _link_score(link) > _link_score(cur):
+            entry = dict(link)
+            for carried in ("band", "limes_score"):
+                if carried not in entry and carried in cur:
+                    entry[carried] = cur[carried]
+        else:
+            entry = cur
+            for carried in ("band", "limes_score"):
+                if carried not in entry and carried in link:
+                    entry[carried] = link[carried]
+        entry["methods"] = merged_methods
+        best[key] = entry
+    return list(best.values())
+
+
+def _order_members(
+    clusters: dict[int, list[str]], entity_by_uri: dict[str, dict], links: list[dict]
+) -> None:
+    """Sort every cluster in place so ``members[0]`` (the canonical member the
+    merged node is named after) is the same on every run: the member the most
+    links point at, then the longest name (the fullest written form), then URI."""
+    degree: dict[str, int] = {}
+    for link in links:
+        for end in (link.get("source", ""), link.get("target", "")):
+            degree[end] = degree.get(end, 0) + 1
+    for members in clusters.values():
+        members.sort(key=lambda uri: (
+            -degree.get(uri, 0),
+            -len(entity_by_uri.get(uri, {}).get("name") or ""),
+            uri,
+        ))
+
+
+def _link_records(
+    links: list[dict],
+    entity_by_uri: dict[str, dict],
+    canonical_by_uri: dict[str, tuple[str, str]],
+    compilation_id: str,
+) -> list[dict]:
+    """The merge trail: one record per link that joined two collected entities,
+    naming both ends, every matcher that found the pair, the score and the merged
+    node the pair ended up in."""
+    records = []
+    for link in links:
+        s, t = link.get("source", ""), link.get("target", "")
+        if s not in entity_by_uri or t not in entity_by_uri:
+            continue
+        if s > t:
+            s, t = t, s
+        name, etype = canonical_by_uri.get(s, ("", ""))
+        records.append({
+            "source_uri": s,
+            "target_uri": t,
+            "source_name": entity_by_uri[s].get("name") or "",
+            "target_name": entity_by_uri[t].get("name") or "",
+            "entity_type": _coarse_of(entity_by_uri[s]) or "",
+            "methods": link.get("methods") or [link.get("method", "")],
+            "score": _link_score(link),
+            "limes_score": link.get("limes_score"),
+            "band": link.get("band"),
+            "merged_uri": f"{name}_{etype}_{compilation_id}",
+        })
+    return records
+
+
 def _group_relations_onto_canonical(
     relations: list[dict], canonical_by_uri: dict[str, tuple[str, str]]
 ) -> dict[tuple, list[dict]]:
@@ -766,6 +862,7 @@ class ThreeStageEntityMerger:
 
         # ── Stage 2: Semantic Resolver ─────────────────────────────────
         matched_uris = self._extract_matched_uris(stage1_links)
+        self._stage2_fell_back = False
         stage2_links = self._stage2_resolver(source_job_ids, exclude_uris=matched_uris)
         logger.info(
             f"[{compilation_id}] Stage 2 (resolver): {len(stage2_links)} fuzzy matches"
@@ -815,6 +912,10 @@ class ThreeStageEntityMerger:
             + smart_links + canonical_links + embedding_links
         )
         all_links = self._deduplicate_links(all_links)
+        links_by_method: dict[str, int] = {}
+        for link in all_links:
+            for method in link["methods"]:
+                links_by_method[method] = links_by_method.get(method, 0) + 1
 
         # Write merged graph to Neo4j
         stats = self._write_merged_graph(
@@ -862,12 +963,19 @@ class ThreeStageEntityMerger:
             "canonical_link": len(canonical_links),
             "embedding_match": len(embedding_links),
             "total_links": len(all_links),
+            # Which engine produced Stage 2: 'fallback' = LIMES was unhealthy,
+            # failed or returned nothing and the python string matcher ran instead.
+            "stage2_engine": "fallback" if self._stage2_fell_back else "resolver",
+            "links_by_method": links_by_method,
             "_conflicts": conflicts,
             "conflicts_found": len(conflicts),
             "fact_conflicts_found": fact_conflicts_found,
         })
 
-        logger.info(f"[{compilation_id}] Merge complete: {stats}")
+        logger.info(
+            f"[{compilation_id}] Merge complete: "
+            f"{ {k: v for k, v in stats.items() if not k.startswith('_')} }"
+        )
         return stats
 
     # ── Stage 1: Neo4j APOC ─────────────────────────────────────────
@@ -885,6 +993,7 @@ class ThreeStageEntityMerger:
         MATCH (a:Entity), (b:Entity)
         WHERE {job_scope('a')}
           AND {job_scope('b')}
+          AND NOT a:Merged AND NOT b:Merged
           AND a._source_job <> b._source_job
           AND coalesce(a.coarse_type, a.type) = coalesce(b.coarse_type, b.type)
           AND toLower(a.name) = toLower(b.name)
@@ -948,6 +1057,7 @@ class ThreeStageEntityMerger:
                 "a degraded path; investigate resolver health.",
                 getattr(config, "RESOLVER_URL", "?"),
             )
+            self._stage2_fell_back = True
             return self._stage2_fallback(source_job_ids, exclude_uris)
 
         # Pick the LIMES metric. Precedence:
@@ -1184,12 +1294,14 @@ class ThreeStageEntityMerger:
                     "(docker logs gctrl-resolver): config XML / CSV / metric may be wrong.",
                     metric, len(src_export), len(tgt_export),
                 )
+                self._stage2_fell_back = True
                 return self._stage2_fallback(source_job_ids, exclude_uris)
         except Exception as exc:
             logger.error(
                 "STAGE-2 FALLBACK (resolver_fallback): LIMES resolver raised %r — "
                 "falling back to O(n^2) python string matcher.", exc,
             )
+            self._stage2_fell_back = True
             return self._stage2_fallback(source_job_ids, exclude_uris)
 
     def _stage2_field_mode(
@@ -1507,16 +1619,7 @@ class ThreeStageEntityMerger:
         """Dedup an undirected (source,target) link list, keeping the highest
         confidence per pair. Used to union the LIMES + difflib Stage-2 passes
         without double-counting a pair both engines agree on."""
-        best: dict[tuple[str, str], dict] = {}
-        for l in links:
-            s = l.get("source", "")
-            t = l.get("target", "")
-            if not s or not t:
-                continue
-            key = (min(s, t), max(s, t))
-            if key not in best or l.get("confidence", 0) > best[key].get("confidence", 0):
-                best[key] = l
-        return list(best.values())
+        return _dedup_links(links)
 
     def _stage2_fallback(
         self, source_job_ids: list[str], exclude_uris: set[str] | None = None,
@@ -1928,16 +2031,23 @@ class ThreeStageEntityMerger:
         # alongside name/type so Stage-2 can do ATTRIBUTE-AWARE (per-field)
         # matching. These are absent on the general-KG / synthetic-gold path
         # (return null → pruned downstream), so that path is unchanged.
+        #
+        # `NOT e:Merged`: merged nodes are :Entity too and carry the same
+        # `_source_jobs`, so without it a re-merge fed the previous run's merged
+        # nodes back in as sources (merge counts inflated, renamed nodes never
+        # went away, and another compilation sharing a job leaked its merged nodes).
         extra = ", ".join(f"e.{p} AS {p}" for p in ATTR_EXTRA_PROPS)
         query = f"""
         MATCH (e:Entity)
         WHERE {job_scope('e')}
+          AND NOT e:Merged
         RETURN e.name AS name, e.type AS type, e.coarse_type AS coarse_type,
                e.label AS label,
                {extra},
                e.uri AS uri, e._source_job AS source_job,
                e._classification AS classification,
                e._class_labels AS class_labels, e._label_ranks AS label_ranks
+        ORDER BY e.uri
         """
         with self.driver.session() as session:
             result = session.run(query, job_ids=source_job_ids)
@@ -1949,6 +2059,7 @@ class ThreeStageEntityMerger:
         MATCH (a:Entity)-[r]->(b:Entity)
         WHERE {job_scope('a')}
           AND {job_scope('b')}
+          AND NOT a:Merged AND NOT b:Merged
           AND NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
         RETURN a.uri AS head, type(r) AS rel, b.uri AS tail
         """
@@ -1970,15 +2081,7 @@ class ThreeStageEntityMerger:
 
     def _deduplicate_links(self, links: list[dict]) -> list[dict]:
         """Remove duplicate links, keeping highest confidence."""
-        seen: dict[tuple[str, str], dict] = {}
-        for link in links:
-            key = (
-                min(link["source"], link["target"]),
-                max(link["source"], link["target"]),
-            )
-            if key not in seen or link["confidence"] > seen[key]["confidence"]:
-                seen[key] = link
-        return list(seen.values())
+        return _dedup_links(links)
 
     @staticmethod
     def _canonical_coarse_type(member_recs: list[dict]) -> tuple[str, list[str]]:
@@ -2058,9 +2161,12 @@ class ThreeStageEntityMerger:
             if uri:
                 entity_by_uri[uri] = e
 
+        _order_members(clusters, entity_by_uri, all_links)
+
         # Create merged entities in Neo4j
         unique_clusters = set(uri_to_cluster.values())
         conflicts: list[dict] = []
+        written_uris: list[str] = []
         # Every member URI -> the (name, type) its cluster's merged node is written
         # under. _merge_relations needs it: a merged node exists ONLY under the
         # canonical member's name, so an edge attached to any other member
@@ -2130,7 +2236,9 @@ class ThreeStageEntityMerger:
                         e._owner = $user_id,
                         e._source_jobs = $source_jobs,
                         e._coarse_types = $coarse_types,
-                        e._merge_count = $merge_count
+                        e._merge_count = $merge_count,
+                        e._member_uris = $member_uris,
+                        e._aliases = $aliases
                     WITH e
                     MATCH (c:Compilation {compilation_id: $cid})
                     MERGE (c)-[:CONTAINS]->(e)
@@ -2149,8 +2257,24 @@ class ThreeStageEntityMerger:
                     source_jobs=source_jobs,
                     coarse_types=constituent_coarses,
                     merge_count=len(members),
+                    member_uris=members,
+                    aliases=sorted({rec.get("name") or "" for rec in member_recs} - {""}),
                 )
+                written_uris.append(merged_uri)
                 entities_created += 1
+
+            # A re-merge used to leave behind every merged node whose canonical
+            # name changed or whose cluster split. A merge always runs over the
+            # compilation's full source list, so whatever this run did not write
+            # is stale.
+            session.run(
+                """
+                MATCH (e:Entity:Merged {_compilation: $cid})
+                WHERE NOT e.uri IN $uris
+                DETACH DELETE e
+                """,
+                cid=compilation_id, uris=written_uris,
+            )
 
         duplicates_found = sum(1 for c in unique_clusters if len(clusters.get(c, [])) > 1)
 
@@ -2160,6 +2284,9 @@ class ThreeStageEntityMerger:
             "nodes_total": entities_created,
             "_conflicts": conflicts,
             "_canonical_by_uri": canonical_by_uri,
+            "_links": _link_records(
+                all_links, entity_by_uri, canonical_by_uri, compilation_id
+            ),
         }
 
     def _merge_relations(
@@ -2181,6 +2308,7 @@ class ThreeStageEntityMerger:
         MATCH (a:Entity)-[r]->(b:Entity)
         WHERE {job_scope('a')}
           AND {job_scope('b')}
+          AND NOT a:Merged AND NOT b:Merged
           AND NOT type(r) IN ['CONTAINS', 'SIMILAR_TO']
         RETURN a.uri AS head_uri, b.uri AS tail_uri,
                a.name AS head_name, a.type AS head_type,
