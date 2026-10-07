@@ -5,7 +5,7 @@ pub struct AppState {
     pub cfg:   Arc<crate::config::Config>,
     pub db:    PgPool,
     pub neo:   Arc<neo4rs::Graph>,
-    pub redis: Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    pub redis: Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     /// Process-wide generation gate for the active `openai_compatible` runtime
     /// (spec D2): `(configured size, semaphore)`. `llm::acquire_slot` swaps in a
     /// fresh semaphore when `runtime_config.max_concurrency` changes, so the size

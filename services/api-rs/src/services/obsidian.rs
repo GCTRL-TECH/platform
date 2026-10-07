@@ -130,7 +130,7 @@ pub struct ReingestResult {
 /// continue.
 pub async fn reingest_vault(
     db: &sqlx::PgPool,
-    redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    redis: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     http: &reqwest::Client,
     vaults_root: &str,
     vault: &VaultRow,
@@ -151,7 +151,7 @@ pub async fn reingest_vault(
 
 async fn reingest_folder_vault(
     db: &sqlx::PgPool,
-    redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    redis: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     vaults_root: &str,
     vault: &VaultRow,
     opts: &ReingestOpts,
@@ -317,7 +317,7 @@ async fn reingest_folder_vault(
 
 async fn reingest_rest_vault(
     db: &sqlx::PgPool,
-    redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    redis: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     http: &reqwest::Client,
     vault: &VaultRow,
     opts: &ReingestOpts,

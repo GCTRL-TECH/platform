@@ -114,7 +114,7 @@ async fn resolve_credentials(
 
 /// Store `key` → `value` in Redis with an expiry of `ttl_secs` seconds.
 async fn redis_set_ex(
-    conn: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    conn: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     key: &str,
     value: &str,
     ttl_secs: u64,
@@ -132,7 +132,7 @@ async fn redis_set_ex(
 /// Atomically GET and DELETE a key from Redis.
 /// Returns `None` if the key does not exist.
 async fn redis_get_del(
-    conn: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    conn: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     key: &str,
 ) -> redis::RedisResult<Option<String>> {
     let mut c = conn.lock().await;
@@ -1959,7 +1959,7 @@ async fn sync_sharepoint(
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_sharepoint_file(
     db: &sqlx::PgPool,
-    redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    redis: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     user_id: Uuid,
     // Access token that triggered this file (provenance). None on the scheduled
     // trigger + retry paths, where there is no calling token (background/cron).
@@ -3098,7 +3098,7 @@ pub(crate) async fn retry_connector_job(
 
 async fn enqueue_drive_file(
     db: &sqlx::PgPool,
-    redis: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    redis: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     http: &reqwest::Client,
     token: &str,
     user_id: Uuid,

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use serde_json::{json, Value};
-use futures::StreamExt;
 use uuid::Uuid;
 use crate::models::AppState;
 
@@ -861,33 +860,23 @@ async fn run_one_sharepoint_trigger(
     Ok(synced)
 }
 
+/// Job results from kex/fuse/distill. Resubscribes after a Redis restart (see
+/// `services::redis::subscribe_forever`); this task used to end on the first
+/// break, after which no job ever left `pending` until the api restarted.
 async fn subscribe_results(state: Arc<AppState>) {
-    let client = match redis::Client::open(state.cfg.redis_url.as_str()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Redis subscriber client error: {e}");
-            return;
-        }
-    };
-    let mut pubsub = match client.get_async_pubsub().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Redis pubsub connection failed: {e}");
-            return;
-        }
-    };
-    if let Err(e) = pubsub.subscribe(&["kex:results", "fuse:results", "distill:results"]).await {
-        tracing::warn!("Redis subscribe failed: {e}");
-        return;
-    }
-
-    let mut stream = pubsub.into_on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: String = msg.get_payload().unwrap_or_default();
-        if let Ok(result) = serde_json::from_str::<Value>(&payload) {
-            process_job_result(&state, result).await;
-        }
-    }
+    let url = state.cfg.redis_url.clone();
+    crate::services::redis::subscribe_forever(
+        &url,
+        &["kex:results", "fuse:results", "distill:results"],
+        |payload| {
+            let state = state.clone();
+            async move {
+                if let Ok(result) = serde_json::from_str::<Value>(&payload) {
+                    process_job_result(&state, result).await;
+                }
+            }
+        },
+    ).await;
 }
 
 async fn process_job_result(state: &AppState, result: Value) {
