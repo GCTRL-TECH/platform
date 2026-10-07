@@ -361,6 +361,9 @@ class Installer:
         if self.neo4j_uri == "bolt://gctrl-neo4j:7687":
             self.neo4j_password = _read_prev_env("NEO4J_PASSWORD") or secrets.token_hex(24)
         vllm_model = _read_prev_env("VLLM_MODEL") or "Qwen/Qwen2.5-3B-Instruct"
+        # Optional Qdrant API key: empty by default (Qdrant without auth, as
+        # before); an operator-set key is kept across re-installs.
+        qdrant_api_key = _read_prev_env("QDRANT_API_KEY")
 
         env = "\n".join([
             "GCTRL_API_URL=https://api.gctrl.tech",
@@ -371,6 +374,7 @@ class Installer:
             f"NEO4J_USER={NEO4J_USER}",
             f"NEO4J_PASSWORD={self.neo4j_password}",
             f"QDRANT_URL={self.qdrant_url}",
+            f"QDRANT_API_KEY={qdrant_api_key}",
             f"OLLAMA_BASE={self.ollama_base}",
             f"RELEX_MODEL={self.chat_model or 'qwen2.5:7b'}",
             f"AUTO_CLASSIFY_MODEL={self.chat_model or 'llama3.2'}",

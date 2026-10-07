@@ -297,6 +297,9 @@ generate_config() {
 
   # Preserve VLLM_MODEL on re-install if already set
   local vllm_model_prev; vllm_model_prev="$(read_prev VLLM_MODEL)"
+  # Optional Qdrant API key: empty by default (Qdrant without auth, as before);
+  # an operator-set key is kept across re-installs.
+  local qdrant_api_key; qdrant_api_key="$(read_prev QDRANT_API_KEY)"
 
   cat > "${INSTALL_DIR}/.env" <<EOF
 GCTRL_API_URL=https://api.gctrl.tech
@@ -307,6 +310,7 @@ NEO4J_URI=${NEO4J_URI}
 NEO4J_USER=${NEO4J_USER}
 NEO4J_PASSWORD=${NEO4J_PASSWORD}
 QDRANT_URL=${QDRANT_URL}
+QDRANT_API_KEY=${qdrant_api_key}
 OLLAMA_BASE=${OLLAMA_BASE}
 RELEX_MODEL=${CHAT_MODEL:-qwen2.5:7b}
 AUTO_CLASSIFY_MODEL=${CHAT_MODEL:-llama3.2}

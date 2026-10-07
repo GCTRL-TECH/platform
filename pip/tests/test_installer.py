@@ -63,6 +63,27 @@ def test_env_generation_has_all_keys(tmp_path, monkeypatch):
     assert installer._read_prev_env("JWT_SECRET") == jwt1  # not rotated
 
 
+def test_qdrant_api_key_empty_by_default_and_preserved(tmp_path, monkeypatch):
+    # QDRANT_API_KEY ships empty (= Qdrant without auth, exactly as before). An
+    # operator who set one keeps it across re-installs; a re-run must never drop
+    # it, or kex/fuse/api would lose access to a keyed Qdrant.
+    monkeypatch.setattr(installer, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(installer, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(installer, "download", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("stub"))
+
+    inst = installer.Installer()
+    inst.neo4j_uri = "bolt://gctrl-neo4j:7687"
+    inst.qdrant_url = "http://gctrl-qdrant:6333"
+    inst.ollama_base = "http://gctrl-ollama:11434"
+    inst.generate_config()
+    assert "QDRANT_API_KEY=\n" in (tmp_path / ".env").read_text()
+
+    env = (tmp_path / ".env").read_text().replace("QDRANT_API_KEY=\n", "QDRANT_API_KEY=op-key\n")
+    (tmp_path / ".env").write_text(env)
+    inst.generate_config()
+    assert installer._read_prev_env("QDRANT_API_KEY") == "op-key"
+
+
 # -- Superseded-image cleanup --------------------------------------------------
 # The attribution half is pure, so the safety property that matters - never
 # touch an image that isn't GCTRL's - is provable without Docker.

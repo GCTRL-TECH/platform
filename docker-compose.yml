@@ -32,6 +32,7 @@ services:
       - FUSE_URL=http://fuse:4020
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - OLLAMA_BASE=http://ollama:11434
       # Cloak Gateway cloud upstreams (default: the official hosts, pinned).
       # - ANTHROPIC_BASE=https://api.anthropic.com
@@ -117,6 +118,7 @@ services:
       - NEO4J_PASSWORD=password
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_COLLECTION=GCTRL_chunks
       - EMBEDDING_MODEL=nomic-embed-text
       - PG_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL
@@ -161,6 +163,7 @@ services:
       # zero-config local Ollama llama3.2.
       - PG_URL=postgresql://GCTRL:GCTRL@postgres:5432/GCTRL
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_COLLECTION=GCTRL_chunks
       - OLLAMA_BASE=http://ollama:11434
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-gctrl-dev-internal-secret-change-me}

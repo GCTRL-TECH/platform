@@ -66,6 +66,7 @@ services:
       - GCTRL_BASE_URL=${GCTRL_BASE_URL:-https://api.GCTRL.ai}
       - KEX_WORKER_URL=http://kex:4010
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - OLLAMA_BASE=http://ollama:11434
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
@@ -128,6 +129,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - PG_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - KEX_WORKER_THREADS=${KEX_WORKER_THREADS:-1}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
@@ -173,6 +175,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD}
       - PG_URL=postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
       - PHOENIX_SERVICE_NAME=gctrl-fuse
     depends_on:
@@ -277,6 +280,13 @@ services:
     image: qdrant/qdrant:latest
     container_name: gctrl-qdrant
     restart: unless-stopped
+    # Optional API key. Qdrant treats an EMPTY QDRANT__SERVICE__API_KEY as the key ""
+    # and then answers 401 to every client without a header, so the variable is only
+    # exported when QDRANT_API_KEY is set; unset/empty = no auth, exactly as before.
+    # (Keep in lockstep with QDRANT_API_KEY on kex, fuse and api.)
+    environment:
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    command: ["bash", "-c", "if [ -n \"$${QDRANT_API_KEY}\" ]; then export QDRANT__SERVICE__API_KEY=\"$${QDRANT_API_KEY}\"; fi; unset QDRANT_API_KEY; exec ./entrypoint.sh"]
     volumes:
       - GCTRL-qdrant:/qdrant/storage
     networks:

@@ -70,6 +70,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-gctrl-neo4j-password}
       - REDIS_URL=redis://gctrl-redis:6379
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_COLLECTION=gctrl_chunks
       - EMBEDDING_MODEL=nomic-embed-text
       # Default bi-encoder GLiNER is baked into the image; these are operator
@@ -142,6 +143,7 @@ services:
       # produces no prose. Mirror the api/kex service names.
       - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
       - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
@@ -182,6 +184,7 @@ services:
       - FUSE_URL=http://gctrl-fuse:4020
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-}
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
       - PHOENIX_SERVICE_NAME=gctrl-api
@@ -260,6 +263,13 @@ services:
     container_name: gctrl-qdrant
     restart: unless-stopped
     profiles: [bundled-qdrant]
+    # Optional API key. Qdrant treats an EMPTY QDRANT__SERVICE__API_KEY as the key ""
+    # and then answers 401 to every client without a header, so the variable is only
+    # exported when QDRANT_API_KEY is set; unset/empty = no auth, exactly as before.
+    # (Keep in lockstep with QDRANT_API_KEY on kex, fuse and api.)
+    environment:
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    command: ["bash", "-c", "if [ -n \"$${QDRANT_API_KEY}\" ]; then export QDRANT__SERVICE__API_KEY=\"$${QDRANT_API_KEY}\"; fi; unset QDRANT_API_KEY; exec ./entrypoint.sh"]
     volumes:
       - gctrl-qdrantdata:/qdrant/storage
     networks:
