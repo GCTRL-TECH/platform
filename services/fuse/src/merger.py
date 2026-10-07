@@ -952,7 +952,13 @@ class ThreeStageEntityMerger:
         # ── Smart-match pass (optional) ────────────────────────────────
         smart_links: list[dict] = []
         if enable_smart_match:
-            smart_links = self._stage_smart_match(all_entities)
+            # A type with a rule of its own is judged by that rule alone among
+            # the name-based matchers: the acronym / word-order / legal-suffix
+            # heuristics would otherwise re-link what a stricter rule split
+            # (seen on "Nordlicht Robotics" / "Nordlicht Robotics GmbH").
+            ruled = {t for t in (getattr(self, "metric_overrides", None) or {}) if t != "*"}
+            smart_input = [e for e in all_entities if str(_coarse_of(e)).lower() not in ruled] if ruled else all_entities
+            smart_links = self._stage_smart_match(smart_input)
             logger.info(
                 f"[{compilation_id}] Smart-match: {len(smart_links)} acronym/word-order links"
             )
