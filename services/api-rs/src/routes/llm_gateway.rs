@@ -1424,6 +1424,39 @@ mod tests {
     }
 
     #[test]
+    fn stream_keeps_paths_numbers_and_dates_byte_exact_at_every_split() {
+        // Asgard 2026-10-08: a cover-slide edit came back with `….png` as `….ng` and
+        // placeholders in the deck. The decloaker must never touch identifiers,
+        // numbers, dates or vocabulary — in prose and inside tool arguments — however
+        // the upstream splits the stream.
+        let path = "assets/abstract-dark-b8c4410e.png";
+        let prose = format!("Cover für [Person-27] bei [Org-5]: 08.10.2026, 1024 px, {path}, Full Service Angebot, Term-2x, p-3");
+        let args = format!("{{\"path\":\"{path}\",\"width\":1024,\"date\":\"08.10.2026\",\"who\":\"[Person-27]\"}}");
+        let mut map = std::collections::HashMap::new();
+        map.insert("[Person-27]".to_string(), "Tom \"TA\" Arenstam".to_string());
+        map.insert("[Org-5]".to_string(), "Nexovar GmbH".to_string());
+        let want_prose = format!("Cover für Tom \"TA\" Arenstam bei Nexovar GmbH: 08.10.2026, 1024 px, {path}, Full Service Angebot, Term-2x, p-3");
+        let (p1, p2) = prose.split_at(prose.find("dark-b8").unwrap() + 7);
+        let (a1, a2) = args.split_at(args.find(".png").unwrap() - 2);
+        let input = chunk(json!({ "content": p1 }), None)
+            + &chunk(json!({ "content": p2, "tool_calls": [ { "index": 0, "id": "w", "function": { "name": "write", "arguments": a1 } } ] }), None)
+            + &chunk(json!({ "tool_calls": [ { "index": 0, "function": { "arguments": a2 } } ] }), Some("tool_calls"))
+            + "data: [DONE]\n\n";
+        let bytes = input.as_bytes();
+        for split in 0..=bytes.len() {
+            let s = privacy::CloakSession { map: map.clone() };
+            let out = run(s, &[&bytes[..split], &bytes[split..]]);
+            assert_eq!(content_of(&out), want_prose, "split {split}");
+            let got = &args_of(&out)[&0];
+            let v: Value = serde_json::from_str(got).unwrap_or_else(|e| panic!("split {split}: {e} {got}"));
+            assert_eq!(v["path"], path, "split {split}");
+            assert_eq!(v["width"], 1024, "split {split}");
+            assert_eq!(v["date"], "08.10.2026", "split {split}");
+            assert_eq!(v["who"], "Tom \"TA\" Arenstam", "split {split}");
+        }
+    }
+
+    #[test]
     fn stream_calls_without_index_do_not_share_a_buffer() {
         let input = chunk(
             json!({ "tool_calls": [

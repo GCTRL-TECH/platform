@@ -282,6 +282,16 @@ pub fn candidates_from_entity_mentions(mentions_arrays: &[serde_json::Value]) ->
 // dictionary size (see `PreparedDictionary`), so a frequency cap would only
 // decide which known people leak (E2E 2026-10-04: 2000 of 46 623 names kept,
 // 686 of 755 known people sent to the cloud in clear).
+//
+// Only NAMED entities enter it, though (see `is_gateway_dictionary_kind`). KEX also
+// extracts concepts, tools, products, quantities, dates and amounts, and the full
+// corpus made every one of them a placeholder in the chat (Asgard, 2026-10-08):
+// "Full Service Angebot" became `[Term-8517]`, a slide's "1024" `[NUM-3229]`, its
+// date `[DATE-n]`; tool results and the agent's own history were rewritten the same
+// way, so the model read garbled slides and code, wrote placeholders back into
+// files and spent 145k tokens on one cover-slide edit fighting the mask. Those
+// classes hide no personal data. People, organisations and places (plus the PII
+// regex sweep) are what the cloak is for, and they still all fit without a cap.
 
 /// Keep-priority of an entity type when a bound has to bite: named entities and
 /// PII first, then the bracketed value classes, terms/tools/concepts last.
@@ -291,6 +301,18 @@ fn kind_priority(kind: Option<&str>) -> u8 {
         "DATE" | "AMOUNT" | "NUM" => 1,
         _ => 2,
     }
+}
+
+/// PURE: does an entity of this type belong in the free-chat cloak dictionary?
+/// Only NAMED entities — people, organisations, places — and the PII classes.
+/// Concepts, tools, products, quantities, dates and amounts (everything that
+/// would become `[Term-n]`, `[NUM-n]`, `[DATE-n]`, `[AMOUNT-n]`) are the working
+/// vocabulary of slides, tables and code: cloaking them hides no personal data
+/// and breaks every edit the model has to reproduce verbatim (2026-10-08). The
+/// RAG/agent paths, which cloak the mentions of the chunks they retrieved, are
+/// not affected by this filter.
+pub fn is_gateway_dictionary_kind(kind: Option<&str>) -> bool {
+    kind_priority(kind) == 0
 }
 
 /// PURE: dedup a raw candidate list by (case-folded) name and keep at most `cap`
@@ -337,21 +359,28 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
 }
 
 /// PURE: build a capped, deduped cloak dictionary straight from raw
-/// `text_chunks.entity_mentions` JSONB arrays. Extracted so it's testable with a
-/// fake mentions array (no DB).
+/// `text_chunks.entity_mentions` JSONB arrays — named entities only (see
+/// [`is_gateway_dictionary_kind`]). Filtered BEFORE the dedup, so a name KEX typed
+/// both `person` and `concept` keeps its person mention and stays in. Extracted so
+/// it's testable with a fake mentions array (no DB).
 pub fn candidates_from_mentions_capped(
     mentions_arrays: &[serde_json::Value],
     cap: usize,
 ) -> Vec<EntityCandidate> {
-    dedup_and_cap(candidates_from_entity_mentions(mentions_arrays), cap)
+    let named: Vec<EntityCandidate> = candidates_from_entity_mentions(mentions_arrays)
+        .into_iter()
+        .filter(|c| is_gateway_dictionary_kind(c.kind.as_deref()))
+        .collect();
+    dedup_and_cap(named, cap)
 }
 
 /// Memory bound only, NOT a cost bound: per-request cost is proportional to the
 /// prompt, not the dictionary (see [`PreparedDictionary`]). The largest live corpus
-/// (Asgard, 2026-10-04) has 46 623 distinct names; at roughly 100 bytes per entry
-/// a full 200 000-entry dictionary costs about 20 MB per cached user (5 MB at
-/// today's size). If it ever bites, [`dedup_and_cap`] drops terms before people,
-/// organisations and places, deterministically.
+/// (Asgard, 2026-10-04) has 46 623 distinct names, of which only the people,
+/// organisations and places enter the dictionary; at roughly 100 bytes per entry
+/// a full 200 000-entry dictionary costs about 20 MB per cached user (well under
+/// 5 MB at today's size). If it ever bites, [`dedup_and_cap`] drops in a
+/// deterministic order.
 const CANDIDATE_CAP: usize = 200_000;
 /// In-memory TTL for the per-user dictionary — rebuilding it hits Postgres, and a
 /// user's extracted-entity set changes slowly, so a short cache keeps the gateway
@@ -2115,6 +2144,61 @@ mod tests {
         let mut names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
         names.sort();
         assert_eq!(names, ["Erika Muster", "Goettingen", "Nexovar GmbH"]);
+    }
+
+    // ── named entities only (Asgard 2026-10-08, cover-slide edit = 145k tokens) ──
+
+    #[test]
+    fn the_dictionary_holds_only_people_orgs_and_places() {
+        // Live 2026-10-08: the full corpus made every concept, tool, quantity and date a
+        // placeholder in the chat; the model read garbled slides and wrote placeholders
+        // back into files. Only named entities (and the PII sweep) hide personal data.
+        let mut arrays = vec![
+            mentions(&[("Erika Muster", "person"), ("Nexovar GmbH", "organization"), ("Goettingen", "location")]),
+            mentions(&[("Full Service Angebot", "concept"), ("Excel-Tracking", "tool"), ("Anvil Prod", "product")]),
+            mentions(&[("1024", "quantity"), ("08.10.2026", "date"), ("12,5 Mio. EUR", "money")]),
+        ];
+        // A mention without any type would bucket as Term-N — not a name either.
+        arrays.push(serde_json::json!([{ "name": "Target Process & Solution Design" }]));
+        let out = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        let mut names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Erika Muster", "Goettingen", "Nexovar GmbH"]);
+        for kind in ["person", "per", "organization", "org", "company", "location", "place", "gpe", "loc", "email", "phone", "iban"] {
+            assert!(is_gateway_dictionary_kind(Some(kind)), "{kind} is a name/PII class");
+        }
+        for kind in ["concept", "tool", "product", "technology", "quantity", "number", "date", "time", "money", "amount", "event", ""] {
+            assert!(!is_gateway_dictionary_kind(Some(kind)), "{kind} is vocabulary, not a name");
+        }
+        assert!(!is_gateway_dictionary_kind(None));
+    }
+
+    #[test]
+    fn a_slide_edit_round_trips_byte_exact_with_the_names_only_dictionary() {
+        // Fabio's cover-slide prompt of 2026-10-08, reduced: the person and the company
+        // are hidden, everything the model has to reproduce verbatim stays as it is.
+        let arrays = vec![
+            mentions(&[("Fabio Chiaramonte", "person"), ("Multiversum GmbH", "organization")]),
+            mentions(&[("Full Service Angebot", "concept"), ("Excel-Tracking", "tool"), ("Document Governance", "concept")]),
+            mentions(&[("1024", "quantity"), ("08.10.2026", "date"), ("png", "tool"), ("PNG", "technology")]),
+        ];
+        let dict = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        let text = "Titelseite (08.10.2026): Fabio Chiaramonte, Multiversum GmbH — Full Service Angebot, Document Governance, \
+                    1024 px, Bild assets/abstract-dark-b8c4410e.png als PNG, Excel-Tracking bleibt.";
+        let (cloaked, session) = cloak_pure(&dict, text);
+        assert!(!cloaked.contains("Fabio") && !cloaked.contains("Multiversum"), "names must be hidden: {cloaked}");
+        for verbatim in [
+            "08.10.2026",
+            "Full Service Angebot",
+            "Document Governance",
+            "1024 px",
+            "assets/abstract-dark-b8c4410e.png",
+            "als PNG",
+            "Excel-Tracking",
+        ] {
+            assert!(cloaked.contains(verbatim), "{verbatim:?} must reach the model untouched: {cloaked}");
+        }
+        assert_eq!(decloak(&session, &cloaked), text, "round trip is byte-exact");
     }
 
     #[test]
