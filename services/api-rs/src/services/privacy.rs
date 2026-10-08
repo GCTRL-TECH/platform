@@ -325,15 +325,20 @@ pub fn is_gateway_dictionary_kind(kind: Option<&str>) -> bool {
 ///     frequency, then longer name, then the name itself.
 fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCandidate> {
     let uppers = |n: &str| n.chars().filter(|ch| ch.is_uppercase()).count();
-    let mut agg: HashMap<String, (usize, EntityCandidate)> = HashMap::new();
+    // per key: (mentions, mentions typed as a name/PII class, best candidate)
+    let mut agg: HashMap<String, (usize, usize, EntityCandidate)> = HashMap::new();
     for c in candidates {
         let key = lower_key(c.name.trim());
         if key.chars().count() < 2 {
             continue;
         }
-        let entry = agg.entry(key).or_insert_with(|| (0, c.clone()));
+        let named = is_gateway_dictionary_kind(c.kind.as_deref());
+        let entry = agg.entry(key).or_insert_with(|| (0, 0, c.clone()));
         entry.0 += 1;
-        let best = &mut entry.1;
+        if named {
+            entry.1 += 1;
+        }
+        let best = &mut entry.2;
         // Keep the spelling with the MOST uppercase letters (ALL-CAPS > Title-case >
         // lowercase). A lowercase "mit" is dropped later as identifier-shaped and a
         // Title-case "Mit"/"Sap" as a stop-word or a non-acronym; keeping either here
@@ -347,7 +352,16 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
             best.kind = c.kind;
         }
     }
-    let mut items: Vec<(usize, EntityCandidate)> = agg.into_values().collect();
+    // Named entities only, and only when the name/PII mentions are at least half of all
+    // mentions of that name. KEX mistypes a common noun now and then ("Governance" 78x
+    // field, 2x organization; "Service" 1x organization among financial/other, Asgard
+    // 2026-10-08) and a single stray mention must not turn everyday vocabulary into a
+    // placeholder. A real person or company is typed as such in (nearly) every mention.
+    let mut items: Vec<(usize, EntityCandidate)> = agg
+        .into_values()
+        .filter(|(total, named, _)| *named > 0 && *named * 2 >= *total)
+        .map(|(total, _, c)| (total, c))
+        .collect();
     items.sort_by(|a, b| {
         kind_priority(a.1.kind.as_deref())
             .cmp(&kind_priority(b.1.kind.as_deref()))
@@ -360,18 +374,13 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
 
 /// PURE: build a capped, deduped cloak dictionary straight from raw
 /// `text_chunks.entity_mentions` JSONB arrays — named entities only (see
-/// [`is_gateway_dictionary_kind`]). Filtered BEFORE the dedup, so a name KEX typed
-/// both `person` and `concept` keeps its person mention and stays in. Extracted so
-/// it's testable with a fake mentions array (no DB).
+/// [`is_gateway_dictionary_kind`] and the majority rule in [`dedup_and_cap`]).
+/// Extracted so it's testable with a fake mentions array (no DB).
 pub fn candidates_from_mentions_capped(
     mentions_arrays: &[serde_json::Value],
     cap: usize,
 ) -> Vec<EntityCandidate> {
-    let named: Vec<EntityCandidate> = candidates_from_entity_mentions(mentions_arrays)
-        .into_iter()
-        .filter(|c| is_gateway_dictionary_kind(c.kind.as_deref()))
-        .collect();
-    dedup_and_cap(named, cap)
+    dedup_and_cap(candidates_from_entity_mentions(mentions_arrays), cap)
 }
 
 /// Memory bound only, NOT a cost bound: per-request cost is proportional to the
@@ -2174,6 +2183,24 @@ mod tests {
     }
 
     #[test]
+    fn a_noun_mistyped_once_as_an_organisation_stays_vocabulary() {
+        // Live 2026-10-08 after the class filter: "Governance" (78x field, 2x organization)
+        // and "Service" (1x organization next to financial/other) still became
+        // placeholders — "Full [Org-250] Angebot, Document [Term-827]". One stray
+        // mention must not win against the corpus.
+        let mut arrays: Vec<serde_json::Value> = (0..78).map(|_| mentions(&[("Governance", "field")])).collect();
+        arrays.push(mentions(&[("Governance", "organization"), ("Governance", "organization")]));
+        arrays.push(mentions(&[("Service", "financial"), ("Service", "organization"), ("Service", "other")]));
+        // A real company is typed as such in (nearly) every mention; a tie counts as a name.
+        arrays.push(mentions(&[("Nexovar GmbH", "organization"), ("Nexovar GmbH", "organization"), ("Nexovar GmbH", "technology")]));
+        arrays.push(mentions(&[("Julian Fels", "person"), ("Julian Fels", "concept")]));
+        let out = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        let mut names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Julian Fels", "Nexovar GmbH"]);
+    }
+
+    #[test]
     fn a_slide_edit_round_trips_byte_exact_with_the_names_only_dictionary() {
         // Fabio's cover-slide prompt of 2026-10-08, reduced: the person and the company
         // are hidden, everything the model has to reproduce verbatim stays as it is.
@@ -2206,7 +2233,7 @@ mod tests {
         // The 10-minute rebuild reads rows in no defined order; ties at a bound were
         // decided by HashMap order and names flipped between cloaked and clear.
         let mut items: Vec<serde_json::Value> = (0..400)
-            .map(|i| mentions(&[(&format!("Name{}", i % 97), if i % 3 == 0 { "person" } else { "concept" })]))
+            .map(|i| mentions(&[(&format!("Name{}", i % 97), if i % 3 == 0 { "concept" } else { "person" })]))
             .collect();
         items.push(mentions(&[("sap", "organization"), ("Sap", "organization")]));
         let snapshot = |rows: &[serde_json::Value]| -> Vec<(String, Option<String>)> {
