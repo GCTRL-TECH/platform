@@ -2324,6 +2324,7 @@ mod job_overview_tests {
             sub: Uuid::nil(), email: "a@b".into(), role: "admin".into(), clearance: None, exp: 0,
             api_key_rank: None, api_key_id: None, read_only: false, code_access: true,
             agent_override_rank: None,
+            on_behalf_rank: None,
         };
         assert!(is_admin_session(&c));
         c.api_key_id = Some(Uuid::nil());

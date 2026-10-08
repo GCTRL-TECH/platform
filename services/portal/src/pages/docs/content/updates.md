@@ -11,6 +11,15 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 6dfb8e8 -->
 
+## v0.9.23 - Lessons keep the classification of the work they come from
+
+*8 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A lesson is as confidential as its source.** Every lesson now carries a classification. Without one it inherits the classification of its knowledge base; a stricter one is kept, a looser one is never accepted. Existing lessons are lifted to the level of their knowledge base, so nothing that was confidential stays readable as public.
+- **You only see lessons you are cleared for.** Listing lessons, reporting a lesson as applied and searching return only lessons at or below your clearance, the same rule that already applies to every other chunk. The search service checks each hit against the database before it answers, so an older vector entry can never hand out a lesson that was classified higher later.
+- **Team lessons take the strictest source.** When a lesson proven in several projects is promoted to team knowledge, the promoted copy gets the strictest classification of the lessons it came from.
+- **Acting on behalf of a person, never above them.** Account-level integrations can pass `clearanceRank` to read on behalf of a person with a lower clearance. The value can only lower what the key may see, never raise it, and it applies after any per-graph grant.
+
 ## v0.9.22 - Agents see one consistent set of placeholders, and the token filter is searchable
 
 *8 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*

@@ -296,8 +296,8 @@ remembered so re-extraction never re-introduces it):
 - supersede_chunk    : A chunk carries a statement the user has corrected, but it comes from a reviewed document — keep the document, take the chunk out of every retrieval path (archived 'superseded', vector removed, remembered). Args: { chunkId: string, reason?: string }
 
 Lessons (the project's playbook — what worked, what broke, how we do things here):
-- list_lessons       : Read a knowledge base's lessons, most used first. Args: { compilationId: string, limit?: number }
-- store_lesson       : Store a CONFIRMED convention / recipe / pitfall / decision (user confirmed, test green, fix worked). Args: { compilationId: string, lessonType: string, title: string, text: string, evidence?: string }
+- list_lessons       : Read a knowledge base's lessons, most used first. Only lessons within your clearance come back. Args: { compilationId: string, limit?: number, clearanceRank?: number }
+- store_lesson       : Store a CONFIRMED convention / recipe / pitfall / decision (user confirmed, test green, fix worked). Args: { compilationId: string, lessonType: string, title: string, text: string, evidence?: string, classification?: string (PUBLIC|INTERNAL|CONFIDENTIAL|STRICTLY_CONFIDENTIAL; never below the knowledge base's own) }
 - lesson_applied     : Report the lessons you applied, so they stay hot. Args: { lessonIds: string[] }
 
 To use a tool, respond with ONLY a JSON object on a single line — exactly ONE tool
@@ -373,13 +373,13 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "get_neighbors",      "description": "List entities within N hops of a node (dependency tracing; great for code graphs — what does X touch?). Use depth 1 first; increase only if needed. Limit is fixed at 100.", "args": { "name": "string", "depth": "number?" } },
             { "name": "shortest_path",      "description": "Find the shortest path between two entities (how is A connected to B / does X depend on Y)", "args": { "from": "string", "to": "string" } },
             { "name": "get_dossier",        "description": "Read the authoritative entity dossier (HOT memory: summary, key facts with confidence, origin files, timeline, groundingChunks — verbatim source-text snippets). Highest-trust source for 'who/what is X' and 'where does X come from' — state it directly, do not hedge", "args": { "name": "string" } },
-            { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval). compilationId is a hard filter (only that knowledge base's passages). Use limit for more passages (default 5, max 50).", "args": { "query": "string", "compilationId": "string?", "limit": "number?" } },
+            { "name": "search_chunks",      "description": "Retrieve source text passages for a question (RAG retrieval). compilationId is a hard filter (only that knowledge base's passages). Use limit for more passages (default 5, max 50). clearanceRank (optional) lowers the clearance to that of the user a system key reads for.", "args": { "query": "string", "compilationId": "string?", "limit": "number?", "clearanceRank": "number?" } },
             { "name": "list_wiki_pages",    "description": "List the distilled pages of a WIKI compilation (clearance-filtered — you only see pages you're cleared for)", "args": { "compilationId": "string" } },
             { "name": "get_wiki_page",      "description": "Read one distilled wiki page (markdown body + citations) by slug from a WIKI compilation", "args": { "compilationId": "string", "slug": "string" } },
             { "name": "detect_communities", "description": "Run community detection + centrality on a graph (writes community/god-node tags onto nodes); returns the cluster summary + top 'god nodes'", "args": { "compilationId": "string" } },
-            { "name": "store_lesson",       "description": "Store a project LESSON in a knowledge base: a convention (how we do X here), recipe (steps that worked), pitfall (what broke and the fix) or decision (with its reason). Only for things CONFIRMED by the user, a green test or a working fix — never guesses. Lessons are kept warm only while they are used (applied/found) and cool down otherwise. Cheap: no entity extraction.", "args": { "compilationId": "string", "lessonType": "convention|recipe|pitfall|decision", "title": "string", "text": "string", "evidence": "string?", "sourceRef": "string?" } },
-            { "name": "list_lessons",       "description": "List the lessons of a knowledge base, hottest (most used) first — the project's playbook. Listing does not count as use.", "args": { "compilationId": "string", "limit": "number?" } },
-            { "name": "lesson_applied",     "description": "Report that you APPLIED these lessons in your work (ids from list_lessons / the playbook). This is how the system learns which lessons work: applied lessons stay hot, unused ones cool down.", "args": { "lessonIds": "string[]" } },
+            { "name": "store_lesson",       "description": "Store a project LESSON in a knowledge base: a convention (how we do X here), recipe (steps that worked), pitfall (what broke and the fix) or decision (with its reason). Only for things CONFIRMED by the user, a green test or a working fix — never guesses. Lessons are kept warm only while they are used (applied/found) and cool down otherwise. Cheap: no entity extraction.", "args": { "compilationId": "string", "lessonType": "convention|recipe|pitfall|decision", "title": "string", "text": "string", "evidence": "string?", "sourceRef": "string?", "classification": "string? (PUBLIC|INTERNAL|CONFIDENTIAL|STRICTLY_CONFIDENTIAL — default and floor: the knowledge base's classification)" } },
+            { "name": "list_lessons",       "description": "List the lessons of a knowledge base, hottest (most used) first — the project's playbook. Listing does not count as use. Only lessons within the caller's clearance are returned; a system key reading for a user passes that user's clearanceRank (it can only lower access).", "args": { "compilationId": "string", "limit": "number?", "clearanceRank": "number?" } },
+            { "name": "lesson_applied",     "description": "Report that you APPLIED these lessons in your work (ids from list_lessons / the playbook). This is how the system learns which lessons work: applied lessons stay hot, unused ones cool down.", "args": { "lessonIds": "string[]", "clearanceRank": "number?" } },
             { "name": "pin_dossier",        "description": "Pin (or unpin) an entity's dossier so it stays in HOT memory and is always injected. Owner-level memory curation", "args": { "name": "string", "pinned": "boolean?" } },
             { "name": "memory_feedback",    "description": "Reinforce or distrust a fact: vote 'up' raises the entity dossier's trust, 'down' sets it to 0 (and, with a fact triple, deletes that wrong edge + remembers the correction). Owner-level", "args": { "entity": "string", "vote": "string", "compilationId": "string?", "head": "string?", "relType": "string?", "tail": "string?" } },
             { "name": "memory_health",      "description": "Read the memory snapshot: coverage, store sizes, heat/trust distribution, last maintenance cycle. Owner-level", "args": {} },
@@ -715,12 +715,28 @@ async fn resolve_ingest_provenance(
     IngestProvenance { source_document_id, source_path, source_ref, resolution }
 }
 
+/// `clearanceRank` aus den Werkzeug-Argumenten (Zahl oder Ziffernfolge), auf den
+/// i32-Bereich geklemmt. Fehlt er oder ist er unlesbar: keine Deckelung.
+pub(crate) fn on_behalf_rank_arg(args: &Value) -> Option<i32> {
+    let v = args.get("clearanceRank")?;
+    let n = v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))?;
+    Some(n.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+}
+
 async fn execute_tool_inner(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
     tool_name: &str,
     args: &Value,
 ) -> Value {
+    // Stellvertreter-Freigabe: ein System-/Kontoschluessel, der fuer einen Nutzer liest,
+    // nennt dessen Freigabe als `clearanceRank`. Gilt fuer JEDES Werkzeug und kann nur
+    // senken (JwtClaims::lowered_to / apply_on_behalf) — eine hoehere Angabe aendert nichts.
+    let lowered;
+    let claims = match on_behalf_rank_arg(args) {
+        Some(r) => { lowered = claims.lowered_to(r); &lowered }
+        None => claims,
+    };
     if claims.read_only && !READ_TOOLS.contains(&tool_name) {
         return json!({ "error": format!(
             "This access token is read-only — tool '{tool_name}' mutates state and is not permitted"
@@ -1974,6 +1990,7 @@ async fn execute_tool_inner(
                 "compilationId": args["compilationId"], "lessonType": args["lessonType"],
                 "title": args["title"], "text": args["text"], "evidence": args["evidence"],
                 "sourceRef": args["sourceRef"], "origin": args["origin"].as_str().unwrap_or("agent"),
+                "classification": args["classification"],
             })) {
                 Ok(r) => r,
                 Err(e) => return json!({ "error": format!("invalid lesson: {e}") }),
@@ -1988,7 +2005,7 @@ async fn execute_tool_inner(
                 return json!({ "error": "compilationId is required" });
             };
             let q = crate::routes::lessons::ListLessonsQuery {
-                compilation_id: cid, limit: args["limit"].as_i64(), include_archived: false,
+                compilation_id: cid, limit: args["limit"].as_i64(), include_archived: false, clearance_rank: None,
             };
             match crate::routes::lessons::list_lessons_core(state, claims, &q).await {
                 Ok(v) => v,
@@ -1999,7 +2016,7 @@ async fn execute_tool_inner(
             let ids: Vec<uuid::Uuid> = args["lessonIds"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).filter_map(|s| s.parse().ok()).collect())
                 .unwrap_or_default();
-            let req = crate::routes::lessons::AppliedReq { lesson_ids: ids };
+            let req = crate::routes::lessons::AppliedReq { lesson_ids: ids, clearance_rank: None };
             match crate::routes::lessons::applied_core(state, claims, &req).await {
                 Ok(v) => v,
                 Err(e) => json!({ "error": e.to_string() }),
@@ -3082,6 +3099,21 @@ mod agent_tool_registration_tests {
         }
     }
 
+    #[test]
+    fn clearance_rank_argument_is_read_for_every_tool() {
+        assert_eq!(super::on_behalf_rank_arg(&json!({ "clearanceRank": 100 })), Some(100));
+        assert_eq!(super::on_behalf_rank_arg(&json!({ "clearanceRank": "200" })), Some(200));
+        assert_eq!(super::on_behalf_rank_arg(&json!({ "clearanceRank": 1e12 })), None, "keine Ganzzahl");
+        assert_eq!(super::on_behalf_rank_arg(&json!({ "clearanceRank": 99999999999i64 })), Some(i32::MAX));
+        assert_eq!(super::on_behalf_rank_arg(&json!({ "query": "x" })), None);
+        assert_eq!(super::on_behalf_rank_arg(&json!({ "clearanceRank": "viel" })), None);
+        // Angewendet wird es vor jedem Werkzeug, und nur als Senkung.
+        let src = include_str!("agent.rs");
+        let inner = &src[src.find("async fn execute_tool_inner(").unwrap()..];
+        let head = &inner[..inner.find("match tool_name {").unwrap()];
+        assert!(head.contains("on_behalf_rank_arg(args)") && head.contains("claims.lowered_to(r)"));
+    }
+
     /// A claims stub for the pure capability tests (no DB, no signing involved).
     fn claims_stub(code_access: bool) -> crate::middleware::auth::JwtClaims {
         crate::middleware::auth::JwtClaims {
@@ -3095,6 +3127,7 @@ mod agent_tool_registration_tests {
             read_only: false,
             code_access,
             agent_override_rank: None,
+            on_behalf_rank: None,
         }
     }
 

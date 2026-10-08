@@ -50,6 +50,8 @@ pub(crate) async fn clearance_rank_with_cap(db: &sqlx::PgPool, claims: &JwtClaim
     } else {
         match claims.api_key_rank { Some(key_rank) => db_rank.min(key_rank), None => db_rank }
     };
+    // Stellvertreter-Freigabe (`clearanceRank` eines System-/Kontoschluessels): nur senken.
+    let effective = crate::middleware::auth::apply_on_behalf(effective, claims.on_behalf_rank);
     (effective, effective < db_rank)
 }
 
@@ -541,11 +543,14 @@ pub(crate) async fn effective_rank_for_compilation(
     let grant: Option<(Option<i32>,)> = sqlx::query_as(
         "SELECT granted_rank FROM api_key_grants WHERE api_key_id = $1 AND compilation_id = $2"
     ).bind(key_id).bind(compilation_id).fetch_optional(db).await.ok().flatten();
-    match grant {
+    let raised = match grant {
         Some((Some(r),)) => base.max(r),
         Some((None,))    => i32::MAX,
         None             => base,
-    }
+    };
+    // Ein Grant hebt die Freigabe des TOKENS — nie die des Nutzers, fuer den ein
+    // System-/Kontoschluessel stellvertretend liest (`clearanceRank`).
+    crate::middleware::auth::apply_on_behalf(raised, claims.on_behalf_rank)
 }
 
 #[derive(Deserialize)]
@@ -2899,6 +2904,7 @@ async fn public_get_graph(
         sub: owner_id, email: "public-embed".into(), role: "viewer".into(), clearance: None,
         exp: usize::MAX, api_key_rank: None, api_key_id: None, read_only: true, code_access: true,
         agent_override_rank: None,
+        on_behalf_rank: None,
     };
     crate::services::audit::log_access(&state.db, &synthetic_claims, "graph.read.public_embed",
         "compilation", &id.to_string(), 0, None, true, None).await;

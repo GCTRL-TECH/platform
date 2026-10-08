@@ -41,6 +41,29 @@ pub struct JwtClaims {
     /// never read from or written to a token, so it can't be forged.
     #[serde(skip)]
     pub agent_override_rank: Option<i32>,
+    /// Stellvertreter-Freigabe: ein System-/Kontoschluessel, der im Auftrag eines
+    /// Nutzers liest (Anvil liest Global/Lessons mit dem Kontoschluessel), nennt die
+    /// Freigabe DIESES Nutzers (`clearanceRank` im Aufruf). Sie kann die wirksame
+    /// Freigabe nur SENKEN, nie heben — angewendet ganz am Ende von
+    /// `clearance_rank_with_cap` und `effective_rank_for_compilation`, also auch
+    /// nach einem Grant. In-process only (`#[serde(skip)]`), aus keinem Token lesbar.
+    #[serde(skip)]
+    pub on_behalf_rank: Option<i32>,
+}
+
+impl JwtClaims {
+    /// Kopie dieser Claims, gedeckelt auf `rank`. Eine schon gesetzte, strengere
+    /// Deckelung bleibt: zweimal senken ergibt das Minimum, nie eine Anhebung.
+    pub fn lowered_to(&self, rank: i32) -> JwtClaims {
+        let mut c = self.clone();
+        c.on_behalf_rank = Some(match self.on_behalf_rank { Some(o) => o.min(rank), None => rank });
+        c
+    }
+}
+
+/// Wirksame Freigabe nach der Stellvertreter-Deckelung: nur senken, nie heben.
+pub fn apply_on_behalf(rank: i32, on_behalf: Option<i32>) -> i32 {
+    match on_behalf { Some(o) => rank.min(o), None => rank }
 }
 
 /// serde default for `code_access` - absent means "on", so pre-078 tokens and
@@ -139,6 +162,7 @@ pub async fn require_auth(
             read_only,
             code_access,
             agent_override_rank: None,
+            on_behalf_rank: None,
         }
     } else {
         return Err(StatusCode::UNAUTHORIZED);
@@ -198,6 +222,7 @@ pub async fn optional_auth(
                 read_only,
                 code_access,
                 agent_override_rank: None,
+                on_behalf_rank: None,
             })
         }
         _ => None,
@@ -248,4 +273,40 @@ pub fn sign_refresh(cfg: &crate::config::Config, sub: uuid::Uuid, email: &str) -
         exp: (chrono::Utc::now() + chrono::Duration::days(7)).timestamp() as usize,
     };
     encode(&Header::default(), &claims, &EncodingKey::from_secret(cfg.jwt_refresh_secret.as_bytes())).unwrap()
+}
+
+#[cfg(test)]
+mod on_behalf_tests {
+    use super::*;
+
+    fn claims() -> JwtClaims {
+        JwtClaims {
+            sub: uuid::Uuid::nil(), email: "t@example.com".into(), role: "admin".into(),
+            clearance: None, exp: usize::MAX, api_key_rank: Some(300), api_key_id: None,
+            read_only: false, code_access: true, agent_override_rank: None, on_behalf_rank: None,
+        }
+    }
+
+    #[test]
+    fn stellvertreter_freigabe_senkt_nur() {
+        assert_eq!(apply_on_behalf(300, Some(100)), 100);
+        assert_eq!(apply_on_behalf(100, Some(300)), 100, "eine hoehere Angabe hebt nie an");
+        assert_eq!(apply_on_behalf(200, None), 200);
+        assert_eq!(apply_on_behalf(i32::MAX, Some(200)), 200, "auch ein Voll-Grant wird gedeckelt");
+        assert_eq!(apply_on_behalf(i32::MIN, Some(300)), i32::MIN, "eine Verweigerung bleibt eine");
+    }
+
+    #[test]
+    fn zweimal_senken_ergibt_das_minimum() {
+        let c = claims().lowered_to(200).lowered_to(300);
+        assert_eq!(c.on_behalf_rank, Some(200));
+        let c = claims().lowered_to(200).lowered_to(0);
+        assert_eq!(c.on_behalf_rank, Some(0));
+    }
+
+    #[test]
+    fn die_deckelung_steht_in_keinem_token() {
+        let json = serde_json::to_value(claims().lowered_to(0)).unwrap();
+        assert!(json.get("on_behalf_rank").is_none());
+    }
 }

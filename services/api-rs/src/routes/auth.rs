@@ -110,6 +110,7 @@ async fn register(
         read_only: false,
         code_access: true,
         agent_override_rank: None,
+        on_behalf_rank: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
@@ -148,6 +149,7 @@ async fn login(
         read_only: false,
         code_access: true,
         agent_override_rank: None,
+        on_behalf_rank: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),
@@ -187,6 +189,7 @@ async fn refresh(
         read_only: false,
         code_access: true,
         agent_override_rank: None,
+        on_behalf_rank: None,
     };
     Ok(Json(AuthTokens {
         access_token:  sign_access(&state.cfg, &claims),

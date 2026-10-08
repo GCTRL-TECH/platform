@@ -336,6 +336,7 @@ async fn oidc_callback(
         read_only: false,
         code_access: true,
         agent_override_rank: None,
+        on_behalf_rank: None,
     };
 
     Ok(Json(AuthTokens {

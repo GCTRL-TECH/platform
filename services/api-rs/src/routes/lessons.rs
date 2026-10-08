@@ -19,6 +19,17 @@
 //! it — decays when nobody needs it, is archived after a month without use and
 //! revived when it is found again. Merely listing lessons (the playbook fetch)
 //! is NOT use: otherwise the playbook would keep itself warm.
+//!
+//! Einstufung (08.10.2026): jede Lehre traegt die Freigabestufe ihrer Herkunft —
+//! dieselbe Leiter wie ueberall in GCTRL (classification_levels, Rang 0/100/200/300
+//! = PUBLIC/INTERNAL/CONFIDENTIAL/STRICTLY_CONFIDENTIAL). Gespeichert wird sie dort,
+//! wo jeder Abschnitt seine Einstufung traegt: `text_chunks.min_rank` +
+//! `classification_level_id` (Migration 033), gesetzt vom KEX-Note-Job aus dem
+//! Payload. Ohne Angabe erbt die Lehre die Einstufung ihrer Wissensbasis; eine
+//! Angabe darunter wird auf die Wissensbasis angehoben (nie herabgestuft). Eine
+//! befoerderte Team-Lehre erbt die STRENGSTE Einstufung ihrer Quellen. Gelesen
+//! wird nur, was `min_rank <= Freigabe` erfuellt — dieselbe Regel wie fuer jeden
+//! Abschnitt (`effective_rank_for_compilation`, gesenkt durch `clearanceRank`).
 
 use axum::{
     extract::{Extension, Query, State},
@@ -53,6 +64,92 @@ pub struct StoreLessonReq {
     #[serde(rename = "sourceRef")]
     pub source_ref: Option<String>,
     pub origin: Option<String>,
+    /// Freigabestufe: Name aus classification_levels (PUBLIC, INTERNAL, CONFIDENTIAL,
+    /// STRICTLY_CONFIDENTIAL, Alias RESTRICTED, oder eine eigene Stufe) bzw. deren
+    /// UUID. Fehlt sie, erbt die Lehre die Stufe ihrer Wissensbasis.
+    #[serde(default)]
+    pub classification: Option<String>,
+}
+
+/// Die Einstufung einer Lehre: Rang + (wenn bekannt) die Stufe dazu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LessonClass {
+    pub rank: i32,
+    pub level_id: Option<Uuid>,
+}
+
+/// Feste IDs der vier System-Stufen (Migration 024).
+pub fn system_level_id(rank: i32) -> Option<Uuid> {
+    let n = match rank { 0 => 1, 100 => 2, 200 => 3, 300 => 4, _ => return None };
+    Some(Uuid::from_u128(n))
+}
+
+/// System-Name eines Rangs (fuer Antworten, wenn die Stufe selbst unbekannt ist).
+pub fn system_level_name(rank: i32) -> &'static str {
+    match rank {
+        r if r <= 0 => "PUBLIC",
+        r if r <= 100 => "INTERNAL",
+        r if r <= 200 => "CONFIDENTIAL",
+        _ => "STRICTLY_CONFIDENTIAL",
+    }
+}
+
+/// Rein: die wirksame Einstufung einer neuen Lehre. Die Wissensbasis ist der Boden —
+/// eine Angabe darunter wird angehoben, eine strengere gewinnt. Vererbung = Maximum.
+pub fn effective_lesson_class(kb: LessonClass, requested: Option<LessonClass>) -> LessonClass {
+    match requested {
+        Some(r) if r.rank > kb.rank => r,
+        _ => kb,
+    }
+}
+
+/// Rein: die Einstufung einer befoerderten Team-Lehre — die strengste ihrer Quellen,
+/// mindestens die der Team-Wissensbasis. Eine Quelle ohne bekannte Einstufung zaehlt
+/// als hoechste Stufe (fail-closed): nichts wird durch Befoerderung lesbarer.
+pub fn promoted_lesson_class(sources: &[Option<LessonClass>], team_kb: LessonClass) -> LessonClass {
+    let mut out = team_kb;
+    for s in sources {
+        let c = s.unwrap_or(LessonClass { rank: 300, level_id: system_level_id(300) });
+        if c.rank > out.rank { out = c; }
+    }
+    out
+}
+
+/// Einstufung einer Wissensbasis: expliziter Level, sonst die Alt-Spalte (unbekannt =
+/// hoechste Stufe, wie `kg::classification_rank_of`).
+pub async fn kb_class(db: &sqlx::PgPool, cid: Uuid) -> Result<LessonClass> {
+    let row: Option<(Option<i32>, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT cl.rank, cl.id, c.classification::text FROM compilations c
+           LEFT JOIN classification_levels cl ON cl.id = c.classification_level_id
+          WHERE c.id = $1",
+    ).bind(cid).fetch_optional(db).await?;
+    let (lvl_rank, lvl_id, legacy) = row.ok_or(AppError::NotFound)?;
+    let rank = crate::routes::kg::classification_rank_of(lvl_rank, legacy.as_deref().unwrap_or(""));
+    Ok(LessonClass { rank, level_id: lvl_id.or_else(|| system_level_id(rank)) })
+}
+
+/// Rein: ein Stufenname in GCTRLs Schreibweise (`RESTRICTED` ist der Alt-Name von
+/// STRICTLY_CONFIDENTIAL, Leer- und Bindestriche werden zu `_`).
+pub fn normalize_class_name(raw: &str) -> String {
+    let n = raw.trim().to_uppercase().replace([' ', '-'], "_");
+    if n == "RESTRICTED" { "STRICTLY_CONFIDENTIAL".into() } else { n }
+}
+
+/// Eine angefragte Einstufung (Name oder UUID) aufloesen. Unbekannt = Fehler: still auf
+/// die Wissensbasis zurueckzufallen hiesse, einen Tippfehler als "gilt" zu quittieren.
+async fn resolve_requested_class(db: &sqlx::PgPool, user_id: Uuid, raw: &str) -> Result<LessonClass> {
+    let raw = raw.trim();
+    let row: Option<(Uuid, i32)> = if let Ok(id) = raw.parse::<Uuid>() {
+        sqlx::query_as("SELECT id, rank FROM classification_levels WHERE id = $1 AND (user_id IS NULL OR user_id = $2)")
+            .bind(id).bind(user_id).fetch_optional(db).await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, rank FROM classification_levels WHERE upper(name) = $1 AND (user_id IS NULL OR user_id = $2)
+              ORDER BY (user_id IS NULL) ASC LIMIT 1",
+        ).bind(normalize_class_name(raw)).bind(user_id).fetch_optional(db).await?
+    };
+    row.map(|(id, rank)| LessonClass { rank, level_id: Some(id) })
+        .ok_or_else(|| AppError::BadRequest(format!("unknown classification '{raw}'")))
 }
 
 /// A validated lesson, trimmed to its limits.
@@ -133,15 +230,26 @@ pub async fn store_lesson_core(
     crate::routes::kg::enforce_kb_write_scope(&state.db, claims, cid).await?;
     crate::routes::kg::enforce_code_capability(&state.db, claims, cid).await?;
 
+    // Einstufung: geerbt von der Wissensbasis, eine strengere Angabe gewinnt.
+    let kb = kb_class(&state.db, cid).await?;
+    let requested = match req.classification.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Some(resolve_requested_class(&state.db, claims.sub, raw).await?),
+        None => None,
+    };
+    let class = effective_lesson_class(kb, requested);
+
     // The same lesson twice in one knowledge base is one lesson — stored or still on its way.
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT c.id FROM text_chunks c JOIN compilations k ON c.job_id = ANY(k.source_job_ids)
           WHERE k.id = $1 AND c.user_id = $2 AND c.kind = 'lesson' AND NOT c.archived
             AND c.meta->>'lessonType' = $3 AND c.meta->>'text' = $4
+            AND COALESCE(c.min_rank, 0) >= $5
           LIMIT 1",
     )
-    .bind(cid).bind(claims.sub).bind(&lesson.lesson_type).bind(&lesson.text)
+    .bind(cid).bind(claims.sub).bind(&lesson.lesson_type).bind(&lesson.text).bind(class.rank)
     .fetch_optional(&state.db).await?;
+    // Nur eine mindestens so streng eingestufte Zwillingslehre zaehlt als "gibt es schon";
+    // eine laxere bleibt, wie sie ist, und die strengere wird zusaetzlich gespeichert.
     if let Some(id) = existing {
         return Ok(json!({ "lessonId": id, "jobId": Value::Null, "status": "exists" }));
     }
@@ -150,34 +258,50 @@ pub async fn store_lesson_core(
           WHERE k.id = $1 AND j.user_id = $2 AND j.type = 'kex_lesson'
             AND j.status::text IN ('pending', 'processing')
             AND j.input->>'lessonType' = $3 AND j.input->>'text' = $4
+            AND COALESCE((j.input->>'classificationRank')::int, 0) >= $5
           LIMIT 1",
     )
-    .bind(cid).bind(claims.sub).bind(&lesson.lesson_type).bind(&lesson.text)
+    .bind(cid).bind(claims.sub).bind(&lesson.lesson_type).bind(&lesson.text).bind(class.rank)
     .fetch_optional(&state.db).await?;
     if let Some(job) = pending {
         return Ok(json!({ "lessonId": Value::Null, "jobId": job, "status": "exists" }));
     }
 
-    let meta = lesson_meta(&lesson, cid);
-    let job_id = enqueue_lesson(state, claims.sub, claims.api_key_id, cid, meta).await?;
-    Ok(json!({ "lessonId": Value::Null, "jobId": job_id, "status": "pending" }))
+    let mut meta = lesson_meta(&lesson, cid);
+    set_meta_class(&mut meta, class);
+    let job_id = enqueue_lesson(state, claims.sub, claims.api_key_id, cid, meta, class).await?;
+    Ok(json!({
+        "lessonId": Value::Null, "jobId": job_id, "status": "pending",
+        "classification": system_level_name(class.rank), "classificationRank": class.rank,
+    }))
+}
+
+/// Die Einstufung in die Lehre selbst schreiben (Job-Input und Chunk-Meta): fuer die
+/// Dubletten-Pruefung, solange der Job noch laeuft, und als lesbare Angabe.
+pub fn set_meta_class(meta: &mut Value, class: LessonClass) {
+    if !meta.is_object() { *meta = json!({}); }
+    meta["classification"] = json!(system_level_name(class.rank));
+    meta["classificationRank"] = json!(class.rank);
 }
 
 /// Queue the KEX note job that writes one lesson chunk into `cid`. No access
 /// checks: callers (the HTTP/agent core above, the promotion cycle) have done them.
+/// `class` reist als `classification_level_id` an KEX, das daraus `min_rank` des
+/// Abschnitts (Postgres + Qdrant) setzt — derselbe Weg wie bei jedem Ingest.
 pub async fn enqueue_lesson(
     state: &crate::models::AppState,
     user_id: Uuid,
     api_key_id: Option<Uuid>,
     cid: Uuid,
     meta: Value,
+    class: LessonClass,
 ) -> Result<Uuid> {
     let job_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO jobs (id, user_id, type, status, input, api_key_id)
-         VALUES ($1, $2, 'kex_lesson', 'pending', $3, $4)",
+        "INSERT INTO jobs (id, user_id, type, status, input, api_key_id, classification_level_id)
+         VALUES ($1, $2, 'kex_lesson', 'pending', $3, $4, $5)",
     )
-    .bind(job_id).bind(user_id).bind(&meta).bind(api_key_id)
+    .bind(job_id).bind(user_id).bind(&meta).bind(api_key_id).bind(class.level_id)
     .execute(&state.db).await?;
     crate::routes::kex::link_job_to_compilation(&state.db, user_id, cid, job_id).await;
     crate::services::usage::record_usage(&state.db, user_id, "kex_lesson", 1, Some(job_id)).await;
@@ -185,6 +309,9 @@ pub async fn enqueue_lesson(
     let mut payload = json!({
         "job_id": job_id, "user_id": user_id, "type": "note",
         "kind": "lesson", "meta": meta,
+        // KEX loest bevorzugt die UUID auf; der Name ist die Rueckfallebene (nur System-Stufen).
+        "classification_level_id": class.level_id,
+        "classification": system_level_name(class.rank),
     });
     crate::services::llm::inject_ollama_overrides(&state.db, user_id, &mut payload).await;
     lpush(&state.redis, "kex:jobs", &payload.to_string()).await
@@ -282,8 +409,21 @@ pub async fn promote_recurring_lessons(state: &crate::models::AppState) -> usize
                  LIMIT 1",
             ).bind(uid).bind(&ids).fetch_optional(&state.db).await.ok().flatten();
             if already.is_some() { continue; }
-            let meta = promoted_meta(&g["meta"], &ids, &comps, team_kb);
-            if enqueue_lesson(state, uid, None, team_kb, meta).await.is_ok() {
+            // Strengste Quelle gewinnt: eine Lehre aus einem streng vertraulichen Projekt
+            // wird als Team-Lehre nicht lesbarer, als sie im Projekt war.
+            let Ok(team_class) = kb_class(&state.db, team_kb).await else { continue };
+            let src_rows: Vec<(Uuid, Option<i32>, Option<Uuid>)> = sqlx::query_as(
+                "SELECT id, min_rank, classification_level_id FROM text_chunks
+                  WHERE user_id = $1 AND id::text = ANY($2)",
+            ).bind(uid).bind(&ids).fetch_all(&state.db).await.unwrap_or_default();
+            let sources: Vec<Option<LessonClass>> = ids.iter().map(|id| {
+                src_rows.iter().find(|(cid, _, _)| cid.to_string() == *id)
+                    .map(|(_, r, l)| LessonClass { rank: r.unwrap_or(0), level_id: *l })
+            }).collect();
+            let class = promoted_lesson_class(&sources, team_class);
+            let mut meta = promoted_meta(&g["meta"], &ids, &comps, team_kb);
+            set_meta_class(&mut meta, class);
+            if enqueue_lesson(state, uid, None, team_kb, meta, class).await.is_ok() {
                 promoted += 1;
                 tracing::info!("lessons: a lesson proven in {} projects became team knowledge (user {uid})", comps.len());
             }
@@ -299,6 +439,9 @@ pub struct ListLessonsQuery {
     pub limit: Option<i64>,
     #[serde(rename = "includeArchived", default)]
     pub include_archived: bool,
+    /// Stellvertreter-Freigabe (System-/Kontoschluessel liest fuer einen Nutzer): nur senken.
+    #[serde(rename = "clearanceRank", default)]
+    pub clearance_rank: Option<i32>,
 }
 
 /// Lessons of one knowledge base, hottest first. Listing is not use: no heat changes.
@@ -307,29 +450,45 @@ pub async fn list_lessons_core(
     claims: &JwtClaims,
     q: &ListLessonsQuery,
 ) -> Result<Value> {
+    let lowered;
+    let claims = match q.clearance_rank {
+        Some(r) => { lowered = claims.lowered_to(r); &lowered }
+        None => claims,
+    };
     ensure_readable(state, claims, q.compilation_id).await?;
+    // Dieselbe Freigabe wie fuer jeden Abschnitt dieser Wissensbasis (ein Grant hebt, die
+    // Stellvertreter-Freigabe senkt). Was darueber liegt, existiert fuer den Aufrufer nicht.
+    let rank = crate::routes::kg::effective_rank_for_compilation(&state.db, claims, q.compilation_id).await;
     let limit = q.limit.unwrap_or(40).clamp(1, 200);
     let rows = sqlx::query_as::<_, (Uuid, Option<Value>, Option<f32>, Option<i32>,
-        Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool)>(
-        "SELECT c.id, c.meta, c.heat, c.access_count, c.last_accessed, c.created_at, c.archived
+        Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>, bool, i32, Option<String>)>(
+        "SELECT c.id, c.meta, c.heat, c.access_count, c.last_accessed, c.created_at, c.archived,
+                COALESCE(c.min_rank, 0), cl.name::text
            FROM text_chunks c JOIN compilations k ON c.job_id = ANY(k.source_job_ids)
+           LEFT JOIN classification_levels cl ON cl.id = c.classification_level_id
           WHERE k.id = $1 AND c.user_id = $2 AND c.kind = 'lesson'
             AND ($3 OR NOT c.archived)
             AND coalesce(c.archived_reason, '') NOT IN ('superseded', 'dedup')
+            AND COALESCE(c.min_rank, 0) <= $5
           ORDER BY c.heat DESC NULLS LAST, c.created_at DESC
           LIMIT $4",
     )
-    .bind(q.compilation_id).bind(claims.sub).bind(q.include_archived).bind(limit)
+    .bind(q.compilation_id).bind(claims.sub).bind(q.include_archived).bind(limit).bind(rank)
     .fetch_all(&state.db).await?;
-    let lessons: Vec<Value> = rows.into_iter().map(|(id, meta, heat, access, last, created, archived)| {
+    let lessons: Vec<Value> = rows.into_iter().map(|(id, meta, heat, access, last, created, archived, min_rank, level)| {
         let m = meta.unwrap_or_else(|| json!({}));
         json!({
+            "classification": level.unwrap_or_else(|| system_level_name(min_rank).to_string()),
+            "classificationRank": min_rank,
             "id": id,
             "lessonType": m.get("lessonType"),
             "title": m.get("title"),
             "text": m.get("text"),
             "evidence": m.get("evidence"),
             "origin": m.get("origin"),
+            // Herkunft (Anvil: `anvil:automation:<id>…`) — der Client entscheidet damit, ob eine
+            // Lehre aus DIESEM Kontext stammt.
+            "sourceRef": m.get("sourceRef"),
             "promotedFrom": m.get("promotedFrom"),
             "appliedCount": m.get("appliedCount").and_then(|v| v.as_i64()).unwrap_or(0),
             "lastApplied": m.get("lastApplied"),
@@ -347,6 +506,9 @@ pub async fn list_lessons_core(
 pub struct AppliedReq {
     #[serde(rename = "lessonIds")]
     pub lesson_ids: Vec<Uuid>,
+    /// Stellvertreter-Freigabe (System-/Kontoschluessel meldet fuer einen Nutzer): nur senken.
+    #[serde(rename = "clearanceRank", default)]
+    pub clearance_rank: Option<i32>,
 }
 
 /// The agent applied these lessons: the strongest use signal there is. Only the
@@ -357,6 +519,11 @@ pub async fn applied_core(
     claims: &JwtClaims,
     req: &AppliedReq,
 ) -> Result<Value> {
+    let lowered;
+    let claims = match req.clearance_rank {
+        Some(r) => { lowered = claims.lowered_to(r); &lowered }
+        None => claims,
+    };
     let mut ids = req.lesson_ids.clone();
     ids.sort();
     ids.dedup();
@@ -366,16 +533,32 @@ pub async fn applied_core(
     }
     let scope: Option<Vec<Uuid>> = crate::routes::kg::api_key_scope(&state.db, claims).await
         .map(|s| s.into_iter().collect());
-    let valid: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT c.id FROM text_chunks c
+    // Je Lehre die Wissensbasen, in denen sie liegt (im Scope des Tokens), samt Einstufung.
+    let rows: Vec<(Uuid, i32, Uuid)> = sqlx::query_as(
+        "SELECT c.id, COALESCE(c.min_rank, 0), k.id FROM text_chunks c
+           JOIN compilations k ON c.job_id = ANY(k.source_job_ids) AND k.user_id = c.user_id
           WHERE c.id = ANY($1) AND c.user_id = $2 AND c.kind = 'lesson'
             AND coalesce(c.archived_reason, '') NOT IN ('superseded', 'dedup')
-            AND ($3::uuid[] IS NULL OR EXISTS (
-                  SELECT 1 FROM compilations k
-                   WHERE k.id = ANY($3) AND c.job_id = ANY(k.source_job_ids)))",
+            AND ($3::uuid[] IS NULL OR k.id = ANY($3))",
     )
     .bind(&ids).bind(claims.sub).bind(scope.as_deref())
     .fetch_all(&state.db).await?;
+    // Nur was der Aufrufer auch LESEN darf, zaehlt als angewendet — sonst liesse sich die
+    // Existenz einer hoeher eingestuften Lehre ueber "reinforced" erfragen.
+    let mut ranks: std::collections::HashMap<Uuid, i32> = std::collections::HashMap::new();
+    let mut valid: Vec<Uuid> = Vec::new();
+    for (id, min_rank, kid) in rows {
+        if valid.contains(&id) { continue; }
+        let eff = match ranks.get(&kid) {
+            Some(r) => *r,
+            None => {
+                let r = crate::routes::kg::effective_rank_for_compilation(&state.db, claims, kid).await;
+                ranks.insert(kid, r);
+                r
+            }
+        };
+        if lesson_visible(min_rank, eff) { valid.push(id); }
+    }
     // Same strength for each: being applied is not a ranking.
     for id in &valid {
         crate::services::hebb::reinforce_chunks(&state.db, claims.sub, &[*id],
@@ -394,6 +577,11 @@ pub async fn applied_core(
          .map_err(|e| tracing::warn!("lessons: applied count not recorded: {e}"));
     }
     Ok(json!({ "reinforced": valid.len() }))
+}
+
+/// Rein: die Leseregel einer Lehre — dieselbe wie fuer jeden Abschnitt.
+pub fn lesson_visible(min_rank: i32, clearance: i32) -> bool {
+    min_rank <= clearance
 }
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -446,7 +634,73 @@ mod tests {
         StoreLessonReq {
             compilation_id: Uuid::nil(), lesson_type: t.into(), title: title.into(), text: text.into(),
             evidence: Some("  Test wurde gruen  ".into()), source_ref: None, origin: Some("Terminal".into()),
+            classification: None,
         }
+    }
+
+    fn class(rank: i32) -> LessonClass {
+        LessonClass { rank, level_id: system_level_id(rank) }
+    }
+
+    #[test]
+    fn ohne_angabe_erbt_die_lehre_die_stufe_der_wissensbasis() {
+        assert_eq!(effective_lesson_class(class(300), None), class(300), "streng vertrauliches Projekt");
+        assert_eq!(effective_lesson_class(class(100), None), class(100));
+    }
+
+    #[test]
+    fn eine_strengere_angabe_gewinnt_eine_laxere_nie() {
+        assert_eq!(effective_lesson_class(class(100), Some(class(300))), class(300), "Ordner strenger als Projekt");
+        assert_eq!(effective_lesson_class(class(200), Some(class(0))), class(200), "nie unter die Wissensbasis");
+        assert_eq!(effective_lesson_class(class(200), Some(class(200))), class(200));
+    }
+
+    #[test]
+    fn eine_befoerderte_lehre_erbt_die_strengste_quelle() {
+        let team = class(100);
+        assert_eq!(promoted_lesson_class(&[Some(class(100)), Some(class(300)), Some(class(200))], team), class(300));
+        assert_eq!(promoted_lesson_class(&[Some(class(0)), Some(class(0))], team), team, "nie unter die Team-KB");
+        assert_eq!(promoted_lesson_class(&[Some(class(100)), None], team).rank, 300, "unbekannte Quelle = hoechste Stufe");
+    }
+
+    #[test]
+    fn leseregel_wer_die_freigabe_hat_sieht_wer_nicht_nicht() {
+        assert!(lesson_visible(300, 300));
+        assert!(lesson_visible(100, 200));
+        assert!(!lesson_visible(300, 100), "Mitglied mit INTERNAL sieht keine streng vertrauliche Lehre");
+        assert!(!lesson_visible(0, i32::MIN), "ausserhalb des Scopes sieht man nichts");
+    }
+
+    /// Die Leseregel steckt in SQL (nicht unit-testbar ohne DB) — hier festgenagelt, dass
+    /// Liste und "angewendet" sie anwenden und die Stellvertreter-Freigabe einfliesst.
+    #[test]
+    fn lesestellen_filtern_nach_einstufung() {
+        let src = include_str!("lessons.rs");
+        let list = &src[src.find("pub async fn list_lessons_core").unwrap()..src.find("pub struct AppliedReq").unwrap()];
+        assert!(list.contains("lowered_to(r)"), "clearanceRank wird angewendet");
+        assert!(list.contains("effective_rank_for_compilation"), "dieselbe Freigabe wie fuer Abschnitte");
+        assert!(list.contains("AND COALESCE(c.min_rank, 0) <= $5"), "Liste filtert nach Rang");
+        let applied = &src[src.find("pub async fn applied_core").unwrap()..src.find("// ── HTTP").unwrap()];
+        assert!(applied.contains("lowered_to(r)") && applied.contains("lesson_visible(min_rank, eff)"));
+        let store = &src[src.find("pub async fn store_lesson_core").unwrap()..src.find("pub fn set_meta_class").unwrap()];
+        assert!(store.contains("effective_lesson_class(kb, requested)"));
+        assert!(store.contains("enqueue_lesson(state, claims.sub, claims.api_key_id, cid, meta, class)"));
+        let promote = &src[src.find("pub async fn promote_recurring_lessons").unwrap()..src.find("pub struct ListLessonsQuery").unwrap()];
+        assert!(promote.contains("promoted_lesson_class(&sources, team_class)"));
+    }
+
+    #[test]
+    fn stufen_namen_und_ids() {
+        assert_eq!(normalize_class_name(" restricted "), "STRICTLY_CONFIDENTIAL");
+        assert_eq!(normalize_class_name("strictly-confidential"), "STRICTLY_CONFIDENTIAL");
+        assert_eq!(normalize_class_name("Internal"), "INTERNAL");
+        assert_eq!(system_level_id(300).unwrap().to_string(), "00000000-0000-0000-0000-000000000004");
+        assert_eq!(system_level_id(150), None);
+        assert_eq!(system_level_name(150), "CONFIDENTIAL");
+        let mut m = json!({ "title": "x" });
+        set_meta_class(&mut m, class(200));
+        assert_eq!(m["classification"], "CONFIDENTIAL");
+        assert_eq!(m["classificationRank"], 200);
     }
 
     #[test]

@@ -417,6 +417,7 @@ pub(super) async fn resolve_gctrl_token(
             read_only,
             code_access,
             agent_override_rank: None,
+            on_behalf_rank: None,
         });
     }
 

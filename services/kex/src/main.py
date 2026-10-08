@@ -53,6 +53,7 @@ from .relex import get_extractor
 from . import reranker
 from . import hebb
 from . import search_scope
+from . import clearance_guard
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
@@ -2007,6 +2008,9 @@ async def search_endpoint(req: SearchReq, request: Request):
     # Last word: whatever the channels, the reranker or a co-activated neighbour
     # produced, nothing outside the job scope leaves this endpoint.
     reranked = search_scope.filter_chunks(reranked, req.job_ids)
+    # Einstufung: Postgres hat das letzte Wort, nicht der Qdrant-Payload (der bei einer
+    # spaeteren Hochstufung, z. B. Migration 100 fuer Lehren, auf dem alten Rang bleibt).
+    reranked = clearance_guard.filter_by_pg_rank(reranked, req.max_rank, get_search_pg)
 
     # Provenance, last: every channel above carries the raw source_documents.id,
     # so resolving the readable name here covers dense, lexical AND the Hebbian
