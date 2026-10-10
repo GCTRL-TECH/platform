@@ -45,6 +45,7 @@ Agent skill: https://gctrl.tech/skill.md
 
 ## Articles
 
+- [Knowledge Graph vs Vector Database: Choosing a Retrieval Backbone](https://gctrl.tech/blog/knowledge-graph-vs-vector-database-choosing-a-retrieval-backbone): Compare knowledge graph vs vector database to decide between semantic similarity and structured reasoning for your RAG system's retrieval architecture.
 - [LLM Token CDN Caching Strategy: Why CDNs Fall Short](https://gctrl.tech/blog/why-llm-token-caching-isn-t-solved-by-cdns-yet): Learn why a standard llm token cdn caching strategy fails and how semantic prefix matching at the model layer is required for effective token caching.
 - [How to Sync AI Coding Agents with Figma for Continuous Loops](https://gctrl.tech/blog/automating-sync-between-figma-designs-and-coding-agents): Learn how to sync ai coding agents with figma using MCP to enable bidirectional data flow and replace static handoffs with continuous design-to-code loops.
 - [Unified Interface for Multiple AI Agents: The Case for Dashboards](https://gctrl.tech/blog/the-case-for-unified-ai-agent-dashboards): Learn how a unified interface for multiple AI agents reduces friction by consolidating specialized agents into a single control plane for coordination.
