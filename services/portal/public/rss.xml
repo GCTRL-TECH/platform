@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>Running Ollama in Production: Challenges and Alternatives</title>
+      <link>https://gctrl.tech/blog/running-ollama-in-production-what-changes</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/running-ollama-in-production-what-changes</guid>
+      <description>Learn the limitations of running ollama in production and why frameworks like vLLM are better for high concurrency and multi-user traffic.</description>
+      <pubDate>Thu, 15 Oct 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>Knowledge Graph vs Vector Database: Choosing a Retrieval Backbone</title>
       <link>https://gctrl.tech/blog/knowledge-graph-vs-vector-database-choosing-a-retrieval-backbone</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/knowledge-graph-vs-vector-database-choosing-a-retrieval-backbone</guid>
