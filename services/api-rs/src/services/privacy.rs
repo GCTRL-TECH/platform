@@ -2435,7 +2435,7 @@ mod tests {
         let mut cands = Vec::new();
         let mut rows: Vec<(String, String, usize)> = Vec::new();
         for line in raw.lines() {
-            let mut it = line.split('	');
+            let mut it = line.split('\t');
             let (Some(n), Some(t), Some(c)) = (it.next(), it.next(), it.next()) else { continue };
             let c: usize = c.trim().parse().unwrap_or(1);
             rows.push((n.to_string(), t.to_string(), c));
