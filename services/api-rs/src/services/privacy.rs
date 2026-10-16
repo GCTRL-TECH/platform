@@ -2420,4 +2420,93 @@ mod tests {
         assert_eq!(PrivacyMode::from_db("local_only").as_db_str(), "local_only");
         assert_eq!(PrivacyMode::from_db("garbage").as_db_str(), "open", "unknown value fails open");
     }
+
+    /// Realistic cost + quality probe (ignored; needs local data, never committed):
+    /// `GCTRL_CLOAK_BENCH_MENTIONS` = TSV `name<TAB>type<TAB>count` (aggregated
+    /// `text_chunks.entity_mentions` of one account). Builds the gateway dictionary exactly
+    /// like `user_entity_candidates`, cloaks a ~60k-char German chat prompt split into 40
+    /// messages and prints timings plus which placeholders the cloud would have seen.
+    /// `cargo test --release --bin gctrl-api cloak_cost_real_dictionary -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cloak_cost_real_dictionary() {
+        let Ok(path) = std::env::var("GCTRL_CLOAK_BENCH_MENTIONS") else { return };
+        let raw = std::fs::read_to_string(path).unwrap();
+        let mut cands = Vec::new();
+        let mut rows: Vec<(String, String, usize)> = Vec::new();
+        for line in raw.lines() {
+            let mut it = line.split('	');
+            let (Some(n), Some(t), Some(c)) = (it.next(), it.next(), it.next()) else { continue };
+            let c: usize = c.trim().parse().unwrap_or(1);
+            rows.push((n.to_string(), t.to_string(), c));
+            for _ in 0..c.min(50) {
+                cands.push(EntityCandidate { name: n.to_string(), kind: (!t.is_empty()).then(|| t.to_string()) });
+            }
+        }
+        let t0 = Instant::now();
+        let dict = dedup_and_cap(cands, CANDIDATE_CAP);
+        let build = t0.elapsed();
+        // A prompt that mixes everyday vocabulary the KB happens to know with real names.
+        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        let names: Vec<&str> = rows.iter().take(400).map(|r| r.0.as_str()).collect();
+        let prose = [
+            "Der Kunde hat im Backend die IT gebeten, das Portal bis 2025-2030 zu planen. ",
+            "Laut Geschäftsführung liegt der Wert bei 1234.56789012, Stand 20261008, Ticket 4711081512. ",
+            "Bitte ruf Fabio unter +49 171 1234567 an oder schreib an anna.schmidt@example.org. ",
+            "Das Team im Serverraum prüft die Rolle der Behörden und des Betriebsrats für das Projekt. ",
+        ];
+        let mut text = String::new();
+        let mut i = 0usize;
+        while text.chars().count() < 60_000 {
+            text.push_str(prose[i % prose.len()]);
+            text.push_str(names[i % names.len()]);
+            text.push_str(" wird erwähnt. ");
+            i += 1;
+        }
+        let msgs: Vec<String> = {
+            let chars: Vec<char> = text.chars().collect();
+            chars.chunks(chars.len() / 40 + 1).map(|c| c.iter().collect()).collect()
+        };
+        let refs: Vec<&str> = msgs.iter().map(String::as_str).collect();
+        let mut best = Duration::MAX;
+        let mut best_prepare = Duration::MAX;
+        let mut cloaked_out = Vec::new();
+        let mut seen_n = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let prepared = prepare_candidates(&dict);
+            best_prepare = best_prepare.min(t.elapsed());
+            let mut seen: HashMap<String, (Option<String>, String)> = HashMap::new();
+            for m in &refs {
+                for (k, v) in collect_prepared(&prepared, m) {
+                    seen.entry(k).or_insert(v);
+                }
+            }
+            let map: HashMap<String, String> = seen
+                .values()
+                .enumerate()
+                .map(|(n, (kind, c))| (match_key(c), format!("[{}-{n}]", bucket_template(kind.as_deref()).0)))
+                .collect();
+            let mut session = CloakSession::empty();
+            cloaked_out = apply_batch(&refs, &map, &mut session);
+            best = best.min(t.elapsed());
+            seen_n = seen.len();
+        }
+        let joined = cloaked_out.join("");
+        let fams = Lazy::force(&PSEUDONYM_CORE_RE)
+            .find_iter(&joined)
+            .fold(HashMap::<String, usize>::new(), |mut m, x| {
+                *m.entry(x.as_str().split('-').next().unwrap_or("").to_string()).or_default() += 1;
+                m
+            });
+        eprintln!(
+            "real dict: {} entries (build {build:?}); prompt {} chars / {} msgs; {} distinct hits; best of 5 = {best:?} (prepare {best_prepare:?})",
+            dict.len(),
+            text.chars().count(),
+            refs.len(),
+            seen_n
+        );
+        eprintln!("placeholder families in cloaked prompt: {fams:?}");
+        eprintln!("sample: {}", &cloaked_out[0].chars().take(700).collect::<String>());
+    }
 }
