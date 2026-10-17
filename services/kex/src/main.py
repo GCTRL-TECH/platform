@@ -53,6 +53,7 @@ from .relex import get_extractor
 from . import reranker
 from . import hebb
 from . import search_scope
+from . import lexical_terms
 from . import clearance_guard
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
@@ -1759,11 +1760,12 @@ def _lexical_search(req: "SearchReq") -> list[dict]:
             # When the strict pass leaves headroom, fill it with an OR-ranked pass:
             # ts_rank_cd still puts the densest multi-term matches first, so this
             # adds recall without displacing strict hits (appended AFTER them).
+            # Content words only, capped (src/lexical_terms.py): an OR over every
+            # token of a long chat message matched most of the corpus and cost
+            # 5-14 s — the whole per-turn budget of a chat client.
             if len(order) < limit:
-                toks = list(dict.fromkeys(
-                    t for t in "".join(c if c.isalnum() else " " for c in q).split()
-                    if len(t) >= 2))
-                if len(toks) >= 2:
+                toks = lexical_terms.or_relaxation_terms(q)
+                if toks:
                     with conn.cursor() as cur:
                         sql, params = _scope_sql(include_comp)
                         params = dict(params)
