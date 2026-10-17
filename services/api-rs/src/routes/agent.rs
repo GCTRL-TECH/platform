@@ -1143,9 +1143,10 @@ async fn execute_tool_inner(
             // the returned chunks are wired together, exactly like the chat path —
             // before this, agent reads left no trace and the memory could not learn
             // what its agents actually use.
+            // Detached: the writes wait on row locks when searches overlap, and the
+            // response does not depend on them.
             let used = crate::services::hebb::chunk_ids_from_search(&chunks);
-            crate::services::hebb::reinforce_chunks(&state.db, claims.sub, &used, crate::services::hebb::Signal::Search).await;
-            crate::services::hebb::record_coactivation(&state.db, claims.sub, &used).await;
+            crate::services::hebb::reinforce_retrieval_detached(&state.db, claims.sub, &used, crate::services::hebb::Signal::Search);
             crate::services::audit::log_access(&state.db, claims, "agent.search_chunks", "chunks", "*", rank as i32, None, true, None).await;
             chunks
         }

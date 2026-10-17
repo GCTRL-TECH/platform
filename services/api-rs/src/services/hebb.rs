@@ -88,7 +88,68 @@ pub fn coactivation_pairs(ids: &[Uuid]) -> Vec<(Uuid, Uuid)> {
             pairs.push((a, b));
         }
     }
+    // Sorted, so every upsert locks its conflicting rows in the same order (see
+    // `reinforce_chunks` for why the order matters).
+    pairs.sort_unstable();
     pairs
+}
+
+/// `(ids, deltas)` for `reinforce_chunks`: each id once with the delta of its BEST
+/// rank, sorted by id. The sort is the deadlock fix: two retrievals that share
+/// chunks lock those rows in the same order, so neither can wait on the other.
+pub fn reinforcement_rows(ids_in_rank_order: &[Uuid], signal: Signal) -> (Vec<Uuid>, Vec<f32>) {
+    let mut rows: Vec<(Uuid, f32)> = Vec::with_capacity(ids_in_rank_order.len());
+    for (rank, id) in ids_in_rank_order.iter().enumerate() {
+        if rows.iter().any(|(r, _)| r == id) { continue; }
+        rows.push((*id, rank_delta(rank, signal) as f32));
+    }
+    rows.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+    rows.into_iter().unzip()
+}
+
+/// Postgres deadlock (40P01) or serialization failure (40001): a lost race that is
+/// safe to run again.
+pub fn is_retryable_conflict(code: Option<&str>) -> bool {
+    matches!(code, Some("40P01") | Some("40001"))
+}
+
+const WRITE_ATTEMPTS: usize = 3;
+
+/// Run a best-effort heat write, retrying a lost lock race a couple of times.
+async fn with_conflict_retry<F, Fut>(what: &str, mut op: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<sqlx::postgres::PgQueryResult, sqlx::Error>>,
+{
+    for attempt in 1..=WRITE_ATTEMPTS {
+        match op().await {
+            Ok(_) => return,
+            Err(e) => {
+                let code = e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());
+                if attempt < WRITE_ATTEMPTS && is_retryable_conflict(code.as_deref()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * attempt as u64)).await;
+                    continue;
+                }
+                tracing::debug!("hebb: {what} failed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Reinforce + wire the chunks of one retrieval WITHOUT holding up the response.
+/// The writes wait on row locks whenever several searches touch the same chunks;
+/// on the request path that wait (and, before the lock-order fix, a 1 s deadlock
+/// timeout) landed on the caller's latency. The answer never depends on these
+/// writes, so they run detached.
+pub fn reinforce_retrieval_detached(db: &sqlx::PgPool, user_id: Uuid, ids_in_rank_order: &[Uuid], signal: Signal) {
+    if ids_in_rank_order.is_empty() { return; }
+    let db = db.clone();
+    let ids = ids_in_rank_order.to_vec();
+    tokio::spawn(async move {
+        reinforce_chunks(&db, user_id, &ids, signal).await;
+        record_coactivation(&db, user_id, &ids).await;
+    });
 }
 
 /// Reinforce the chunks a retrieval returned, in rank order. Owner-scoped: an id
@@ -96,32 +157,34 @@ pub fn coactivation_pairs(ids: &[Uuid]) -> Vec<(Uuid, Uuid)> {
 /// duplicates archived (their vectors are gone).
 pub async fn reinforce_chunks(db: &sqlx::PgPool, user_id: Uuid, ids_in_rank_order: &[Uuid], signal: Signal) {
     if ids_in_rank_order.is_empty() { return; }
-    let mut ids: Vec<Uuid> = Vec::with_capacity(ids_in_rank_order.len());
-    let mut deltas: Vec<f32> = Vec::with_capacity(ids_in_rank_order.len());
-    for (rank, id) in ids_in_rank_order.iter().enumerate() {
-        if ids.contains(id) { continue; }
-        ids.push(*id);
-        deltas.push(rank_delta(rank, signal) as f32);
-    }
-    let _ = sqlx::query(
-        "UPDATE text_chunks tc \
-            SET heat = tc.heat + u.delta, \
-                access_count = tc.access_count + 1, \
-                last_accessed = NOW(), \
-                half_life_secs = LEAST($4, (tc.half_life_secs::float8 * $5)::int), \
-                archived = CASE WHEN tc.archived_reason IN ('dedup', 'superseded') THEN tc.archived ELSE false END, \
-                archived_reason = CASE WHEN tc.archived_reason IN ('dedup', 'superseded') THEN tc.archived_reason ELSE NULL END \
-           FROM unnest($1::uuid[], $2::real[]) AS u(id, delta) \
-          WHERE tc.id = u.id AND tc.user_id = $3"
-    )
-    .bind(&ids)
-    .bind(&deltas)
-    .bind(user_id)
-    .bind(HALF_LIFE_CAP_SECS as i32)
-    .bind(HALF_LIFE_GROWTH)
-    .execute(db)
-    .await
-    .map_err(|e| tracing::debug!("hebb: reinforce_chunks failed: {e}"));
+    let (ids, deltas) = reinforcement_rows(ids_in_rank_order, signal);
+    // Lock first, in id order, then update. A plain `UPDATE ... FROM unnest(...)`
+    // locks rows in whatever order the join yields them, so two concurrent searches
+    // sharing chunks deadlocked (Asgard 2026-10-17 01:52/01:54 UTC, 40P01).
+    with_conflict_retry("reinforce_chunks", || {
+        sqlx::query(
+            "WITH locked AS MATERIALIZED ( \
+                 SELECT id FROM text_chunks \
+                  WHERE id = ANY($1::uuid[]) AND user_id = $3 \
+                  ORDER BY id FOR UPDATE \
+             ) \
+             UPDATE text_chunks tc \
+                SET heat = tc.heat + u.delta, \
+                    access_count = tc.access_count + 1, \
+                    last_accessed = NOW(), \
+                    half_life_secs = LEAST($4, (tc.half_life_secs::float8 * $5)::int), \
+                    archived = CASE WHEN tc.archived_reason IN ('dedup', 'superseded') THEN tc.archived ELSE false END, \
+                    archived_reason = CASE WHEN tc.archived_reason IN ('dedup', 'superseded') THEN tc.archived_reason ELSE NULL END \
+               FROM unnest($1::uuid[], $2::real[]) AS u(id, delta), locked l \
+              WHERE tc.id = u.id AND tc.id = l.id AND tc.user_id = $3"
+        )
+        .bind(&ids)
+        .bind(&deltas)
+        .bind(user_id)
+        .bind(HALF_LIFE_CAP_SECS as i32)
+        .bind(HALF_LIFE_GROWTH)
+        .execute(db)
+    }).await;
 }
 
 /// Reinforce one dossier (HOT tier) with the full signal weight (rank 0).
@@ -178,21 +241,21 @@ pub async fn record_coactivation(db: &sqlx::PgPool, user_id: Uuid, ids_in_rank_o
     if pairs.is_empty() { return; }
     let a: Vec<Uuid> = pairs.iter().map(|p| p.0).collect();
     let b: Vec<Uuid> = pairs.iter().map(|p| p.1).collect();
-    let _ = sqlx::query(
-        "INSERT INTO memory_coactivation (user_id, a, b, weight, fired, last_fired) \
-         SELECT $1, u.a, u.b, $4, 1, NOW() FROM unnest($2::uuid[], $3::uuid[]) AS u(a, b) \
-         ON CONFLICT (user_id, a, b) DO UPDATE \
-            SET weight = memory_coactivation.weight + $4 * (1.0 - memory_coactivation.weight), \
-                fired = memory_coactivation.fired + 1, \
-                last_fired = NOW()"
-    )
-    .bind(user_id)
-    .bind(&a)
-    .bind(&b)
-    .bind(COACT_ETA as f32)
-    .execute(db)
-    .await
-    .map_err(|e| tracing::debug!("hebb: record_coactivation failed: {e}"));
+    with_conflict_retry("record_coactivation", || {
+        sqlx::query(
+            "INSERT INTO memory_coactivation (user_id, a, b, weight, fired, last_fired) \
+             SELECT $1, u.a, u.b, $4, 1, NOW() FROM unnest($2::uuid[], $3::uuid[]) AS u(a, b) \
+             ON CONFLICT (user_id, a, b) DO UPDATE \
+                SET weight = memory_coactivation.weight + $4 * (1.0 - memory_coactivation.weight), \
+                    fired = memory_coactivation.fired + 1, \
+                    last_fired = NOW()"
+        )
+        .bind(user_id)
+        .bind(&a)
+        .bind(&b)
+        .bind(COACT_ETA as f32)
+        .execute(db)
+    }).await;
 }
 
 /// Governance step: decay pairs idle ≥ `idle_secs` by one tick, prune the faded
@@ -266,6 +329,53 @@ mod tests {
         assert_eq!(coactivation_pairs(&dup).len(), 1);
         assert!(coactivation_pairs(&[ids[0]]).is_empty());
         assert!(coactivation_pairs(&[]).is_empty());
+    }
+
+    #[test]
+    fn reinforcement_rows_are_sorted_deduped_and_keep_the_best_rank() {
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let ranked = vec![ids[3], ids[1], ids[3], ids[5], ids[0]];
+        let (rows, deltas) = reinforcement_rows(&ranked, Signal::Search);
+        let mut want = vec![ids[0], ids[1], ids[3], ids[5]];
+        want.sort();
+        assert_eq!(rows, want, "each id once, in id order");
+        let delta_of = |id: Uuid| deltas[rows.iter().position(|r| *r == id).unwrap()] as f64;
+        // ids[3] first appears at rank 0: it keeps the rank-0 delta, not rank 2's.
+        assert!((delta_of(ids[3]) - rank_delta(0, Signal::Search)).abs() < 1e-6);
+        assert!((delta_of(ids[0]) - rank_delta(4, Signal::Search)).abs() < 1e-6);
+        // Two retrievals over the same chunks in a different rank order lock them
+        // in the SAME order - the property that removes the deadlock.
+        let (other, _) = reinforcement_rows(&[ids[0], ids[5], ids[1], ids[3]], Signal::Answer);
+        assert_eq!(rows, other);
+        assert!(reinforcement_rows(&[], Signal::Search).0.is_empty());
+    }
+
+    #[test]
+    fn coactivation_pairs_come_out_in_one_global_order() {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let mut rev = ids.clone();
+        rev.reverse();
+        let p = coactivation_pairs(&ids);
+        assert_eq!(p, coactivation_pairs(&rev));
+        assert!(p.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn only_lock_races_are_retried() {
+        assert!(is_retryable_conflict(Some("40P01")));
+        assert!(is_retryable_conflict(Some("40001")));
+        assert!(!is_retryable_conflict(Some("23505")));
+        assert!(!is_retryable_conflict(None));
+    }
+
+    /// Source guard: the row locks are taken in id order before the update.
+    #[test]
+    fn reinforce_locks_rows_in_id_order() {
+        let src = include_str!("hebb.rs");
+        let start = src.find("pub async fn reinforce_chunks(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("ORDER BY id FOR UPDATE"));
+        assert!(body.contains("reinforcement_rows("));
     }
 
     #[test]

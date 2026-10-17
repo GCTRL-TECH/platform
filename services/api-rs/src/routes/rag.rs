@@ -51,9 +51,8 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
 /// wired together as co-activated (services/hebb.rs). `chunk_ids` must be in
 /// rank order. Best-effort — a DB hiccup never fails the query.
 pub(crate) async fn bump_chunk_heat(db: &sqlx::PgPool, user_id: Uuid, chunk_ids: &[Uuid]) {
-    if chunk_ids.is_empty() { return; }
-    crate::services::hebb::reinforce_chunks(db, user_id, chunk_ids, crate::services::hebb::Signal::Answer).await;
-    crate::services::hebb::record_coactivation(db, user_id, chunk_ids).await;
+    // Detached (services/hebb.rs): a lock wait on hot chunks must not delay the answer.
+    crate::services::hebb::reinforce_retrieval_detached(db, user_id, chunk_ids, crate::services::hebb::Signal::Answer);
 }
 
 /// A4 — TRUST feedback. `POST /api/rag/feedback`.
