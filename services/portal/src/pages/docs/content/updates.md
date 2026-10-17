@@ -20,7 +20,7 @@ keep improving - so here it is, release by release.
 - **Numbers stay numbers.** The phone sweep took any run of seven digits: dates, year ranges, decimals, ticket numbers and timestamps. It now needs the shape of a dialled number (a leading `+`, `(` or `0`) or a keyword such as "Tel." right before it. This also removes most of the database work the gateway did for new placeholders on each request.
 - **Identity numbers are cloaked.** A tax ID, VAT ID, ID card, passport or social security number that follows its keyword becomes `[ID-n]`.
 - **A name keeps the type most mentions give it.** A person typed once as an organisation was cloaked as `[Org-n]`. The majority type now wins, and a tie goes to the person.
-- **Old placeholders heal.** Placeholders from the October 7 and 8 releases sit in files, boards and chat histories. The gateway now restores every placeholder it finds in a request before it cloaks, so the model never copies one it cannot map back.
+- **Old placeholders heal.** Placeholders from the October 7 and 8 releases sit in files, boards and chat histories. The gateway now restores name and term placeholders it finds in a request before it cloaks, so the model never copies one it cannot map back. It restores only entities from your own knowledge bases, at most 50 per request, and never phone numbers, IBANs, e-mail addresses, ID numbers, addresses, amounts or dates: those placeholders stay as they are.
 - **Changed placeholders still come back.** The gateway now also restores placeholders a model translated (`[Ort-2]`), re-cased (`[place-2]`), wrote with a space or another dash, or escaped for Markdown (`\[Person-1\]`), across stream chunks too.
 
 ## v0.9.24 - The cloak hides names, not your vocabulary

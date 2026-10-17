@@ -520,31 +520,46 @@ pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Arc<Vec
 static SPELLING_CACHE: Lazy<Mutex<HashMap<Uuid, (Instant, Arc<HashMap<String, String>>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Most regular cores one request may look up in `cloak_maps` (a bound on the query, not
-/// a correctness limit: the rest stay as they are).
-const STALE_LOOKUP_CAP: usize = 5_000;
+//// Most placeholder cores one request may look up in `cloak_maps` (2026-10-17 security
+/// review): bounds the query and how many registry entries one request can probe. The
+/// rest stay as they are, and hitting the cap is logged.
+const STALE_LOOKUP_CAP: usize = 50;
 
-/// The regular placeholder cores (`Person-12`, canonical family spelling) that occur in
-/// `texts` in any form [`decloak`] understands (bracketed, escaped, bare, translated).
-pub fn placeholder_cores(texts: &[&str]) -> Vec<String> {
+/// Placeholder families the heal may restore: names and terms. PII and value families
+/// (`PHONE`, `IBAN`, `EMAIL`, `ID`, `ADDRESS`, `NUM`, `DATE`, `AMOUNT`) are NEVER resolved
+/// from the registry: a typed `[PHONE-500]` would otherwise send the real number to the
+/// cloud in clear, an enumeration oracle over the registry. Such leftovers stay as they are.
+fn is_healable_family(family: &str) -> bool {
+    matches!(family, "Person" | "Org" | "Place" | "Term")
+}
+
+/// The healable placeholder cores (`Person-12`, canonical family spelling) that occur in
+/// `texts` in any form [`decloak`] understands (bracketed, escaped, bare, translated), at
+/// most [`STALE_LOOKUP_CAP`]; the flag says whether the cap cut the list.
+pub fn placeholder_cores(texts: &[&str]) -> (Vec<String>, bool) {
     let mut out: HashSet<String> = HashSet::new();
-    for t in texts {
+    let mut capped = false;
+    'texts: for t in texts {
         for m in PSEUDONYM_SCAN_RE.find_iter(t) {
             let Some(p) = split_placeholder(m.as_str()) else { continue };
             for (off, _) in p.letters.char_indices() {
                 if let Some(f) = canonical_family(&p.letters[off..]) {
-                    out.insert(format!("{f}-{}", p.digits));
+                    if is_healable_family(f) {
+                        let core = format!("{f}-{}", p.digits);
+                        if !out.contains(&core) && out.len() >= STALE_LOOKUP_CAP {
+                            capped = true;
+                            break 'texts;
+                        }
+                        out.insert(core);
+                    }
                     break;
                 }
-            }
-            if out.len() >= STALE_LOOKUP_CAP {
-                break;
             }
         }
     }
     let mut v: Vec<String> = out.into_iter().collect();
     v.sort();
-    v
+    (v, capped)
 }
 
 /// Request-side HEAL (2026-10-17): placeholders that are already IN a request were never
@@ -554,22 +569,41 @@ pub fn placeholder_cores(texts: &[&str]) -> Vec<String> {
 /// (2026-10-07/08), or a pseudonym the de-cloaker missed. Prod sessions of 15.-17.10. held
 /// thousands of them, read back by tools and replayed by pi every turn; the session map
 /// of the new request does not know them, so the model copied them into its answer and
-/// the user saw brackets. This looks the leftovers up in the namespace's registry and
-/// returns a session that maps each one back to its original (the preferred spelling
-/// from [`SPELLING_CACHE`], else the stored key). Apply it with [`heal_texts`] BEFORE
-/// cloaking: names are then cloaked again under their (stable) pseudonym, everything
-/// else (terms, numbers, dates) goes in clear, as today's policy wants.
-/// One query, and only when the request contains placeholder-shaped tokens.
+/// the user saw brackets. Apply the returned session with [`heal_texts`] BEFORE cloaking:
+/// names are then cloaked again under their (stable) pseudonym, terms go in clear.
+///
+/// Access rule (security review 2026-10-17): a leftover is restored only when the
+/// requester could legitimately have seen it, i.e. its registry key is an entity KEX
+/// extracted from the requester's OWN documents (`text_chunks.user_id` = requester, the
+/// same set the requester's cloak dictionary is built from, via [`SPELLING_CACHE`]). The
+/// gateway is stateless and does not record earlier responses per session, so this is the
+/// strongest check the data model offers. Without a fresh index nothing is restored
+/// (fail closed). PII and value families are never restored ([`is_healable_family`]), and
+/// at most [`STALE_LOOKUP_CAP`] cores are looked up per request.
 pub async fn stale_placeholder_session(
     db: &sqlx::PgPool,
     namespace: Uuid,
     user_id: Uuid,
     texts: &[&str],
 ) -> CloakSession {
-    let cores = placeholder_cores(texts);
+    let (cores, capped) = placeholder_cores(texts);
+    if capped {
+        tracing::warn!(
+            "cloak heal: request of user {user_id} holds more than {STALE_LOOKUP_CAP} placeholder cores; only the first {STALE_LOOKUP_CAP} are looked up"
+        );
+    }
     if cores.is_empty() {
         return CloakSession::empty();
     }
+    let Some(spelling) = SPELLING_CACHE
+        .lock()
+        .unwrap()
+        .get(&user_id)
+        .filter(|(t, _)| t.elapsed() < CANDIDATE_TTL)
+        .map(|(_, s)| s.clone())
+    else {
+        return CloakSession::empty();
+    };
     let mut stored: Vec<String> = Vec::with_capacity(cores.len() * 2);
     for c in &cores {
         stored.push(c.clone());
@@ -583,33 +617,28 @@ pub async fn stale_placeholder_session(
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    let spelling = SPELLING_CACHE
-        .lock()
-        .unwrap()
-        .get(&user_id)
-        .filter(|(t, _)| t.elapsed() < CANDIDATE_TTL)
-        .map(|(_, s)| s.clone());
-    stale_session_from_rows(&rows, spelling.as_deref())
+    stale_session_from_rows(&rows, &spelling)
 }
 
-/// PURE tail of [`stale_placeholder_session`]: registry rows -> heal session.
-fn stale_session_from_rows(rows: &[(String, String)], spelling: Option<&HashMap<String, String>>) -> CloakSession {
+/// PURE tail of [`stale_placeholder_session`]: registry rows -> heal session. A row is
+/// restored only for a healable family AND when its key is one of the requester's own
+/// entities (`own_entities`: lowercase key -> preferred spelling, see [`spelling_index`]).
+fn stale_session_from_rows(rows: &[(String, String)], own_entities: &HashMap<String, String>) -> CloakSession {
     let mut session = CloakSession::empty();
     for (pseudonym, key) in rows {
         let core = pseudonym_core(pseudonym);
         if !is_regular_core(core) {
             continue;
         }
-        let original = match spelling.and_then(|s| s.get(key)) {
-            Some(s) => s.clone(),
-            None if core.starts_with("IBAN-") => key.to_uppercase(),
-            None => key.clone(),
-        };
-        session.map.insert(wire_pseudonym(core), original);
+        let family = core.split('-').next().unwrap_or("");
+        if !is_healable_family(family) {
+            continue;
+        }
+        let Some(original) = own_entities.get(key) else { continue };
+        session.map.insert(wire_pseudonym(core), original.clone());
     }
     session
 }
-
 /// PURE: restore every placeholder of `heal` in each text (see [`stale_placeholder_session`]).
 pub fn heal_texts(heal: &CloakSession, texts: &[&str]) -> Vec<String> {
     texts.iter().map(|t| decloak(heal, t)).collect()
@@ -3284,34 +3313,89 @@ mod tests {
 
     #[test]
     fn stale_placeholders_in_a_request_are_healed_before_cloaking() {
-        // Registry rows as `cloak_maps` holds them (folded entity_key) + the spelling index.
+        // Registry rows as `cloak_maps` holds them (folded entity_key) + the requester's own
+        // entity index (lowercase key -> preferred spelling).
         let rows = vec![
             ("[Term-3450]".to_string(), "epr".to_string()),
             ("Term-3240".to_string(), "andre".to_string()),
             ("Term-3180".to_string(), "anvil-host".to_string()),
             ("[Org-621]".to_string(), "nexovar gmbh".to_string()),
-            ("[PHONE-43]".to_string(), "1234.56789012".to_string()),
-            ("[IBAN-2]".to_string(), "de02120300000000202051".to_string()),
         ];
-        let spelling: HashMap<String, String> = [("epr", "EPR"), ("nexovar gmbh", "Nexovar GmbH")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let heal = stale_session_from_rows(&rows, Some(&spelling));
+        let own: HashMap<String, String> =
+            [("epr", "EPR"), ("nexovar gmbh", "Nexovar GmbH"), ("andre", "andre"), ("anvil-host", "anvil-host")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let heal = stale_session_from_rows(&rows, &own);
         let texts = [
-            "Die [Term-3450]-Pflicht für [Org-621] ab Wert [PHONE-43].",
+            "Die [Term-3450]-Pflicht für [Org-621] gilt.",
             "Author: Andre (Anvil) <Term-3240@Term-3180.local>",
-            "IBAN [IBAN-2], unbekannt bleibt [Term-99999].",
+            "unbekannt bleibt [Term-99999].",
         ];
         let healed = heal_texts(&heal, &texts);
-        assert_eq!(healed[0], "Die EPR-Pflicht für Nexovar GmbH ab Wert 1234.56789012.");
+        assert_eq!(healed[0], "Die EPR-Pflicht für Nexovar GmbH gilt.");
         assert_eq!(healed[1], "Author: Andre (Anvil) <andre@anvil-host.local>");
-        assert_eq!(healed[2], "IBAN DE02120300000000202051, unbekannt bleibt [Term-99999].");
-        // The names are then cloaked again like any other mention; terms/numbers go in clear.
+        assert_eq!(healed[2], "unbekannt bleibt [Term-99999].");
+        // The names are then cloaked again like any other mention; terms go in clear.
         let (cloaked, _) = cloak_wire(&[cand("Nexovar GmbH", Some("organization"))], &healed[0]);
-        assert_eq!(cloaked, "Die EPR-Pflicht für [Org-1] ab Wert 1234.56789012.");
-        let cores = placeholder_cores(&["[Ort-2] und \\[Org-621\\], Term-3240@x, [Seite 3]"]);
+        assert_eq!(cloaked, "Die EPR-Pflicht für [Org-1] gilt.");
+        let (cores, capped) = placeholder_cores(&["[Ort-2] und \\[Org-621\\], Term-3240@x, [Seite 3]"]);
         assert_eq!(cores, vec!["Org-621", "Place-2", "Term-3240"]);
+        assert!(!capped);
+    }
+
+    #[test]
+    fn a_typed_pii_placeholder_is_never_resolved_from_the_registry() {
+        // Security review 2026-10-17: typing "[PHONE-500]" must not send the real number of
+        // another user (or one's own) to the cloud in clear.
+        let rows: Vec<(String, String)> = [
+            ("[PHONE-500]", "+49 171 7654321"),
+            ("[IBAN-3]", "de02120300000000202051"),
+            ("[EMAIL-7]", "jane@example.org"),
+            ("[ID-1]", "12 345 678 901"),
+            ("[ADDRESS-2]", "kaiserstraße 47"),
+            ("[NUM-9]", "4711"),
+            ("[DATE-3]", "08.10.2026"),
+            ("[AMOUNT-5]", "12,5 mio. eur"),
+        ]
+        .into_iter()
+        .map(|(p, k)| (p.to_string(), k.to_string()))
+        .collect();
+        // Even when the key is in the requester's own index.
+        let own: HashMap<String, String> = rows.iter().map(|(_, k)| (k.clone(), k.clone())).collect();
+        assert!(stale_session_from_rows(&rows, &own).is_empty());
+        let text = "Ruf [PHONE-500] an, IBAN [IBAN-3], Mail [EMAIL-7], [ID-1], [ADDRESS-2]";
+        let (cores, _) = placeholder_cores(&[text]);
+        assert!(cores.is_empty(), "PII cores are not even looked up: {cores:?}");
+        assert_eq!(heal_texts(&stale_session_from_rows(&rows, &own), &[text])[0], text);
+    }
+
+    #[test]
+    fn a_name_placeholder_outside_the_requesters_own_entities_is_not_resolved() {
+        let rows = vec![
+            ("[Person-4]".to_string(), "erika muster".to_string()),
+            ("[Org-8]".to_string(), "fremdfirma ag".to_string()),
+        ];
+        // The requester's own KB knows Erika Muster, not the other user's company.
+        let own: HashMap<String, String> =
+            [("erika muster".to_string(), "Erika Muster".to_string())].into_iter().collect();
+        let heal = stale_session_from_rows(&rows, &own);
+        assert_eq!(heal_texts(&heal, &["[Person-4] und [Org-8]"])[0], "Erika Muster und [Org-8]");
+        // No own index at all: nothing is restored.
+        assert!(stale_session_from_rows(&rows, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn heal_lookups_are_capped_per_request() {
+        let text: String = (1..=STALE_LOOKUP_CAP + 25).map(|n| format!("[Term-{n}] ")).collect();
+        let (cores, capped) = placeholder_cores(&[text.as_str()]);
+        assert_eq!(cores.len(), STALE_LOOKUP_CAP);
+        assert!(capped);
+        // Repeats of the same cores do not count against the cap.
+        let text: String = (0..200).map(|n| format!("[Term-{}] ", n % 10 + 1)).collect();
+        let (cores, capped) = placeholder_cores(&[text.as_str()]);
+        assert_eq!((cores.len(), capped), (10, false));
+        assert_eq!(STALE_LOOKUP_CAP, 50);
     }
 
     /// Realistic cost + quality probe (ignored; needs local data, never committed):
