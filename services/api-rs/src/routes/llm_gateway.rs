@@ -586,11 +586,26 @@ async fn chat_completions_inner(
     };
 
     // Parse the OpenAI body.
-    let parsed: Value = match serde_json::from_slice(&body) {
+    let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return gateway_error_json(StatusCode::BAD_REQUEST, "invalid_request_error", format!("invalid JSON body: {e}"))
         }
+    };
+    // Before cloaking and passthrough alike: Ollama drops `developer` messages, so they go
+    // out as `system` (see `upstream_supports_developer_role`). The passthrough stays
+    // byte-for-byte unless this changed the body.
+    let roles_adapted = adapt_roles_for_upstream(&mut parsed, upstream);
+    let body = if roles_adapted {
+        tracing::debug!("llm_gateway: developer role sent as system for upstream {upstream:?}");
+        match serde_json::to_vec(&parsed) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                return gateway_error_json(StatusCode::INTERNAL_SERVER_ERROR, "api_error", format!("body encode failed: {e}"))
+            }
+        }
+    } else {
+        body
     };
 
     let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
@@ -1186,6 +1201,40 @@ fn write_cloaked_texts(messages: &mut [Value], slots: &[ChatSlot], cloaked: &[St
 
 /// Prepend [`PLACEHOLDER_NOTE`] to the first system message (string or parts form),
 /// or insert a system message at the top when there is none.
+/// Does this upstream understand the OpenAI `developer` role? Only OpenAI's own API does.
+/// Ollama (local models and `:cloud` tags alike) silently DROPS a `developer` message: an
+/// OpenAI client that sends its system prompt that way (pi does for every reasoning model
+/// unless `compat.supportsDeveloperRole` is false) reached the model with no instructions at
+/// all. Observed 2026-10-17 on Asgard: the same 2.8k-token prompt arrived as 36 prompt tokens.
+fn upstream_supports_developer_role(upstream: Upstream) -> bool {
+    matches!(upstream, Upstream::OpenAi)
+}
+
+/// PURE: rewrite every `developer` message to `system` (content untouched). Returns how many
+/// were rewritten.
+fn developer_role_to_system(messages: &mut [Value]) -> usize {
+    let mut n = 0;
+    for m in messages.iter_mut() {
+        if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
+            m["role"] = json!("system");
+            n += 1;
+        }
+    }
+    n
+}
+
+/// PURE: prepare a parsed chat body for `upstream`: an upstream without the `developer` role
+/// gets those messages as `system`. Returns whether the body changed.
+fn adapt_roles_for_upstream(body: &mut Value, upstream: Upstream) -> bool {
+    if upstream_supports_developer_role(upstream) {
+        return false;
+    }
+    body.get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .map(|m| developer_role_to_system(m) > 0)
+        .unwrap_or(false)
+}
+
 fn add_placeholder_note(messages: &mut Vec<Value>) {
     let first_system = messages
         .iter()
@@ -1206,6 +1255,52 @@ fn add_placeholder_note(messages: &mut Vec<Value>) {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn ollama_gets_developer_messages_as_system() {
+        let mut body = json!({ "model": "glm-5.3-flash:cloud", "messages": [
+            { "role": "developer", "content": "Du bist Jarvis." },
+            { "role": "user", "content": [{ "type": "text", "text": "Hallo" }] },
+            { "role": "developer", "content": [{ "type": "text", "text": "Zweiter Block" }] },
+            { "role": "assistant", "content": "Hi" },
+        ] });
+        assert!(adapt_roles_for_upstream(&mut body, Upstream::Ollama));
+        let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "system", "assistant"]);
+        assert_eq!(body["messages"][0]["content"], "Du bist Jarvis.", "content untouched");
+        assert_eq!(body["messages"][2]["content"][0]["text"], "Zweiter Block");
+    }
+
+    #[test]
+    fn openai_keeps_the_developer_role() {
+        let mut body = json!({ "messages": [{ "role": "developer", "content": "x" }, { "role": "user", "content": "y" }] });
+        let before = body.clone();
+        assert!(!adapt_roles_for_upstream(&mut body, Upstream::OpenAi));
+        assert_eq!(body, before);
+        assert!(upstream_supports_developer_role(Upstream::OpenAi));
+        assert!(!upstream_supports_developer_role(Upstream::Ollama));
+    }
+
+    #[test]
+    fn a_body_without_developer_messages_is_left_alone() {
+        let mut body = json!({ "messages": [{ "role": "system", "content": "s" }, { "role": "user", "content": "u" }] });
+        let before = body.clone();
+        assert!(!adapt_roles_for_upstream(&mut body, Upstream::Ollama), "passthrough stays byte-for-byte");
+        assert_eq!(body, before);
+        let mut no_messages = json!({ "model": "m" });
+        assert!(!adapt_roles_for_upstream(&mut no_messages, Upstream::Ollama));
+    }
+
+    #[test]
+    fn the_placeholder_note_joins_the_rewritten_system_prompt() {
+        let mut body = json!({ "messages": [{ "role": "developer", "content": "Prompt" }, { "role": "user", "content": "u" }] });
+        adapt_roles_for_upstream(&mut body, Upstream::Ollama);
+        let messages = body["messages"].as_array_mut().unwrap();
+        add_placeholder_note(messages);
+        assert_eq!(messages.len(), 2, "no second system message");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.starts_with(PLACEHOLDER_NOTE) && content.ends_with("Prompt"));
+    }
 
     #[test]
     fn cloak_texts_cover_string_and_content_parts() {

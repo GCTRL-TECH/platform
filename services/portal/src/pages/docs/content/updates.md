@@ -16,6 +16,7 @@ keep improving - so here it is, release by release.
 *17 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
 
 - **A short name in capitals is cloaked however you type it.** The gateway matched names of up to four capital letters, such as "DENA", only in exactly that spelling, so "dena" or "Dena" in a message reached the cloud model in clear. Such a name now matches in any case. The strict spelling stays only where the lowercase word means something else: "MIT" never hides the German "mit", "US" never hides "us", "BILD" never hides "Bild". Names of one or two letters and names with digits keep the strict spelling too.
+- **Your instructions reach Ollama models again.** Some clients send their system prompt with the newer OpenAI role `developer`. Ollama ignores that role, so the model answered with no instructions at all. The gateway now sends such messages as `system` to Ollama, for local models and cloud tags alike. Requests to OpenAI keep the `developer` role.
 
 ## v0.9.25 - Ordinary words stay ordinary words
 
