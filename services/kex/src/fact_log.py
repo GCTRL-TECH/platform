@@ -41,6 +41,53 @@ EXCERPT:
 {text}
 """
 
+# Non-conversation documents (agent write-backs, notes, files) have no user voice.
+# The conversation prompt above made the model frame them as dialogue anyway and
+# invent speech acts ("The user clarified that ...") the user never made — those
+# then ranked as authoritative memory in the user's personal knowledge base.
+DOC_PROMPT = """Extract the key memory-worthy facts from this document excerpt. Rules:
+- Each fact: ONE self-contained sentence, keeping the document's exact names, numbers, and dates.
+- State each fact as the document states it. This is NOT a conversation: never write "The user ..." or "The assistant ..." and never invent who said, clarified, confirmed or asked something. Name a person only when the document itself names them.
+- ALWAYS capture: updates/changes (state BOTH old and new value), decisions, deadlines, and dated events (include the date).
+- Skip boilerplate.
+- 4 to 10 facts. Output each fact on its OWN line starting with "- ". No other text before or after.
+
+EXCERPT:
+{text}
+"""
+
+# A speaker turn of the human side: "USER: …", "USER (2023-05-01): …", "Nutzer: …",
+# "Human: …". Only then can a fact truthfully say what "the user" said.
+_USER_TURN = re.compile(
+    r"^\s*\**\s*(?:user|human|nutzer|benutzer)\b[^:\n]{0,40}:\s*\S",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# "The user clarified/stated/confirmed ..." - a reported speech act. Grounded only
+# when the source has user turns; in a document it is a fabrication.
+_SPEECH_ACT = re.compile(
+    r"^\s*(?:the\s+)?(?:user|assistant)\s+(?:has\s+|had\s+)?(?:\w+ly\s+)?"
+    r"(?:said|says|stated|states|clarified|clarifies|confirmed|confirms|explained|"
+    r"noted|mentioned|asked|asks|provided|established|emphasi[sz]ed|requested|"
+    r"indicated|specified|insisted|agreed|told|instructed|reported|pointed\s+out|"
+    r"expressed|shared|highlighted|acknowledged|described|suggested|recommended|"
+    r"wants|wanted|denied|corrected|gave|supplied)\b",
+    re.IGNORECASE,
+)
+
+
+def is_conversation(text: str) -> bool:
+    """True when the text carries at least one speaker turn of the user side."""
+    return bool(_USER_TURN.search(text or ""))
+
+
+def drop_ungrounded_attributions(facts: list[str], conversation: bool) -> list[str]:
+    """Outside a conversation, drop facts that attribute a speech act to the
+    user/assistant — nobody spoke, so the attribution is invented."""
+    if conversation:
+        return facts
+    return [f for f in facts if not _SPEECH_ACT.match(f)]
+
 
 def _parse_facts(raw: str) -> list[str]:
     """Parse '- fact' lines; tolerate numbered lists. (Plain lines beat JSON
@@ -100,7 +147,8 @@ def extract_facts(
     if not FACT_LOG_ENABLED or len(text) < 200:
         return []
     base = (ollama_base or config.OLLAMA_BASE).rstrip("/")
-    prompt = PROMPT.format(text=text[:9000])
+    conversation = is_conversation(text[:9000])
+    prompt = (PROMPT if conversation else DOC_PROMPT).format(text=text[:9000])
     if kind == "ollama":
         primary, fallback = FACT_LOG_MODEL, FACT_LOG_FALLBACK
     else:
@@ -113,7 +161,7 @@ def extract_facts(
     facts = _parse_facts(raw)
     # sanity: drop fragments and runaway outputs
     facts = [f for f in facts if 20 <= len(f) <= 400][:12]
-    return facts
+    return drop_ungrounded_attributions(facts, conversation)
 
 
 def fact_chunks(doc_text: str, facts: list[str]) -> list[dict]:

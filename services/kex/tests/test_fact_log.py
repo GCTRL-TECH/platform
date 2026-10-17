@@ -5,7 +5,8 @@ from unittest.mock import patch
 import requests
 
 
-TEXT = ("The user changed the deadline from March 3 to March 10. " * 6).strip()
+TEXT = ("USER: I moved the deadline from March 3 to March 10.\n"
+        "ASSISTANT: Noted, I suggest a weekly check-in on Mondays.\n" * 4).strip()
 RAW = (
     "- The user changed the project deadline from March 3 to March 10.\n"
     "- The assistant suggested a weekly check-in on Mondays.\n"
@@ -73,3 +74,51 @@ class TestFactLogRuntime:
         args, _ = mock_client.complete.call_args
         assert args[2] == config.OLLAMA_BASE.rstrip("/")
         assert args[3] == "ollama"
+
+
+DOC = (
+    "Konfliktpruefung GCTRL-Quellenkorpus: Ergebnis KEINE Widersprueche. Das Korpus besteht "
+    "aus Paraphrasen-Clustern desselben Produktselbstbilds. Einzelnes Unternehmens-KG gegen "
+    "je Projekt isolierte Wissensspeicher sind verschiedene Use Cases (Enterprise-Memory vs. Agentur)."
+)
+DOC_RAW = (
+    "- The user clarified that a single corporate KG and project-isolated stores are different use cases.\n"
+    "- The corpus about GCTRL contains no contradictory statement pairs.\n"
+    "- The assistant confirmed that the corpus consists of paraphrase clusters.\n"
+)
+
+
+class TestFactLogAttribution:
+    """17.10.2026: an agent write-back (a plain note, no dialogue) came back as
+    "[Fact] The user clarified ..." in the user's personal KB. Documents get the
+    document prompt, and invented speech acts are dropped."""
+
+    def test_is_conversation_needs_a_user_turn(self):
+        from src import fact_log
+        assert fact_log.is_conversation("[Conversation session 1]\n\nUSER (2023-05-01): hi there")
+        assert fact_log.is_conversation("Jarvis-Gespraech.\nNutzer: Wer ist X?\nAnvil: X ist ...")
+        assert not fact_log.is_conversation(DOC)
+        assert not fact_log.is_conversation("Ergebnis: der Nutzer-Wunsch lautet ...")
+
+    def test_document_uses_doc_prompt_and_drops_invented_speech_acts(self):
+        from src import fact_log
+        with patch("src.fact_log.llm_client") as mock_client:
+            mock_client.complete.return_value = DOC_RAW
+            facts = fact_log.extract_facts(DOC * 2)
+        prompt = mock_client.complete.call_args.args[0]
+        assert "document excerpt" in prompt and "conversation session" not in prompt
+        assert facts == ["The corpus about GCTRL contains no contradictory statement pairs."]
+
+    def test_conversation_keeps_user_attribution(self):
+        from src import fact_log
+        with patch("src.fact_log.llm_client") as mock_client:
+            mock_client.complete.return_value = RAW
+            facts = fact_log.extract_facts(TEXT)
+        assert "conversation session" in mock_client.complete.call_args.args[0]
+        assert len(facts) == 2
+
+    def test_document_keeps_non_speech_user_facts(self):
+        from src import fact_log
+        out = fact_log.drop_ungrounded_attributions(
+            ["The user account was created on 2026-10-01.", "The user clarified X is Y."], conversation=False)
+        assert out == ["The user account was created on 2026-10-01."]
