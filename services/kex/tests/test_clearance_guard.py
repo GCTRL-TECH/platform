@@ -75,7 +75,7 @@ class TestPg:
 
 def test_main_ruft_die_pruefung_als_letzten_filter():
     src = (pathlib.Path(__file__).resolve().parents[1] / "src" / "main.py").read_text(encoding="utf-8")
-    m = re.search(r"^async def search_endpoint\(.*?(?=^(?:async )?def |^@app\.|^class )", src, re.S | re.M)
+    m = re.search(r"^(?:async )?def search_endpoint\(.*?(?=^(?:async )?def |^@app\.|^class )", src, re.S | re.M)
     assert m
     body = m.group(0)
     scope = body.index("search_scope.filter_chunks(reranked, req.job_ids)")

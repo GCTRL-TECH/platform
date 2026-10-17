@@ -54,6 +54,7 @@ from . import reranker
 from . import hebb
 from . import search_scope
 from . import lexical_terms
+from . import search_pg
 from . import clearance_guard
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
@@ -114,10 +115,21 @@ import psycopg2 as _psycopg2  # noqa: E402  (kept local to the search subsystem)
 _pg_search_conn = None
 
 
+# /search runs in FastAPI's threadpool (plain `def`): each request gets its own
+# pooled connection for its lifetime (src/search_pg.py), so parallel searches no
+# longer share one psycopg2 connection.
+SEARCH_PG_POOL_SIZE = max(1, int(os.environ.get("SEARCH_PG_POOL_SIZE", "4")))
+_search_pool = search_pg.SearchConnPool(
+    lambda: _psycopg2.connect(config.PG_URL, connect_timeout=5), SEARCH_PG_POOL_SIZE)
+
+
 def get_search_pg():
-    """Lazy autocommit psycopg2 connection used only for lexical chunk search.
-    Returns None if Postgres is unreachable (lexical channel degrades to empty,
-    dense still answers)."""
+    """Autocommit psycopg2 connection for the search subsystem. Inside a /search
+    request: that request's own pooled connection (src/search_pg.py). Outside
+    one: the lazy shared connection as before. Returns None if Postgres is
+    unreachable (lexical channel degrades to empty, dense still answers)."""
+    if _search_pool.in_scope():
+        return _search_pool.current()
     global _pg_search_conn
     if _pg_search_conn is not None:
         try:
@@ -1927,7 +1939,7 @@ def _rrf_fuse(channels: list[list[dict]], limit: int, k: int = 60) -> list[dict]
 
 
 @app.post("/search")
-async def search_endpoint(req: SearchReq, request: Request):
+def search_endpoint(req: SearchReq, request: Request):
     # Internal trust boundary: /search takes a caller-supplied user_id + max_rank and
     # has no user auth of its own, so when INTERNAL_API_SECRET is set it MUST be
     # presented (the api-rs layer sends it). This closes the hole where a host-local
@@ -1953,78 +1965,81 @@ async def search_endpoint(req: SearchReq, request: Request):
     `job_ids` (when given) is a HARD allow-list through all four steps and the
     Hebbian pull-in — see src/search_scope.py.
     """
-    query = req.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail={"error": "query must not be empty"})
-    if len(query) > 2000:
-        raise HTTPException(status_code=400, detail={"error": "query exceeds 2000 character limit"})
+    # Plain `def`: FastAPI runs it in its threadpool. Embedding, Qdrant and
+    # psycopg2 are all blocking; as `async def` one slow search held the event
+    # loop and every parallel /search (and /health) queued behind it.
+    with _search_pool.scope():
+        query = req.query.strip()
+        if not query:
+            raise HTTPException(status_code=400, detail={"error": "query must not be empty"})
+        if len(query) > 2000:
+            raise HTTPException(status_code=400, detail={"error": "query exceeds 2000 character limit"})
 
-    # Hard KB boundary. Normalized once and written back onto the request so every
-    # channel below reads the same canonical list. An empty scope short-circuits
-    # BEFORE any embedding/DB work: a token with nothing granted sees nothing.
-    req.job_ids = search_scope.normalize_job_ids(req.job_ids)
-    if search_scope.denies_all(req.job_ids):
-        return {"chunks": []}
+        # Hard KB boundary. Normalized once and written back onto the request so every
+        # channel below reads the same canonical list. An empty scope short-circuits
+        # BEFORE any embedding/DB work: a token with nothing granted sees nothing.
+        req.job_ids = search_scope.normalize_job_ids(req.job_ids)
+        if search_scope.denies_all(req.job_ids):
+            return {"chunks": []}
 
-    # Dense channel — embed the query; embedding failure degrades to lexical-only
-    # rather than 503, so exact-token retrieval still works if Ollama is down.
-    dense_hits: list[dict] = []
-    vector = get_embedding_client().embed(query)
-    if vector is None:
-        logger.warning("/search: embedding unavailable — dense channel skipped, lexical-only")
-    else:
-        dense_hits = _dense_search(vector, req)
+        # Dense channel — embed the query; embedding failure degrades to lexical-only
+        # rather than 503, so exact-token retrieval still works if Ollama is down.
+        dense_hits: list[dict] = []
+        vector = get_embedding_client().embed(query)
+        if vector is None:
+            logger.warning("/search: embedding unavailable — dense channel skipped, lexical-only")
+        else:
+            dense_hits = _dense_search(vector, req)
 
-    # Lexical channel — Postgres full-text + exact-substring (BM25-style).
-    lexical_hits = _lexical_search(req)
+        # Lexical channel — Postgres full-text + exact-substring (BM25-style).
+        lexical_hits = _lexical_search(req)
 
-    # RRF fusion of dense ∪ lexical into a single ranked list.
-    fused = _rrf_fuse([dense_hits, lexical_hits], limit=max(1, req.limit))
+        # RRF fusion of dense ∪ lexical into a single ranked list.
+        fused = _rrf_fuse([dense_hits, lexical_hits], limit=max(1, req.limit))
 
-    # Final fallback: nothing fused (e.g. compilation scope hid everything and the
-    # dense fallback also empty) → lexical-only over the WHOLE owner corpus.
-    if not fused:
-        # "Whole corpus" drops the SOFT compilation preference only — the job scope
-        # travels along, or this fallback would hand a scoped token the owner's
-        # other knowledge bases (the 2026-09-17 leak).
-        corpus_req = SearchReq(query=req.query, limit=req.limit, compilation_id=None,
-                               user_id=req.user_id, max_rank=req.max_rank,
-                               job_ids=req.job_ids)
-        corpus_lex = _lexical_search(corpus_req)
-        fused = _rrf_fuse([corpus_lex], limit=max(1, req.limit))
+        # Final fallback: nothing fused (e.g. compilation scope hid everything and the
+        # dense fallback also empty) → lexical-only over the WHOLE owner corpus.
+        if not fused:
+            # "Whole corpus" drops the SOFT compilation preference only — the job scope
+            # travels along, or this fallback would hand a scoped token the owner's
+            # other knowledge bases (the 2026-09-17 leak).
+            corpus_req = SearchReq(query=req.query, limit=req.limit, compilation_id=None,
+                                   user_id=req.user_id, max_rank=req.max_rank,
+                                   job_ids=req.job_ids)
+            corpus_lex = _lexical_search(corpus_req)
+            fused = _rrf_fuse([corpus_lex], limit=max(1, req.limit))
 
-    # Cross-encoder rerank: RRF orders by rank-fusion, but only a true query×passage
-    # cross-encoder scores actual relevance. Reorders the fused candidate pool so the
-    # best passages bubble to the top before rag.rs cuts to its final few. Degrades to
-    # a no-op (RRF order) if the model is unavailable.
-    reranked = reranker.rerank(query, fused, top_k=max(1, req.limit))
+        # Cross-encoder rerank: RRF orders by rank-fusion, but only a true query×passage
+        # cross-encoder scores actual relevance. Reorders the fused candidate pool so the
+        # best passages bubble to the top before rag.rs cuts to its final few. Degrades to
+        # a no-op (RRF order) if the model is unavailable.
+        reranked = reranker.rerank(query, fused, top_k=max(1, req.limit))
 
-    # Hebbian prior (src/hebb.py): chunks that keep being used get a bounded rank
-    # bonus, and a strongly co-activated neighbour of the hits is pulled in. Applied
-    # last so relevance ranking stays the base; fail-safe (keeps the order above).
-    reranked = hebb.rerank_with_memory(
-        reranked, user_id=req.user_id, limit=max(1, req.limit),
-        max_rank=req.max_rank, compilation_id=req.compilation_id,
-        conn_factory=get_search_pg, job_ids=req.job_ids,
-    )
-    # Last word: whatever the channels, the reranker or a co-activated neighbour
-    # produced, nothing outside the job scope leaves this endpoint.
-    reranked = search_scope.filter_chunks(reranked, req.job_ids)
-    # Einstufung: Postgres hat das letzte Wort, nicht der Qdrant-Payload (der bei einer
-    # spaeteren Hochstufung, z. B. Migration 100 fuer Lehren, auf dem alten Rang bleibt).
-    reranked = clearance_guard.filter_by_pg_rank(reranked, req.max_rank, get_search_pg)
+        # Hebbian prior (src/hebb.py): chunks that keep being used get a bounded rank
+        # bonus, and a strongly co-activated neighbour of the hits is pulled in. Applied
+        # last so relevance ranking stays the base; fail-safe (keeps the order above).
+        reranked = hebb.rerank_with_memory(
+            reranked, user_id=req.user_id, limit=max(1, req.limit),
+            max_rank=req.max_rank, compilation_id=req.compilation_id,
+            conn_factory=get_search_pg, job_ids=req.job_ids,
+        )
+        # Last word: whatever the channels, the reranker or a co-activated neighbour
+        # produced, nothing outside the job scope leaves this endpoint.
+        reranked = search_scope.filter_chunks(reranked, req.job_ids)
+        # Einstufung: Postgres hat das letzte Wort, nicht der Qdrant-Payload (der bei einer
+        # spaeteren Hochstufung, z. B. Migration 100 fuer Lehren, auf dem alten Rang bleibt).
+        reranked = clearance_guard.filter_by_pg_rank(reranked, req.max_rank, get_search_pg)
 
-    # Provenance, last: every channel above carries the raw source_documents.id,
-    # so resolving the readable name here covers dense, lexical AND the Hebbian
-    # pull-in with a single query over the final result set.
-    reranked = _resolve_sources(reranked)
+        # Provenance, last: every channel above carries the raw source_documents.id,
+        # so resolving the readable name here covers dense, lexical AND the Hebbian
+        # pull-in with a single query over the final result set.
+        reranked = _resolve_sources(reranked)
 
-    logger.info(
-        "/search hybrid: dense=%d lexical=%d fused=%d reranked=%d (comp=%s)",
-        len(dense_hits), len(lexical_hits), len(fused), len(reranked), req.compilation_id,
-    )
-    return {"chunks": reranked}
-
+        logger.info(
+            "/search hybrid: dense=%d lexical=%d fused=%d reranked=%d (comp=%s)",
+            len(dense_hits), len(lexical_hits), len(fused), len(reranked), req.compilation_id,
+        )
+        return {"chunks": reranked}
 
 # ── A5: semantic dedup-merge ──────────────────────────────────────────
 
