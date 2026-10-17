@@ -11,6 +11,15 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 713cf51 -->
 
+## v0.9.27 - Search answers in a fraction of a second, even for long questions
+
+*17 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Long questions no longer stall retrieval.** When a question did not match word for word, the keyword half of hybrid search fell back to "any of these words" over every word of the question, "the", "and" and "die" included. A chat message of a thousand characters became a hundred search terms, matched most of the knowledge base and took 5 to 14 seconds. Chat clients that look up context before every turn ran into their timeout and answered without your knowledge. The fallback now uses the content words only, at most 16, the most specific first. On real chat questions over a large knowledge base, the 95th percentile fell from 5.9 seconds to under half a second, and the passages that come back match the question more closely.
+- **Pasted texts get context too.** A search over 2000 characters used to come back empty. `search_chunks` now searches with the first 2000 characters.
+- **Parallel searches run in parallel.** The search worker handled one request at a time. It now serves several at once, each with its own database connection: eight searches that used to take two seconds finish in about 0.6.
+- **Learning from use no longer gets in the way of answers.** Every search strengthens the passages it returns. Two searches that returned the same passages could block each other in the database, and the caller waited for it. These updates now take their locks in a fixed order, retry a lost race, and run after the answer is already on its way.
+
 ## v0.9.26 - Short names are hidden in every spelling
 
 *17 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
