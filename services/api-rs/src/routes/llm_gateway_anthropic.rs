@@ -692,6 +692,11 @@ async fn cloak_anthropic_request(
     let candidates = privacy::user_entity_candidates(&state.db, user_id).await;
     let (slots, plain) = collect_anthropic_cloak_texts(&body);
     let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
+    // Leftover placeholders already in the request (files, history, summaries) are
+    // restored first, so the model never copies one the de-cloaker cannot map.
+    let heal = privacy::stale_placeholder_session(&state.db, namespace, user_id, &refs).await;
+    let healed = privacy::heal_texts(&heal, &refs);
+    let refs: Vec<&str> = healed.iter().map(String::as_str).collect();
     let (cloaked, session) = privacy::cloak_batch(&state.db, &[namespace], &candidates, &refs).await;
     // write_anthropic_cloaked_texts zips: a short result would leave plaintext slots.
     if cloaked.len() != slots.len() {

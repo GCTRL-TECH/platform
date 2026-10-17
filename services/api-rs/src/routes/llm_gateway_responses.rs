@@ -961,6 +961,11 @@ async fn cloak_responses_request(
     normalize_duplicate_argument_keys(&mut body);
     let (slots, plain) = collect_responses_cloak_texts(&body, cloak_tool_outputs);
     let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
+    // Leftover placeholders already in the request (files, history, summaries) are
+    // restored first, so the model never copies one the de-cloaker cannot map.
+    let heal = privacy::stale_placeholder_session(&state.db, namespace, user_id, &refs).await;
+    let healed = privacy::heal_texts(&heal, &refs);
+    let refs: Vec<&str> = healed.iter().map(String::as_str).collect();
     let (cloaked, session) = privacy::cloak_batch(&state.db, &[namespace], &candidates, &refs).await;
     // write_responses_cloaked_texts zips: a short result would leave plaintext slots.
     if cloaked.len() != slots.len() {

@@ -293,63 +293,110 @@ pub fn candidates_from_entity_mentions(mentions_arrays: &[serde_json::Value]) ->
 // classes hide no personal data. People, organisations and places (plus the PII
 // regex sweep) are what the cloak is for, and they still all fit without a cap.
 
-/// Keep-priority of an entity type when a bound has to bite: named entities and
-/// PII first, then the bracketed value classes, terms/tools/concepts last.
-fn kind_priority(kind: Option<&str>) -> u8 {
+/// Are PLACES (KEX `location`) cloaked in the free-chat gateway? Opt-in via
+/// `GCTRL_CLOAK_PLACES=1|true|yes|on`, default OFF (2026-10-17). A place name hides no
+/// personal data (a full postal address is caught by the address net), and KEX types
+/// working vocabulary as `location` more than any other class: on Asgard "Backend",
+/// "Frontend", "Portal", "Cockpit", "Serverraum", "Kundenportal" and "Vorschau" were all
+/// `[Place-n]`, and users saw words swallowed into brackets.
+pub fn cloak_places_enabled() -> bool {
+    static ON: Lazy<bool> = Lazy::new(|| {
+        std::env::var("GCTRL_CLOAK_PLACES")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    });
+    *ON
+}
+
+/// The dictionary family a KEX type maps to when it is a NAMED/PII class the free-chat
+/// dictionary may hold, else `None`. Places only when `places` is on.
+fn gateway_family(kind: Option<&str>, places: bool) -> Option<&'static str> {
     match bucket_template(kind).0 {
-        "Person" | "Org" | "Place" | "EMAIL" | "PHONE" | "IBAN" => 0,
-        "DATE" | "AMOUNT" | "NUM" => 1,
-        _ => 2,
+        "Place" if !places => None,
+        f @ ("Person" | "Org" | "Place" | "EMAIL" | "PHONE" | "IBAN" | "ADDRESS" | "ID") => Some(f),
+        _ => None,
+    }
+}
+
+/// The canonical KEX type a family is stored under in the dictionary (fed back into
+/// [`bucket_template`]).
+fn family_kind(family: &str) -> &'static str {
+    match family {
+        "Person" => "person",
+        "Org" => "organization",
+        "Place" => "location",
+        "EMAIL" => "email",
+        "PHONE" => "phone",
+        "IBAN" => "iban",
+        "ADDRESS" => "address",
+        _ => "idnumber",
+    }
+}
+
+/// Tie-break between named families with equally many mentions: a person outranks an
+/// organisation outranks a place (the stricter class wins; never leak a person because
+/// one mention called them a place).
+fn family_rank(family: &str) -> u8 {
+    match family {
+        "Person" => 0,
+        "Org" => 1,
+        "Place" => 2,
+        _ => 3,
     }
 }
 
 /// PURE: does an entity of this type belong in the free-chat cloak dictionary?
-/// Only NAMED entities — people, organisations, places — and the PII classes.
+/// Only NAMED entities — people, organisations, places (opt-in, see
+/// [`cloak_places_enabled`]) — and the PII classes.
 /// Concepts, tools, products, quantities, dates and amounts (everything that
 /// would become `[Term-n]`, `[NUM-n]`, `[DATE-n]`, `[AMOUNT-n]`) are the working
 /// vocabulary of slides, tables and code: cloaking them hides no personal data
 /// and breaks every edit the model has to reproduce verbatim (2026-10-08). The
 /// RAG/agent paths, which cloak the mentions of the chunks they retrieved, are
 /// not affected by this filter.
+#[cfg(test)]
 pub fn is_gateway_dictionary_kind(kind: Option<&str>) -> bool {
-    kind_priority(kind) == 0
+    gateway_family(kind, cloak_places_enabled()).is_some()
 }
 
 /// PURE: dedup a raw candidate list by (case-folded) name and keep at most `cap`
-/// entries. Deterministic whatever order the rows arrive in, so a rebuild never
-/// flips a name between cloaked and clear:
-///   - per name, the spelling with the most uppercase letters wins (ties: the
-///     smallest string), and the highest-priority type any mention gave it
-///     (a name typed both `person` and `concept` is a person);
-///   - ranking for the bound: type priority ([`kind_priority`]), then mention
-///     frequency, then longer name, then the name itself.
+/// entries. See [`dedup_and_cap_with`]; places follow [`cloak_places_enabled`].
 fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCandidate> {
+    dedup_and_cap_with(candidates, cap, cloak_places_enabled())
+}
+
+/// PURE: dedup by (case-folded) name, keep named entities only, at most `cap`.
+/// Deterministic whatever order the rows arrive in, so a rebuild never flips a name
+/// between cloaked and clear:
+///   - per name, the spelling with the most uppercase letters wins (ties: the
+///     smallest string);
+///   - its family is the named family MOST of its mentions gave it (ties: person >
+///     org > place). Until 2026-10-17 the alphabetically smallest type won, so a
+///     person typed `organization` once became `[Org-n]` ("Fabio" on Asgard) and, with
+///     places opt-in, a single `location` mention would have let a person leak;
+///   - ranking for the bound: mention frequency, then longer name, then the name.
+fn dedup_and_cap_with(candidates: Vec<EntityCandidate>, cap: usize, places: bool) -> Vec<EntityCandidate> {
     let uppers = |n: &str| n.chars().filter(|ch| ch.is_uppercase()).count();
-    // per key: (mentions, mentions typed as a name/PII class, best candidate)
-    let mut agg: HashMap<String, (usize, usize, EntityCandidate)> = HashMap::new();
+    // per key: (mentions, mentions per named family, best spelling)
+    let mut agg: HashMap<String, (usize, HashMap<&'static str, usize>, String)> = HashMap::new();
     for c in candidates {
         let key = lower_key(c.name.trim());
         if key.chars().count() < 2 {
             continue;
         }
-        let named = is_gateway_dictionary_kind(c.kind.as_deref());
-        let entry = agg.entry(key).or_insert_with(|| (0, 0, c.clone()));
+        let family = gateway_family(c.kind.as_deref(), places);
+        let entry = agg.entry(key).or_insert_with(|| (0, HashMap::new(), c.name.clone()));
         entry.0 += 1;
-        if named {
-            entry.1 += 1;
+        if let Some(f) = family {
+            *entry.1.entry(f).or_default() += 1;
         }
-        let best = &mut entry.2;
         // Keep the spelling with the MOST uppercase letters (ALL-CAPS > Title-case >
         // lowercase). A lowercase "mit" is dropped later as identifier-shaped and a
         // Title-case "Mit"/"Sap" as a stop-word or a non-acronym; keeping either here
         // would silently lose the real entity ("MIT", "SAP").
-        let (cu, bu) = (uppers(&c.name), uppers(&best.name));
-        if cu > bu || (cu == bu && c.name < best.name) {
-            best.name = c.name;
-        }
-        let (cp, bp) = (kind_priority(c.kind.as_deref()), kind_priority(best.kind.as_deref()));
-        if cp < bp || (cp == bp && c.kind < best.kind) {
-            best.kind = c.kind;
+        let (cu, bu) = (uppers(&c.name), uppers(&entry.2));
+        if cu > bu || (cu == bu && c.name < entry.2) {
+            entry.2 = c.name;
         }
     }
     // Named entities only, and only when the name/PII mentions are at least half of all
@@ -359,13 +406,19 @@ fn dedup_and_cap(candidates: Vec<EntityCandidate>, cap: usize) -> Vec<EntityCand
     // placeholder. A real person or company is typed as such in (nearly) every mention.
     let mut items: Vec<(usize, EntityCandidate)> = agg
         .into_values()
-        .filter(|(total, named, _)| *named > 0 && *named * 2 >= *total)
-        .map(|(total, _, c)| (total, c))
+        .filter_map(|(total, fams, name)| {
+            let named: usize = fams.values().sum();
+            if named == 0 || named * 2 < total {
+                return None;
+            }
+            let (family, _) = fams
+                .into_iter()
+                .min_by(|a, b| b.1.cmp(&a.1).then_with(|| family_rank(a.0).cmp(&family_rank(b.0))))?;
+            Some((total, EntityCandidate { name, kind: Some(family_kind(family).to_string()) }))
+        })
         .collect();
     items.sort_by(|a, b| {
-        kind_priority(a.1.kind.as_deref())
-            .cmp(&kind_priority(b.1.kind.as_deref()))
-            .then_with(|| b.0.cmp(&a.0))
+        b.0.cmp(&a.0)
             .then_with(|| b.1.name.chars().count().cmp(&a.1.name.chars().count()))
             .then_with(|| a.1.name.cmp(&b.1.name))
     });
@@ -381,6 +434,32 @@ pub fn candidates_from_mentions_capped(
     cap: usize,
 ) -> Vec<EntityCandidate> {
     dedup_and_cap(candidates_from_entity_mentions(mentions_arrays), cap)
+}
+
+/// PURE: lowercase key -> preferred spelling (most uppercase letters, ties: smallest)
+/// for EVERY mention, whatever its type. Used to restore stale placeholders (see
+/// [`stale_placeholder_session`]): `cloak_maps` stores only the folded key, and a
+/// `[Term-3450]` left in a file from the 2026-10-07/08 window must come back as "EPR",
+/// not "epr".
+fn spelling_index(mentions_arrays: &[serde_json::Value]) -> HashMap<String, String> {
+    let uppers = |n: &str| n.chars().filter(|ch| ch.is_uppercase()).count();
+    let mut out: HashMap<String, String> = HashMap::new();
+    for c in candidates_from_entity_mentions(mentions_arrays) {
+        let name = c.name.trim();
+        let key = lower_key(name);
+        match out.get_mut(&key) {
+            Some(best) => {
+                let (cu, bu) = (uppers(name), uppers(best));
+                if cu > bu || (cu == bu && name < best.as_str()) {
+                    *best = name.to_string();
+                }
+            }
+            None => {
+                out.insert(key, name.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Memory bound only, NOT a cost bound: per-request cost is proportional to the
@@ -429,11 +508,111 @@ pub async fn user_entity_candidates(db: &sqlx::PgPool, user_id: Uuid) -> Arc<Vec
     .unwrap_or_default();
 
     let capped = Arc::new(candidates_from_mentions_capped(&rows, CANDIDATE_CAP));
-    CANDIDATE_CACHE
+    let now = Instant::now();
+    SPELLING_CACHE.lock().unwrap().insert(user_id, (now, Arc::new(spelling_index(&rows))));
+    CANDIDATE_CACHE.lock().unwrap().insert(user_id, (now, capped.clone()));
+    capped
+}
+
+/// Per-user [`spelling_index`], filled by [`user_entity_candidates`] from the same rows
+/// (no extra query) and evicted on the same TTL.
+#[allow(clippy::type_complexity)]
+static SPELLING_CACHE: Lazy<Mutex<HashMap<Uuid, (Instant, Arc<HashMap<String, String>>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Most regular cores one request may look up in `cloak_maps` (a bound on the query, not
+/// a correctness limit: the rest stay as they are).
+const STALE_LOOKUP_CAP: usize = 5_000;
+
+/// The regular placeholder cores (`Person-12`, canonical family spelling) that occur in
+/// `texts` in any form [`decloak`] understands (bracketed, escaped, bare, translated).
+pub fn placeholder_cores(texts: &[&str]) -> Vec<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for t in texts {
+        for m in PSEUDONYM_SCAN_RE.find_iter(t) {
+            let Some(p) = split_placeholder(m.as_str()) else { continue };
+            for (off, _) in p.letters.char_indices() {
+                if let Some(f) = canonical_family(&p.letters[off..]) {
+                    out.insert(format!("{f}-{}", p.digits));
+                    break;
+                }
+            }
+            if out.len() >= STALE_LOOKUP_CAP {
+                break;
+            }
+        }
+    }
+    let mut v: Vec<String> = out.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Request-side HEAL (2026-10-17): placeholders that are already IN a request were never
+/// produced for it. The gateway de-cloaks every answer, so the client only holds clear
+/// text; a `[Term-3450]` or `[Org-621]` in a request is a leftover: written into a file,
+/// a board, a git config or a compaction summary while the dictionary was too broad
+/// (2026-10-07/08), or a pseudonym the de-cloaker missed. Prod sessions of 15.-17.10. held
+/// thousands of them, read back by tools and replayed by pi every turn; the session map
+/// of the new request does not know them, so the model copied them into its answer and
+/// the user saw brackets. This looks the leftovers up in the namespace's registry and
+/// returns a session that maps each one back to its original (the preferred spelling
+/// from [`SPELLING_CACHE`], else the stored key). Apply it with [`heal_texts`] BEFORE
+/// cloaking: names are then cloaked again under their (stable) pseudonym, everything
+/// else (terms, numbers, dates) goes in clear, as today's policy wants.
+/// One query, and only when the request contains placeholder-shaped tokens.
+pub async fn stale_placeholder_session(
+    db: &sqlx::PgPool,
+    namespace: Uuid,
+    user_id: Uuid,
+    texts: &[&str],
+) -> CloakSession {
+    let cores = placeholder_cores(texts);
+    if cores.is_empty() {
+        return CloakSession::empty();
+    }
+    let mut stored: Vec<String> = Vec::with_capacity(cores.len() * 2);
+    for c in &cores {
+        stored.push(c.clone());
+        stored.push(format!("[{c}]"));
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT pseudonym, entity_key FROM cloak_maps WHERE compilation_id = $1 AND pseudonym = ANY($2)",
+    )
+    .bind(namespace)
+    .bind(&stored)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let spelling = SPELLING_CACHE
         .lock()
         .unwrap()
-        .insert(user_id, (Instant::now(), capped.clone()));
-    capped
+        .get(&user_id)
+        .filter(|(t, _)| t.elapsed() < CANDIDATE_TTL)
+        .map(|(_, s)| s.clone());
+    stale_session_from_rows(&rows, spelling.as_deref())
+}
+
+/// PURE tail of [`stale_placeholder_session`]: registry rows -> heal session.
+fn stale_session_from_rows(rows: &[(String, String)], spelling: Option<&HashMap<String, String>>) -> CloakSession {
+    let mut session = CloakSession::empty();
+    for (pseudonym, key) in rows {
+        let core = pseudonym_core(pseudonym);
+        if !is_regular_core(core) {
+            continue;
+        }
+        let original = match spelling.and_then(|s| s.get(key)) {
+            Some(s) => s.clone(),
+            None if core.starts_with("IBAN-") => key.to_uppercase(),
+            None => key.clone(),
+        };
+        session.map.insert(wire_pseudonym(core), original);
+    }
+    session
+}
+
+/// PURE: restore every placeholder of `heal` in each text (see [`stale_placeholder_session`]).
+pub fn heal_texts(heal: &CloakSession, texts: &[&str]) -> Vec<String> {
+    texts.iter().map(|t| decloak(heal, t)).collect()
 }
 
 /// The result of a `cloak()` call: the pseudonym → canonical-original map
@@ -492,6 +671,8 @@ fn bucket_template(kind: Option<&str>) -> (&'static str, bool) {
         "email" => ("EMAIL", true),
         "phone" => ("PHONE", true),
         "iban" => ("IBAN", true),
+        "address" => ("ADDRESS", true),
+        "idnumber" | "id_number" => ("ID", true),
         _ => ("Term", false),
     }
 }
@@ -555,10 +736,84 @@ fn iban_hits(text: &str) -> Vec<(usize, usize)> {
     }
     out
 }
-// Loose net for phone-like digit runs; filtered by digit count below so it
-// doesn't fire on every short number. Best-effort — no locale-aware parsing.
+// Loose net for phone-like digit runs; [`is_phone_hit`] decides which ones really are
+// phone numbers. Best-effort — no locale-aware parsing.
 static PHONE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-    regex::Regex::new(r"(?:\+\d{1,3}[\s.\-]?)?(?:\(\d{2,4}\)[\s.\-]?)?\d{3,4}[\s.\-]?\d{3,4}(?:[\s.\-]?\d{2,4})?").unwrap()
+    regex::Regex::new(r"(?:\+\d{1,3}[\s./\-]?)?(?:\(\d{2,4}\)[\s./\-]?)?\d{3,5}[\s./\-]?\d{3,4}(?:[\s./\-]?\d{2,4})?").unwrap()
+});
+/// A phone keyword right before a number ("Tel.: ", "Mobil ", "Fax: ", "phone: ").
+static PHONE_KEYWORD_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(
+        r"(?i)(?:\btel|\btelefon|\btelephone|\bphone|\bfon|\bmobil|\bmobile|\bhandy|\bfax|\bcell|\brufnummer|\bdurchwahl|\bwhatsapp)\.?(?:\s*(?:nr|no|number|nummer)\.?)?\s*[:.]?\s*$",
+    )
+    .unwrap()
+});
+/// `2025-2030`, `1990 - 2026`: a span of years, never a phone number.
+static YEAR_RANGE_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"^(?:19|20)\d{2}\s*[-/]\s*(?:19|20)\d{2}$").unwrap());
+
+/// PURE: is the PHONE_RE match `text[start..end]` a phone number? Until 2026-10-17 any
+/// run of 7+ digits counted, and the Asgard registry held 13 421 `[PHONE-n]`, ~1 500 new
+/// per day: dates (`20261008`), year ranges (`2025-2030`), decimals (`1234.56789012`),
+/// ticket numbers, epoch timestamps, sizes in tool output. The cloud read garbled tables
+/// and code, and every new number minted a registry row on the request path.
+/// Now: 7..=15 digits, not glued into a longer token or decimal, never a year range, and
+/// either an explicit phone keyword right before it, or the shape of a dialled number:
+/// a leading `+` (international), `(`, or a leading `0` (national trunk prefix, the DACH
+/// norm) with no `.` inside. A US-style `555-123-4567` without a keyword stays in clear.
+fn is_phone_hit(text: &str, start: usize, end: usize) -> bool {
+    let s = &text[start..end];
+    let digits = s.chars().filter(|c| c.is_ascii_digit()).count();
+    if !(7..=15).contains(&digits) {
+        return false;
+    }
+    let before = text[..start].chars().next_back();
+    let mut after_it = text[end..].chars();
+    let after = after_it.next();
+    // Glued into a longer token: `v20261008`, `id_1234567`, `4711081512x`.
+    if before.is_some_and(|c| c.is_alphanumeric() || c == '_') || after.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    // Part of a decimal or a longer dotted/comma'd number: `0.12345678`, `1234567.89`.
+    if matches!(before, Some('.' | ',')) && text[..start].chars().rev().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if matches!(after, Some('.' | ',')) && after_it.next().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if YEAR_RANGE_RE.is_match(s) {
+        return false;
+    }
+    let mut w = start.saturating_sub(32);
+    while !text.is_char_boundary(w) {
+        w -= 1;
+    }
+    if PHONE_KEYWORD_RE.is_match(&text[w..start]) {
+        return true;
+    }
+    if s.contains('.') {
+        return false;
+    }
+    s.starts_with('+') || s.starts_with('(') || (s.starts_with('0') && !s.starts_with("000"))
+}
+
+// Postal address: a German street name (…straße/strasse/str./weg/allee/gasse/damm/
+// chaussee/ufer) with a house number, optionally followed by a postcode and town. The
+// street suffix keeps it specific: a bare "Platz 3" or "Ring 2" is not matched.
+static ADDRESS_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(
+        r"\b[A-ZÄÖÜ][a-zäöüß]+(?:-[A-ZÄÖÜ]?[a-zäöüß]+)*(?:straße|strasse|str\.|weg|allee|gasse|damm|chaussee|ufer)\s+\d{1,4}(?:\s?[a-zA-Z]\b)?(?:,?\s+\d{5}\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+)?)?",
+    )
+    .unwrap()
+});
+// Identity numbers, anchored on their keyword (the keyword stays readable, the value is
+// cloaked): tax ID, VAT ID, ID card, passport, social-security and health-insurance
+// numbers. Without a keyword such numbers are indistinguishable from any other.
+static ID_NUMBER_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(
+        r"(?i:\b(?:steuer-?id(?:entifikationsnummer)?|steuernummer|st\.?-?nr|ust-?id(?:-?nr)?|umsatzsteuer-?id(?:entifikationsnummer)?|vat(?:\s?id|\s?no)?|personalausweis(?:nummer)?|ausweis-?nr|ausweisnummer|reisepass(?:nummer)?|passnummer|pass-?nr|sozialversicherungsnummer|sv-?nummer|rentenversicherungsnummer|krankenversichertennummer|versichertennummer|tax\s?id|passport(?:\s?no)?|ssn))\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9 /.\-]{4,22}[A-Z0-9])",
+    )
+    .unwrap()
 });
 
 fn find_pii(text: &str) -> Vec<(String, &'static str)> {
@@ -570,13 +825,23 @@ fn find_pii(text: &str) -> Vec<(String, &'static str)> {
     for &(start, end) in &ibans {
         out.push((text[start..end].to_string(), "iban"));
     }
+    let mut taken: Vec<(usize, usize)> = ibans.clone();
+    for c in ID_NUMBER_RE.captures_iter(text) {
+        if let Some(v) = c.get(1) {
+            taken.push((v.start(), v.end()));
+            out.push((v.as_str().to_string(), "idnumber"));
+        }
+    }
+    for m in ADDRESS_RE.find_iter(text) {
+        taken.push((m.start(), m.end()));
+        out.push((m.as_str().to_string(), "address"));
+    }
     for m in PHONE_RE.find_iter(text) {
-        // Digits inside an IBAN are the IBAN, not a phone number.
-        if ibans.iter().any(|&(s, e)| m.start() < e && s < m.end()) {
+        // Digits inside an IBAN, ID number or address belong to that, not to a phone.
+        if taken.iter().any(|&(s, e)| m.start() < e && s < m.end()) {
             continue;
         }
-        let digits = m.as_str().chars().filter(|c| c.is_ascii_digit()).count();
-        if digits >= 7 {
+        if is_phone_hit(text, m.start(), m.end()) {
             out.push((m.as_str().to_string(), "phone"));
         }
     }
@@ -637,8 +902,18 @@ fn is_identifier_like(name: &str) -> bool {
         return true;
     }
     let has_upper = t.chars().any(|c| c.is_uppercase());
+    // camelCase starts lowercase and has an uppercase letter inside ("economicBuyer").
+    if t.chars().next().is_some_and(|c| c.is_lowercase()) && has_upper {
+        return true;
+    }
     // kebab-case slug ("multiversum-brand-v2") vs. a hyphenated surname ("Schmidt-Weber").
     if t.contains('-') {
+        // A generated name: three or more segments, one of them a number
+        // ("sbhh-projektmanagement-2026-06-29T13-25-04-376Z").
+        let segs: Vec<&str> = t.split('-').collect();
+        if segs.len() >= 3 && segs.iter().any(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())) {
+            return true;
+        }
         return !has_upper;
     }
     // A bare lowercase/digit token ("gctrl", "prod", "omlx") is a slug, not a name.
@@ -727,11 +1002,266 @@ fn is_stop_word_entity(name: &str) -> bool {
     !is_case_sensitive_key(t)
 }
 
+// ── Generic names (2026-10-17) ──────────────────────────────────────────────
+//
+// KEX types everyday vocabulary as person/organisation/location, consistently enough to
+// pass the majority rule. The Asgard dictionary (3 851 names after the 08.10. fix) held
+// Org "IT", "HR", "Legal", "TEAM", "Geschäftsführung", "Betriebsrat", "Kernteam",
+// "Behörden", "Organisation", "AG", "GmbH"; Person "Kunde", "Owner", "Admin", "CISO",
+// "AUDITOR", "Datenschutzbeauftragte", "Menschen", "Leer", "ZWECK"; Place "Backend",
+// "Portal", "Root", "Cockpit", "Serverraum". Each became `[Org-n]`/`[Person-n]`/
+// `[Place-n]`: the cloud read "Der [Place-94] hat im [Place-74] die IT gebeten", and
+// whenever a placeholder did not come back verbatim the user saw the word swallowed into
+// brackets. A generic name hides nobody; it is never cloaked.
+
+/// Common German + English words (top 10 000 of each, OpenSubtitles frequency lists,
+/// see the file header). Applied to ORGANISATION and PLACE names only: person first
+/// names are frequent words in subtitles too ("Daniel", "Anna", "Fabio" would leak).
+static COMMON_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    include_str!("cloak_common_words.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+});
+
+/// Roles, functions and group words: "a person/organisation" in general, never a name.
+static ROLE_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    "kunde kunden kundin nutzer nutzerin nutzende user users owner owners admin admins administrator \
+     administratoren administratorin sponsor sponsoren champion champions berater beraterin beratende \
+     experte experten expertin manager managerin managers geschäftsführer geschäftsführerin geschäftsführung \
+     auditor auditoren auditorin prüfer prüferin mitarbeiter mitarbeiterin mitarbeitende kollege kollegen \
+     kollegin leitung leiter leiterin person personen menschen mensch team teams trainer trainerin designer \
+     designerin consultant consultants operator operators speaker speakers coach coaches empfänger \
+     empfängerin besucher besucherin käufer käuferin angreifer journalisten journalist diplomaten ambassador \
+     master warden leer zweck sie ort fach edge running north schleife operations verantwortliche \
+     verantwortlicher verantwortlichen koordinator koordinatorin beauftragte beauftragter beauftragten \
+     ansprechpartner ansprechpartnerin teilnehmer teilnehmerin teilnehmende moderator moderatorin entwickler \
+     entwicklerin developer developers engineer engineers architekt architektin analyst analystin lead leads \
+     stakeholder stakeholders steward stewards officer officers vertrieb sales marketing legal finance einkauf \
+     buchhaltung controlling personal personalabteilung recht compliance revision support helpdesk service \
+     services betrieb betriebsrat vorstand aufsichtsrat gesellschafter gesellschafterin geschäftsleitung \
+     bereichsleitung abteilungsleitung projektleitung projektleiter projektleiterin produktmanager \
+     produktmanagerin lieferant lieferanten dienstleister partner partnerin auftraggeber auftraggeberin \
+     auftragnehmer kundschaft zielgruppe endkunde endkunden anwender anwenderin anwendende interessent \
+     interessenten bewerber bewerberin praktikant praktikantin werkstudent werkstudentin azubi azubis chef \
+     chefin boss eigentümer inhaber inhaberin gründer gründerin founder founders cofounder investor investoren \
+     investorin führungskraft führungskräfte behörde behörden akteur akteure berechtigte berechtigten betroffene \
+     betroffenen betroffener blocker erfinder handwerker notar notare vermittler verstorbene verstorbener \
+     verstorbenen pseudonym entrepreneur entrepreneurs fachexperte fachexpert consulting catering certification \
+     delegation externe"
+        .split_whitespace()
+        .collect()
+});
+
+/// Acronyms of roles, functions, legal forms and regions (lowercase).
+static GENERIC_ACRONYMS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    "it hr ki ai ml pmo po pm qa vc bu ceo cfo cio ciso coo cto cdo cpo cmo cro dpo dsb isb fde eu de uk us \
+     usa ag gmbh kg se ug ev mbh ltd inc llc plc sa sas bv nv ohg gbr kgaa isms ism bsi iso dach emea apac \
+     nda sla kpi okr crm erp hrm b2b b2c saas api ui ux ot iot ops devops secops sre noc soc csirt cert"
+        .split_whitespace()
+        .collect()
+});
+
+/// Our own product names and the tools/vendors every technical chat talks about: never
+/// confidential, and a placeholder for "Docker" or "GitHub" breaks every command.
+static PRODUCT_NAMES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    [
+        "anvil", "gctrl", "ground control", "borghive", "asgard", "loki", "bifroest", "jarvis", "hermes",
+        "databorg", "github", "gitlab", "docker", "ollama", "openai", "anthropic", "claude", "chatgpt",
+        "codex", "google", "microsoft", "azure", "aws", "hetzner", "hostinger", "ionos", "netlify",
+        "cloudflare", "tailscale", "neo4j", "postgres", "postgresql", "redis", "qdrant", "traefik", "colima",
+        "forgejo", "n8n", "obsidian", "notion", "slack", "jira", "confluence", "jfrog", "nvidia", "apple",
+        "linux", "ubuntu", "python", "react", "nextjs", "next.js", "node", "nodejs", "tavus", "comfyui",
+        "remotion", "gemini", "mistral", "meta", "huggingface", "hugging face", "vercel", "supabase",
+        "stripe", "outlook", "sharepoint", "onedrive", "excel", "powerpoint", "windows", "macos",
+    ]
+    .into_iter()
+    .collect()
+});
+
+/// Endings of compound role words ("Datenschutzbeauftragte", "Risikomanager", "IT-Admin").
+const PERSON_ROLE_SUFFIXES: &[&str] = &[
+    "beauftragte", "beauftragter", "beauftragten", "manager", "managerin", "experte", "experten", "expertin",
+    "administrator", "administratoren", "administratorin", "admin", "verantwortliche", "verantwortlicher",
+    "verantwortlichen", "leiter", "leiterin", "leitung", "berater", "beraterin", "mitarbeiter", "mitarbeiterin",
+    "mitarbeitende", "koordinator", "koordinatorin", "owner", "team", "auditor", "auditoren", "prüfer", "sponsor",
+    "steward", "spezialist", "spezialistin", "entwickler", "entwicklerin", "architekt", "architektin", "officer",
+    "rat", "stab", "vorstand", "verantwortung", "koordination", "coach", "partner", "kräfte", "kraft", "anwälte",
+    "anwalt", "reviewer", "prompter", "schreiber", "tester", "testerin", "coder", "vertretung", "vertreter",
+];
+
+/// Endings of compound group/structure words ("Kernteam", "Leitungsrunde", "Serverraum").
+const GROUP_SUFFIXES: &[&str] = &[
+    "team", "teams", "runde", "rat", "führung", "leitung", "abteilung", "abteilungen", "bereich", "bereiche",
+    "betreiber", "werke", "verwaltung", "gremium", "ausschuss", "administration", "management", "gesellschafter",
+    "office", "room", "raum", "behörde", "behörden", "ministerium", "kommission", "stelle", "stellen", "gruppe",
+    "kreis", "strukturen", "struktur", "zentrale", "einheit", "einheiten", "organisation", "kunden", "partner",
+    "lieferanten", "portal", "server", "backend", "frontend", "infrastruktur", "plattform", "platform",
+    "dashboard", "workspace", "cloud", "storage", "netz", "dienstleister", "unternehmen", "konzern", "konzerne",
+    "anbieter", "hersteller", "zulieferer", "betrieb", "branche", "wirtschaft", "verband", "verbände", "vertretung",
+    "versicherer", "kasse", "investor", "geber", "nehmer", "träger", "firmen", "planung", "beratung", "bearbeiter",
+    "verarbeiter", "vermarkter", "importeur", "belegschaft", "provider", "hoster", "community", "funktion",
+    "kanzlei", "ebene", "netzwerk", "cluster", "ministerien", "institutionen", "kommunen", "mittelstand",
+];
+
+/// A legal form marks an explicit company: "Stadtwerke Bremen GmbH" stays cloaked even
+/// though every other word of it is ordinary.
+static LEGAL_FORM_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?i)(?:^|[\s,])(?:gmbh|ag|se|kg|kgaa|ohg|gbr|ug|e\.\s?v\.|mbh|ltd\.?|inc\.?|llc|plc|corp\.?)(?:$|[\s,.&])")
+        .unwrap()
+});
+
+fn name_tokens(lower: &str) -> Vec<&str> {
+    lower
+        .split(|c: char| c.is_whitespace() || matches!(c, '-' | '\u{2013}' | '/' | '&' | ',' | '(' | ')' | '+'))
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// `w` and its German inflection stems (genitive/plural `-s`, `-es`, `-n`, `-en`):
+/// "Betriebsrats" is "Betriebsrat", "Geschäftsführers" is "Geschäftsführer".
+fn inflection_stems(w: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(w).chain(
+        ["es", "en", "s", "n"]
+            .into_iter()
+            .filter_map(move |suf| w.strip_suffix(suf))
+            .filter(|s| s.chars().count() >= 3),
+    )
+}
+
+/// `t` (or one of its [`inflection_stems`]) is `suffix` itself or a compound ending in it
+/// (at least three chars before it).
+fn ends_with_any(t: &str, suffixes: &[&str]) -> bool {
+    inflection_stems(t).any(|t| {
+        suffixes
+            .iter()
+            .any(|s| t == *s || (t.ends_with(s) && t.chars().count() >= s.chars().count() + 3))
+    })
+}
+
+/// `w` (or one of its [`inflection_stems`]) is a role/group word or a generic acronym.
+fn is_role_word(w: &str) -> bool {
+    GENERIC_ACRONYMS.contains(w) || inflection_stems(w).any(|s| ROLE_WORDS.contains(s))
+}
+
+/// `w` (or one of its [`inflection_stems`]) is exactly a group word ("Team", "Rates").
+fn is_group_word(w: &str) -> bool {
+    inflection_stems(w).any(|s| GROUP_SUFFIXES.contains(&s))
+}
+
+/// PURE: is `name` (dictionary family `family`) a generic word rather than the name of a
+/// specific person, organisation or place? See the section comment above. Multi-word
+/// names are generic only when every word is ordinary AND they read like a description
+/// (a lowercase word, or a group word at the end: "Supply Chain Management team",
+/// "ISMS Team"); "Deutsche Energie-Agentur" stays a name.
+#[cfg(test)]
+pub(crate) fn is_generic_name(name: &str, family: &str) -> bool {
+    is_generic_name_with(name, family, &HashSet::new())
+}
+
+/// PURE: the tokens of every multi-word PERSON name in the dictionary ("Fabio
+/// Chiaramonte" gives "fabio" and "chiaramonte"). A single-word person that is also an
+/// everyday word ("Kinder", "Tester", "Betroffene") is generic, unless the dictionary
+/// knows it as part of a full name: first names are frequent words too ("Frank", "Rose",
+/// "Will"), and "Fabio" or "Anna" must keep their placeholder.
+fn given_name_tokens(candidates: &[EntityCandidate]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for c in candidates {
+        let t = c.name.trim();
+        if bucket_template(c.kind.as_deref()).0 != "Person" || !t.contains(char::is_whitespace) {
+            continue;
+        }
+        let lower = lower_key(t);
+        for w in name_tokens(&lower) {
+            if w.chars().count() >= 2 && !is_role_word(w) {
+                out.insert(w.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// [`is_generic_name`] with the dictionary's [`given_name_tokens`].
+fn is_generic_name_with(name: &str, family: &str, given: &HashSet<String>) -> bool {
+    let t = name.trim();
+    let lower = lower_key(t);
+    if PRODUCT_NAMES.contains(lower.as_str()) || is_role_word(lower.as_str()) {
+        return true;
+    }
+    let toks = name_tokens(&lower);
+    let Some(&last) = toks.last() else { return false };
+    let lexical = is_role_word;
+    if family == "Person" {
+        // Single token or hyphen compound ("IT-Administratoren", "KI-Experte").
+        if !t.contains(char::is_whitespace) {
+            if lexical(last) || ends_with_any(last, PERSON_ROLE_SUFFIXES) {
+                return true;
+            }
+            // Every part an everyday word and none of them a known name part
+            // ("Kinder", "Code-Reviewer"; not "Fabio", "Anna-Leonie", "Cotton-Barratt").
+            return toks
+                .iter()
+                .all(|w| !given.contains(*w) && inflection_stems(w).any(|s| COMMON_WORDS.contains(s)));
+        }
+        // "Lead Auditor", "Product Owner", "Chief Compliance Officer": a role at the end,
+        // only ordinary words before it. "Fabio Chiaramonte" keeps its surname.
+        let (head, _) = toks.split_at(toks.len() - 1);
+        return (lexical(last) || ends_with_any(last, PERSON_ROLE_SUFFIXES))
+            && head.iter().all(|w| lexical(w) || COMMON_WORDS.contains(w));
+    }
+    if family != "Org" && family != "Place" {
+        return false;
+    }
+    if !t.contains(char::is_whitespace) {
+        // A short ALL-CAPS acronym is matched case-sensitively and never hits the word in
+        // running text ("MIT" the institute vs "mit"); only the explicit acronym list
+        // above makes one generic.
+        if !t.contains('-') && !is_case_sensitive_key(t) && inflection_stems(&lower).any(|w| COMMON_WORDS.contains(w)) {
+            return true;
+        }
+        if lexical(last) || ends_with_any(last, GROUP_SUFFIXES) {
+            return true;
+        }
+        // "IT-Strukturen", "DACH-Raum": generic head word after an acronym prefix.
+        return toks.len() == 2 && GENERIC_ACRONYMS.contains(toks[0]) && COMMON_WORDS.contains(last);
+    }
+    if LEGAL_FORM_RE.is_match(t) {
+        return false;
+    }
+    // A description, not a name: every word after the first is lowercase ("French
+    // consulting firm", "European systems integrator", "corporate security").
+    if t.split_whitespace().skip(1).all(|w| w.chars().next().is_some_and(|c| c.is_lowercase())) {
+        return true;
+    }
+    let ordinary = |w: &str| lexical(w) || COMMON_WORDS.contains(w) || STOP_WORDS.contains(w);
+    if !toks.iter().all(|w| ordinary(w)) {
+        // A specific word in it ("Kernteam Digitalisierung" has none, "Automotive Team" has
+        // one) still names a group when it ends in a group word.
+        return lexical(last) || is_group_word(last);
+    }
+    let has_lowercase_word = t
+        .split_whitespace()
+        .any(|w| w.chars().next().is_some_and(|c| c.is_lowercase()) && !STOP_WORDS.contains(lower_key(w).as_str()));
+    has_lowercase_word || lexical(last) || is_group_word(last)
+}
+
+/// PURE: does `name` look like a placeholder itself (`Term-8517`, `[Org-3]`)? KEX extracted
+/// placeholders from texts written during 2026-10-07/08 as entities (cloak_maps
+/// `Term-8517` -> entity_key `term-4161`); one must never be cloaked into another.
+fn is_placeholder_like(name: &str) -> bool {
+    static RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"^\\?\[?\s*[A-Za-zÄÖÜäöüß]+[-\u{2010}-\u{2014} ][0-9]+\s*\\?\]?$").unwrap());
+    RE.is_match(name.trim())
+}
+
 /// PURE: fold a candidate dictionary into match keys once, dropping entries too
 /// short to be worth hiding (they would match noise), identifier-shaped names
 /// (see [`is_identifier_like`]) and stop-words (see [`STOP_WORDS`]), and index
 /// the survivors by their first run (see [`PreparedDictionary`]).
 fn prepare_candidates(candidates: &[EntityCandidate]) -> PreparedDictionary {
+    let given = given_name_tokens(candidates);
     let mut out = Vec::with_capacity(candidates.len());
     for c in candidates {
         let trimmed = c.name.trim();
@@ -743,6 +1273,12 @@ fn prepare_candidates(candidates: &[EntityCandidate]) -> PreparedDictionary {
             continue;
         }
         if is_stop_word_entity(trimmed) {
+            continue;
+        }
+        if is_placeholder_like(trimmed) {
+            continue;
+        }
+        if is_generic_name_with(trimmed, bucket_template(c.kind.as_deref()).0, &given) {
             continue;
         }
         out.push(PreparedCandidate {
@@ -1012,7 +1548,56 @@ fn is_regular_core(core: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 static PSEUDONYM_CORE_RE: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"[A-Za-z]+-[0-9]+").unwrap());
+
+/// Scanner for placeholder candidates in any form a model writes them: a letter run
+/// (umlauts included, for translated families), ONE separator (ASCII hyphen, a Unicode
+/// hyphen/dash, or a space) and a digit run. Which of them count is decided per hit in
+/// [`decloak_with_next`].
+static PSEUDONYM_SCAN_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"[A-Za-zÄÖÜäöüß]+[-\u{2010}-\u{2014} ][0-9]+").unwrap());
+
+/// Longest family alias [`canonical_family`] knows ("organisationen" = 14).
+const FAMILY_ALIAS_MAX_CHARS: usize = 14;
+
+/// One [`PSEUDONYM_SCAN_RE`] hit split into its parts.
+struct PlaceholderParts<'a> {
+    letters: &'a str,
+    sep: char,
+    digits: &'a str,
+}
+
+fn split_placeholder(s: &str) -> Option<PlaceholderParts<'_>> {
+    let (i, sep) = s.char_indices().find(|(_, c)| !c.is_alphabetic())?;
+    let digits = &s[i + sep.len_utf8()..];
+    (i > 0 && !digits.is_empty()).then(|| PlaceholderParts { letters: &s[..i], sep, digits })
+}
+
+/// The wire family a model meant when it wrote `f`: the family itself in any case, or a
+/// translation. Prod sessions (12.-17.10.2026) held hundreds of `[Ort-2]` for `[Place-2]`,
+/// `[org-143]`, `[place 3]`, none of which the exact match restored.
+fn canonical_family(f: &str) -> Option<&'static str> {
+    if f.chars().count() > FAMILY_ALIAS_MAX_CHARS {
+        return None;
+    }
+    Some(match lower_key(f).as_str() {
+        "person" | "personen" | "persona" | "pers" => "Person",
+        "org" | "orga" | "organisation" | "organization" | "organisationen" | "organizations" | "firma"
+        | "unternehmen" | "company" => "Org",
+        "place" | "ort" | "orte" | "location" | "standort" | "platz" => "Place",
+        "term" | "begriff" => "Term",
+        "email" | "mail" => "EMAIL",
+        "phone" | "telefon" | "tel" => "PHONE",
+        "iban" => "IBAN",
+        "address" | "adresse" | "anschrift" => "ADDRESS",
+        "id" => "ID",
+        "date" | "datum" => "DATE",
+        "amount" | "betrag" => "AMOUNT",
+        "num" | "nummer" | "zahl" => "NUM",
+        _ => return None,
+    })
+}
 
 /// Lookup tables for one de-cloak call. Regular cores (`Family-123`) are found by a
 /// boundary-aware scan; irregular keys (the UUID fallback of `next_pseudonym`) by
@@ -1049,11 +1634,16 @@ impl<'a> DecloakIndex<'a> {
 /// De-cloak `text`; `next` is the char that follows `text` in the full stream (the
 /// streaming path emits a prefix whose follower is still held back).
 ///
-/// Boundary rule: a pseudonym is replaced only when it is complete, i.e. the next
-/// char is not an ASCII digit (`Term-2` never matches inside `Term-27`); a bare
-/// form additionally needs a non-alphanumeric follower. Both `[Place-7]` and
-/// `Place-7` are accepted, so history with bare pseudonyms still de-cloaks. One
-/// left-to-right pass: a restored original is never scanned again.
+/// Forms restored:
+///   - EXACT (`Place-7`: the wire family, ASCII hyphen) bracketed `[Place-7]`, escaped
+///     `\[Place-7\]` (Markdown escaping; the old scan left `\[Name\]`, which renders as
+///     `[Name]`), or bare. A bare form needs a non-alphanumeric follower and may sit at
+///     the end of a letter run (`asgard_Term-3`, `xTerm-3` find `Term-3`).
+///   - VARIANT (a translated or re-cased family, a Unicode dash, a space: `[Ort-7]`,
+///     `[place-7]`, `[Place 7]`, `[Place‑7]`) only when bracketed: bare, "Person 1" or
+///     "Ort-2" is ordinary prose far too often.
+/// Boundary rule: the digit run is maximal, so `Term-2` never matches inside `Term-27`.
+/// One left-to-right pass: a restored original is never scanned again.
 fn decloak_with_next(session: &CloakSession, text: &str, next: Option<char>) -> String {
     if session.map.is_empty() {
         return text.to_string();
@@ -1062,23 +1652,53 @@ fn decloak_with_next(session: &CloakSession, text: &str, next: Option<char>) -> 
     let mut out = String::with_capacity(text.len());
     let mut last = 0usize;
     if !idx.regular.is_empty() {
-        let bytes = text.as_bytes();
-        for m in PSEUDONYM_CORE_RE.find_iter(text) {
-            let s = m.as_str();
-            let dash = s.find('-').unwrap_or(0);
-            // Longest family suffix of the letter run that is a known core
-            // (`asgard_Term-3` and `xTerm-3` both find `Term-3`).
-            let Some((cs, orig)) = (0..dash).find_map(|off| idx.regular.get(&s[off..]).map(|o| (m.start() + off, *o)))
-            else {
-                continue;
-            };
+        for m in PSEUDONYM_SCAN_RE.find_iter(text) {
+            let Some(p) = split_placeholder(m.as_str()) else { continue };
+            let mut hit: Option<(usize, &str, bool)> = None;
+            for (off, _) in p.letters.char_indices() {
+                let fam = &p.letters[off..];
+                if p.sep == '-' {
+                    if let Some(o) = idx.regular.get(format!("{fam}-{}", p.digits).as_str()) {
+                        hit = Some((m.start() + off, o, true));
+                        break;
+                    }
+                }
+                if off == 0 {
+                    if let Some(cf) = canonical_family(fam) {
+                        if let Some(o) = idx.regular.get(format!("{cf}-{}", p.digits).as_str()) {
+                            hit = Some((m.start(), o, false));
+                            break;
+                        }
+                    }
+                }
+            }
+            let Some((cs, orig, exact)) = hit else { continue };
             let ce = m.end();
-            let after = if ce < text.len() { text[ce..].chars().next() } else { next };
-            let (start, end) = if cs > 0 && bytes[cs - 1] == b'[' && ce < text.len() && bytes[ce] == b']' {
-                (cs - 1, ce + 1)
-            } else if after.is_some_and(|c| c.is_alphanumeric()) {
+            let pre = &text[..cs];
+            let open = if pre.ends_with("\\[") {
+                2
+            } else if pre.ends_with('[') {
+                1
+            } else {
+                0
+            };
+            let post = &text[ce..];
+            let close = if post.starts_with("\\]") {
+                2
+            } else if post.starts_with(']') {
+                1
+            } else {
+                0
+            };
+            let (start, end) = if open > 0 && close > 0 {
+                (cs - open, ce + close)
+            } else if !exact {
                 continue;
             } else {
+                let after = if ce < text.len() { text[ce..].chars().next() } else { next };
+                if after.is_some_and(|c| c.is_alphanumeric()) {
+                    continue;
+                }
                 (cs, ce)
             };
             if start < last {
@@ -1104,38 +1724,69 @@ pub fn decloak(session: &CloakSession, text: &str) -> String {
     decloak_with_next(session, text, None)
 }
 
-/// Byte offset where the undecidable tail of `buf` starts: a trailing
-/// `[?Letters-Digits`-shaped run (letters capped at `max_family`) could still grow
-/// into, or be closed as, a pseudonym by the next chunk.
+fn is_placeholder_separator(c: char) -> bool {
+    c == '-' || c == ' ' || ('\u{2010}'..='\u{2014}').contains(&c)
+}
+
+/// Byte offset where the undecidable tail of `buf` starts: a trailing run that could
+/// still grow into, or be closed as, a placeholder by the next chunk:
+/// `(\\?\[)? Letters (Sep Digits*)? \\?`, letters capped at `max_family` (at least the
+/// longest alias), a space separator only after an opening bracket.
 fn regular_hold_start(buf: &str, max_family: usize) -> usize {
-    let b = buf.as_bytes();
-    let len = b.len();
+    let len = buf.len();
     if max_family == 0 || len == 0 {
         return len;
     }
-    let mut d = len;
-    while d > 0 && b[d - 1].is_ascii_digit() {
-        d -= 1;
+    let max_letters = max_family.max(FAMILY_ALIAS_MAX_CHARS);
+    // A trailing backslash may open `\]` or `\[`: hold at least it.
+    let end = if buf.ends_with('\\') { len - 1 } else { len };
+    let head = &buf[..end];
+    let mut d = head.len();
+    for (i, c) in head.char_indices().rev() {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        d = i;
     }
-    let k = if d > 0 && b[d - 1] == b'-' {
-        d - 1
-    } else if d < len {
-        // digits not preceded by '-' cannot end a pseudonym
-        return len;
-    } else {
-        len
-    };
+    let mut k = d;
+    let mut sep: Option<char> = None;
+    if let Some(c) = head[..d].chars().next_back() {
+        if is_placeholder_separator(c) {
+            sep = Some(c);
+            k = d - c.len_utf8();
+        } else if d < head.len() {
+            // digits not preceded by a separator cannot end a placeholder
+            return end;
+        }
+    }
     let mut l = k;
-    while l > 0 && b[l - 1].is_ascii_alphabetic() && k - l < max_family {
-        l -= 1;
+    let mut n = 0usize;
+    for (i, c) in head[..k].char_indices().rev() {
+        if !c.is_alphabetic() || n >= max_letters {
+            break;
+        }
+        l = i;
+        n += 1;
     }
-    if l > 0 && b[l - 1] == b'[' {
-        l -= 1;
+    if n == 0 && sep.is_some() {
+        // "- 12" / "x 12": a separator without letters is not a placeholder
+        return end;
     }
-    l
+    let pre = &head[..l];
+    let open = if pre.ends_with("\\[") {
+        2
+    } else if pre.ends_with('[') {
+        1
+    } else {
+        0
+    };
+    if sep == Some(' ') && open == 0 {
+        return end;
+    }
+    l - open
 }
 
-/// Streaming-safe decloak for SSE: pseudonyms can be split across provider chunk
+// Streaming-safe decloak for SSE: pseudonyms can be split across provider chunk
 /// boundaries (`"[Person-"` then `"7]"`). `buffer` holds text received so far that
 /// is not yet decidable; call this on every new `chunk`, emit the returned text
 /// immediately, and call [`decloak_stream_finish`] at end-of-stream.
@@ -1571,11 +2222,13 @@ mod tests {
             cand("gctrl", Some("tool")),
             cand("Fabio Chiaramonte", Some("person")),
             cand("Multiversum GmbH", Some("organization")),
+            cand("Nordlicht", Some("search engine")),
+            // Our own product names are on the stop list (2026-10-17), whatever their type.
             cand("Anvil", Some("search engine")),
         ];
         let prepared = prepare_candidates(&candidates);
         let names: Vec<&str> = prepared.entries.iter().map(|e| e.canonical.as_str()).collect();
-        assert_eq!(names, vec!["Fabio Chiaramonte", "Multiversum GmbH", "Anvil"]);
+        assert_eq!(names, vec!["Fabio Chiaramonte", "Multiversum GmbH", "Nordlicht"]);
         assert!(is_identifier_like("ai_lab_team") && is_identifier_like("SKILL.md") && is_identifier_like("gctrl"));
         assert!(!is_identifier_like("Anvil") && !is_identifier_like("Fabio Chiaramonte"));
         assert!(is_identifier_like("multiversum-brand-v2") && is_identifier_like("anvil.local") && is_identifier_like("host:8020"));
@@ -1648,9 +2301,10 @@ mod tests {
         // carrying it in the map only ever cost time.)
         let names = [
             "LAN", "Anna Schmidt", "Anna Schmidt-Weber", "12,5 Mio. EUR",
-            "Ground Control", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.",
+            "Ground Crew", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.",
         ];
-        let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, Some("person"))).collect();
+        // Untyped: this pins the pre-filter, not the generic-name policy ("LAN" is an everyday word).
+        let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, None)).collect();
         let full: HashMap<String, String> = names
             .iter()
             .enumerate()
@@ -1659,7 +2313,7 @@ mod tests {
         for text in [
             "Anna Schmidt-Weber plant 12,5 Mio. EUR fuer Projekt Nordwind im LAN.",
             "Die Anlage plant mehr Euro, Björn Öztürk widerspricht.",
-            "GROUND CONTROL und ACME & Co. sprachen mit Anna Schmidt.",
+            "GROUND CREW und ACME & Co. sprachen mit Anna Schmidt.",
             "Nichts hiervon nennt eine Entitaet.",
         ] {
             let narrowed: HashMap<String, String> = collect_candidates(&candidates, text)
@@ -1682,14 +2336,14 @@ mod tests {
         // (Identifier-shaped names like "x9" are dropped by POLICY in prepare_candidates, not
         // by the pre-filter — see is_identifier_like — so the corpus uses "X9".)
         let names = [
-            "LAN", "Anna Schmidt", "Anna Schmidt-Weber", "12,5 Mio. EUR", "Ground Control",
-            "GCTRL", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.", "X9",
+            "LAN", "Anna Schmidt", "Anna Schmidt-Weber", "12,5 Mio. EUR", "Ground Crew",
+            "GCTRX", "Projekt Nordwind", "Björn Öztürk", "ACME & Co.", "X9",
         ];
         let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, None)).collect();
         let texts = [
             "Das LAN ist offline.", "Die Anlage plant mehr.", "Anna Schmidt-Weber rief an.",
             "Anna Schmidt rief an.", "Budget 12,5 Mio. EUR heute.", "12,5 Mio. USD heute.",
-            "GROUND CONTROL steuert das.", "gctrl/anvil läuft.", "Björn Öztürk kam.",
+            "GROUND CREW steuert das.", "gctrx/anvil läuft.", "Björn Öztürk kam.",
             "ACME & Co. liefert.", "ACME liefert.", "Wert X9 gesetzt.", "Wert X99 gesetzt.",
             "Nichts davon hier.", "",
         ];
@@ -2149,7 +2803,7 @@ mod tests {
             .map(|_| mentions(&[("Fachbegriff", "concept"), ("Werkzeug", "tool")]))
             .collect();
         arrays.push(mentions(&[("Erika Muster", "person"), ("Nexovar GmbH", "organization"), ("Goettingen", "location")]));
-        let out = candidates_from_mentions_capped(&arrays, 3);
+        let out = dedup_and_cap_with(candidates_from_entity_mentions(&arrays), 3, true);
         let mut names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
         names.sort();
         assert_eq!(names, ["Erika Muster", "Goettingen", "Nexovar GmbH"]);
@@ -2172,9 +2826,18 @@ mod tests {
         let out = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
         let mut names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
         names.sort();
+        // Places are opt-in (GCTRL_CLOAK_PLACES), off by default.
+        assert_eq!(names, ["Erika Muster", "Nexovar GmbH"]);
+        let with_places = dedup_and_cap_with(candidates_from_entity_mentions(&arrays), CANDIDATE_CAP, true);
+        let mut names: Vec<&str> = with_places.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
         assert_eq!(names, ["Erika Muster", "Goettingen", "Nexovar GmbH"]);
-        for kind in ["person", "per", "organization", "org", "company", "location", "place", "gpe", "loc", "email", "phone", "iban"] {
+        for kind in ["person", "per", "organization", "org", "company", "email", "phone", "iban", "address", "idnumber"] {
             assert!(is_gateway_dictionary_kind(Some(kind)), "{kind} is a name/PII class");
+        }
+        for kind in ["location", "place", "gpe", "loc"] {
+            assert!(!is_gateway_dictionary_kind(Some(kind)), "{kind} is opt-in");
+            assert_eq!(gateway_family(Some(kind), true), Some("Place"));
         }
         for kind in ["concept", "tool", "product", "technology", "quantity", "number", "date", "time", "money", "amount", "event", ""] {
             assert!(!is_gateway_dictionary_kind(Some(kind)), "{kind} is vocabulary, not a name");
@@ -2421,6 +3084,236 @@ mod tests {
         assert_eq!(PrivacyMode::from_db("garbage").as_db_str(), "open", "unknown value fails open");
     }
 
+    // ── Hardening 2026-10-17: words swallowed into brackets on Anvil Prod ──
+
+    /// Cloak like production (wire form `[Family-n]`, family from the entry's type), no DB.
+    fn cloak_wire(candidates: &[EntityCandidate], text: &str) -> (String, CloakSession) {
+        let seen = collect_candidates(candidates, text);
+        let mut keys: Vec<(&String, &(Option<String>, String))> = seen.iter().collect();
+        keys.sort_by(|a, b| a.0.cmp(b.0));
+        let map: HashMap<String, String> = keys
+            .iter()
+            .enumerate()
+            .map(|(n, (_, (kind, canonical)))| {
+                (match_key(canonical), format!("[{}-{}]", bucket_template(kind.as_deref()).0, n + 1))
+            })
+            .collect();
+        let mut session = CloakSession::empty();
+        let out = apply_batch(&[text], &map, &mut session);
+        (out.into_iter().next().unwrap(), session)
+    }
+
+    #[test]
+    fn everyday_vocabulary_typed_as_a_name_is_never_cloaked() {
+        // Real entries of the Asgard dictionary (after the 08.10. fix) next to real names.
+        let generic = [
+            ("IT", "organization"), ("HR", "organization"), ("Legal", "organization"), ("TEAM", "organization"),
+            ("Geschäftsführung", "organization"), ("Betriebsrat", "organization"), ("Betriebsrats", "organization"), ("Kernteam", "organization"),
+            ("Leitungsrunde", "organization"), ("Behörden", "organization"), ("Organisation", "organization"),
+            ("ISMS-Team", "organization"), ("IT-Administration", "organization"), ("GmbH", "organization"),
+            ("Stadtwerke", "organization"), ("Unternehmens", "organization"), ("French consulting firm", "organization"), ("Supply Chain Management team", "organization"), ("ISMS Team", "organization"),
+            ("GitHub", "organization"), ("Docker", "organization"), ("Ground Control", "organization"),
+            ("Kunde", "person"), ("Owner", "person"), ("Admin", "person"), ("CISO", "person"), ("AUDITOR", "person"),
+            ("Datenschutzbeauftragte", "person"), ("IT-Administratoren", "person"), ("KI-Experte", "person"),
+            ("Menschen", "person"), ("Leer", "person"), ("ZWECK", "person"), ("Product Owner", "person"),
+            ("Lead Auditor", "person"), ("Chief Compliance Officer", "person"),
+            ("Backend", "location"), ("Portal", "location"), ("Serverraum", "location"), ("Kundenportal", "location"),
+            ("Krisenstab", "person"), ("Personalrat", "person"), ("Code-Reviewer", "person"),
+            ("Energieunternehmen", "organization"), ("Branchenverband", "organization"), ("Zulieferer", "organization"),
+        ];
+        let names = [
+            ("Fabio Chiaramonte", "person"), ("Fabio", "person"), ("Anna Schmidt-Weber", "person"),
+            ("Knorr-Bremse AG", "organization"), ("DENA", "organization"), ("Deutsche Energie-Agentur", "organization"),
+            ("Stadtwerke Bremen GmbH", "organization"), ("Lionizers", "organization"), ("MIT", "organization"),
+        ];
+        for (n, k) in generic {
+            assert!(is_generic_name(n, bucket_template(Some(k)).0), "{n} ({k}) must stay vocabulary");
+        }
+        for (n, k) in names {
+            assert!(!is_generic_name(n, bucket_template(Some(k)).0), "{n} ({k}) is a real name");
+        }
+        let cands: Vec<EntityCandidate> = generic.iter().chain(names.iter()).map(|(n, k)| cand(n, Some(k))).collect();
+        // Everyday words typed person are generic unless a full name in the dictionary uses them.
+        let given = given_name_tokens(&cands);
+        assert!(given.contains("fabio") && given.contains("anna"));
+        assert!(is_generic_name_with("Kinder", "Person", &given));
+        assert!(is_generic_name_with("Tester", "Person", &given));
+        assert!(!is_generic_name_with("Fabio", "Person", &given));
+        assert!(!is_generic_name_with("Anna", "Person", &given));
+        let with_frank = given_name_tokens(&[cand("Frank Becker", Some("person"))]);
+        assert!(is_generic_name_with("Frank", "Person", &HashSet::new()));
+        assert!(!is_generic_name_with("Frank", "Person", &with_frank));
+        assert!(is_identifier_like("economicBuyer"));
+        assert!(is_identifier_like("sbhh-projektmanagement-2026-06-29T13-25-04-376Z"));
+        assert!(!is_identifier_like("Knorr-Bremse") && !is_identifier_like("T-Systems") && !is_identifier_like("Q-Cells"));
+        let text = "Der Kunde hat die IT gebeten, das Backend vor dem Betriebsrat zu zeigen. Die Geschäftsführung, \
+                    das Kernteam und der Product Owner stimmen zu; Fabio Chiaramonte informiert DENA und die \
+                    Knorr-Bremse AG, Fabio schickt es an Anna Schmidt-Weber. Das ISMS-Team prüft mit dem MIT.";
+        let (cloaked, session) = cloak_wire(&cands, text);
+        for word in ["Der Kunde", "die IT", "das Backend", "dem Betriebsrat", "Die Geschäftsführung", "das Kernteam",
+                     "der Product Owner", "Das ISMS-Team"] {
+            assert!(cloaked.contains(word), "{word:?} was swallowed: {cloaked}");
+        }
+        for name in ["Fabio", "DENA", "Knorr-Bremse", "Anna Schmidt-Weber", "MIT"] {
+            assert!(!cloaked.contains(name), "{name} leaked: {cloaked}");
+        }
+        assert_eq!(decloak(&session, &cloaked), text, "round trip is byte-exact");
+    }
+
+    #[test]
+    fn a_name_takes_the_family_most_mentions_gave_it() {
+        // "Fabio" was `[Org-51]` on Asgard: the alphabetically smallest type used to win.
+        let mut arrays: Vec<serde_json::Value> = (0..3).map(|_| mentions(&[("Fabio", "person")])).collect();
+        arrays.push(mentions(&[("Fabio", "organization")]));
+        arrays.push(mentions(&[("Nexovar", "organization"), ("Nexovar", "organization"), ("Nexovar", "person")]));
+        // A tie goes to the stricter class.
+        arrays.push(mentions(&[("Mira Kovac", "person"), ("Mira Kovac", "organization")]));
+        let out = candidates_from_mentions_capped(&arrays, CANDIDATE_CAP);
+        let kind = |n: &str| out.iter().find(|c| c.name == n).and_then(|c| c.kind.clone()).unwrap();
+        assert_eq!(kind("Fabio"), "person");
+        assert_eq!(kind("Nexovar"), "organization");
+        assert_eq!(kind("Mira Kovac"), "person");
+        // With places off, a person typed `location` once is still a person, never dropped.
+        let arrays = vec![mentions(&[("Tom Arenstam", "person"), ("Tom Arenstam", "location")])];
+        let out = dedup_and_cap_with(candidates_from_entity_mentions(&arrays), CANDIDATE_CAP, false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind.as_deref(), Some("person"));
+    }
+
+    #[test]
+    fn numbers_that_are_not_phone_numbers_stay_in_clear() {
+        let phones = |t: &str| find_pii(t).into_iter().filter(|(_, k)| *k == "phone").map(|(v, _)| v).collect::<Vec<_>>();
+        for t in [
+            "Laufzeit 2025-2030 geplant", "Stand 20261008, Ticket 4711081512", "Wert 1234.56789012 gemessen",
+            "Koordinaten 51.2345678, 7.1234567", "epoch 1760000000000 ms", "Version v20261008 gebaut",
+            "Datei rollback-20261008-173423.tar", "Umsatz 100.000.000 EUR", "Preis 1234567,89 EUR",
+            "Order 123 4567 89 erfasst", "0.12345678 Prozent", "ID 0001234567",
+        ] {
+            assert!(phones(t).is_empty(), "{t:?} -> {:?}", phones(t));
+        }
+        for (t, want) in [
+            ("Ruf an: +49 171 1234567.", "+49 171 1234567"),
+            ("mobil 0171 1234567", "0171 1234567"),
+            ("Zentrale 0521/123456", "0521/123456"),
+            ("Büro (0521) 123456", "(0521) 123456"),
+            ("Tel.: 555-123-4567", "555-123-4567"),
+            ("Fax 030 12345678", "030 12345678"),
+        ] {
+            assert_eq!(phones(t), vec![want.to_string()], "{t:?}");
+        }
+    }
+
+    #[test]
+    fn addresses_and_identity_numbers_are_cloaked() {
+        let pii = |t: &str| find_pii(t);
+        let a = pii("Lieferung an Kaiserstraße 47, 60329 Frankfurt am Main bitte.");
+        assert!(a.contains(&("Kaiserstraße 47, 60329 Frankfurt".to_string(), "address")), "{a:?}");
+        assert!(pii("Treffpunkt Hauptstr. 5").iter().any(|(v, k)| *k == "address" && v == "Hauptstr. 5"));
+        for t in ["Arbeitsplatz 3 ist frei", "Lösung 2 und Seite 47", "Kapitel Datenweg"] {
+            assert!(pii(t).iter().all(|(_, k)| *k != "address"), "{t:?}");
+        }
+        let ids = pii("Steuer-ID: 12 345 678 901 und USt-IdNr. DE123456789 liegen vor.");
+        assert!(ids.contains(&("12 345 678 901".to_string(), "idnumber")), "{ids:?}");
+        assert!(ids.contains(&("DE123456789".to_string(), "idnumber")), "{ids:?}");
+        assert!(ids.iter().all(|(_, k)| *k != "phone"), "the ID digits are no phone: {ids:?}");
+        assert_eq!(bucket_template(Some("address")), ("ADDRESS", true));
+        assert_eq!(bucket_template(Some("idnumber")), ("ID", true));
+    }
+
+    #[test]
+    fn a_placeholder_extracted_as_an_entity_is_never_cloaked_again() {
+        let cands = vec![cand("Term-8517", Some("organization")), cand("[Org-3]", Some("organization")), cand("Erika Muster", Some("person"))];
+        let prepared = prepare_candidates(&cands);
+        let names: Vec<&str> = prepared.entries.iter().map(|e| e.canonical.as_str()).collect();
+        assert_eq!(names, vec!["Erika Muster"]);
+    }
+
+    fn variant_session() -> CloakSession {
+        let mut map = HashMap::new();
+        map.insert("[Place-2]".to_string(), "Hamburg".to_string());
+        map.insert("[Org-5]".to_string(), "Nexovar GmbH".to_string());
+        map.insert("[Person-1]".to_string(), "Fabio".to_string());
+        map.insert("[Person-12]".to_string(), "Anna Schmidt".to_string());
+        CloakSession { map }
+    }
+
+    #[test]
+    fn decloak_restores_placeholders_the_model_altered() {
+        let s = variant_session();
+        for (cloud, want) in [
+            ("Treffen in [Ort-2].", "Treffen in Hamburg."),                      // translated family
+            ("Vertrag mit [Firma-5] und [Organisation-5].", "Vertrag mit Nexovar GmbH und Nexovar GmbH."),
+            ("bei [place-2] und [ORG-5]", "bei Hamburg und Nexovar GmbH"),       // re-cased
+            ("bei [Place 2]", "bei Hamburg"),                                     // space
+            ("bei [Place\u{2011}2] und [Org\u{2013}5]", "bei Hamburg und Nexovar GmbH"), // Unicode dashes
+            ("Markdown \\[Person-12\\] schrieb", "Markdown Anna Schmidt schrieb"), // escaped brackets
+            ("[Person-1]s Bericht", "Fabios Bericht"),                            // genitive after bracket
+            ("`{\"name\": \"[Person-12]\"}`", "`{\"name\": \"Anna Schmidt\"}`"),  // inside code/JSON
+        ] {
+            assert_eq!(decloak(&s, cloud), want, "{cloud:?}");
+        }
+        // Bare variants are ordinary prose and stay untouched.
+        for prose in ["Person 1 und Person 12 sind Beispiele", "Ort-2 im Plan", "die Firma-5 Liste", "place-2.md"] {
+            assert_eq!(decloak(&s, prose), prose, "{prose:?}");
+        }
+    }
+
+    #[test]
+    fn variant_decloak_streams_exactly_like_the_whole_text() {
+        let s = variant_session();
+        let text = "A [Ort-2], \\[Person-12\\] und [place 2]; [Org\u{2013}5] ü[Person-1]s Person 1 [Person-12x] \\[Person-1]";
+        let want = decloak(&s, text);
+        assert_eq!(want, "A Hamburg, Anna Schmidt und Hamburg; Nexovar GmbH üFabios Person 1 [Person-12x] Fabio");
+        for split in 0..=text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            for split2 in split..=text.len() {
+                if !text.is_char_boundary(split2) {
+                    continue;
+                }
+                let mut buf = String::new();
+                let mut out = decloak_stream_chunk(&s, &mut buf, &text[..split]);
+                out += &decloak_stream_chunk(&s, &mut buf, &text[split..split2]);
+                out += &decloak_stream_chunk(&s, &mut buf, &text[split2..]);
+                out += &decloak_stream_finish(&s, &mut buf);
+                assert_eq!(out, want, "splits {split}/{split2}");
+            }
+        }
+    }
+
+    #[test]
+    fn stale_placeholders_in_a_request_are_healed_before_cloaking() {
+        // Registry rows as `cloak_maps` holds them (folded entity_key) + the spelling index.
+        let rows = vec![
+            ("[Term-3450]".to_string(), "epr".to_string()),
+            ("Term-3240".to_string(), "andre".to_string()),
+            ("Term-3180".to_string(), "anvil-host".to_string()),
+            ("[Org-621]".to_string(), "nexovar gmbh".to_string()),
+            ("[PHONE-43]".to_string(), "1234.56789012".to_string()),
+            ("[IBAN-2]".to_string(), "de02120300000000202051".to_string()),
+        ];
+        let spelling: HashMap<String, String> = [("epr", "EPR"), ("nexovar gmbh", "Nexovar GmbH")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let heal = stale_session_from_rows(&rows, Some(&spelling));
+        let texts = [
+            "Die [Term-3450]-Pflicht für [Org-621] ab Wert [PHONE-43].",
+            "Author: Andre (Anvil) <Term-3240@Term-3180.local>",
+            "IBAN [IBAN-2], unbekannt bleibt [Term-99999].",
+        ];
+        let healed = heal_texts(&heal, &texts);
+        assert_eq!(healed[0], "Die EPR-Pflicht für Nexovar GmbH ab Wert 1234.56789012.");
+        assert_eq!(healed[1], "Author: Andre (Anvil) <andre@anvil-host.local>");
+        assert_eq!(healed[2], "IBAN DE02120300000000202051, unbekannt bleibt [Term-99999].");
+        // The names are then cloaked again like any other mention; terms/numbers go in clear.
+        let (cloaked, _) = cloak_wire(&[cand("Nexovar GmbH", Some("organization"))], &healed[0]);
+        assert_eq!(cloaked, "Die EPR-Pflicht für [Org-1] ab Wert 1234.56789012.");
+        let cores = placeholder_cores(&["[Ort-2] und \\[Org-621\\], Term-3240@x, [Seite 3]"]);
+        assert_eq!(cores, vec!["Org-621", "Place-2", "Term-3240"]);
+    }
+
     /// Realistic cost + quality probe (ignored; needs local data, never committed):
     /// `GCTRL_CLOAK_BENCH_MENTIONS` = TSV `name<TAB>type<TAB>count` (aggregated
     /// `text_chunks.entity_mentions` of one account). Builds the gateway dictionary exactly
@@ -2471,6 +3364,7 @@ mod tests {
         let mut best = Duration::MAX;
         let mut best_prepare = Duration::MAX;
         let mut cloaked_out = Vec::new();
+        let mut surfaces: Vec<String> = Vec::new();
         let mut seen_n = 0;
         for _ in 0..5 {
             let t = Instant::now();
@@ -2489,6 +3383,7 @@ mod tests {
                 .collect();
             let mut session = CloakSession::empty();
             cloaked_out = apply_batch(&refs, &map, &mut session);
+            surfaces = session.map.values().cloned().collect();
             best = best.min(t.elapsed());
             seen_n = seen.len();
         }
@@ -2507,6 +3402,24 @@ mod tests {
             seen_n
         );
         eprintln!("placeholder families in cloaked prompt: {fams:?}");
+        let prepared = prepare_candidates(&dict);
+        for fam in ["Person", "Org", "Place"] {
+            let mut single: Vec<&str> = prepared
+                .entries
+                .iter()
+                .filter(|e| bucket_template(e.kind.as_deref()).0 == fam && !e.canonical.contains(' '))
+                .map(|e| e.canonical.as_str())
+                .collect();
+            single.sort();
+            let total = prepared.entries.iter().filter(|e| bucket_template(e.kind.as_deref()).0 == fam).count();
+            if std::env::var("GCTRL_CLOAK_BENCH_LIST").is_ok() {
+                eprintln!("prepared {fam}: {total} entries, {} single-token: {}", single.len(), single.join(", "));
+            } else {
+                eprintln!("prepared {fam}: {total} entries, {} single-token", single.len());
+            }
+        }
         eprintln!("sample: {}", &cloaked_out[0].chars().take(700).collect::<String>());
+        surfaces.sort();
+        eprintln!("cloaked surfaces ({}): {}", surfaces.len(), surfaces.join(" | "));
     }
 }

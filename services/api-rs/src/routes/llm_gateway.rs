@@ -638,6 +638,11 @@ async fn chat_completions_inner(
         .map(|m| collect_cloak_texts(m, cloak_tool_outputs))
         .unwrap_or_default();
     let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
+    // Leftover placeholders already in the request (files, history, summaries) are
+    // restored first, so the model never copies one the de-cloaker cannot map.
+    let heal = privacy::stale_placeholder_session(&state.db, namespace, claims.sub, &refs).await;
+    let healed = privacy::heal_texts(&heal, &refs);
+    let refs: Vec<&str> = healed.iter().map(String::as_str).collect();
     let (cloaked, cloak_session) = privacy::cloak_batch(&state.db, &ns, &candidates, &refs).await;
     // write_cloaked_texts zips: a short result would leave plaintext slots.
     if cloaked.len() != slots.len() {
@@ -1061,8 +1066,10 @@ pub(super) enum ChatSlot {
     ToolArguments(usize, usize),
 }
 
-/// The system note added to a cloaked request: placeholders are not values.
-pub(super) const PLACEHOLDER_NOTE: &str = "Begriffe in eckigen Klammern wie [Place-3] sind Platzhalter für echte Namen. Gib sie unverändert an Werkzeuge weiter und ersetze sie nie durch ausgedachte Werte.\nTerms in square brackets like [Place-3] are placeholders for real names. Pass them to tools unchanged and never replace them with invented values.";
+/// The system note added to a cloaked request: placeholders are not values. The example
+/// carries number 0, which the registry never assigns (numbering starts at 1): the former
+/// `[Place-3]` was a real pseudonym on Asgard ("Vorschau"), and models quoted it.
+pub(super) const PLACEHOLDER_NOTE: &str = "Begriffe in eckigen Klammern wie [Person-0] sind Platzhalter für echte Namen. Gib sie unverändert an Werkzeuge weiter (Typ nicht übersetzen, Klammern nicht escapen) und ersetze sie nie durch ausgedachte Werte.\nTerms in square brackets like [Person-0] are placeholders for real names. Pass them to tools unchanged (do not translate the type, do not escape the brackets) and never replace them with invented values.";
 
 /// Every free text a cloud model would read, in request order: each message's
 /// `content` (string or the text of content parts; agent harnesses like pi send
@@ -1339,7 +1346,9 @@ mod tests {
         let mut m = vec![json!({ "role": "user", "content": "hi" })];
         add_placeholder_note(&mut m);
         assert_eq!(m[0], json!({ "role": "system", "content": PLACEHOLDER_NOTE }));
-        assert!(PLACEHOLDER_NOTE.contains("[Place-3]"));
+        assert!(PLACEHOLDER_NOTE.contains("[Person-0]"));
+        // Never a number the registry assigns (it counts from 1).
+        assert!(!regex::Regex::new(r"[A-Za-z]+-[1-9]").unwrap().is_match(PLACEHOLDER_NOTE));
     }
 
     // ── response side: ChatSseDecloaker + decloak_chat_completion ─────────

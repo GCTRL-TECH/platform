@@ -11,6 +11,18 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 713cf51 -->
 
+## v0.9.25 - Ordinary words stay ordinary words
+
+*17 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The chat gateway no longer swallows everyday words.** KEX types many ordinary words as people, organisations or places: "IT", "HR", "Geschäftsführung", "Betriebsrat", "Kunde", "Owner", "CISO", "Backend", "Portal". The gateway turned each of them into a placeholder, so a cloud model read "Der [Place-94] hat im [Place-74] die IT gebeten" and you saw brackets where words belonged. The gateway now skips role words, group words, legal forms, regions, our own product names and common tools, plus any one-word organisation that is a common German or English word. Real names stay hidden: "Fabio Chiaramonte", "Knorr-Bremse AG" and "Deutsche Energie-Agentur" still travel as placeholders.
+- **Places are opt-in.** A city or a country hides no personal data, and the location class held the most everyday words. Set `GCTRL_CLOAK_PLACES=1` to cloak places again. Postal addresses are now caught on their own, as `[ADDRESS-n]`.
+- **Numbers stay numbers.** The phone sweep took any run of seven digits: dates, year ranges, decimals, ticket numbers and timestamps. It now needs the shape of a dialled number (a leading `+`, `(` or `0`) or a keyword such as "Tel." right before it. This also removes most of the database work the gateway did for new placeholders on each request.
+- **Identity numbers are cloaked.** A tax ID, VAT ID, ID card, passport or social security number that follows its keyword becomes `[ID-n]`.
+- **A name keeps the type most mentions give it.** A person typed once as an organisation was cloaked as `[Org-n]`. The majority type now wins, and a tie goes to the person.
+- **Old placeholders heal.** Placeholders from the October 7 and 8 releases sit in files, boards and chat histories. The gateway now restores every placeholder it finds in a request before it cloaks, so the model never copies one it cannot map back.
+- **Changed placeholders still come back.** The gateway now also restores placeholders a model translated (`[Ort-2]`), re-cased (`[place-2]`), wrote with a space or another dash, or escaped for Markdown (`\[Person-1\]`), across stream chunks too.
+
 ## v0.9.24 - The cloak hides names, not your vocabulary
 
 *8 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
