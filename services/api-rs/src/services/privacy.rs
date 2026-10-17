@@ -39,8 +39,12 @@
 //!     preposition `mit`. Observed live 2026-10-06: the org entities "MIT"/"mit"
 //!     cloaked every German "mit" to `Org-259`.
 //!   - A single-token ALL-CAPS key of at most `CASE_SENSITIVE_MAX_CHARS` (4)
-//!     alphanumeric chars (`MIT`, `SAP`, `IBM`, `BMW`) matches CASE-SENSITIVELY:
-//!     `SAP` cloaks `SAP`, never `sap` or `Sap`.
+//!     alphanumeric chars matches CASE-SENSITIVELY only where its lowercase form is
+//!     an ordinary word (`MIT`/`mit`, `US`/`us`, `BILD`/`bild`), and always when it is
+//!     shorter than 3 chars or holds a digit (`DB`, `X9`): `MIT` cloaks `MIT`, never
+//!     `mit`. Every other short acronym (`DENA`, `SAP`, `BMW`) matches
+//!     case-insensitively, so a user typing `dena` or `Dena` is cloaked too
+//!     (2026-10-17: lowercase `dena` went out in clear).
 //!   - Every other key (Title-case or mixed short keys like `Audi`, longer or
 //!     multi-word keys) matches case-insensitively, so the user's own spelling
 //!     variants (`AUDI`, `nexovar gmbh`) are still caught.
@@ -988,12 +992,11 @@ static STOP_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// Longest single-token key (in chars) that is matched case-sensitively.
 const CASE_SENSITIVE_MAX_CHARS: usize = 4;
 
-/// PURE: is `key` a short ALL-CAPS acronym that must match CASE-SENSITIVELY? A single run
-/// of 1..=[`CASE_SENSITIVE_MAX_CHARS`] alphanumeric chars with at least one uppercase letter
-/// and no lowercase letter (`MIT`, `SAP`, `IBM`, `X9`). Title-case or mixed short keys
-/// (`Audi`, `Bild`) and folded keys ([`lower_key`]) never qualify, so they and every longer
-/// or multi-word key keep case-insensitive matching.
-fn is_case_sensitive_key(key: &str) -> bool {
+/// PURE: is `key` shaped like a short ALL-CAPS acronym? A single run of
+/// 1..=[`CASE_SENSITIVE_MAX_CHARS`] alphanumeric chars with at least one uppercase letter
+/// and no lowercase letter (`MIT`, `SAP`, `DENA`, `X9`). Title-case or mixed short keys
+/// (`Audi`, `Bild`) and folded keys ([`lower_key`]) never qualify.
+fn is_short_acronym(key: &str) -> bool {
     let mut n = 0usize;
     let mut has_upper = false;
     for c in key.chars() {
@@ -1007,6 +1010,25 @@ fn is_case_sensitive_key(key: &str) -> bool {
         has_upper |= c.is_uppercase();
     }
     n > 0 && has_upper
+}
+
+/// PURE: is `key` a short acronym that must match CASE-SENSITIVELY? Only a
+/// [`is_short_acronym`] whose lowercase spelling would hit ordinary running text: a
+/// function word ([`STOP_WORDS`]: `MIT`/`mit`, `US`/`us`) or a common word
+/// ([`COMMON_WORDS`]: `BILD`/`bild`, `ARM`/`arm`), and every acronym under 3 chars or
+/// with a digit (`DB`, `X9`), whose lowercase forms are units and abbreviations. Any
+/// other acronym (`DENA`, `SAP`, `BMW`) is folded like a long key: its lowercase form
+/// names nothing but the entity, and matching only the ALL-CAPS spelling let "dena"
+/// reach the cloud in clear (2026-10-17). Title-case, folded and longer keys never qualify.
+fn is_case_sensitive_key(key: &str) -> bool {
+    if !is_short_acronym(key) {
+        return false;
+    }
+    if key.chars().count() < 3 || key.chars().any(|c| !c.is_alphabetic()) {
+        return true;
+    }
+    let lower = lower_key(key);
+    STOP_WORDS.contains(lower.as_str()) || COMMON_WORDS.contains(lower.as_str())
 }
 
 /// PURE: the key [`apply_pseudonyms`] matches a candidate by: its exact spelling for a short
@@ -1244,10 +1266,10 @@ fn is_generic_name_with(name: &str, family: &str, given: &HashSet<String>) -> bo
         return false;
     }
     if !t.contains(char::is_whitespace) {
-        // A short ALL-CAPS acronym is matched case-sensitively and never hits the word in
-        // running text ("MIT" the institute vs "mit"); only the explicit acronym list
-        // above makes one generic.
-        if !t.contains('-') && !is_case_sensitive_key(t) && inflection_stems(&lower).any(|w| COMMON_WORDS.contains(w)) {
+        // A short ALL-CAPS acronym is never made generic by a word it only resembles
+        // ("MIT" the institute vs "mit", "DENA" vs the stem "den"); only the explicit
+        // acronym list above makes one generic.
+        if !t.contains('-') && !is_short_acronym(t) && inflection_stems(&lower).any(|w| COMMON_WORDS.contains(w)) {
             return true;
         }
         if lexical(last) || ends_with_any(last, GROUP_SUFFIXES) {
@@ -2661,16 +2683,44 @@ mod tests {
 
     #[test]
     fn short_acronyms_match_case_sensitively() {
-        let candidates = vec![cand("SAP", Some("organization")), cand("Bosch", Some("organization"))];
-        assert_eq!(cloak_pure(&candidates, "Wir nutzen SAP.").0, "Wir nutzen Org-0.");
-        assert_eq!(cloak_pure(&candidates, "ein sap im Baum").0, "ein sap im Baum");
-        assert_eq!(cloak_pure(&candidates, "Ein Sap im Baum").0, "Ein Sap im Baum");
+        // "ARM" collides with the common word "arm": only the ALL-CAPS spelling is the entity.
+        let candidates = vec![cand("ARM", Some("organization")), cand("Bosch", Some("organization"))];
+        assert_eq!(cloak_pure(&candidates, "Wir nutzen ARM.").0, "Wir nutzen Org-0.");
+        assert_eq!(cloak_pure(&candidates, "ein arm im Gips").0, "ein arm im Gips");
+        assert_eq!(cloak_pure(&candidates, "Ein Arm im Gips").0, "Ein Arm im Gips");
         assert_eq!(cloak_pure(&candidates, "BOSCH liefert").0, "Org-0 liefert");
-        assert!(is_case_sensitive_key("SAP") && is_case_sensitive_key("IBM") && is_case_sensitive_key("X9"));
-        assert!(!is_case_sensitive_key("sap") && !is_case_sensitive_key("Bosch") && !is_case_sensitive_key("A B"));
-        assert!(!is_case_sensitive_key("Bild") && !is_case_sensitive_key("Audi") && !is_case_sensitive_key("SAPx"));
-        assert_eq!(match_key("SAP"), "SAP");
+        assert!(is_case_sensitive_key("ARM") && is_case_sensitive_key("MIT") && is_case_sensitive_key("US"));
+        assert!(is_case_sensitive_key("BILD") && is_case_sensitive_key("X9") && is_case_sensitive_key("DB"));
+        assert!(!is_case_sensitive_key("arm") && !is_case_sensitive_key("Bosch") && !is_case_sensitive_key("A B"));
+        assert!(!is_case_sensitive_key("Bild") && !is_case_sensitive_key("Audi") && !is_case_sensitive_key("ARMx"));
+        assert_eq!(match_key("ARM"), "ARM");
         assert_eq!(match_key("Bosch"), "bosch");
+    }
+
+    #[test]
+    fn a_short_acronym_that_is_no_word_matches_every_casing() {
+        // Live 2026-10-17: the org "DENA" matched only as DENA; a user typing "dena" or
+        // "Dena" sent the name to the cloud in clear.
+        assert!(!is_case_sensitive_key("DENA") && !is_case_sensitive_key("SAP") && !is_case_sensitive_key("BMW"));
+        assert_eq!(match_key("DENA"), "dena");
+        let candidates = vec![cand("DENA", Some("organization")), cand("MIT", Some("organization"))];
+        for text in ["Termin mit der DENA.", "Termin mit der Dena.", "Termin mit der dena."] {
+            let (cloaked, session) = cloak_pure(&candidates, text);
+            assert_eq!(cloaked, "Termin mit der Org-0.", "{text:?}");
+            assert_eq!(decloak(&session, &cloaked), text, "round trip is byte-exact");
+        }
+        // Word and identifier boundaries still hold: no match inside a word, a host or a path.
+        for text in ["Die Denare von Rom.", "Siehe dena.de und /data/dena/plan.md."] {
+            assert_eq!(cloak_pure(&candidates, text).0, text, "{text:?}");
+        }
+        // Acronyms that collide with ordinary words keep exact case: the preposition stays.
+        assert_eq!(cloak_pure(&candidates, "Ich gehe mit dena zum MIT.").0, "Ich gehe mit Org-0 zum Org-1.");
+        // The dictionary keeps the entity (no generic filter on the stem "den").
+        let arrays = vec![mentions(&[("DENA", "organization")]), mentions(&[("dena", "organization")])];
+        let out = candidates_from_mentions_capped(&arrays, 2000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "DENA");
+        assert!(!collect_candidates(&out, "frag die dena").is_empty());
     }
 
     #[test]
@@ -2680,10 +2730,11 @@ mod tests {
         assert!(key_can_occur("MIT", &text_tokens("forscht am MIT.")));
         assert!(key_can_occur("bosch", &text_tokens("BOSCH liefert")));
         // Exhaustive agreement over a corpus, using production match keys.
-        let names = ["MIT", "SAP", "Bild", "X9", "Nexovar GmbH", "Bosch", "ACME & Co."];
+        let names = ["MIT", "ARM", "DENA", "Bild", "X9", "Nexovar GmbH", "Bosch", "ACME & Co."];
         let candidates: Vec<EntityCandidate> = names.iter().map(|n| cand(n, None)).collect();
         for text in [
-            "mit der Nexovar", "am MIT", "sap und SAP", "ein bild", "das Bild", "Wert x9", "Wert X9",
+            "mit der Nexovar", "am MIT", "arm und ARM", "die dena", "die Dena", "ein bild", "das Bild",
+            "Wert x9", "Wert X9",
             "NEXOVAR GMBH", "acme & co. liefert", "bosch", "",
         ] {
             let survived = collect_candidates(&candidates, text);
@@ -2723,16 +2774,16 @@ mod tests {
 
     #[test]
     fn title_case_short_keys_stay_case_insensitive() {
-        let candidates = vec![cand("Audi", Some("organization")), cand("SAP", Some("organization"))];
+        let candidates = vec![cand("Audi", Some("organization")), cand("ARM", Some("organization"))];
         for text in ["Termin bei AUDI.", "Termin bei audi.", "Termin bei Audi."] {
             let (cloaked, session) = cloak_pure(&candidates, text);
             assert_eq!(cloaked, "Termin bei Org-0.", "{text:?}");
             assert_eq!(decloak(&session, &cloaked), text);
         }
         assert_eq!(match_key("Audi"), "audi");
-        assert_eq!(cloak_pure(&candidates, "ein sap").0, "ein sap", "SAP stays case-sensitive");
+        assert_eq!(cloak_pure(&candidates, "ein arm").0, "ein arm", "ARM stays case-sensitive");
         assert!(key_can_occur("audi", &text_tokens("bei AUDI")));
-        assert!(!key_can_occur("SAP", &text_tokens("ein sap")));
+        assert!(!key_can_occur("ARM", &text_tokens("ein arm")));
     }
 
     // ── request-side cloak cost ───────────────────────────────────────────

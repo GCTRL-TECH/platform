@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: 713cf51 -->
 
+## v0.9.26 - Short names are hidden in every spelling
+
+*17 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A short name in capitals is cloaked however you type it.** The gateway matched names of up to four capital letters, such as "DENA", only in exactly that spelling, so "dena" or "Dena" in a message reached the cloud model in clear. Such a name now matches in any case. The strict spelling stays only where the lowercase word means something else: "MIT" never hides the German "mit", "US" never hides "us", "BILD" never hides "Bild". Names of one or two letters and names with digits keep the strict spelling too.
+
 ## v0.9.25 - Ordinary words stay ordinary words
 
 *17 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
