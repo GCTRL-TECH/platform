@@ -387,6 +387,16 @@ pub(crate) async fn chunk_job_scope(
     Some(jobs.into_iter().map(|j| j.to_string()).collect())
 }
 
+/// KEX `/search` rejects a query over 2000 characters with a 400, which reached a
+/// chat client as "no chunks" — a pasted text got no knowledge-base context at all
+/// (Anvil Prod, 2026-10-13/16: 2930 and 7581 characters). Searching with the first
+/// 2000 characters answers instead. Counted in chars, as Python's `len` counts them.
+pub(crate) const KEX_MAX_QUERY_CHARS: usize = 2000;
+
+pub(crate) fn kex_search_query(query: &str) -> String {
+    query.trim().chars().take(KEX_MAX_QUERY_CHARS).collect()
+}
+
 /// Caller-supplied chunk `limit`: default 5, clamped to 1..=50.
 pub(crate) fn clamp_chunk_limit(requested: Option<i64>) -> usize {
     requested.unwrap_or(5).clamp(1, 50) as usize
@@ -5485,7 +5495,7 @@ mod user_folder_segments_tests {
 // ── Chunk job scope (KB boundary of chunk retrieval) ──────────────────────────
 #[cfg(test)]
 mod chunk_scope_tests {
-    use super::{chunk_fetch_limit, clamp_chunk_limit, retain_allowed_chunks};
+    use super::{chunk_fetch_limit, clamp_chunk_limit, kex_search_query, retain_allowed_chunks, KEX_MAX_QUERY_CHARS};
     use serde_json::{json, Value};
     use std::collections::HashSet;
 
@@ -5570,6 +5580,19 @@ mod chunk_scope_tests {
         assert_eq!(clamp_chunk_limit(Some(50)), 50);
         assert_eq!(clamp_chunk_limit(Some(51)), 50);
         assert_eq!(clamp_chunk_limit(Some(i64::MAX)), 50);
+    }
+
+    /// A query KEX would reject (> 2000 chars -> 400 -> "no chunks") is cut, not
+    /// passed on; counted in chars, so multi-byte text is never split mid-character.
+    #[test]
+    fn long_queries_are_cut_to_what_kex_accepts() {
+        assert_eq!(kex_search_query("  Was ist DENA?  "), "Was ist DENA?");
+        let long = "ä".repeat(KEX_MAX_QUERY_CHARS + 500);
+        let cut = kex_search_query(&long);
+        assert_eq!(cut.chars().count(), KEX_MAX_QUERY_CHARS);
+        assert!(long.starts_with(&cut));
+        let exact = "x".repeat(KEX_MAX_QUERY_CHARS);
+        assert_eq!(kex_search_query(&exact), exact);
     }
 
     /// Unscoped requests ask KEX for exactly what they need; scoped ones over-fetch

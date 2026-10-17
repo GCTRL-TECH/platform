@@ -1084,6 +1084,7 @@ async fn execute_tool_inner(
         "search_chunks" => {
             let query = args["query"].as_str().unwrap_or("").to_string();
             if query.trim().is_empty() { return json!({ "error": "query is required" }); }
+            let query = crate::routes::kg::kex_search_query(&query);
             let compilation_id = args["compilationId"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
             let rank: i64 = match compilation_id {
                 Some(cid) => crate::routes::kg::effective_rank_for_compilation(&state.db, claims, cid).await as i64,
