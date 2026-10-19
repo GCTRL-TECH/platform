@@ -66,8 +66,10 @@ async fn agent_card() -> Json<Value> {
         },
         "usage": "READ the right layer: get_dossier (HOT/authoritative — state it, don't hedge) \
                   > query (blended answer) > search_entities/get_entity/get_neighbors/shortest_path \
-                  (graph) > wiki_page (curated prose). WRITE back after any substantive task with \
-                  store/extract into your granted compilationId (call list_graphs first).",
+                  (graph) > wiki_page (curated prose). WRITE back only when the user asks you to \
+                  remember something or confirms your proposal, with store/extract into your \
+                  granted compilationId (call list_graphs first); never store unverified \
+                  findings as facts.",
         "capabilities": tool_summaries()
     }))
 }
@@ -95,8 +97,9 @@ async fn llms_txt() -> impl IntoResponse {
          ## Discipline (this is the point of GCTRL)\n\
          READ the right layer: get_dossier (HOT/authoritative — state it, don't hedge) > query\n\
          (blended) > search_entities/get_entity/get_neighbors/shortest_path (graph) > wiki_page.\n\
-         After ANY substantive task, WRITE your conclusions back with store/extract into your\n\
-         granted compilationId (call list_graphs first) so future sessions inherit them.\n\n\
+         WRITE only when the user asks you to remember something or confirms your proposal\n\
+         (offer: 'Shall I remember this?'), with store/extract into your granted compilationId\n\
+         (call list_graphs first). Never store unverified findings or future dates as facts.\n\n\
          ## Tools\n{tool_lines}",
     );
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
