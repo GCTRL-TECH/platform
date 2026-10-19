@@ -9,7 +9,15 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: 713cf51 -->
+<!-- baseline-sha: b9d19b2 -->
+
+## v0.9.28 - Your knowledge base keeps what you asked it to keep
+
+*19 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Agents write back only when you ask.** Connected agents used to store their own conclusions after every larger task, including unchecked research results. Later answers quoted those notes back as facts. Agents now store something only when you ask them to remember it or confirm their offer, and never store unverified findings or future dates as facts. Notes an agent stored rank after your documents in search.
+- **Placeholders no longer turn into the wrong word.** A cloud model sometimes rewrote a name placeholder such as `[Org-631]` as `[Term-631]`. The gateway then restored an unrelated term with the same number. It now maps such a slip back to the name it came from, and leaves any other `[Term-N]` in a request as it is.
+- **Clear feedback for placeholder lookups.** A search, lookup or store call that contains nothing but placeholders now gets a short note instead of an empty result, because such a placeholder can never resolve.
 
 ## v0.9.27 - Search answers in a fraction of a second, even for long questions
 
