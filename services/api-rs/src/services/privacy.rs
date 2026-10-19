@@ -643,6 +643,36 @@ fn stale_session_from_rows(rows: &[(String, String)], own_entities: &HashMap<Str
     }
     session
 }
+/// Bracketed placeholders in any family spelling (`[Org-12]`, `\[Ort 3\]`) and the bare wire
+/// families (`Term-7`), for [`is_placeholder_only`].
+static PLACEHOLDER_ANY_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"\\?\[\\?\s*[A-Za-zÄÖÜäöüß]+[-\u{2010}-\u{2014} ][0-9]+\s*\\?\]|\b(?:Person|Org|Place|Term)-[0-9]+\b").unwrap()
+});
+
+/// Filler words that carry no lookup meaning on their own.
+const PLACEHOLDER_FILLER: &[&str] = &[
+    "und", "oder", "der", "die", "das", "den", "dem", "des", "von", "vom", "zu", "zum", "zur", "mit", "im", "in",
+    "bei", "für", "über", "ein", "eine", "einer", "eines", "nach", "an", "auf", "aus", "wer", "was", "wie", "ist",
+    "sind", "the", "and", "of", "for", "to", "with", "about", "who", "what", "is", "are",
+];
+
+/// PURE (2026-10-19): does `text` hold at least one placeholder and, without them, at most one
+/// content word (3+ letters, not filler)? Such a lookup or store can never resolve: the cloak
+/// gateway restores every placeholder it minted inside tool arguments, so one that still reaches
+/// a tool was invented by the model or copied from an old leftover. Same rule as Anvil's
+/// `lib/chat/cloak-placeholder-guard.ts`.
+pub fn is_placeholder_only(text: &str) -> bool {
+    if !PLACEHOLDER_ANY_RE.is_match(text) {
+        return false;
+    }
+    let rest = PLACEHOLDER_ANY_RE.replace_all(text, " ");
+    let words = rest
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3 && !PLACEHOLDER_FILLER.contains(&lower_key(w).as_str()))
+        .count();
+    words <= 1
+}
+
 /// PURE: restore every placeholder of `heal` in each text (see [`stale_placeholder_session`]).
 pub fn heal_texts(heal: &CloakSession, texts: &[&str]) -> Vec<String> {
     texts.iter().map(|t| decloak(heal, t)).collect()
@@ -1655,6 +1685,10 @@ fn canonical_family(f: &str) -> Option<&'static str> {
 /// plain replacement of their bracketed and bare form, longest first.
 struct DecloakIndex<'a> {
     regular: HashMap<&'a str, &'a str>,
+    /// Digits -> original, for the NAME cores (`Person`/`Org`/`Place`) of the session; `None`
+    /// when two name cores share the number. Feeds the `[Term-N]` slip rule in
+    /// [`decloak_with_next`].
+    name_by_number: HashMap<&'a str, Option<&'a str>>,
     /// Longest family name among the regular cores (`Person` = 6).
     max_family: usize,
     irregular: Vec<(&'a str, &'a str)>,
@@ -1665,11 +1699,20 @@ impl<'a> DecloakIndex<'a> {
         let mut regular = HashMap::new();
         let mut max_family = 0;
         let mut irregular = Vec::new();
+        let mut name_by_number: HashMap<&str, Option<&str>> = HashMap::new();
         for (key, orig) in &session.map {
             let core = pseudonym_core(key);
             if is_regular_core(core) {
                 max_family = max_family.max(core.find('-').unwrap_or(0));
                 regular.insert(core, orig.as_str());
+                if let Some((fam, digits)) = core.split_once('-') {
+                    if matches!(fam, "Person" | "Org" | "Place") {
+                        name_by_number
+                            .entry(digits)
+                            .and_modify(|v| *v = None)
+                            .or_insert(Some(orig.as_str()));
+                    }
+                }
             } else {
                 irregular.push((key.as_str(), orig.as_str()));
                 if core != key.as_str() {
@@ -1678,7 +1721,7 @@ impl<'a> DecloakIndex<'a> {
             }
         }
         irregular.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
-        Self { regular, max_family, irregular }
+        Self { regular, name_by_number, max_family, irregular }
     }
 }
 
@@ -1719,6 +1762,18 @@ fn decloak_with_next(session: &CloakSession, text: &str, next: Option<char>) -> 
                         if let Some(o) = idx.regular.get(format!("{cf}-{}", p.digits).as_str()) {
                             hit = Some((m.start(), o, false));
                             break;
+                        }
+                        // `[Term-N]` slip (Prod 2026-10-19): the chat route mints no Term
+                        // placeholders since 2026-10-08, so a `[Term-631]` the session does not
+                        // know is the model's copy of a name core with the same number (it
+                        // received `[Org-631]` for "Deutschen Bahn" and wrote `[Term-631]`).
+                        // Restored only bracketed (exact=false) and only when exactly one name
+                        // core carries the number; PII cores never take part.
+                        if cf == "Term" {
+                            if let Some(Some(o)) = idx.name_by_number.get(p.digits) {
+                                hit = Some((m.start(), o, false));
+                                break;
+                            }
                         }
                     }
                 }
@@ -3335,6 +3390,47 @@ mod tests {
         // Bare variants are ordinary prose and stay untouched.
         for prose in ["Person 1 und Person 12 sind Beispiele", "Ort-2 im Plan", "die Firma-5 Liste", "place-2.md"] {
             assert_eq!(decloak(&s, prose), prose, "{prose:?}");
+        }
+    }
+
+    #[test]
+    fn placeholder_only_lookups_are_recognised() {
+        for q in ["[Org-948]", "[Org-948] [Org-944] [Person-1]", "Wer ist [Person-1]?", "Term-3316", "\\[Org-12\\] Windpark", "[Ort 3] und [Firma-2]"] {
+            assert!(is_placeholder_only(q), "{q:?}");
+        }
+        for q in ["Thomas Becker [Term-631] Ausschreibung Hamburg", "Siemens Energy Windpark Rosenheim", "", "COVID-19 Regeln", "Ticket 4711"] {
+            assert!(!is_placeholder_only(q), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn a_term_slip_of_a_name_core_is_restored_only_when_the_number_is_unique() {
+        // Prod 2026-10-19: the model got `[Org-631]` ("Deutschen Bahn") and wrote `[Term-631]`.
+        let mut map = HashMap::new();
+        map.insert("[Org-631]".to_string(), "Deutschen Bahn".to_string());
+        map.insert("[Person-596]".to_string(), "Thomas Becker".to_string());
+        map.insert("[Org-7]".to_string(), "Nexovar GmbH".to_string());
+        map.insert("[Place-7]".to_string(), "Hamburg".to_string());
+        map.insert("[PHONE-12]".to_string(), "+49 40 1234".to_string());
+        let s = CloakSession { map };
+        assert_eq!(decloak(&s, "[Person-596] von der [Term-631]"), "Thomas Becker von der Deutschen Bahn");
+        assert_eq!(decloak(&s, "Markdown \\[Term-631\\] und [Begriff-596]"), "Markdown Deutschen Bahn und Thomas Becker");
+        // Ambiguous number (Org-7 and Place-7), PII number, bare form, unknown number: untouched.
+        for keep in ["bei [Term-7]", "Nummer [Term-12]", "Term-631 im Text", "[Term-999]"] {
+            assert_eq!(decloak(&s, keep), keep, "{keep:?}");
+        }
+        // Other families never swap: a model-invented `[Person-631]` stays a placeholder.
+        assert_eq!(decloak(&s, "[Person-631]"), "[Person-631]");
+        // Streaming decides exactly like the whole text.
+        let text = "A [Term-631], [Term-7] und [Term-631]s";
+        let want = decloak(&s, text);
+        assert_eq!(want, "A Deutschen Bahn, [Term-7] und Deutschen Bahns");
+        for split in 0..=text.len() {
+            let mut buf = String::new();
+            let mut out = decloak_stream_chunk(&s, &mut buf, &text[..split]);
+            out += &decloak_stream_chunk(&s, &mut buf, &text[split..]);
+            out += &decloak_stream_finish(&s, &mut buf);
+            assert_eq!(out, want, "split {split}");
         }
     }
 
