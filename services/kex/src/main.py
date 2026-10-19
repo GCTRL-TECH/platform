@@ -56,6 +56,7 @@ from . import search_scope
 from . import lexical_terms
 from . import search_pg
 from . import clearance_guard
+from . import trust
 from .sources.file_handler import extract_text
 from .sources.url_handler import extract_from_url, crawl_website
 from .sources.sharepoint_handler import fetch_sharepoint_file
@@ -2029,6 +2030,10 @@ def search_endpoint(req: SearchReq, request: Request):
         # Einstufung: Postgres hat das letzte Wort, nicht der Qdrant-Payload (der bei einer
         # spaeteren Hochstufung, z. B. Migration 100 fuer Lehren, auf dem alten Rang bleibt).
         reranked = clearance_guard.filter_by_pg_rank(reranked, req.max_rank, get_search_pg)
+        # Trust order (src/trust.py): agent `store` notes never outrank source documents —
+        # after the Hebbian prior on purpose, which otherwise heats a note every time an
+        # answer quotes it back (Anvil prod nightly 2026-10-19).
+        reranked = trust.apply_trust_order(reranked, get_search_pg)
 
         # Provenance, last: every channel above carries the raw source_documents.id,
         # so resolving the readable name here covers dense, lexical AND the Hebbian

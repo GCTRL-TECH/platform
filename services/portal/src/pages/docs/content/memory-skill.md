@@ -77,20 +77,20 @@ Match the tool to the question. Reading the wrong layer produces hedged or unfou
 - **Graph tools → provenance/structure.** When the question is about relationships or lineage, traverse rather than guess.
 - **Wiki → prose.** When a human needs explanation, hand back curated pages.
 
-## Rule 2 - Write conclusions back
+## Rule 2 - Write back what the user wants kept
 
-After each task, **write what you concluded** back into your assigned knowledge base:
+Write only when the user asks you to remember something or confirms your proposal ("Shall I remember this?"). Unrequested agent notes - unverified research results, guesses, future dates - are read back later as facts and the error compounds. Then write into your assigned knowledge base:
 
 - Store new facts (`store`), corrections (`correct`), and links (`add_relationships`).
 - Pin a dossier (`pin_dossier`) when a conclusion is authoritative and should never be evicted.
-- This is the habit that pays off: **future sessions inherit your conclusions** instead of re-deriving them. Memory compounds.
+- This is the habit that pays off: **future sessions inherit confirmed conclusions** instead of re-deriving them. Memory compounds only while it stays true.
 
 ```text
 TASK LOOP
   1. Classify the question  → pick the layer (Rule 1)
   2. Read with the matching tool
   3. Answer (assert on HOT, cite on blended)
-  4. Write conclusions back → store / correct / add_relationships / pin_dossier
+  4. Offer the conclusion; on yes → store / correct / add_relationships / pin_dossier
 ```
 
 ## Rule 3 - Code is knowledge: the coding protocol
