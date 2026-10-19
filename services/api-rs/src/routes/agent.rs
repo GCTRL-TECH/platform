@@ -723,6 +723,22 @@ pub(crate) fn on_behalf_rank_arg(args: &Value) -> Option<i32> {
     Some(n.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
 }
 
+/// Short answer instead of a lookup made of cloak placeholders only.
+pub(crate) const PLACEHOLDER_LOOKUP_NOTE: &str =
+    "Platzhalter werden automatisch aufgelöst, nicht nachschlagen. Verwende sie unverändert in der Antwort. (Placeholders are resolved automatically; do not look them up.)";
+
+/// The free-text argument a lookup or store tool works on, for the placeholder guard.
+fn placeholder_guarded_text<'a>(tool_name: &str, args: &'a Value) -> Option<&'a str> {
+    let key = match tool_name {
+        "query" => "message",
+        "search_chunks" | "search_entities" | "find_file" => "query",
+        "get_dossier" | "get_entity" | "get_neighbors" => "name",
+        "store" | "create_extraction" => "text",
+        _ => return None,
+    };
+    args.get(key).and_then(|v| v.as_str())
+}
+
 async fn execute_tool_inner(
     state: &Arc<crate::models::AppState>,
     claims: &JwtClaims,
@@ -748,6 +764,15 @@ async fn execute_tool_inner(
     // the enforcement half (a hand-written tools/call still lands here).
     if !claims.code_access && crate::routes::code_tools::TOOLS.contains(&tool_name) {
         return json!({ "error": CODE_ACCESS_DENIED });
+    }
+    // Cloaked chat turns (Prod 2026-10-19): the cloak gateway restores every placeholder it
+    // minted inside tool arguments, so one that still arrives here can never resolve (the model
+    // invented it or copied an old leftover). Looking it up costs a round trip and finds nothing;
+    // storing it writes a placeholder into the knowledge base that the next turn reads back.
+    if let Some(text) = placeholder_guarded_text(tool_name, args) {
+        if crate::services::privacy::is_placeholder_only(text) {
+            return json!({ "note": PLACEHOLDER_LOOKUP_NOTE });
+        }
     }
     match tool_name {
         t if crate::routes::code_tools::TOOLS.contains(&t) => {
@@ -2871,6 +2896,19 @@ mod agent_tool_registration_tests {
     }
 
     // ── Read-only runtime tools registered ────────────────────────────────────
+
+    #[test]
+    fn placeholder_only_lookups_get_the_short_note() {
+        let a = json!({ "query": "[Org-948] [Person-1]", "message": "Wer ist [Person-1]?", "name": "[Org-948]", "text": "[Term-631]" });
+        for t in ["query", "search_chunks", "search_entities", "find_file", "get_dossier", "get_entity", "get_neighbors", "store", "create_extraction"] {
+            let text = super::placeholder_guarded_text(t, &a).expect(t);
+            assert!(crate::services::privacy::is_placeholder_only(text), "{t}");
+        }
+        assert!(super::placeholder_guarded_text("list_graphs", &a).is_none());
+        let real = json!({ "message": "Thomas Becker Ausschreibung Hamburg" });
+        assert!(!crate::services::privacy::is_placeholder_only(super::placeholder_guarded_text("query", &real).unwrap()));
+        assert!(super::PLACEHOLDER_LOOKUP_NOTE.starts_with("Platzhalter werden automatisch aufgelöst, nicht nachschlagen."));
+    }
 
     #[test]
     fn tool_schema_contains_get_hardware() {
