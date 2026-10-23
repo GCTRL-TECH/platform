@@ -9,6 +9,7 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
+<<<<<<< HEAD
 <!-- baseline-sha: b9d19b2 -->
 
 ## v0.9.28 - Your knowledge base keeps what you asked it to keep
@@ -95,6 +96,9 @@ keep improving - so here it is, release by release.
 - **Qdrant can require an API key.** Set `QDRANT_API_KEY` in your `.env` and every GCTRL service sends it to Qdrant, and the bundled Qdrant starts with that key. Leave it empty and nothing changes: no key is sent and Qdrant stays open as before, so an update never locks your own services out.
 - **Scoped tokens see only their own extractions and their granted knowledge bases.** A token limited to some knowledge bases could list every extraction of its owner, with file names, and the job details named knowledge bases outside its grants. It now sees only the jobs it started and only the knowledge bases it is granted.
 - **An empty result from the entity resolver no longer triggers a looser merge.** When LIMES ran fine but found no matching pair, the merge treated that as a failure and fell back to a looser name comparison, which could merge two different companies with similar names. A successful empty result now counts as an answer; the fallback runs only when the resolver really fails.
+=======
+<!-- baseline-sha: 9daa45b -->
+>>>>>>> 05bc265 (docs(updates): baseline-sha auf 9daa45b)
 
 ## v0.9.20 - Colleague tokens see every granted knowledge base and can merge them
 
