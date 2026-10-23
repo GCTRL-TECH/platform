@@ -622,8 +622,11 @@ def _update_job_status(job_id: str, status: str, result: dict | None = None, err
             with conn.cursor() as cur:
                 if status == "completed":
                     import json as _json
+                    # error=NULL: a job the watchdog had failed in the meantime
+                    # finished after all; a stale error text next to 'completed'
+                    # would read as a half-failure in the job view.
                     cur.execute(
-                        "UPDATE jobs SET status='completed', result=%s::jsonb, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
+                        "UPDATE jobs SET status='completed', result=%s::jsonb, error=NULL, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
                         (_json.dumps(result or {}), job_id),
                     )
                 elif status == "processing":
