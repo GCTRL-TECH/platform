@@ -622,13 +622,18 @@ def _update_job_status(job_id: str, status: str, result: dict | None = None, err
             with conn.cursor() as cur:
                 if status == "completed":
                     import json as _json
-                    # error=NULL: a job the watchdog had failed in the meantime
-                    # finished after all; a stale error text next to 'completed'
-                    # would read as a half-failure in the job view.
+                    # Only a job that is still ours may complete: 'processing', or
+                    # one the stale-job sweep failed while we kept computing (its
+                    # error text is the sweep's) - that one heals, error=NULL. A
+                    # job cancelled by a user (cancel_job -> 'failed'/'Cancelled')
+                    # keeps its terminal state; we must not overrule that decision.
                     cur.execute(
-                        "UPDATE jobs SET status='completed', result=%s::jsonb, error=NULL, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
+                        "UPDATE jobs SET status='completed', result=%s::jsonb, error=NULL, completed_at=NOW(), updated_at=NOW() "
+                        "WHERE id=%s AND (status='processing' OR error LIKE 'Worker died mid-processing%%')",
                         (_json.dumps(result or {}), job_id),
                     )
+                    if cur.rowcount == 0:
+                        logger.warning(f"Job {job_id} finished but was already finalized elsewhere (cancelled?); result not recorded")
                 elif status == "processing":
                     cur.execute(
                         "UPDATE jobs SET status='processing', updated_at=NOW() WHERE id=%s",
