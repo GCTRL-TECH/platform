@@ -10,6 +10,7 @@ import { createPortal } from 'react-dom'
 import { Copy, X, Check } from 'lucide-react'
 import { useApiQuery } from '@/hooks/useApi'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { getNodeColor, resolveTypeLabel } from './colors'
 import { NodeDetailOverview } from './NodeDetailOverview'
 import { NodeDetailChunks } from './NodeDetailChunks'
@@ -127,7 +128,7 @@ export function NodeDetailDrawer({
 
   async function handleCopy() {
     try {
-      await navigator.clipboard.writeText(entityName)
+      await copyToClipboard(entityName)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch {

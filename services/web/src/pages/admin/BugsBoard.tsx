@@ -17,6 +17,7 @@ import {
   Monitor,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import {
   BUG_STATUS_LABEL,
   createBugSpec,
@@ -119,7 +120,7 @@ export default function BugsBoard() {
 
   function copySpec() {
     if (!spec) return
-    void navigator.clipboard.writeText(spec.markdown)
+    void copyToClipboard(spec.markdown)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }

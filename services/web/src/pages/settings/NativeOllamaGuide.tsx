@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Cpu, Copy, Check, RefreshCw } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 
 /**
  * Shown when GCTRL can't reach Ollama. The most common cause: the user runs
@@ -41,7 +42,7 @@ export function NativeOllamaGuide({
   const tab = OS_TABS.find((t) => t.id === os) ?? OS_TABS[0]!
 
   const copy = () => {
-    void navigator.clipboard.writeText(tab.cmd)
+    void copyToClipboard(tab.cmd)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }

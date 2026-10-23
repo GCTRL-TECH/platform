@@ -53,6 +53,7 @@ import { useTokenBalance } from '@/hooks/useTokenBalance'
 import { useUiMode } from '@/hooks/useUiMode'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { api, apiGet } from '@/lib/api'
 import { UpdateModal, useLicenseStatus } from '@/components/LicenseBanner'
 import ObsidianVaultManager from '@/components/connectors/ObsidianVaultManager'
@@ -1812,7 +1813,7 @@ function AgentTab({ initialSubTab = 'harness' }: { initialSubTab?: AgentSubTabId
   }, [])
 
   function copyText(text: string, id: string) {
-    void navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(id)
     setTimeout(() => setCopied(''), 2000)
   }
@@ -1831,7 +1832,7 @@ function AgentTab({ initialSubTab = 'harness' }: { initialSubTab?: AgentSubTabId
   async function copySkillMd() {
     try {
       const { data } = await api.get('/agent/skill.md', { responseType: 'text' })
-      await navigator.clipboard.writeText(typeof data === 'string' ? data : String(data))
+      await copyToClipboard(typeof data === 'string' ? data : String(data))
       setSkillCopied(true)
       setTimeout(() => setSkillCopied(false), 1800)
     } catch { /* non-fatal */ }
@@ -2085,7 +2086,7 @@ function McpTab() {
   const mcpEndpoint = cfg.mcpEndpoint // e.g. http://localhost:3001/api
 
   function copyText(text: string, id: string) {
-    void navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(id)
     setTimeout(() => setCopied(''), 2000)
   }
@@ -2259,7 +2260,7 @@ function N8nTab() {
   const cfg = usePublicConfig()
 
   function copyText(text: string, id: string) {
-    void navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(id)
     setTimeout(() => setCopied(''), 2000)
   }
@@ -3953,7 +3954,7 @@ function LicenseTab() {
           params: { reveal: true },
         })
         if (data.license?.licenseKey) {
-          await navigator.clipboard.writeText(data.license.licenseKey)
+          await copyToClipboard(data.license.licenseKey)
           setResult({ ok: true, msg: 'License key copied to clipboard' })
           setTimeout(() => setResult(null), 2500)
         }
@@ -3962,7 +3963,7 @@ function LicenseTab() {
       }
     } else {
       try {
-        await navigator.clipboard.writeText(fullKey)
+        await copyToClipboard(fullKey)
         setResult({ ok: true, msg: 'License key copied to clipboard' })
         setTimeout(() => setResult(null), 2500)
       } catch { /* clipboard denied */ }
@@ -4217,7 +4218,7 @@ function ConnectAgentTab() {
   }, [])
 
   function copyText(text: string, id: string) {
-    void navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(id)
     setTimeout(() => setCopied(''), 2000)
   }

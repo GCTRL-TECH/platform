@@ -20,6 +20,7 @@ import { useApiQuery } from '@/hooks/useApi'
 import { useKbTree } from '@/hooks/useKbTree'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { matchFocusNode } from '@/lib/graph-focus'
 import { useGraphData } from '@/components/graph-explorer/hooks'
 import { getNodeColor, resolveTypeLabel } from '@/components/graph-explorer/colors'
@@ -483,7 +484,7 @@ function NodeContext({
           <h2 className="truncate text-sm font-semibold text-slate-100">{entityName}</h2>
           <p className="mt-0.5 text-[10px] uppercase tracking-wide text-slate-500">{typeLabel}</p>
         </div>
-        <button onClick={() => { navigator.clipboard.writeText(entityName); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
+        <button onClick={() => { void copyToClipboard(entityName); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
           className="rounded-md p-1.5 text-slate-500 hover:bg-slate-800 hover:text-slate-200" title="Copy name">
           {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
         </button>

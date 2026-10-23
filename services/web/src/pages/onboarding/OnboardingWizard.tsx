@@ -17,6 +17,7 @@ import {
   Copy,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { api } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
 
@@ -91,7 +92,7 @@ export default function OnboardingWizard() {
   ].join('\n')
 
   function copy(text: string, what: string) {
-    void navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(what)
     setTimeout(() => setCopied(''), 2000)
   }
@@ -99,7 +100,7 @@ export default function OnboardingWizard() {
   async function copySkillMd() {
     try {
       const { data } = await api.get('/agent/skill.md', { responseType: 'text' })
-      await navigator.clipboard.writeText(typeof data === 'string' ? data : String(data))
+      await copyToClipboard(typeof data === 'string' ? data : String(data))
       setCopied('skill')
       setTimeout(() => setCopied(''), 2000)
     } catch { /* non-fatal */ }

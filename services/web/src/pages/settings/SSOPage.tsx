@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -291,7 +292,7 @@ export default function SSOPage() {
 
   // ── Copy Helper ──────────────────────────────────────────────────────────────
   function copyText(value: string, id: string) {
-    void navigator.clipboard.writeText(value)
+    void copyToClipboard(value)
     setCopied(id)
     setTimeout(() => setCopied(''), 2000)
   }

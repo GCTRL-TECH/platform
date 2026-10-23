@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 import redis as redis_lib
@@ -480,13 +480,18 @@ def _worker_loop() -> None:
             _update_job_status(job_id, "processing")
 
             check_result = check_credits("fuse_merge", 0)
-            result = run_merge(
-                compilation_id, source_job_ids, user_id, classification,
-                match_rules=match_rules,
-                enable_smart_match=bool(payload.get("enable_smart_match", True)),
-                enable_canonical_link=bool(payload.get("enable_canonical_link", True)),
-                enable_embedding_match=bool(payload.get("enable_embedding_match", True)),
-            )
+            # The api-rs watchdog (recover_stale_jobs) fails every job whose
+            # updated_at is older than 5 min - a 16k-entity merge with ConEx
+            # takes longer than that while this thread is busy, so keep the
+            # row warm until run_merge returns.
+            with _job_heartbeat(job_id):
+                result = run_merge(
+                    compilation_id, source_job_ids, user_id, classification,
+                    match_rules=match_rules,
+                    enable_smart_match=bool(payload.get("enable_smart_match", True)),
+                    enable_canonical_link=bool(payload.get("enable_canonical_link", True)),
+                    enable_embedding_match=bool(payload.get("enable_embedding_match", True)),
+                )
             report_usage("fuse_merge", 0, check_result["credits_spent"])
             _publish_result(r, job_id, compilation_id, result)
             # The merge is delivered; now let the confirmed pairs teach the
@@ -530,12 +535,14 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
         # Use generation_base for the distiller's generation step when provided;
         # fall back to ollama_base (default install unchanged).
         distill_base = generation_base if generation_base else ollama_base
-        result = distiller.distill(
-            compilation_id, user_id, limit=limit,
-            model=distill_model, ollama_base=distill_base,
-            kind=generation_kind, api_key=generation_api_key,
-            max_concurrency=generation_max_concurrency,
-        )
+        # Same watchdog as the merge: keep the row warm while the LLM runs.
+        with _job_heartbeat(job_id):
+            result = distiller.distill(
+                compilation_id, user_id, limit=limit,
+                model=distill_model, ollama_base=distill_base,
+                kind=generation_kind, api_key=generation_api_key,
+                max_concurrency=generation_max_concurrency,
+            )
 
         if job_id != "unknown":
             _update_job_status(job_id, "completed", result=result)
@@ -561,6 +568,48 @@ def _handle_distill_job(r: redis_lib.Redis, raw_payload: str) -> None:
             pass
 
     logger.info("FUSE worker thread stopped")
+
+
+@contextmanager
+def _job_heartbeat(job_id: str, interval_s: float = 60.0):
+    """Bump jobs.updated_at while a long merge runs. Without it the api-rs
+    stale-job sweep flags the job 'Worker died mid-processing (>5min)' although
+    this worker is alive and finishes later (seen 2026-10-23, 51-source merge).
+    Daemon thread; the final completed/failed update still comes from the caller."""
+    if job_id == "unknown":
+        yield
+        return
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(interval_s):
+            _touch_job(job_id)
+
+    t = threading.Thread(target=_beat, name=f"heartbeat-{job_id[:8]}", daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
+def _touch_job(job_id: str) -> None:
+    """Heartbeat write: bump updated_at ONLY while the job is still 'processing'.
+    The guard keeps a beat from resurrecting a job that was cancelled
+    (fuse.rs cancel_job -> 'failed') or already finalized by the watchdog -
+    same rule as the KEX worker's _start_job_heartbeat."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.PG_URL, connect_timeout=5)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE jobs SET updated_at=NOW() WHERE id=%s AND status='processing'",
+                    (job_id,),
+                )
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"Heartbeat for job {job_id} failed: {exc}")
 
 
 def _update_job_status(job_id: str, status: str, result: dict | None = None, error: str | None = None) -> None:

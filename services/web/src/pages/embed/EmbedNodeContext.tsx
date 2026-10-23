@@ -15,6 +15,7 @@
  * Read-only by design: no delete/correct affordances, no load-more.
  */
 
+import { copyToClipboard } from '@/lib/clipboard'
 import { Suspense, lazy, useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { AlertCircle, ArrowLeft, ArrowRight, Copy, Check, FileText, Network, X } from 'lucide-react'
@@ -351,7 +352,7 @@ export function EmbedNodeContext({
           <p className="mt-0.5 text-[10px] uppercase tracking-wide text-slate-500">{typeLabel}</p>
         </div>
         <button
-          onClick={() => { navigator.clipboard.writeText(entityName); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
+          onClick={() => { void copyToClipboard(entityName); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
           className="rounded-md p-1.5 text-slate-500 hover:bg-slate-800 hover:text-slate-200"
           title="Copy name"
         >

@@ -17,6 +17,7 @@ import { createPortal } from 'react-dom'
 import { Share2, X, Copy, Check, KeyRound, Globe2, AlertTriangle, Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 
 interface EmbedShareDialogProps {
   open: boolean
@@ -127,7 +128,7 @@ function TokenTab({ compilationId, compilationName }: { compilationId: string; c
   }
 
   function copy(which: 'url' | 'iframe', text: string) {
-    navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(which)
     setTimeout(() => setCopied(null), 1500)
   }
@@ -207,7 +208,7 @@ function PublicTab({
   }
 
   function copy(which: 'url' | 'iframe', text: string) {
-    navigator.clipboard.writeText(text)
+    void copyToClipboard(text)
     setCopied(which)
     setTimeout(() => setCopied(null), 1500)
   }

@@ -27,7 +27,7 @@
     { "name": "list_sources",      "description": "List connected data sources.", "args": {} },
     { "name": "check_balance",     "description": "Check the account's token balance.", "args": {} },
     { "name": "create_extraction", "description": "Ingest text into the knowledge graph at a given classification.", "args": { "text": "string", "classificationLevelId": "string?" } },
-    { "name": "fuse_graphs",       "description": "Merge graphs by their source job ids; the merge preserves each element's classification.", "args": { "name": "string", "sourceJobIds": "string[]" } }
+    { "name": "fuse_graphs",       "description": "Merge knowledge graphs into a new one (by compilationIds, or low-level by sourceJobIds); the merge preserves each element's classification. Pass folderPath to file the result. A KB-scoped token may merge the knowledge bases it is granted; the result is granted onto it.", "args": { "name": "string", "compilationIds": "string[]?", "sourceJobIds": "string[]?", "folderPath": "string[]?", "description": "string?" } }
   ],
   "security_model": "Access is enforced at the API, not by convention. A token with PUBLIC clearance physically cannot retrieve INTERNAL+ data through any tool, unless explicitly granted a specific graph. Every tool call is recorded in the audit trail (which token accessed what)."
 }

@@ -281,7 +281,7 @@ Read tools:
 
 Action tools:
 - create_extraction  : Ingest text into the graph. Args: { text: string, classificationLevelId?: string }
-- fuse_graphs        : Merge graphs by their source jobs. Args: { name: string, sourceJobIds: string[] }
+- fuse_graphs        : Merge graphs into a new one. Args: { name: string, compilationIds?: string[], sourceJobIds?: string[], folderPath?: string[], description?: string }
 - create_compilation : Create a new (empty) knowledge graph. Args: { name: string, description?: string }
 - delete_compilation : Delete a compilation the caller owns. Args: { compilationId: string }
 - refresh_compilation: Re-run fusion to refresh a compilation. Args: { compilationId: string }
@@ -392,7 +392,7 @@ pub(crate) fn tool_schema() -> Value {
             { "name": "schema",             "description": "Graph schema for your knowledge: distinct entity types (coarse buckets) and relationship types with counts, clearance- and KB-scope-filtered. Use to learn 'what kinds of things and relations exist' before querying. No args", "args": {} },
             { "name": "check_balance",      "description": "Check token balance", "args": {} },
             { "name": "create_extraction",  "description": "Ingest text into the knowledge graph. Pass sourceRef with the origin (file path, URL, ticket/run id) so every extracted fact stays traceable to where it came from.", "args": { "text": "string", "classificationLevelId": "string?", "sourceRef": "string?" } },
-            { "name": "fuse_graphs",        "description": "Merge graphs by their source job ids", "args": { "name": "string", "sourceJobIds": "string[]" } },
+            { "name": "fuse_graphs",        "description": "Merge knowledge graphs into a NEW one (FUSE entity matching). Name the graphs to merge by compilationIds (from list_graphs); sourceJobIds is the low-level alternative. ALWAYS pass folderPath so the result is filed where it belongs (find-or-create), e.g. [\"Projects\",\"<Kunde>\",\"<Projekt>\"] - without it the merge lands unfiled at the tree root. A KB-scoped token may merge the knowledge bases it is granted; the result is granted onto that token automatically. Returns jobId + compilationId; the merge runs asynchronously.", "args": { "name": "string", "compilationIds": "string[]?", "sourceJobIds": "string[]?", "folderPath": "string[]?", "description": "string?" } },
             { "name": "create_compilation", "description": "Create a new empty knowledge graph. ALWAYS pass folderPath so the graph is filed where it belongs (find-or-create): personal graphs under [\"Users\",\"<name>\"], project graphs under [\"Projects\",\"<Kunde>\"]; a graph created without folderPath lands unfiled at the tree root. type 'CODE' creates a Codebase KB (one per repository, default folder Users/<name>/Code) - the only kind a KB-scoped token may create; it is granted onto that token automatically.", "args": { "name": "string", "description": "string?", "folderPath": "string[]?", "type": "string?" } },
             { "name": "delete_compilation", "description": "Delete a compilation the caller owns", "args": { "compilationId": "string" } },
             { "name": "refresh_compilation","description": "Re-run fusion to refresh a compilation", "args": { "compilationId": "string" } },
@@ -787,6 +787,13 @@ async fn execute_tool_inner(
             // NULL-classification branch used to bypass every rank cap. Granted
             // graphs stay visible so scoped/embed tokens can still list them.
             let (rank, rank_capped) = crate::routes::kg::clearance_rank_with_cap(&state.db, claims).await;
+            // KB-scoped token: only its assigned knowledge base(s) are visible. The
+            // scope goes INTO the query for the same reason as the CODE exclusion
+            // below: filtering the page afterwards hid every granted graph older than
+            // the 200 newest ones of the account (a colleague with 163 grants saw 29,
+            // and the two graphs he was asked to merge were not among them).
+            let scope = crate::routes::kg::api_key_scope(&state.db, claims).await;
+            let scope_ids: Option<Vec<uuid::Uuid>> = scope.as_ref().map(|s| s.iter().copied().collect());
             // Codebase access off (078): CODE knowledge bases are excluded in SQL,
             // not after the fact - a post-filter would shorten the LIMIT 50 page and
             // hide non-code graphs behind the code ones it dropped.
@@ -798,6 +805,7 @@ async fn execute_tool_inner(
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
                  WHERE c.user_id = $1
                    AND ($5 OR c.type::text <> 'CODE')
+                   AND ($6::uuid[] IS NULL OR c.id = ANY($6))
                    AND (cl.rank <= $2
                         OR (c.classification_level_id IS NULL AND NOT $3)
                         OR EXISTS (SELECT 1 FROM api_key_grants g
@@ -809,10 +817,9 @@ async fn execute_tool_inner(
             )
             .bind(claims.sub).bind(rank).bind(rank_capped).bind(claims.api_key_id)
             .bind(claims.code_access)
+            .bind(&scope_ids)
             .fetch_all(&state.db).await.unwrap_or_default();
 
-            // KB-scoped token: only its assigned knowledge base(s) are visible.
-            let scope = crate::routes::kg::api_key_scope(&state.db, claims).await;
             // The skill tells a model to pick its knowledge base from this list -
             // so the list must say what each graph IS (RAW / WIKI / CODE), WHERE
             // it lives (Users/<name>/Code, Projects/<client>/..., Global/...) and
@@ -821,7 +828,6 @@ async fn execute_tool_inner(
             let paths = crate::routes::kg::folder_paths(&state.db, claims.sub).await;
             let mut graphs: Vec<Value> = Vec::with_capacity(rows.len());
             for (id, name, desc, cls, privacy, ctype, folder_id, sji) in rows.iter() {
-                if let Some(s) = &scope { if !s.contains(id) { continue; } }
                 let (nodes, edges) = crate::routes::kg::live_counts(&state.neo, sji).await;
                 graphs.push(json!({
                     "id": id, "name": name, "description": desc,
@@ -1307,61 +1313,28 @@ async fn execute_tool_inner(
 
         // ── Action: merge graphs ──────────────────────────────────────────────
         "fuse_graphs" => {
-            // Merging/creating a new graph is an owner (CEO) action. A KB-scoped
-            // colleague token writes into its assigned KB but does not fuse new ones.
-            if crate::routes::kg::api_key_scope(&state.db, claims).await.is_some() {
-                return json!({ "error": "this access token is scoped to specific knowledge bases and cannot fuse new ones" });
-            }
-            let name = args["name"].as_str().unwrap_or("Merged Graph").to_string();
-            let mut source_job_ids: Vec<uuid::Uuid> = args["sourceJobIds"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).filter_map(|s| s.parse().ok()).collect())
-                .unwrap_or_default();
-            source_job_ids.sort();
-            source_job_ids.dedup();
-            if source_job_ids.is_empty() { return json!({ "error": "sourceJobIds is required" }); }
-
-            // IDOR guard: every source job must belong to the caller — never merge
-            // another user's graph data into a compilation this token controls.
-            let owned: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM jobs WHERE id = ANY($1) AND user_id = $2"
-            ).bind(&source_job_ids).bind(claims.sub).fetch_one(&state.db).await.unwrap_or(0);
-            if (owned as usize) != source_job_ids.len() {
-                return json!({ "error": "one or more sourceJobIds are not yours" });
-            }
-
-            // Most-permissive source level (mirrors routes::fuse).
-            let src_level = sqlx::query_as::<_, (uuid::Uuid, i32)>(
-                "SELECT cl.id, cl.rank FROM jobs j JOIN classification_levels cl ON cl.id = j.classification_level_id
-                 WHERE j.id = ANY($1) AND j.user_id = $2 ORDER BY cl.rank ASC LIMIT 1"
-            ).bind(&source_job_ids).bind(claims.sub).fetch_optional(&state.db).await.ok().flatten();
-            let (level_id, legacy): (Option<uuid::Uuid>, &str) = match src_level {
-                Some((id, r)) if r <= 0   => (Some(id), "PUBLIC"),
-                Some((id, r)) if r <= 100 => (Some(id), "INTERNAL"),
-                Some((id, r)) if r <= 200 => (Some(id), "CONFIDENTIAL"),
-                Some((id, _))             => (Some(id), "RESTRICTED"),
-                None                      => (None, "PUBLIC"),
+            // One path with POST /fuse/merge (routes::fuse::start_merge): owner
+            // check, KB scope of a colleague token, Codebase access, filing and
+            // the grant of the result onto a scoped token all live there.
+            let ids = |key: &str| -> Vec<uuid::Uuid> {
+                args[key].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).filter_map(|s| s.parse().ok()).collect())
+                    .unwrap_or_default()
             };
-            let comp_id = uuid::Uuid::new_v4();
-            let _ = sqlx::query("UPDATE users SET tokens_balance = GREATEST(0, tokens_balance - 10) WHERE id = $1")
-                .bind(claims.sub).execute(&state.db).await;
-            if sqlx::query(
-                "INSERT INTO compilations (id, user_id, name, source_job_ids, classification, classification_level_id, version)
-                 VALUES ($1, $2, $3, $4, $5, $6, 1)"
-            ).bind(comp_id).bind(claims.sub).bind(&name).bind(&source_job_ids).bind(legacy).bind(level_id)
-            .execute(&state.db).await.is_err() {
-                return json!({ "error": "failed to create merged compilation" });
+            let req = crate::routes::fuse::MergeReq {
+                name: args["name"].as_str().unwrap_or("Merged Graph").to_string(),
+                source_job_ids: ids("sourceJobIds"),
+                compilation_ids: ids("compilationIds"),
+                description: args["description"].as_str().map(|s| s.to_string()),
+                ontology_id: args["ontologyId"].as_str().and_then(|s| s.parse().ok()),
+                folder_path: args["folderPath"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+                    .unwrap_or_default(),
+            };
+            match crate::routes::fuse::start_merge(&state, claims, req).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
             }
-            let job_id = uuid::Uuid::new_v4();
-            let _ = sqlx::query("INSERT INTO jobs (id, user_id, type, status, input) VALUES ($1,$2,'fuse_merge','pending',$3)")
-                .bind(job_id).bind(claims.sub)
-                .bind(json!({ "compilationId": comp_id, "sourceJobIds": source_job_ids, "name": name }))
-                .execute(&state.db).await;
-            crate::services::usage::record_usage(&state.db, claims.sub, "fuse_merge", 10, Some(job_id)).await;
-            let _ = crate::services::redis::lpush(&state.redis, "fuse:jobs", &json!({
-                "job_id": job_id, "user_id": claims.sub, "compilation_id": comp_id,
-                "source_job_ids": source_job_ids, "name": name, "classification": legacy
-            }).to_string()).await;
-            json!({ "jobId": job_id, "compilationId": comp_id, "status": "pending" })
         }
 
         "check_balance" => {
@@ -2994,6 +2967,21 @@ mod agent_tool_registration_tests {
             .expect("create_compilation must be registered");
         assert_eq!(tool["args"]["folderPath"], json!("string[]?"),
             "create_compilation must accept folderPath");
+    }
+
+    /// A colleague's agent merges by graph, not by job: `fuse_graphs` must take
+    /// `compilationIds` and file the result through `folderPath`, or every merge
+    /// needs job ids no tool exposes and lands at the unfiled tree root.
+    #[test]
+    fn fuse_graphs_advertises_compilation_ids_and_folder_path() {
+        let schema = tool_schema();
+        let tool = schema["tools"].as_array().expect("tools")
+            .iter().find(|t| t["name"] == "fuse_graphs")
+            .expect("fuse_graphs must be registered");
+        assert_eq!(tool["args"]["compilationIds"], json!("string[]?"));
+        assert_eq!(tool["args"]["sourceJobIds"], json!("string[]?"));
+        assert_eq!(tool["args"]["folderPath"], json!("string[]?"));
+        assert_eq!(tool["args"]["description"], json!("string?"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { X, RefreshCw, Copy, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { getToken } from '@/lib/auth'
 import { apiGet } from '@/lib/api'
 import { usePublicConfig } from '@/hooks/usePublicConfig'
@@ -222,7 +223,7 @@ export function UpdateModal({ onClose }: { onClose: () => void }) {
   }, [attempt])
 
   function copyCommand() {
-    void navigator.clipboard.writeText(manualCommand || MANUAL_COMMAND)
+    void copyToClipboard(manualCommand || MANUAL_COMMAND)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }

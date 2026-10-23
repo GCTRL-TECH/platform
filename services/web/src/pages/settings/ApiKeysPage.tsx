@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { Button } from '@/components/ui/button'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ function KeyRevealBox({ createdKey, onDismiss }: KeyRevealBoxProps) {
 
   async function handleCopy() {
     try {
-      await navigator.clipboard.writeText(createdKey.key)
+      await copyToClipboard(createdKey.key)
       setCopied(true)
       setTimeout(() => setCopied(false), 2500)
     } catch {

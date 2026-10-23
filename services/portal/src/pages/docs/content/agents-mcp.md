@@ -25,7 +25,7 @@ GCTRL exposes roughly **30 MCP tools**, split into read and write operations. Ev
 | Tool | Effect |
 |------|--------|
 | `extract` | Run KEX over new source |
-| `fuse` | Merge extraction jobs into the graph |
+| `fuse` | Merge knowledge graphs (or extraction jobs) into a new graph, filed by folder path |
 | `store` | Write a fact / entity |
 | `correct` | Correct a wrong fact (never re-extracted) |
 | `add_relationships` | Link entities |

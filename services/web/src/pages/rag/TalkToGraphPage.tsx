@@ -45,6 +45,7 @@ import { HeaderCorner } from '@/components/layout/HeaderCorner'
 import { useUiMode } from '@/hooks/useUiMode'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { isCompleted, isDegraded } from '@/lib/jobStatus'
 import { getToken } from '@/lib/auth'
 import { pickDefaultChatModel, isValidChatSelection } from '@/lib/models'
@@ -527,7 +528,7 @@ function TracePanel({
 
   function copyQuery() {
     if (!message.cypher) return
-    void navigator.clipboard.writeText(message.cypher)
+    void copyToClipboard(message.cypher)
     setCypherCopied(true)
     setTimeout(() => setCypherCopied(false), 2000)
   }
@@ -781,7 +782,7 @@ const MessageItem = memo(function MessageItem({
   const isHuman = message.role === 'human'
 
   function handleCopy() {
-    void navigator.clipboard.writeText(message.content)
+    void copyToClipboard(message.content)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }

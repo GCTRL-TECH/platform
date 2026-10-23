@@ -492,19 +492,34 @@ registerToolWithAlias<Record<string, never>>(
   'List all knowledge graph compilations available in Ground Control. Shows name, entity count, relation count, and classification level.',
   {},
   async () => {
-    const result = await apiCall('GET', '/kg/compilations?limit=200') as {
+    const result = await apiCall('GET', '/kg/compilations?limit=500') as {
       compilations: Array<{
         id: string;
         name: string;
+        type?: string;
+        folderId?: string | null;
         nodeCount: number;
         edgeCount: number;
         classification: string;
         sourceJobIds: string[];
       }>;
     };
+    // Placement, so a model picks its knowledge base by WHERE it lives (several
+    // graphs share a name); folders come from one extra call, best effort.
+    const folderPath = new Map<string, string>();
+    try {
+      const f = await apiCall('GET', '/kg/folders') as { folders: Array<{ id: string; name: string; parentFolderId: string | null }> };
+      const byId = new Map(f.folders.map((x) => [x.id, x]));
+      for (const x of f.folders) {
+        const segs: string[] = [];
+        let cur: { id: string; name: string; parentFolderId: string | null } | undefined = x;
+        while (cur) { segs.unshift(cur.name); cur = cur.parentFolderId ? byId.get(cur.parentFolderId) : undefined; }
+        folderPath.set(x.id, segs.join('/'));
+      }
+    } catch { /* folders are decoration; the list still answers */ }
 
     const lines = result.compilations.map((c) =>
-      `- **${c.name}** (${c.nodeCount} entities, ${c.edgeCount} relations) [${c.classification}] — ID: ${c.id}`
+      `- **${c.name}** (${c.type ?? 'RAW'}, ${c.nodeCount} entities, ${c.edgeCount} relations) [${c.classification}] — ${c.folderId ? folderPath.get(c.folderId) ?? 'unfiled' : 'root'} — ID: ${c.id}`
     );
 
     return {
@@ -522,19 +537,23 @@ registerToolWithAlias<Record<string, never>>(
 
 const fuseSchema = {
   name: z.string().describe('Name for the new fused knowledge graph'),
-  sourceJobIds: z.array(z.string()).describe('Array of KEX job IDs to merge'),
+  compilationIds: z.array(z.string()).optional().describe('Knowledge graphs to merge (IDs from gctrl_list_graphs); each contributes its source jobs. Preferred form.'),
+  sourceJobIds: z.array(z.string()).optional().describe('Low-level alternative: KEX job IDs to merge'),
+  folderPath: z.array(z.string()).optional().describe('Where to file the result (find-or-create), e.g. ["Projects","<Kunde>","<Projekt>"]. Without it the merge lands unfiled at the tree root.'),
   description: z.string().optional().describe('Optional description'),
 };
 
-registerToolWithAlias<{ name: string; sourceJobIds: string[]; description?: string }>(
+registerToolWithAlias<{ name: string; compilationIds?: string[]; sourceJobIds?: string[]; folderPath?: string[]; description?: string }>(
   'gctrl_fuse',
   'borghive_fuse',
-  'Merge multiple extraction jobs into a unified knowledge graph. Uses entity matching to find duplicates across sources and creates a consolidated graph.',
+  'Merge knowledge graphs (or extraction jobs) into a NEW unified knowledge graph. Uses entity matching to find duplicates across sources and creates a consolidated graph. A KB-scoped token may merge the knowledge bases it is granted; the result is granted onto that token automatically. ALWAYS pass folderPath so the result is filed where it belongs.',
   fuseSchema,
-  async ({ name, sourceJobIds, description }) => {
+  async ({ name, compilationIds, sourceJobIds, folderPath, description }) => {
     const result = await apiCall('POST', '/fuse/merge', {
       name,
+      compilationIds,
       sourceJobIds,
+      folderPath,
       description,
     }) as { compilationId: string; jobId: string; status: string };
 

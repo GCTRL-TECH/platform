@@ -65,7 +65,7 @@ driven by the model. Also available in-app as the floating Pi Console.
 | `list_sources` | Connected data sources |
 | `check_balance` | Token balance |
 | `create_extraction` | Ingest text at a classification |
-| `fuse_graphs` | Merge graphs by source jobs (labels preserved) |
+| `fuse_graphs` | Merge knowledge graphs into a new one, filed by `folderPath` (labels preserved) |
 
 ## Team pattern
 

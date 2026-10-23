@@ -7,6 +7,7 @@ import { useApiQuery } from '@/hooks/useApi'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { copyToClipboard } from '@/lib/clipboard'
 import { Tabs } from '@/components/ui/Tabs'
 import { KbPicker } from '@/components/kb/KbPicker'
 import ClassificationPage from '@/pages/admin/ClassificationPage'
@@ -223,7 +224,7 @@ function TokensSection() {
           <div className="flex items-center gap-2">
             <code className="flex-1 break-all rounded bg-slate-950 px-3 py-2 font-mono text-xs text-emerald-200">{freshKey}</code>
             <button
-              onClick={() => { navigator.clipboard.writeText(freshKey); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
+              onClick={() => { void copyToClipboard(freshKey); setCopied(true); setTimeout(() => setCopied(false), 1500) }}
               className="rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700"
             >
               {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
@@ -620,7 +621,7 @@ function AgentSnippet({ token }: { token: string }) {
   async function copySkill() {
     try {
       const { data } = await api.get('/agent/skill.md', { responseType: 'text' })
-      await navigator.clipboard.writeText(typeof data === 'string' ? data : String(data))
+      await copyToClipboard(typeof data === 'string' ? data : String(data))
       setSkillCopied(true); setTimeout(() => setSkillCopied(false), 1500)
     } catch { /* non-fatal */ }
   }
@@ -665,7 +666,7 @@ function AgentSnippet({ token }: { token: string }) {
   }, null, 2)
 
   function copy(which: 'remote' | 'local', text: string) {
-    navigator.clipboard.writeText(text); setCopied(which); setTimeout(() => setCopied(null), 1500)
+    void copyToClipboard(text); setCopied(which); setTimeout(() => setCopied(null), 1500)
   }
 
   return (

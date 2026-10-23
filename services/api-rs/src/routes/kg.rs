@@ -1289,6 +1289,7 @@ async fn list(
     // Wissensbasen ihrer Freigabeklasse (Migration 089), die hier als $10 auch in
     // die Sicht-SQL muss, weil sie keinen expliziten Level tragen muessen.
     let scope = api_key_scope(&state.db, &claims).await;
+    let scope_ids: Option<Vec<Uuid>> = scope.as_ref().map(|s| s.iter().copied().collect());
     let class_ids: Vec<Uuid> = api_key_class_scope(&state.db, &claims).await.unwrap_or_default();
     // Default 100 (was 20): every list consumer - folder view, FUSE picker, MCP
     // list_graphs - read the 20 newest and silently dropped the rest.
@@ -1342,11 +1343,15 @@ async fn list(
                 OR c.folder_id::text = $8::text)
            AND ($9::text IS NULL OR c.type::text = $9::text)
            AND ($10::text IS NULL OR c.name ILIKE '%' || $10::text || '%')
+           -- KB scope IN the query: filtering the page afterwards hid every
+           -- granted graph older than the LIMIT newest ones of the account (a
+           -- colleague with 163 grants listed 29) and broke offset/total.
+           AND ($12::uuid[] IS NULL OR c.id = ANY($12))
          ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
     ).bind(claims.sub).bind(clearance_rank).bind(limit).bind(offset)
      .bind(rank_capped).bind(claims.api_key_id).bind(claims.code_access)
      .bind(folder_filter.as_deref()).bind(type_filter.as_deref())
-     .bind(name_filter.as_deref()).bind(&class_ids)
+     .bind(name_filter.as_deref()).bind(&class_ids).bind(&scope_ids)
      .fetch_all(&state.db).await?;
 
     // Sqlx's tuple FromRow tops out at 16 elements (see get_one's comment below for
@@ -1364,7 +1369,6 @@ async fn list(
     // Live counts for the whole page in ONE Neo4j query (was two per row, in series).
     let count_scope: Vec<(Uuid, Vec<Uuid>)> = rows
         .iter()
-        .filter(|r| scope.as_ref().is_none_or(|set| set.contains(&r.0)))
         .map(|r| (r.0, r.4.clone()))
         .collect();
     let live = live_counts_batch(&state.neo, &count_scope).await.unwrap_or_else(|e| {
@@ -1374,7 +1378,6 @@ async fn list(
 
     let mut comps: Vec<Value> = Vec::with_capacity(rows.len());
     for (id, n, d, cls, sji, nc, ec, fid, c, clid, ctype, wiki_src, last_distill, page_count, is_system, embed_public) in rows {
-        if let Some(set) = &scope { if !set.contains(&id) { continue; } }
         let privacy_mode = privacy_map.get(&id).cloned().unwrap_or_else(|| "open".to_string());
         let stored_nc = nc.unwrap_or(0);
         let stored_ec = ec.unwrap_or(0);
@@ -1398,12 +1401,9 @@ async fn list(
 
     // Real total across ALL of the user's visible compilations — the dashboard
     // was counting the returned page (length, capped at the default limit of 20).
-    // Same WHERE clause as the page query. For KB-scoped tokens the SQL total
-    // would overcount (scope filters in Rust above), so fall back to the
-    // filtered page length there — scoped sets are small and unpaginated.
-    let total: i64 = if scope.is_some() {
-        comps.len() as i64
-    } else {
+    // Same WHERE clause as the page query, KB scope included ($9), so a scoped
+    // token pages correctly too.
+    let total: i64 = {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM compilations c
              LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
@@ -1420,10 +1420,11 @@ async fn list(
                     OR ($6::text = 'root' AND c.folder_id IS NULL)
                     OR c.folder_id::text = $6::text)
                AND ($7::text IS NULL OR c.type::text = $7::text)
-               AND ($8::text IS NULL OR c.name ILIKE '%' || $8::text || '%')"
+               AND ($8::text IS NULL OR c.name ILIKE '%' || $8::text || '%')
+               AND ($9::uuid[] IS NULL OR c.id = ANY($9))"
         ).bind(claims.sub).bind(clearance_rank).bind(rank_capped).bind(claims.api_key_id)
          .bind(claims.code_access).bind(folder_filter.as_deref()).bind(type_filter.as_deref())
-         .bind(name_filter.as_deref())
+         .bind(name_filter.as_deref()).bind(&scope_ids)
          .fetch_one(&state.db).await?
     };
 
