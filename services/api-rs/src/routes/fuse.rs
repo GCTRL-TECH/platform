@@ -183,13 +183,26 @@ pub(crate) async fn start_merge(
     .execute(&state.db).await?;
 
     // A scoped token sees only its grants - without this row the merge it just
-    // started would be invisible to it (same as POST /kg/compilations).
+    // started would be invisible to it (same as POST /kg/compilations). The
+    // grant is CAPPED at the lowest rank the token holds on any source: a
+    // NULL rank would open the merge up to the key's own ceiling, above a
+    // rank-limited source grant, and the merged elements keep their labels.
     if scope.is_some() {
         if let Some(key_id) = claims.api_key_id {
+            let key_rank = crate::routes::kg::get_user_clearance_rank(&state.db, claims).await;
+            let cap: Option<i32> = sqlx::query_scalar(
+                "SELECT LEAST(
+                   (SELECT MIN(COALESCE(g.granted_rank, $3)) FROM api_key_grants g
+                      JOIN compilations c ON c.id = g.compilation_id
+                     WHERE g.api_key_id = $1 AND c.source_job_ids && $2::uuid[]),
+                   (SELECT cl.rank FROM api_keys k
+                      JOIN classification_levels cl ON cl.id = k.class_scope_level_id
+                     WHERE k.id = $1))"
+            ).bind(key_id).bind(&source_job_ids).bind(key_rank).fetch_one(&state.db).await?;
             sqlx::query(
                 "INSERT INTO api_key_grants (api_key_id, compilation_id, granted_rank)
-                 VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING"
-            ).bind(key_id).bind(comp_id).execute(&state.db).await?;
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+            ).bind(key_id).bind(comp_id).bind(cap.unwrap_or(key_rank)).execute(&state.db).await?;
         }
     }
 
