@@ -9,8 +9,17 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<<<<<<< HEAD
-<!-- baseline-sha: b9d19b2 -->
+<!-- baseline-sha: e5b6f8b -->
+
+## v0.9.29 - Colleague tokens see every granted knowledge base and can merge them
+
+*23 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **A colleague's agent now lists every knowledge base it was granted.** The list of knowledge bases used to pick the 200 newest graphs of the account first and apply the token's grants afterwards, so a colleague with many grants saw only the few that happened to be recent - older project graphs were simply missing. The grants are now part of the query itself, in the agent tool `list_graphs`, in the REST list and in the MCP server, and paging and totals are right for scoped tokens too.
+- **Colleague tokens can merge knowledge bases.** The agent tool `fuse_graphs` refused every knowledge-base-scoped token outright. It now merges whatever the token is granted - every source has to lie inside its grants, Codebase sources need Codebase access - and the result is granted onto the token, so the agent can work with the merge it just started.
+- **Merge by knowledge base, filed where it belongs.** `fuse_graphs` and `POST /fuse/merge` take `compilationIds` (the graphs to merge; agents never see job ids) and `folderPath`, so a merge lands in the project folder instead of unfiled at the tree root. The REST merge enforces the same scope rules as the agent tool - it used to check ownership only.
+- **Long merges are no longer declared dead.** A large merge with link prediction runs longer than five minutes; the stale-job sweep then marked it failed while the worker kept computing and later finished. The merge and distill workers now send a heartbeat while they work, and a heartbeat can never revive a job that was cancelled.
+- **Copy buttons work on plain http.** Copying a fresh access token, the "Connect your agent" snippet, a Cypher query or a license key did nothing when Ground Control was opened over `http://<LAN-IP>` - browsers only offer the clipboard API on https and localhost. Every copy button now falls back to the classic selection copy, so it works in every setup.
 
 ## v0.9.28 - Your knowledge base keeps what you asked it to keep
 
@@ -96,19 +105,6 @@ keep improving - so here it is, release by release.
 - **Qdrant can require an API key.** Set `QDRANT_API_KEY` in your `.env` and every GCTRL service sends it to Qdrant, and the bundled Qdrant starts with that key. Leave it empty and nothing changes: no key is sent and Qdrant stays open as before, so an update never locks your own services out.
 - **Scoped tokens see only their own extractions and their granted knowledge bases.** A token limited to some knowledge bases could list every extraction of its owner, with file names, and the job details named knowledge bases outside its grants. It now sees only the jobs it started and only the knowledge bases it is granted.
 - **An empty result from the entity resolver no longer triggers a looser merge.** When LIMES ran fine but found no matching pair, the merge treated that as a failure and fell back to a looser name comparison, which could merge two different companies with similar names. A successful empty result now counts as an answer; the fallback runs only when the resolver really fails.
-=======
-<!-- baseline-sha: 9daa45b -->
->>>>>>> 05bc265 (docs(updates): baseline-sha auf 9daa45b)
-
-## v0.9.20 - Colleague tokens see every granted knowledge base and can merge them
-
-*23 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
-
-- **A colleague's agent now lists every knowledge base it was granted.** The list of knowledge bases used to pick the 200 newest graphs of the account first and apply the token's grants afterwards, so a colleague with many grants saw only the few that happened to be recent - older project graphs were simply missing. The grants are now part of the query itself, in the agent tool `list_graphs`, in the REST list and in the MCP server, and paging and totals are right for scoped tokens too.
-- **Colleague tokens can merge knowledge bases.** The agent tool `fuse_graphs` refused every knowledge-base-scoped token outright. It now merges whatever the token is granted - every source has to lie inside its grants, Codebase sources need Codebase access - and the result is granted onto the token, so the agent can work with the merge it just started.
-- **Merge by knowledge base, filed where it belongs.** `fuse_graphs` and `POST /fuse/merge` take `compilationIds` (the graphs to merge; agents never see job ids) and `folderPath`, so a merge lands in the project folder instead of unfiled at the tree root. The REST merge enforces the same scope rules as the agent tool - it used to check ownership only.
-- **Long merges are no longer declared dead.** A large merge with link prediction runs longer than five minutes; the stale-job sweep then marked it failed while the worker kept computing and later finished. The merge and distill workers now send a heartbeat while they work, and a heartbeat can never revive a job that was cancelled.
-- **Copy buttons work on plain http.** Copying a fresh access token, the "Connect your agent" snippet, a Cypher query or a license key did nothing when Ground Control was opened over `http://<LAN-IP>` - browsers only offer the clipboard API on https and localhost. Every copy button now falls back to the classic selection copy, so it works in every setup.
 
 ## v0.9.19 - Cloaking covers every known name, and long knowledge base lists load at once
 
