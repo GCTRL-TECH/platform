@@ -10,6 +10,7 @@ import os
 import json
 import logging
 import re
+import zipfile
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -616,9 +617,40 @@ def _extract_plaintext(data: bytes) -> str:
 # ── XLSX (Excel) ───────────────────────────────────────────────────
 
 
+_XLSX_AUTOFILTER_RE = re.compile(rb"<autoFilter\b[^>]*?(?:/>|>.*?</autoFilter>)", re.DOTALL)
+
+
+def _xlsx_without_autofilters(data: bytes) -> bytes:
+    """The same workbook with every `<autoFilter>` element removed from the sheet and
+    table parts. openpyxl validates the filter criteria while LOADING (even read-only)
+    and rejects values Excel itself accepts — a text criterion without wildcard raises
+    `ValueError: Value must be either numerical or a string containing a wildcard`.
+    Four uploads of a "Datenkatalog (altes Format)" failed that way on Asgard
+    (2026-10-28). Filters carry no cell content, so dropping them loses nothing."""
+    src = zipfile.ZipFile(io.BytesIO(data))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            payload = src.read(item.filename)
+            if item.filename.startswith(("xl/worksheets/", "xl/tables/")) and item.filename.endswith(".xml"):
+                payload = _XLSX_AUTOFILTER_RE.sub(b"", payload)
+            dst.writestr(item, payload)
+    return out.getvalue()
+
+
 def _xlsx_sheet_parts(data: bytes, data_only: bool) -> list:
     """One text block per non-empty sheet. `data_only=True` reads cached formula RESULTS,
-    `False` the formulas themselves."""
+    `False` the formulas themselves. A workbook openpyxl rejects over its filter criteria
+    is read again without its autofilters (see `_xlsx_without_autofilters`)."""
+    try:
+        return _xlsx_sheet_parts_raw(data, data_only)
+    except ValueError as e:
+        if "wildcard" not in str(e):
+            raise
+        return _xlsx_sheet_parts_raw(_xlsx_without_autofilters(data), data_only)
+
+
+def _xlsx_sheet_parts_raw(data: bytes, data_only: bool) -> list:
     from openpyxl import load_workbook  # type: ignore
 
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=data_only)
