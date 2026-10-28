@@ -9,7 +9,15 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: e5b6f8b -->
+<!-- baseline-sha: cdae2d9 -->
+
+## v0.9.30 - Updates keep your network setup, filtered spreadsheets ingest
+
+*28 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **An in-app update no longer loses a container's network setup.** The updater rebuilds every service container from its running configuration, but it copied only the network aliases. A service with a fixed address (compose `ipv4_address`), a route priority (`gw_priority`) or an extra network joined without alias came back without them. On an installation whose sandbox firewall only admits the API at its fixed address, every cloaked chat failed with "Connection error." after the update until the networks were re-attached by hand. Fixed addresses, route priorities and every joined network now survive the update.
+- **Spreadsheets with filter criteria ingest again.** Excel workbooks whose autofilter carried a text criterion were rejected while loading ("Value must be either numerical or a string containing a wildcard") and the upload failed. Such a workbook is now read again without its filters - the cells are what matters, the filter settings carry no content.
+- **A cancelled merge stays cancelled.** A long merge that finished after you cancelled it could flip back to "completed". The completion is only written for a merge that is still running or that the stale-job sweep had marked failed.
 
 ## v0.9.29 - Colleague tokens see every granted knowledge base and can merge them
 
