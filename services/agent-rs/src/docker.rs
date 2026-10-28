@@ -165,13 +165,7 @@ fn build_create_config(inspect: &Value) -> Value {
     let mut endpoints = serde_json::Map::new();
     if let Some(nets) = inspect["NetworkSettings"]["Networks"].as_object() {
         for (net, ep) in nets {
-            let aliases: Vec<Value> = ep["Aliases"]
-                .as_array()
-                .map(|a| a.iter().filter(|v| v.as_str() != Some(short_id.as_str())).cloned().collect())
-                .unwrap_or_default();
-            if !aliases.is_empty() {
-                endpoints.insert(net.clone(), json!({ "Aliases": aliases }));
-            }
+            endpoints.insert(net.clone(), Value::Object(endpoint_config(ep, &short_id)));
         }
     }
 
@@ -181,6 +175,38 @@ fn build_create_config(inspect: &Value) -> Value {
         body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
     }
     body
+}
+
+/// The `EndpointsConfig` entry for one network of the old container — same rule as
+/// api-rs `endpoint_config` (keep the two in sync). Every network is carried over
+/// (one joined without alias used to be dropped), with its aliases minus the old
+/// short id, the operator's static address (`IPAMConfig`, never the leased
+/// `IPAddress`) and the route priority (`GwPriority`). Why: 2026-10-28 on Asgard the
+/// update recreated gctrl-api without its pinned sandbox-network address and default
+/// route; the sandbox firewall then refused every cloaked chat ("Connection error.").
+fn endpoint_config(ep: &Value, short_id: &str) -> serde_json::Map<String, Value> {
+    let mut endpoint = serde_json::Map::new();
+    let aliases: Vec<Value> = ep["Aliases"]
+        .as_array()
+        .map(|a| a.iter().filter(|v| v.as_str() != Some(short_id)).cloned().collect())
+        .unwrap_or_default();
+    if !aliases.is_empty() {
+        endpoint.insert("Aliases".into(), Value::Array(aliases));
+    }
+    if let Some(ipam) = ep["IPAMConfig"].as_object() {
+        let has_ip = ["IPv4Address", "IPv6Address"]
+            .iter()
+            .any(|k| ipam.get(*k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()));
+        if has_ip {
+            endpoint.insert("IPAMConfig".into(), Value::Object(ipam.clone()));
+        }
+    }
+    if let Some(prio) = ep["GwPriority"].as_i64() {
+        if prio != 0 {
+            endpoint.insert("GwPriority".into(), json!(prio));
+        }
+    }
+    endpoint
 }
 
 /// Re-bases the image-baked parts of a copied `Config` onto the NEW image — same
@@ -400,6 +426,29 @@ mod tests {
         let mut i = sample_inspect();
         i["HostConfig"]["NetworkMode"] = json!("");
         assert_eq!(build_create_config(&i)["HostConfig"]["NetworkMode"], "bridge");
+    }
+
+    // Real case 2026-10-28 (Asgard): pinned sandbox address + gw priority were dropped.
+    #[test]
+    fn build_create_config_keeps_static_ip_and_gw_priority_and_networks_without_alias() {
+        let mut i = sample_inspect();
+        i["NetworkSettings"]["Networks"]["anvil-sandbox-net"] = json!({
+            "Aliases": ["gctrl-api", "abcdef123456"],
+            "IPAMConfig": { "IPv4Address": "10.89.0.10", "IPv6Address": "", "LinkLocalIPs": null },
+            "IPAddress": "10.89.0.10",
+            "GwPriority": -100
+        });
+        i["NetworkSettings"]["Networks"]["plain-net"] = json!({
+            "Aliases": null, "IPAMConfig": null, "IPAddress": "172.30.0.7", "GwPriority": 0
+        });
+        let cfg = build_create_config(&i);
+        let eps = &cfg["NetworkingConfig"]["EndpointsConfig"];
+        assert_eq!(eps["anvil-sandbox-net"]["Aliases"], json!(["gctrl-api"]));
+        assert_eq!(eps["anvil-sandbox-net"]["IPAMConfig"]["IPv4Address"], "10.89.0.10");
+        assert_eq!(eps["anvil-sandbox-net"]["GwPriority"], -100);
+        assert!(eps["anvil-sandbox-net"].get("IPAddress").is_none());
+        assert!(eps["plain-net"].is_object(), "network without alias must be carried over: {eps}");
+        assert_eq!(eps["gctrl_gctrl"], json!({ "Aliases": ["gctrl-web"] }));
     }
 
     #[test]

@@ -1123,13 +1123,7 @@ fn build_create_config(inspect: &Value) -> Value {
     let mut endpoints = serde_json::Map::new();
     if let Some(nets) = inspect["NetworkSettings"]["Networks"].as_object() {
         for (net, ep) in nets {
-            let aliases: Vec<Value> = ep["Aliases"]
-                .as_array()
-                .map(|a| a.iter().filter(|v| v.as_str() != Some(short_id.as_str())).cloned().collect())
-                .unwrap_or_default();
-            if !aliases.is_empty() {
-                endpoints.insert(net.clone(), json!({ "Aliases": aliases }));
-            }
+            endpoints.insert(net.clone(), Value::Object(endpoint_config(ep, &short_id)));
         }
     }
 
@@ -1139,6 +1133,49 @@ fn build_create_config(inspect: &Value) -> Value {
         body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
     }
     body
+}
+
+/// The `EndpointsConfig` entry for one network of the old container.
+///
+/// Every network the container was attached to is carried over, not only those with
+/// aliases: a network joined with `docker network connect` and no alias used to be
+/// dropped silently. What is copied per network:
+/// - `Aliases` minus the old container's short id (compose service aliases keep DNS by
+///   service name working);
+/// - `IPAMConfig` — the OPERATOR'S static address (compose `ipv4_address`,
+///   `docker network connect --ip`). The runtime `IPAddress` is never copied: dockerd
+///   assigns it and a leased address must not be frozen. Seen live on 2026-10-28
+///   (Asgard): the in-app update recreated gctrl-api without its pinned
+///   `10.89.0.10`/`10.89.1.10` in the Anvil sandbox networks; the sandbox firewall only
+///   admits port 4000 to exactly those addresses, so every cloaked chat from a sandbox
+///   failed with "Connection error." until the networks were re-attached by hand;
+/// - `GwPriority` (compose `gw_priority`, `--gw-priority`) — decides which network
+///   holds the default route. Without it the last attached sandbox network became the
+///   default route and the api lost its way to the host's oMLX gateway
+///   ("Ollama upstream unreachable", same incident).
+fn endpoint_config(ep: &Value, short_id: &str) -> serde_json::Map<String, Value> {
+    let mut endpoint = serde_json::Map::new();
+    let aliases: Vec<Value> = ep["Aliases"]
+        .as_array()
+        .map(|a| a.iter().filter(|v| v.as_str() != Some(short_id)).cloned().collect())
+        .unwrap_or_default();
+    if !aliases.is_empty() {
+        endpoint.insert("Aliases".into(), Value::Array(aliases));
+    }
+    if let Some(ipam) = ep["IPAMConfig"].as_object() {
+        let has_ip = ["IPv4Address", "IPv6Address"]
+            .iter()
+            .any(|k| ipam.get(*k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()));
+        if has_ip {
+            endpoint.insert("IPAMConfig".into(), Value::Object(ipam.clone()));
+        }
+    }
+    if let Some(prio) = ep["GwPriority"].as_i64() {
+        if prio != 0 {
+            endpoint.insert("GwPriority".into(), json!(prio));
+        }
+    }
+    endpoint
 }
 
 /// Re-bases the image-baked parts of a copied `Config` onto the NEW image.
@@ -1517,6 +1554,39 @@ mod tests {
         let mut i = sample_inspect();
         i["HostConfig"]["NetworkMode"] = json!("");
         assert_eq!(build_create_config(&i)["HostConfig"]["NetworkMode"], "bridge");
+    }
+
+    // Real case 2026-10-28 (Asgard): gctrl-api is pinned to 10.89.0.10 in the Anvil sandbox
+    // network (compose `ipv4_address`, firewall admits port 4000 only there) and keeps its
+    // default route in gctrl-net via `gw_priority`. The recreate dropped both.
+    #[test]
+    fn build_create_config_keeps_static_ip_and_gw_priority_and_networks_without_alias() {
+        let mut i = sample_inspect();
+        i["NetworkSettings"]["Networks"]["anvil-sandbox-net"] = json!({
+            "Aliases": ["gctrl-api", "abcdef123456"],
+            "IPAMConfig": { "IPv4Address": "10.89.0.10", "IPv6Address": "", "LinkLocalIPs": null },
+            "IPAddress": "10.89.0.10",
+            "GwPriority": -100
+        });
+        // Joined by hand, no alias, leased address only: must still come back.
+        i["NetworkSettings"]["Networks"]["plain-net"] = json!({
+            "Aliases": null, "IPAMConfig": null, "IPAddress": "172.30.0.7", "GwPriority": 0
+        });
+        let cfg = build_create_config(&i);
+        let eps = &cfg["NetworkingConfig"]["EndpointsConfig"];
+
+        let sb = &eps["anvil-sandbox-net"];
+        assert_eq!(sb["Aliases"], json!(["gctrl-api"]));
+        assert_eq!(sb["IPAMConfig"]["IPv4Address"], "10.89.0.10");
+        assert_eq!(sb["GwPriority"], -100);
+        assert!(sb.get("IPAddress").is_none(), "leased address is never copied");
+
+        let plain = &eps["plain-net"];
+        assert!(plain.is_object(), "network without alias must be carried over: {eps}");
+        assert!(plain.get("IPAMConfig").is_none() && plain.get("GwPriority").is_none() && plain.get("Aliases").is_none());
+
+        // The compose network of the sample keeps its old shape: alias only, no pin.
+        assert_eq!(eps["gctrl_gctrl"], json!({ "Aliases": ["gctrl-web"] }));
     }
 
     // Real case 2026-09-28: in-app update 0.1.294 -> 0.1.295 left GCTRL_VERSION=0.1.294.
