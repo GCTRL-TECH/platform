@@ -435,16 +435,15 @@ async fn enqueue_one_distill(
         _ => {}
     }
 
-    // Private Memory: don't distill a local_only/cloaked wiki (or one built
-    // from a local_only/cloaked source graph) through a CLOUD-configured
-    // runtime — the distill LLM call would send graph content off-box. Skips
-    // (not an error) — mirrors the debounce below rather than flipping the
-    // trigger to 'error' status, so it just retries next tick once the
-    // runtime/mode changes. Minimal enforcement: log-only. There is no cheap
-    // field on the wiki page list response to surface "distill paused" today,
-    // so a user won't see WHY a privacy-scoped wiki stopped refreshing except
-    // via server logs — documented gap, not rebuilding the FUSE pipeline to
-    // add one.
+    // Private Memory: don't distill a local_only wiki (or one built from a
+    // local_only source graph) through a CLOUD-configured runtime — the distill
+    // LLM call would send graph content off-box. See `distill_paused_by_privacy`
+    // for why `cloaked` no longer pauses. Skips (not an error) — mirrors the
+    // debounce below rather than flipping the trigger to 'error' status, so it
+    // just retries next tick once the runtime/mode changes. Minimal enforcement:
+    // log-only. There is no cheap field on the wiki page list response to
+    // surface "distill paused" today, so a user won't see WHY a privacy-scoped
+    // wiki stopped refreshing except via server logs — documented gap.
     {
         let mut privacy_scope: Vec<Uuid> = vec![compilation_id];
         let sources: Vec<Uuid> = sqlx::query_scalar(
@@ -465,7 +464,8 @@ async fn enqueue_one_distill(
             .ok()
             .flatten();
             if let Some((Some(provider), base_url)) = runtime_row {
-                if crate::services::privacy::is_cloud_target(&provider, base_url.as_deref(), None) {
+                let cloud = crate::services::privacy::is_cloud_target(&provider, base_url.as_deref(), None);
+                if distill_paused_by_privacy(decision.mode, cloud) {
                     tracing::warn!(
                         "distill paused for wiki {compilation_id}: privacy mode {:?} but the active runtime ({provider}) is cloud — distill (privacy: local runtime required)",
                         decision.mode
@@ -610,6 +610,37 @@ async fn wiki_has_new_content(
     .await
     .map_err(|e| e.to_string())?;
     Ok(used.is_some())
+}
+
+/// Does the privacy mode of a wiki (and its sources) pause the SCHEDULED distill
+/// on this runtime? Only `local_only` on a cloud runtime does.
+///
+/// `cloaked` paused too until 2026-11-02, and that was the only place it did: the
+/// manual `POST /compilations/:id/distill` never checked it, RAG routes cloaked
+/// scopes through the cloak gateway, and KEX relation extraction sends the raw
+/// text of a cloaked graph to the same cloud runtime. Anvil creates every room
+/// knowledge base `cloaked`, so on an install without a GPU (cloud runtime) the
+/// wiki of every room stopped refreshing for good while protecting nothing the
+/// ingest had not already sent (Bifroest demo). FUSE does not pseudonymize distill
+/// prompts yet — that is the follow-up that makes `cloaked` mean what it says here.
+fn distill_paused_by_privacy(mode: crate::services::privacy::PrivacyMode, cloud_runtime: bool) -> bool {
+    cloud_runtime && mode == crate::services::privacy::PrivacyMode::LocalOnly
+}
+
+#[cfg(test)]
+mod distill_privacy_tests {
+    use super::distill_paused_by_privacy;
+    use crate::services::privacy::PrivacyMode;
+
+    #[test]
+    fn only_local_only_on_a_cloud_runtime_pauses() {
+        assert!(distill_paused_by_privacy(PrivacyMode::LocalOnly, true));
+        assert!(!distill_paused_by_privacy(PrivacyMode::Cloaked, true));
+        assert!(!distill_paused_by_privacy(PrivacyMode::Open, true));
+        for mode in [PrivacyMode::Open, PrivacyMode::Cloaked, PrivacyMode::LocalOnly] {
+            assert!(!distill_paused_by_privacy(mode, false), "{mode:?} on a local runtime");
+        }
+    }
 }
 
 /// Compute the next run instant. change_detection → always due next tick (now);

@@ -144,6 +144,10 @@ services:
       - PG_URL=postgresql://gctrl:${POSTGRES_PASSWORD:-gctrl-postgres-password}@gctrl-postgres:5432/gctrl
       - QDRANT_URL=${QDRANT_URL:-http://gctrl-qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      # Same collection kex writes to. Qdrant names are case-sensitive: without this
+      # FUSE fell back to its default "GCTRL_chunks" (404) and distilled pages had no
+      # source passages.
+      - QDRANT_COLLECTION=gctrl_chunks
       - OLLAMA_BASE=${OLLAMA_BASE:-http://gctrl-ollama:11434}
       - GCTRL_DISTILL_MODEL=${GCTRL_DISTILL_MODEL:-llama3.2}
       - PHOENIX_OTLP_URL=${PHOENIX_OTLP_URL:-}
