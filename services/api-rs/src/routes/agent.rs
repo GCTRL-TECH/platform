@@ -360,10 +360,20 @@ pub(crate) async fn build_system_prompt(
 
 // ── Tool definitions (for GET /tools) ────────────────────────────────────────
 
+/// PURE: the page `list_graphs` reads. Default 200 newest (the old fixed page, so a
+/// call without arguments returns what it always did), `limit` up to 1000,
+/// `offset` pages past the first 200 - accounts with more knowledge bases (519 on
+/// Asgard, 2026-11-03) had no way to reach the rest.
+pub(crate) fn list_graphs_page(args: &Value) -> (i64, i64) {
+    let limit = args["limit"].as_i64().unwrap_or(200).clamp(1, 1000);
+    let offset = args["offset"].as_i64().unwrap_or(0).max(0);
+    (limit, offset)
+}
+
 pub(crate) fn tool_schema() -> Value {
     json!({
         "tools": [
-            { "name": "list_graphs",        "description": "List knowledge graphs the caller can access - id, name, type (RAW | WIKI | CODE), folderPath (Users/<name>/..., Projects/<client>/..., Global/...), nodeCount/edgeCount/sourceCount, classification, privacyMode. Pick your target knowledge base by placement and type, never by name alone", "args": {} },
+            { "name": "list_graphs",        "description": "List knowledge graphs the caller can access - id, name, type (RAW | WIKI | CODE), folderPath (Users/<name>/..., Projects/<client>/..., Global/...), nodeCount/edgeCount/sourceCount, classification, privacyMode. Pick your target knowledge base by placement and type, never by name alone. Newest first, 200 per call by default (limit up to 1000); when total exceeds what you got, call again with offset", "args": { "limit": "number?", "offset": "number?" } },
             { "name": "get_graph",          "description": "Read a compilation's entities and relationships. Start with response_format='summary' (default) — returns {name,type,degree} + relation-type counts, much cheaper than 'full'. Only use 'full' if you need the complete edge list. Default limit 100; max 500.", "args": { "compilationId": "string", "limit": "number?", "response_format": "string?" } },
             { "name": "query",              "description": "Blended answer over graph + chunks + dossiers (RAG). Preferred first read tool for open questions — blends all memory tiers automatically and returns a grounded answer with sources + confidence. Args: { message: string, compilationId?: string }", "args": { "message": "string", "compilationId": "string?" } },
             { "name": "store",              "description": "Write-back: extract entities from text and link to a compilation. Call it when the user asks you to remember something or confirms your proposal, never unasked after a task (unverified agent notes are read back later as facts). Always pass compilationId (find via list_graphs). ALWAYS pass sourceRef too — where this knowledge comes from (file path, URL, ticket/run id, 'conversation with <person> on <date>'). It becomes the traceable origin of every fact extracted from this text; without it the graph can state something but never show where it read it. Write conclusions as YOUR findings: say the user said, clarified or confirmed something only when the user's own message in this session says it. Args: { text: string, compilationId?: string, sourceRef?: string }", "args": { "text": "string", "compilationId": "string?", "sourceRef": "string?" } },
@@ -797,11 +807,9 @@ async fn execute_tool_inner(
             // Codebase access off (078): CODE knowledge bases are excluded in SQL,
             // not after the fact - a post-filter would shorten the LIMIT 50 page and
             // hide non-code graphs behind the code ones it dropped.
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String,
-                                             String, Option<uuid::Uuid>, Vec<uuid::Uuid>)>(
-                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode,
-                        c.type::text, c.folder_id, COALESCE(c.source_job_ids, '{}'::uuid[])
-                 FROM compilations c
+            let (limit, offset) = list_graphs_page(args);
+            // One WHERE for the page and for `total`.
+            const VISIBLE: &str = "FROM compilations c
                  LEFT JOIN classification_levels cl ON c.classification_level_id = cl.id
                  WHERE c.user_id = $1
                    AND ($5 OR c.type::text <> 'CODE')
@@ -812,13 +820,24 @@ async fn execute_tool_inner(
                                    WHERE g.api_key_id = $4 AND g.compilation_id = c.id
                                      AND (g.granted_rank IS NULL
                                           OR c.classification_level_id IS NULL
-                                          OR g.granted_rank >= cl.rank)))
-                 ORDER BY c.created_at DESC LIMIT 200"
-            )
+                                          OR g.granted_rank >= cl.rank)))";
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, String,
+                                             String, Option<uuid::Uuid>, Vec<uuid::Uuid>)>(&format!(
+                "SELECT c.id, c.name, c.description, cl.name, c.privacy_mode,
+                        c.type::text, c.folder_id, COALESCE(c.source_job_ids, '{{}}'::uuid[])
+                 {VISIBLE}
+                 ORDER BY c.created_at DESC LIMIT $7 OFFSET $8"
+            ))
             .bind(claims.sub).bind(rank).bind(rank_capped).bind(claims.api_key_id)
             .bind(claims.code_access)
             .bind(&scope_ids)
+            .bind(limit).bind(offset)
             .fetch_all(&state.db).await.unwrap_or_default();
+            let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {VISIBLE}"))
+                .bind(claims.sub).bind(rank).bind(rank_capped).bind(claims.api_key_id)
+                .bind(claims.code_access)
+                .bind(&scope_ids)
+                .fetch_one(&state.db).await.unwrap_or(offset + rows.len() as i64);
 
             // The skill tells a model to pick its knowledge base from this list -
             // so the list must say what each graph IS (RAW / WIKI / CODE), WHERE
@@ -826,9 +845,18 @@ async fn execute_tool_inner(
             // how big it is. Name-only rows made "Team Wave" vs "Team Wave (code)"
             // a guess and hid empty graphs behind identical labels.
             let paths = crate::routes::kg::folder_paths(&state.db, claims.sub).await;
+            // Live counts for the whole page in ONE Neo4j query, as /kg/compilations
+            // does. Per row this ran live_counts: two unindexable full-graph scans
+            // (`any(.. IN _source_jobs)`, ~50 ms each on 97k nodes) in series, so the
+            // default page of 200 took 20-23 s on Asgard whatever the graphs held.
+            let page: Vec<(uuid::Uuid, Vec<uuid::Uuid>)> = rows.iter().map(|r| (r.0, r.7.clone())).collect();
+            let counts = crate::routes::kg::live_counts_batch(&state.neo, &page).await.unwrap_or_else(|e| {
+                tracing::warn!("list_graphs: live counts unavailable: {e}");
+                Default::default()
+            });
             let mut graphs: Vec<Value> = Vec::with_capacity(rows.len());
             for (id, name, desc, cls, privacy, ctype, folder_id, sji) in rows.iter() {
-                let (nodes, edges) = crate::routes::kg::live_counts(&state.neo, sji).await;
+                let (nodes, edges) = counts.get(id).copied().unwrap_or((0, 0));
                 graphs.push(json!({
                     "id": id, "name": name, "description": desc,
                     "classification": cls, "privacyMode": privacy,
@@ -839,7 +867,7 @@ async fn execute_tool_inner(
                     "sourceCount": sji.len(),
                 }));
             }
-            json!({ "graphs": graphs })
+            json!({ "graphs": graphs, "total": total, "limit": limit, "offset": offset })
         }
 
         // ── Read: search entities by name (clearance-filtered) ────────────────
@@ -3346,5 +3374,38 @@ mod provenance_tests {
     fn short_text_is_not_padded_or_truncated() {
         assert_eq!(source_path_for(None, "kurz"), "text:kurz");
         assert_eq!(source_path_for(None, ""), "text:");
+    }
+}
+
+#[cfg(test)]
+mod list_graphs_tests {
+    use super::list_graphs_page;
+    use serde_json::json;
+
+    #[test]
+    fn default_page_is_the_old_fixed_page_of_200() {
+        assert_eq!(list_graphs_page(&json!({})), (200, 0));
+    }
+
+    #[test]
+    fn limit_and_offset_page_and_are_clamped() {
+        assert_eq!(list_graphs_page(&json!({ "limit": 500, "offset": 200 })), (500, 200));
+        assert_eq!(list_graphs_page(&json!({ "limit": 5000 })), (1000, 0));
+        assert_eq!(list_graphs_page(&json!({ "limit": -5, "offset": -10 })), (1, 0));
+        assert_eq!(list_graphs_page(&json!({ "limit": 0 })), (1, 0));
+    }
+
+    /// Asgard 2026-11-03: list_graphs took 20-23 s for its page of 200 because it
+    /// ran `live_counts` (two full-graph scans) per row in series. The counts must
+    /// come from ONE batched query for the page.
+    #[test]
+    fn list_graphs_counts_in_one_batched_query_not_per_row() {
+        let src = include_str!("agent.rs");
+        let start = src.find("\"list_graphs\" => {").expect("list_graphs arm");
+        let end = start + src[start..].find("\"search_entities\" => {").expect("next arm");
+        let arm = &src[start..end];
+        assert!(arm.contains("live_counts_batch("), "list_graphs must batch its live counts");
+        assert!(!arm.contains("kg::live_counts("), "no per-row live_counts in list_graphs");
+        assert!(arm.contains("\"total\": total") && arm.contains("\"limit\": limit") && arm.contains("\"offset\": offset"));
     }
 }
