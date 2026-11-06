@@ -685,6 +685,53 @@ fn compute_next_run_after_error_at(
 }
 
 #[cfg(test)]
+mod dedup_window_tests {
+    use super::dedup_due_at;
+    use chrono::Datelike;
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+    // 2026-11-06 = day 739926 since CE; the tests only compare days relatively.
+    #[test]
+    fn manual_always_dedups() {
+        assert!(dedup_due_at("manual", Some(3), at("2026-11-06T15:00:00Z"), None).0);
+    }
+    #[test]
+    fn tick_mode_dedups_every_cycle() {
+        assert!(dedup_due_at("scheduled", None, at("2026-11-06T15:00:00Z"), None).0);
+    }
+    #[test]
+    fn boot_after_window_counts_today_as_done() {
+        let (due, day) = dedup_due_at("scheduled", Some(3), at("2026-11-06T20:02:00Z"), None);
+        assert!(!due);
+        // next tick the same evening: still not due
+        let (due2, _) = dedup_due_at("scheduled", Some(3), at("2026-11-06T21:02:00Z"), day);
+        assert!(!due2);
+        // next morning before 03:00 UTC: not due; at/after 03:00: due exactly once
+        let (due3, day3) = dedup_due_at("scheduled", Some(3), at("2026-11-07T02:02:00Z"), day);
+        assert!(!due3);
+        let (due4, day4) = dedup_due_at("scheduled", Some(3), at("2026-11-07T03:02:00Z"), day3);
+        assert!(due4);
+        let (due5, _) = dedup_due_at("scheduled", Some(3), at("2026-11-07T04:02:00Z"), day4);
+        assert!(!due5);
+    }
+    #[test]
+    fn boot_before_window_runs_at_the_window() {
+        let (due, day) = dedup_due_at("scheduled", Some(3), at("2026-11-07T01:30:00Z"), None);
+        assert!(!due);
+        let (due2, _) = dedup_due_at("scheduled", Some(3), at("2026-11-07T03:30:00Z"), day);
+        assert!(due2);
+    }
+    #[test]
+    fn a_skipped_window_catches_up_later_the_same_day() {
+        let day = Some(at("2026-11-06T03:00:00Z").date_naive().num_days_from_ce() as i64);
+        let (due, _) = dedup_due_at("scheduled", Some(3), at("2026-11-07T11:00:00Z"), day);
+        assert!(due);
+    }
+}
+
+#[cfg(test)]
 mod next_run_tests {
     use super::*;
 
@@ -1531,6 +1578,67 @@ pub(crate) fn memory_tick_secs() -> u64 {
     std::env::var("GCTRL_MEMORY_TICK_SECS")
         .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(600)
 }
+/// When the SCHEDULED cycle may run the dedup sweep (A5). Dedup is a corpus sweep:
+/// on Asgard one run meant 500-1200 merges = hundreds of `points/delete?wait=true`
+/// against Qdrant for ~10 min, every hour, during office hours (06.11.2026, while
+/// the VM was already under IO pressure every delete timed out). Since then the
+/// scheduled cycle dedups ONCE per day, at the first tick at or after this UTC hour
+/// (env GCTRL_DEDUP_HOUR, default 3 = night). "tick" restores the old every-cycle
+/// behaviour; a manual run (POST /api/memory/maintenance/run) always dedups.
+fn dedup_hour() -> Option<u32> {
+    match std::env::var("GCTRL_DEDUP_HOUR").ok().map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "tick" || v == "always" => None,
+        Some(v) => Some(v.parse::<u32>().ok().filter(|h| *h < 24).unwrap_or(3)),
+        None => Some(3),
+    }
+}
+
+/// Day number (days since CE) of the last scheduled dedup; -2 = not initialised.
+static LAST_DEDUP_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-2);
+
+/// Pure decision: is a dedup due now? `last_day` is the day of the last scheduled run,
+/// `None` on the first call after boot. Returns the decision and the day to remember.
+/// On boot after the window has already passed today, today counts as done — otherwise
+/// every restart in the afternoon would trigger a full sweep two minutes later.
+pub(crate) fn dedup_due_at(
+    trigger: &str,
+    hour: Option<u32>,
+    now: chrono::DateTime<chrono::Utc>,
+    last_day: Option<i64>,
+) -> (bool, Option<i64>) {
+    use chrono::{Datelike, Timelike};
+    if trigger == "manual" {
+        return (true, last_day);
+    }
+    let Some(hour) = hour else { return (true, last_day) };
+    let today = now.date_naive().num_days_from_ce() as i64;
+    let in_window = now.hour() >= hour;
+    match last_day {
+        None => {
+            if in_window { (false, Some(today)) } else { (false, Some(today - 1)) }
+        }
+        Some(d) if d >= today => (false, Some(d)),
+        Some(_) => {
+            if in_window { (true, Some(today)) } else { (false, last_day) }
+        }
+    }
+}
+
+fn dedup_due(trigger: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    let last = LAST_DEDUP_DAY.load(Ordering::SeqCst);
+    let (due, remember) = dedup_due_at(
+        trigger,
+        dedup_hour(),
+        chrono::Utc::now(),
+        if last == -2 { None } else { Some(last) },
+    );
+    if let Some(d) = remember {
+        LAST_DEDUP_DAY.store(d, Ordering::SeqCst);
+    }
+    due
+}
+
 const MEM_PROMOTE_HEAT: f64 = 5.0;        // chunk-heat-around-entity threshold
 // We SCAN up to this many hot candidate names per tick but only BUILD up to
 // MEM_PROMOTE_BUILD_CAP of them — most candidates are noisy entity_mentions that
@@ -1580,7 +1688,13 @@ pub async fn run_memory_cycle(state: &AppState, trigger: &str) -> MemoryCycleSum
     let decayed_c = decay_chunks(state, tick_secs).await;
     let (decayed_p, pruned_p) =
         crate::services::hebb::decay_coactivation(&state.db, tick_secs, MEM_IDLE_SECS).await;
-    let deduped   = dedup_chunks(state).await;          // A5
+    // A5 — once per night on the scheduled cycle (dedup_due), always on a manual run.
+    let deduped = if dedup_due(trigger) {
+        dedup_chunks(state).await
+    } else {
+        tracing::debug!("memory-cycle [{trigger}]: dedup skipped (outside the nightly window)");
+        0
+    };
     let promoted  = promote_hot_entities(state).await;  // A4-refined (degree gate)
     // Lessons proven in several projects become team lessons (routes/lessons.rs).
     let promoted_lessons = crate::routes::lessons::promote_recurring_lessons(state).await;
