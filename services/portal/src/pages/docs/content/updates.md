@@ -11,6 +11,12 @@ keep improving - so here it is, release by release.
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
 <!-- baseline-sha: cdae2d9 -->
 
+## v0.9.31 - Duplicate cleanup runs at night, not every hour
+
+*6 November 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The near-duplicate sweep now runs once per night.** The memory governance cycle merged near-duplicate passages on every tick, on busy installations every hour during office hours. Each sweep meant hundreds of vector deletes in a row, and on a server that was already under load every one of them timed out while the sweep kept the index busy for ten minutes. The scheduled cycle now runs the sweep once per day, at the first tick at or after 03:00 UTC (`GCTRL_DEDUP_HOUR`; `tick` restores the old behaviour); a restart later in the day does not trigger an extra sweep. A manual maintenance run still merges right away, and decay, promotion and eviction keep their cadence.
+
 ## v0.9.30 - Updates keep your network setup, filtered spreadsheets ingest
 
 *28 October 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
