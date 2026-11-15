@@ -208,7 +208,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
       - name: Check api-rs (show real errors)
         run: cd services/api-rs && cargo check 2>&1
       - name: Build and push api (Rust)
