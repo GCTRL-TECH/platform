@@ -66,6 +66,21 @@ pub fn apply_on_behalf(rank: i32, on_behalf: Option<i32>) -> i32 {
     match on_behalf { Some(o) => rank.min(o), None => rank }
 }
 
+/// Raw GCTRL access token from an `Authorization` header, or `None` for a JWT.
+///
+/// `ApiKey <token>` is the documented scheme. `Bearer gctrl_…` is accepted too,
+/// because many MCP clients (n8n NOD, generic OAuth-less connectors) can only
+/// send `Bearer`. Issued keys always carry the `gctrl_` prefix (api_keys.rs) and
+/// a JWT never does, so the two paths stay unambiguous. Same rule as the LLM
+/// gateway (`llm_gateway::is_gctrl_token`).
+fn api_key_token(header: &str) -> Option<&str> {
+    if let Some(raw) = header.strip_prefix("ApiKey ") {
+        return Some(raw.trim());
+    }
+    let raw = header.strip_prefix("Bearer ")?.trim();
+    raw.starts_with("gctrl_").then_some(raw)
+}
+
 /// serde default for `code_access` - absent means "on", so pre-078 tokens and
 /// JWT sessions behave exactly as before.
 fn default_true() -> bool { true }
@@ -80,7 +95,8 @@ pub async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let claims = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+    let api_key = api_key_token(auth_header);
+    let claims = if let (None, Some(token)) = (api_key, auth_header.strip_prefix("Bearer ")) {
         // ── JWT path (existing behaviour) ─────────────────────────────────────
         let key = DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes());
         let claims = decode::<JwtClaims>(token, &key, &Validation::new(Algorithm::HS256))
@@ -103,9 +119,8 @@ pub async fn require_auth(
         }
 
         claims
-    } else if let Some(raw_key) = auth_header.strip_prefix("ApiKey ") {
+    } else if let Some(raw_key) = api_key {
         // ── API key path ───────────────────────────────────────────────────────
-        let raw_key = raw_key.trim();
         let hash = hex::encode(Sha256::digest(raw_key.as_bytes()));
 
         // SEC-2: the join also filters out inactive users (api_keys are deleted on
@@ -183,9 +198,10 @@ pub async fn optional_auth(
         .map(|s| s.to_string());
     let method = req.method().clone();
 
+    let api_key = auth_value.as_deref().and_then(api_key_token);
     let claims: Option<JwtClaims> = match auth_value.as_deref() {
         // JWT path (existing behaviour) — best-effort, never fails the request.
-        Some(v) if v.starts_with("Bearer ") => {
+        Some(v) if api_key.is_none() && v.starts_with("Bearer ") => {
             let token = v.trim_start_matches("Bearer ");
             let key = DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes());
             decode::<JwtClaims>(token, &key, &Validation::new(Algorithm::HS256))
@@ -195,8 +211,8 @@ pub async fn optional_auth(
         // ApiKey path — resolve a scoped access token so RAG (and the WIKI fast
         // path) work under `Authorization: ApiKey …` too. Non-fatal: an invalid
         // key just yields None and the public path is used.
-        Some(v) if v.starts_with("ApiKey ") => {
-            let raw_key = v.trim_start_matches("ApiKey ").trim();
+        Some(_) if api_key.is_some() => {
+            let raw_key = api_key.unwrap_or_default();
             let hash = hex::encode(Sha256::digest(raw_key.as_bytes()));
             sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, i32, String, String, bool, bool)>(
                 "SELECT ak.id, ak.user_id, ak.max_clearance_rank, u.email, u.role, ak.read_only, ak.code_access
@@ -273,6 +289,31 @@ pub fn sign_refresh(cfg: &crate::config::Config, sub: uuid::Uuid, email: &str) -
         exp: (chrono::Utc::now() + chrono::Duration::days(7)).timestamp() as usize,
     };
     encode(&Header::default(), &claims, &EncodingKey::from_secret(cfg.jwt_refresh_secret.as_bytes())).unwrap()
+}
+
+#[cfg(test)]
+mod api_key_header_tests {
+    use super::api_key_token;
+
+    #[test]
+    fn apikey_schema_bleibt_gueltig() {
+        assert_eq!(api_key_token("ApiKey gctrl_abc"), Some("gctrl_abc"));
+        assert_eq!(api_key_token("ApiKey  gctrl_abc "), Some("gctrl_abc"));
+    }
+
+    #[test]
+    fn bearer_mit_gctrl_key_zaehlt_als_api_key() {
+        assert_eq!(api_key_token("Bearer gctrl_abc"), Some("gctrl_abc"));
+        assert_eq!(api_key_token("Bearer  gctrl_abc "), Some("gctrl_abc"));
+    }
+
+    #[test]
+    fn bearer_jwt_bleibt_jwt() {
+        assert_eq!(api_key_token("Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"), None);
+        assert_eq!(api_key_token("Bearer "), None);
+        assert_eq!(api_key_token("Basic gctrl_abc"), None);
+        assert_eq!(api_key_token("gctrl_abc"), None);
+    }
 }
 
 #[cfg(test)]

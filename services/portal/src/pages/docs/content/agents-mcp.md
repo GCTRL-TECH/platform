@@ -98,6 +98,8 @@ In the GCTRL portal: **Settings → Access Control → New Token**. Pick a clear
 Authorization: ApiKey gctrl_your_scoped_token
 ```
 
+Clients that can only send a bearer token (many MCP connectors, for example n8n NOD) may use `Authorization: Bearer gctrl_your_scoped_token` instead. GCTRL treats both the same way, with the same scope, clearance and expiry checks.
+
 > **Settings shortcut** - the **Settings → Agent** Harness tab and the onboarding wizard's "Connect Agent" step both have a one-click **Copy skill.md** button alongside the MCP config, with your instance URL pre-filled.
 
 ## GCTRL as a memory node
