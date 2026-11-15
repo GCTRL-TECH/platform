@@ -1,4 +1,4 @@
-FROM rust:latest AS build
+FROM rust:1.95 AS build
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
