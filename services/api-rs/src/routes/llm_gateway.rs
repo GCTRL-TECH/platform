@@ -20,16 +20,24 @@
 //! just works from inside Docker.
 //!
 //! ## Upstream selection
-//! `X-Upstream-Provider: anthropic|openai|chatgpt` (case-insensitive) picks the upstream;
-//! absent/empty = local Ollama, byte for byte today's behaviour. This module serves
-//! `POST /v1/chat/completions` for Ollama and OpenAI; Anthropic's `/v1/messages`
-//! lives in the sibling module `llm_gateway_anthropic`, and the OpenAI Responses
-//! API (`/v1/responses`, upstreams `chatgpt` = the ChatGPT subscription via Codex,
-//! and `openai`) in `llm_gateway_responses`; both build on the
+//! `X-Upstream-Provider: anthropic|openai|chatgpt|runware` (case-insensitive) picks the
+//! upstream; absent/empty = local Ollama, byte for byte today's behaviour. This module
+//! serves `POST /v1/chat/completions` for Ollama, OpenAI and Runware; Anthropic's
+//! `/v1/messages` lives in the sibling module `llm_gateway_anthropic`, and the OpenAI
+//! Responses API (`/v1/responses`, upstreams `chatgpt` = the ChatGPT subscription via
+//! Codex, and `openai`) in `llm_gateway_responses`; both build on the
 //! `pub(super)` items here (auth, upstream base, header allowlist, cloak helpers).
-//! Bases come from `ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE` (official host pinned via
-//! `validate_llm_base`; dev escape hatch `GCTRL_CLOAK_UPSTREAM_UNPINNED=1`).
+//! Bases come from `ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE` / `RUNWARE_BASE`
+//! (host only, official host pinned via `validate_llm_base`; dev escape hatch
+//! `GCTRL_CLOAK_UPSTREAM_UNPINNED=1`).
 //! `GET /v1/cloak/capabilities` (no auth) lists the supported upstreams.
+//!
+//! `runware` (`https://api.runware.ai`, OpenAI compatible) takes the `openai` chat path
+//! (same cloak, same de-cloak, Bearer key only) with two differences: every model id is
+//! a cloud egress (`anthropic:claude@haiku-5.5`, `zai-glm-5-3`, ... never hit the
+//! `:cloud` tag rule), and `developer` messages go out as `system` because Runware
+//! routes to vendors that do not all know that role. `openai-beta` is not forwarded.
+//! `GET /v1/models` with `runware` relays Runware's catalog (see `llm_gateway_responses`).
 //!
 //! ## Auth
 //! Ollama route: `Authorization: ApiKey <gctrl-token>` OR `Authorization: Bearer
@@ -38,7 +46,7 @@
 //! OUTSIDE the auth middleware so it can accept the Bearer-as-api-key shape (the
 //! shared middleware treats Bearer strictly as a JWT).
 //!
-//! Vendor upstreams (OpenAI/Anthropic): the caller's vendor credential travels in
+//! Vendor upstreams (OpenAI/Anthropic/Runware): the caller's vendor credential travels in
 //! the STANDARD place (`x-api-key` or `Authorization: Bearer`) and is forwarded;
 //! the gctrl token goes in `X-GCTRL-Token` (optional `ApiKey `/`Bearer ` prefix).
 //! If `X-GCTRL-Token` is absent the gctrl token is read from `Authorization`
@@ -106,12 +114,25 @@ pub(super) static HTTP_NOREDIRECT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("reqwest client builds")
 });
 
-/// Cloud upstream (OpenAI, ChatGPT) -> no-redirect client; Ollama keeps the plain one.
+/// Cloud upstream (OpenAI, ChatGPT, Runware, any other name) -> no-redirect client;
+/// only Ollama keeps the plain one, so a new upstream never follows a redirect with its key.
 fn client_for(upstream_name: &str) -> &'static reqwest::Client {
-    if matches!(upstream_name, "OpenAI" | "ChatGPT") {
-        &HTTP_NOREDIRECT
-    } else {
+    if upstream_name == "Ollama" {
         &HTTP
+    } else {
+        &HTTP_NOREDIRECT
+    }
+}
+
+/// Upstream name for logs and `upstream unreachable` errors on the chat route; it also
+/// picks the HTTP client ([`client_for`]).
+fn chat_upstream_name(upstream: Upstream) -> &'static str {
+    match upstream {
+        Upstream::Ollama => "Ollama",
+        Upstream::OpenAi => "OpenAI",
+        Upstream::Runware => "Runware",
+        Upstream::Anthropic => "Anthropic",
+        Upstream::ChatGpt => "ChatGPT",
     }
 }
 
@@ -146,7 +167,7 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
 /// Anvil polls it to decide what to offer; keep the list stable.
 pub(super) async fn capabilities() -> Json<Value> {
     Json(json!({
-        "upstreams": ["ollama", "anthropic", "openai", "chatgpt"],
+        "upstreams": ["ollama", "anthropic", "openai", "chatgpt", "runware"],
         "version": crate::routes::update::current_version(),
     }))
 }
@@ -171,7 +192,12 @@ fn ollama_base() -> String {
 }
 
 fn completions_url() -> String {
-    format!("{}/v1/chat/completions", ollama_base().trim_end_matches('/'))
+    chat_completions_url(&ollama_base())
+}
+
+/// `<base>/v1/chat/completions` (Ollama, and the host-only OpenAI / Runware bases).
+fn chat_completions_url(base: &str) -> String {
+    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
 }
 
 /// Which upstream a request is bound for (`X-Upstream-Provider`).
@@ -182,6 +208,8 @@ pub(super) enum Upstream {
     OpenAi,
     /// The ChatGPT subscription (Codex CLI, Responses API on chatgpt.com).
     ChatGpt,
+    /// Runware's OpenAI-compatible chat completions (Claude, GPT, Gemini, open models).
+    Runware,
 }
 
 /// Read `x-upstream-provider`. Absent/empty -> Ollama; unknown -> 400.
@@ -196,10 +224,11 @@ pub(super) fn upstream_from_headers(headers: &HeaderMap) -> Result<Upstream, Res
         "anthropic" => Ok(Upstream::Anthropic),
         "openai" => Ok(Upstream::OpenAi),
         "chatgpt" => Ok(Upstream::ChatGpt),
+        "runware" => Ok(Upstream::Runware),
         other => Err(gateway_error_json(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai, chatgpt; omit for ollama)"),
+            format!("unknown X-Upstream-Provider '{other}' (allowed: anthropic, openai, chatgpt, runware; omit for ollama)"),
         )),
     }
 }
@@ -213,6 +242,8 @@ pub(super) fn upstream_base_from(upstream: Upstream, raw: Option<&str>, unpinned
         Upstream::OpenAi => ("openai", "https://api.openai.com"),
         // HOST only: the Codex path lives in `llm_gateway_responses::CHATGPT_CODEX_PATH`.
         Upstream::ChatGpt => ("chatgpt", "https://chatgpt.com"),
+        // HOST only, like OpenAI: `/v1/chat/completions` and `/v1/models` are appended.
+        Upstream::Runware => ("runware", "https://api.runware.ai"),
     };
     let raw = raw.map(str::trim).filter(|s| !s.is_empty());
     if unpinned {
@@ -226,14 +257,15 @@ pub(super) fn upstream_base_from(upstream: Upstream, raw: Option<&str>, unpinned
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Resolve the upstream base URL from env (`ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE`).
-/// An invalid base is an error (-> 500 api_error), never a silent fallback.
+/// Resolve the upstream base URL from env (`ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE`
+/// / `RUNWARE_BASE`). An invalid base is an error (-> 500 api_error), never a silent fallback.
 pub(super) fn upstream_base(upstream: Upstream) -> Result<String, String> {
     let var = match upstream {
         Upstream::Ollama => return Ok(ollama_base()),
         Upstream::Anthropic => "ANTHROPIC_BASE",
         Upstream::OpenAi => "OPENAI_BASE",
         Upstream::ChatGpt => "CHATGPT_BASE",
+        Upstream::Runware => "RUNWARE_BASE",
     };
     let unpinned = std::env::var("GCTRL_CLOAK_UPSTREAM_UNPINNED")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
@@ -292,13 +324,16 @@ pub(super) fn forward_headers(incoming: &HeaderMap, upstream: Upstream, consumed
         "x-openai-subagent",
     ];
     let openai_family = matches!(upstream, Upstream::OpenAi | Upstream::ChatGpt);
+    // Runware speaks the OpenAI wire format with a Bearer key: no Anthropic headers
+    // either, and no `openai-beta` (an OpenAI header, not Runware's).
+    let bearer_only = openai_family || upstream == Upstream::Runware;
     let mut out = HeaderMap::new();
     for (name, value) in incoming.iter() {
         let n = name.as_str();
         if n == "authorization" && consumed_authorization {
             continue;
         }
-        if openai_family && ANTHROPIC_ONLY.contains(&n) {
+        if bearer_only && ANTHROPIC_ONLY.contains(&n) {
             continue;
         }
         if (n == "authorization" || n == "x-api-key") && is_gctrl_credential(value) {
@@ -356,6 +391,17 @@ pub(super) fn relay_response_headers(
 fn model_targets_cloud(model: &str) -> bool {
     let m = model.trim().to_ascii_lowercase();
     m.ends_with("-cloud") || m.ends_with(":cloud")
+}
+
+/// Is this chat request a cloud egress (cloaked unless the caller opts out)? Every
+/// vendor upstream is cloud whatever the model id (`anthropic:claude@haiku-5.5` on
+/// Runware carries no `:cloud` tag); only Ollama decides by the tag. Exhaustive on
+/// purpose: a new upstream is cloud unless it is Ollama.
+fn request_targets_cloud(upstream: Upstream, model: &str) -> bool {
+    match upstream {
+        Upstream::Ollama => model_targets_cloud(model),
+        Upstream::OpenAi | Upstream::Runware | Upstream::Anthropic | Upstream::ChatGpt => true,
+    }
 }
 
 /// Is the caller opting OUT of cloaking? `X-Anvil-Cloak: off|0|false` disables it;
@@ -486,7 +532,7 @@ pub(super) async fn authenticate_gateway(
 
 /// Does the request carry a vendor credential for the upstream? Non-empty
 /// `x-api-key`, or an `authorization` header that was not spent on the gctrl token.
-/// OpenAI accepts only `authorization`. A gctrl token in either header is no credential.
+/// OpenAI (and Runware) accept only `authorization`. A gctrl token in either header is no credential.
 pub(super) fn has_upstream_credential(headers: &HeaderMap, upstream: Upstream, consumed_authorization: bool) -> bool {
     let usable = |name: &str| {
         headers
@@ -496,7 +542,7 @@ pub(super) fn has_upstream_credential(headers: &HeaderMap, upstream: Upstream, c
     };
     let auth = !consumed_authorization && usable("authorization");
     match upstream {
-        Upstream::OpenAi | Upstream::ChatGpt => auth,
+        Upstream::OpenAi | Upstream::ChatGpt | Upstream::Runware => auth,
         _ => usable("x-api-key") || auth,
     }
 }
@@ -518,7 +564,7 @@ async fn chat_completions(
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .unwrap_or_default();
     let upstream = upstream_from_headers(&headers).unwrap_or(Upstream::Ollama);
-    let cloud = upstream == Upstream::OpenAi || model_targets_cloud(&model);
+    let cloud = request_targets_cloud(upstream, &model);
     let cloak_on = cloud && !cloak_disabled(&headers);
     let span = tracing::info_span!(
         "gctrl.cloak_gateway",
@@ -557,16 +603,17 @@ async fn chat_completions_inner(
     };
 
     // Auth (manual — this route is not behind the auth middleware).
-    let (claims, url, upstream_headers) = if upstream == Upstream::OpenAi {
+    let (claims, url, upstream_headers) = if matches!(upstream, Upstream::OpenAi | Upstream::Runware) {
         let Some(identity) = authenticate_gateway(&state, &headers).await else {
             return unauthorized();
         };
         if !has_upstream_credential(&headers, upstream, identity.consumed_authorization) {
-            return gateway_error_json(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token",
-            );
+            let hint = if upstream == Upstream::Runware {
+                "no upstream credential: send Authorization: Bearer <runware key> and the gctrl token in X-GCTRL-Token"
+            } else {
+                "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token"
+            };
+            return gateway_error_json(StatusCode::UNAUTHORIZED, "unauthorized", hint);
         }
         let base = match upstream_base(upstream) {
             Ok(b) => b,
@@ -575,7 +622,7 @@ async fn chat_completions_inner(
             }
         };
         let fwd = forward_headers(&headers, upstream, identity.consumed_authorization);
-        (identity.claims, format!("{base}/v1/chat/completions"), fwd)
+        (identity.claims, chat_completions_url(&base), fwd)
     } else {
         let Some(claims) = authenticate(&state, &headers).await else {
             return unauthorized();
@@ -610,10 +657,10 @@ async fn chat_completions_inner(
 
     let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let stream = parsed.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    // OpenAI is always a cloud egress (not tag based); Ollama keeps the tag rule.
-    let is_cloud = upstream == Upstream::OpenAi || model_targets_cloud(&model);
+    // OpenAI and Runware are always a cloud egress (not tag based); Ollama keeps the tag rule.
+    let is_cloud = request_targets_cloud(upstream, &model);
     let cloak_on = is_cloud && !cloak_disabled(&headers);
-    let upstream_name = if upstream == Upstream::OpenAi { "OpenAI" } else { "Ollama" };
+    let upstream_name = chat_upstream_name(upstream);
 
     // ── Transparent passthrough: local model, or cloud with cloak explicitly off.
     if !cloak_on {
@@ -1060,7 +1107,7 @@ async fn proxy_once_decloaked(
     out
 }
 
-/// Message for an unreachable upstream; `name` is "Ollama" / "OpenAI" / "Anthropic".
+/// Message for an unreachable upstream; `name` is "Ollama" / "OpenAI" / "Anthropic" / "Runware".
 pub(super) fn upstream_unreachable_message(name: &str, e: &reqwest::Error) -> String {
     format!("{name} upstream unreachable: {e}")
 }
@@ -1202,6 +1249,7 @@ fn write_cloaked_texts(messages: &mut [Value], slots: &[ChatSlot], cloaked: &[St
 /// Prepend [`PLACEHOLDER_NOTE`] to the first system message (string or parts form),
 /// or insert a system message at the top when there is none.
 /// Does this upstream understand the OpenAI `developer` role? Only OpenAI's own API does.
+/// Runware routes to Claude, Gemini and open models too, so it gets `system` as well.
 /// Ollama (local models and `:cloud` tags alike) silently DROPS a `developer` message: an
 /// OpenAI client that sends its system prompt that way (pi does for every reasoning model
 /// unless `compat.supportsDeveloperRole` is false) reached the model with no instructions at
@@ -1671,6 +1719,180 @@ mod tests {
         }
     }
 
+    // ── runware: OpenAI-compatible, every model is cloud ────────────────────
+
+    #[tokio::test]
+    async fn runware_selection_from_header() {
+        for v in ["runware", "Runware", " RUNWARE "] {
+            assert_eq!(upstream_from_headers(&hm(&[("x-upstream-provider", v)])).ok(), Some(Upstream::Runware), "{v}");
+        }
+        let err = upstream_from_headers(&hm(&[("x-upstream-provider", "runwar")])).err().expect("unknown -> Err");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.headers()[GATEWAY_ERROR_HEADER], "1");
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(err.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("runware"), "{v}");
+    }
+
+    #[test]
+    fn runware_models_are_always_cloud() {
+        for m in [
+            "anthropic-claude-haiku-5-5",
+            "openai-gpt-5-4-mini",
+            "zai-glm-5-3",
+            "anthropic:claude@haiku-5.5",
+            "llama3.2",
+            "qwen2.5:7b",
+            "",
+        ] {
+            assert!(request_targets_cloud(Upstream::Runware, m), "{m}");
+            assert!(request_targets_cloud(Upstream::OpenAi, m), "{m}");
+        }
+        // Ollama keeps the tag rule.
+        assert!(!request_targets_cloud(Upstream::Ollama, "llama3.2"));
+        assert!(!request_targets_cloud(Upstream::Ollama, "anthropic:claude@haiku-5.5"));
+        assert!(request_targets_cloud(Upstream::Ollama, "gpt-oss:120b-cloud"));
+    }
+
+    #[test]
+    fn runware_base_is_pinned_and_the_dev_mock_needs_the_switch() {
+        let pinned = upstream_base_from(Upstream::Runware, None, false).unwrap();
+        assert_eq!(pinned, "https://api.runware.ai");
+        assert_eq!(chat_completions_url(&pinned), "https://api.runware.ai/v1/chat/completions");
+        // Runware documents `https://api.runware.ai/v1`; the pin keeps the host only, so
+        // the path is never doubled.
+        assert_eq!(upstream_base_from(Upstream::Runware, Some("https://api.runware.ai/v1"), false).unwrap(), pinned);
+        assert_eq!(upstream_base_from(Upstream::Runware, Some("  "), false).unwrap(), pinned);
+        for bad in [
+            "http://api.runware.ai",
+            "https://api.runware.ai.evil.example",
+            "https://evil.example",
+            "http://169.254.169.254",
+            "http://localhost:18434",
+            "file:///etc/passwd",
+        ] {
+            assert!(upstream_base_from(Upstream::Runware, Some(bad), false).is_err(), "{bad}");
+        }
+        // Dev mock: only with GCTRL_CLOAK_UPSTREAM_UNPINNED.
+        let dev = upstream_base_from(Upstream::Runware, Some("http://localhost:18434/"), true).unwrap();
+        assert_eq!(chat_completions_url(&dev), "http://localhost:18434/v1/chat/completions");
+        assert_eq!(upstream_base_from(Upstream::Runware, None, true).unwrap(), pinned);
+    }
+
+    #[test]
+    fn runware_base_is_read_from_runware_base() {
+        if std::env::var("GCTRL_CLOAK_UPSTREAM_UNPINNED").is_ok() {
+            return; // a dev shell with the switch on would make the pin check moot
+        }
+        std::env::set_var("RUNWARE_BASE", "https://evil.example");
+        let evil = upstream_base(Upstream::Runware);
+        std::env::set_var("RUNWARE_BASE", "https://api.runware.ai/v1");
+        let official = upstream_base(Upstream::Runware);
+        std::env::remove_var("RUNWARE_BASE");
+        assert!(evil.is_err(), "{evil:?}");
+        assert_eq!(official.unwrap(), "https://api.runware.ai");
+    }
+
+    #[test]
+    fn runware_takes_only_an_unspent_bearer_key() {
+        use Upstream::Runware;
+        assert!(has_upstream_credential(&hm(&[("authorization", "Bearer rw-key")]), Runware, false));
+        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer rw-key")]), Runware, true));
+        assert!(!has_upstream_credential(&hm(&[("x-api-key", "rw-key")]), Runware, false));
+        assert!(!has_upstream_credential(&hm(&[("authorization", "Bearer gctrl_abc")]), Runware, false));
+        assert!(!has_upstream_credential(&HeaderMap::new(), Runware, false));
+    }
+
+    #[test]
+    fn runware_header_allowlist() {
+        let incoming = hm(&[
+            ("authorization", "Bearer rw-key"), ("x-gctrl-token", "gctrl_t"), ("x-upstream-provider", "runware"),
+            ("x-anvil-cloak", "on"), ("x-cloak-tool-outputs", "1"), ("cookie", "a=b"), ("accept-encoding", "gzip"),
+            ("host", "gw"), ("content-length", "12"), ("x-forwarded-for", "1.2.3.4"), ("x-api-key", "sk-ant"),
+            ("anthropic-version", "2023-06-01"), ("anthropic-beta", "b"), ("x-app", "cli"),
+            ("openai-beta", "assistants=v2"), ("chatgpt-account-id", "acc"), ("x-codex-window-id", "w"),
+            ("originator", "codex"), ("user-agent", "anvil"), ("accept", "text/event-stream"), ("x-stainless-lang", "js"),
+        ]);
+        let out = forward_headers(&incoming, Upstream::Runware, false);
+        let mut names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["accept", "authorization", "content-type", "user-agent", "x-stainless-lang"]);
+        assert_eq!(out["authorization"], "Bearer rw-key");
+        assert_eq!(out["content-type"], "application/json");
+        // A gctrl token in Authorization (spent on auth, or misplaced) never travels.
+        assert!(!forward_headers(&incoming, Upstream::Runware, true).contains_key("authorization"));
+        assert!(!forward_headers(&hm(&[("authorization", "Bearer gctrl_x")]), Upstream::Runware, false).contains_key("authorization"));
+    }
+
+    #[test]
+    fn vendor_upstreams_never_follow_redirects() {
+        for up in [Upstream::OpenAi, Upstream::Runware, Upstream::Anthropic, Upstream::ChatGpt] {
+            assert!(std::ptr::eq(client_for(chat_upstream_name(up)), &*HTTP_NOREDIRECT), "{up:?}");
+        }
+        assert!(std::ptr::eq(client_for(chat_upstream_name(Upstream::Ollama)), &*HTTP));
+        assert_eq!(chat_upstream_name(Upstream::Runware), "Runware");
+    }
+
+    #[test]
+    fn runware_gets_developer_messages_as_system() {
+        assert!(!upstream_supports_developer_role(Upstream::Runware));
+        let mut body = json!({ "model": "openai-gpt-5-4-mini", "messages": [
+            { "role": "developer", "content": "Du bist Jarvis." }, { "role": "user", "content": "Hallo" },
+        ] });
+        assert!(adapt_roles_for_upstream(&mut body, Upstream::Runware));
+        assert_eq!(body["messages"][0], json!({ "role": "system", "content": "Du bist Jarvis." }));
+    }
+
+    #[test]
+    fn runware_content_parts_round_trip() {
+        // A pi/Anvil turn to Runware: every message in content-parts form, a replayed
+        // tool call and its result, a `developer` system prompt.
+        let mut body = json!({ "model": "anthropic:claude@haiku-5.5", "stream": true, "messages": [
+            { "role": "developer", "content": [{ "type": "text", "text": "Assistent für Tom \"TA\" Arenstam" }] },
+            { "role": "user", "content": [
+                { "type": "text", "text": "Zug nach Berlin Hbf" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+            ] },
+            { "role": "assistant", "content": [{ "type": "text", "text": "Ich suche Berlin Hbf" }], "tool_calls": [
+                { "id": "c1", "type": "function", "function": { "name": "route", "arguments": "{\"to\":\"Berlin Hbf\",\"n\":3}" } },
+            ] },
+            { "role": "tool", "tool_call_id": "c1", "content": [{ "type": "text", "text": "Ticket für Tom \"TA\" Arenstam nach Berlin Hbf" }] },
+        ] });
+        assert!(request_targets_cloud(Upstream::Runware, body["model"].as_str().unwrap()));
+        assert!(adapt_roles_for_upstream(&mut body, Upstream::Runware));
+        let session = {
+            let messages = body["messages"].as_array_mut().unwrap();
+            let session = cloak_messages(messages, true);
+            add_placeholder_note(messages);
+            session
+        };
+        let m = &body["messages"];
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[0]["content"][0]["text"], PLACEHOLDER_NOTE);
+        assert_eq!(m[0]["content"][1]["text"], "Assistent für [Person-27]");
+        assert_eq!(m[1]["content"][0]["text"], "Zug nach [Place-3]");
+        assert_eq!(m[1]["content"][1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(m[2]["content"][0]["text"], "Ich suche [Place-3]");
+        let args: Value = serde_json::from_str(m[2]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({ "to": "[Place-3]", "n": 3 }));
+        assert_eq!(m[3]["content"][0]["text"], "Ticket für [Person-27] nach [Place-3]");
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(!wire.contains("Berlin") && !wire.contains("Arenstam"), "{wire}");
+
+        // Runware answers in the OpenAI chunk format; the caller gets the real names back.
+        let input = chunk(json!({ "role": "assistant", "content": "" }), None)
+            + &chunk(json!({ "content": "Gute Fahrt nach [Pla" }), None)
+            + &chunk(json!({ "content": "ce-3], [Person-27]" }), None)
+            + &chunk(json!({ "tool_calls": [ { "index": 0, "id": "c2", "function": { "name": "route", "arguments": "{\"to\":\"[Place-3]\"}" } } ] }), Some("tool_calls"))
+            + "data: [DONE]\n\n";
+        let out = run(session.clone(), &[input.as_bytes()]);
+        assert_eq!(content_of(&out), "Gute Fahrt nach Berlin Hbf, Tom \"TA\" Arenstam");
+        assert_eq!(serde_json::from_str::<Value>(&args_of(&out)[&0]).unwrap()["to"], "Berlin Hbf");
+
+        let mut done = json!({ "choices": [ { "index": 0, "message": { "role": "assistant", "content": "[Person-27] fährt nach [Place-3]" } } ] });
+        decloak_chat_completion(&session, &json_escaped_session(&session), &mut done);
+        assert_eq!(done["choices"][0]["message"]["content"], "Tom \"TA\" Arenstam fährt nach Berlin Hbf");
+    }
+
     #[test]
     fn upstream_credential_detection() {
         use Upstream::{Anthropic, OpenAi};
@@ -1773,7 +1995,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai", "chatgpt"]));
+        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai", "chatgpt", "runware"]));
         let res = app
             .oneshot(axum::http::Request::builder().uri("/v1/does-not-exist").body(Body::empty()).unwrap())
             .await

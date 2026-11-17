@@ -652,14 +652,14 @@ async fn count_tokens_inner(state: Arc<AppState>, headers: HeaderMap, body: Byte
 
 /// Plain proxy for the model list (no prompt content): gctrl auth and an upstream
 /// credential are still required. `GET /v1/models` is registered once (here); a
-/// `chatgpt` / `openai` provider header hands it to the Responses module.
+/// `chatgpt` / `openai` / `runware` provider header hands it to the Responses module.
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
     let provider = headers
         .get("x-upstream-provider")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    if provider == "chatgpt" || provider == "openai" {
+    if provider == "chatgpt" || provider == "openai" || provider == "runware" {
         return super::llm_gateway_responses::models_passthrough(state, headers, query).await;
     }
     let g = match gate(&state, &headers).await {

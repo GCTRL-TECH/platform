@@ -783,6 +783,7 @@ impl ResponsesSseDecloaker {
 fn upstream_name(upstream: Upstream) -> &'static str {
     match upstream {
         Upstream::ChatGpt => "ChatGPT",
+        Upstream::Runware => "Runware",
         _ => "OpenAI",
     }
 }
@@ -793,6 +794,7 @@ fn provider_label(upstream: Upstream) -> &'static str {
         Upstream::OpenAi => "openai",
         Upstream::Anthropic => "anthropic",
         Upstream::Ollama => "ollama",
+        Upstream::Runware => "runware",
     }
 }
 
@@ -800,6 +802,9 @@ fn credential_hint(upstream: Upstream) -> &'static str {
     match upstream {
         Upstream::ChatGpt => {
             "no upstream credential: send Authorization: Bearer <ChatGPT access token> and the gctrl token in X-GCTRL-Token"
+        }
+        Upstream::Runware => {
+            "no upstream credential: send Authorization: Bearer <runware key> and the gctrl token in X-GCTRL-Token"
         }
         _ => "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token",
     }
@@ -843,6 +848,19 @@ fn responses_upstream(headers: &HeaderMap) -> Result<Upstream, Response> {
     }
 }
 
+/// `GET /v1/models` also serves `runware` (its catalog sits at `/v1/models` on the
+/// pinned host); `POST /v1/responses` stays `chatgpt` / `openai` only.
+fn models_upstream(headers: &HeaderMap) -> Result<Upstream, Response> {
+    match upstream_from_headers(headers)? {
+        u @ (Upstream::ChatGpt | Upstream::OpenAi | Upstream::Runware) => Ok(u),
+        _ => Err(gateway_error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "this /v1/models handler needs X-Upstream-Provider: chatgpt, openai or runware",
+        )),
+    }
+}
+
 /// Provider + auth + upstream credential + upstream base, in fail-closed order
 /// (nothing is sent upstream before all of it passes).
 struct Gate {
@@ -854,6 +872,11 @@ struct Gate {
 
 async fn gate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Gate, Response> {
     let upstream = responses_upstream(headers)?;
+    gate_for(state, headers, upstream).await
+}
+
+/// [`gate`] for an already chosen upstream.
+async fn gate_for(state: &Arc<AppState>, headers: &HeaderMap, upstream: Upstream) -> Result<Gate, Response> {
     let Some(identity) = authenticate_gateway(state, headers).await else {
         return Err(gateway_error_json(
             StatusCode::UNAUTHORIZED,
@@ -929,11 +952,15 @@ async fn responses_inner(state: Arc<AppState>, headers: HeaderMap, body: Bytes) 
     }
 }
 
-/// `GET /v1/models` for `chatgpt` / `openai` (handed over by the anthropic module,
-/// which owns the route): plain proxy, no prompt content, but gctrl auth and an
+/// `GET /v1/models` for `chatgpt` / `openai` / `runware` (handed over by the anthropic
+/// module, which owns the route): plain proxy, no prompt content, but gctrl auth and an
 /// upstream credential are still required.
 pub(super) async fn models_passthrough(state: Arc<AppState>, headers: HeaderMap, query: Option<String>) -> Response {
-    let g = match gate(&state, &headers).await {
+    let upstream = match models_upstream(&headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let g = match gate_for(&state, &headers, upstream).await {
         Ok(g) => g,
         Err(r) => return r,
     };
@@ -1889,7 +1916,29 @@ mod tests {
     #[tokio::test]
     async fn capabilities_list_chatgpt() {
         let v = super::super::llm_gateway::capabilities().await.0;
-        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai", "chatgpt"]));
+        assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai", "chatgpt", "runware"]));
+    }
+
+    #[test]
+    fn runware_serves_models_but_not_responses() {
+        use super::super::llm_gateway::upstream_base_from;
+        let rw = hm(&[("x-upstream-provider", "runware")]);
+        let r = responses_upstream(&rw).err().expect("/v1/responses rejects runware");
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(r.headers()["x-cloak-gateway-error"], "1");
+        assert_eq!(models_upstream(&rw).ok(), Some(Upstream::Runware));
+        assert_eq!(models_upstream(&hm(&[("x-upstream-provider", "openai")])).ok(), Some(Upstream::OpenAi));
+        assert_eq!(models_upstream(&hm(&[("x-upstream-provider", "chatgpt")])).ok(), Some(Upstream::ChatGpt));
+        for bad in [hm(&[]), hm(&[("x-upstream-provider", "anthropic")]), hm(&[("x-upstream-provider", "foo")])] {
+            let r = models_upstream(&bad).err().expect("rejected");
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        }
+        let base = upstream_base_from(Upstream::Runware, None, false).unwrap();
+        assert_eq!(responses_models_url(Upstream::Runware, &base, None), "https://api.runware.ai/v1/models");
+        assert_eq!(responses_models_url(Upstream::Runware, &base, Some("a=b")), "https://api.runware.ai/v1/models?a=b");
+        assert_eq!(upstream_name(Upstream::Runware), "Runware");
+        assert_eq!(provider_label(Upstream::Runware), "runware");
+        assert!(credential_hint(Upstream::Runware).contains("<runware key>"));
     }
 
     // 22

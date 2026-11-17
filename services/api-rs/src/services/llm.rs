@@ -524,6 +524,9 @@ fn official_cloud_host(provider: &str) -> Option<&'static str> {
         "openrouter" => Some("openrouter.ai"),
         // Cloak gateway upstream for the ChatGPT subscription (Codex).
         "chatgpt" => Some("chatgpt.com"),
+        // Cloak gateway upstream `runware` (OpenAI-compatible chat completions).
+        // Must stay listed: an unknown provider falls into the local/LAN rules below.
+        "runware" => Some("api.runware.ai"),
         _ => None,
     }
 }
@@ -1660,6 +1663,14 @@ mod tests {
             validate_llm_base("openrouter", None).unwrap().host_str(),
             Some("openrouter.ai")
         );
+        // Cloak gateway upstream `runware`: pinned like the other clouds, path dropped.
+        assert_eq!(
+            validate_llm_base("runware", Some("https://api.runware.ai/v1")).unwrap().as_str(),
+            "https://api.runware.ai/"
+        );
+        assert!(validate_llm_base("runware", Some("http://api.runware.ai")).is_err());
+        assert!(validate_llm_base("runware", Some("http://localhost:8080")).is_err());
+        assert!(validate_llm_base("runware", Some("https://api.runware.ai.evil.example")).is_err());
     }
 
     #[test]

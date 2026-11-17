@@ -37,6 +37,7 @@ services:
       # Cloak Gateway cloud upstreams (default: the official hosts, pinned).
       # - ANTHROPIC_BASE=https://api.anthropic.com
       # - OPENAI_BASE=https://api.openai.com
+      # - RUNWARE_BASE=https://api.runware.ai
       # Skips the official-host pin on those bases. Dev only, never in prod.
       # - GCTRL_CLOAK_UPSTREAM_UNPINNED=1
       # OAuth Connectors (set in .env or override here)
