@@ -51,10 +51,14 @@ async fn main() {
         llm_gate: Arc::new(tokio::sync::Mutex::new((4, Arc::new(tokio::sync::Semaphore::new(4))))),
     });
 
-    background::spawn_all(state.clone());
-    // Tell the agent which version is running (manual updates never did) —
-    // best-effort, off the boot path. See routes::update::sync_agent_version.
-    tokio::spawn(routes::update::sync_agent_version());
+    if background::jobs_enabled(std::env::var("GCTRL_BACKGROUND_JOBS").ok().as_deref()) {
+        background::spawn_all(state.clone());
+        // Tell the agent which version is running (manual updates never did) —
+        // best-effort, off the boot path. See routes::update::sync_agent_version.
+        tokio::spawn(routes::update::sync_agent_version());
+    } else {
+        tracing::warn!("GCTRL_BACKGROUND_JOBS is off: HTTP only, no background jobs, no agent version sync");
+    }
 
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", cfg.port);

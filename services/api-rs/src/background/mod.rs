@@ -6,6 +6,18 @@ use crate::models::AppState;
 
 pub mod guardrail;
 
+/// `GCTRL_BACKGROUND_JOBS` (default on). Off (`0|false|no|off`) = this process serves
+/// HTTP only: no [`spawn_all`] loops and no agent version sync. For a SECOND API
+/// instance on the same Postgres/Redis/Neo4j (a gateway test next to the productive
+/// one): result subscriber, stale-job recovery, license heartbeat, memory cycle,
+/// cron triggers and guardrail must run exactly once per installation.
+pub fn jobs_enabled(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
 pub fn spawn_all(state: Arc<AppState>) {
     let s = state.clone();
     tokio::spawn(async move { subscribe_results(s).await });
@@ -682,6 +694,21 @@ fn compute_next_run_after_error_at(
 ) -> chrono::DateTime<chrono::Utc> {
     let scheduled = compute_next_run_at(kind, cron_schedule, now);
     scheduled.max(now + ERROR_RETRY_BACKOFF)
+}
+
+#[cfg(test)]
+mod jobs_switch_tests {
+    use super::jobs_enabled;
+
+    #[test]
+    fn background_jobs_default_on_and_switch_off() {
+        for on in [None, Some(""), Some("1"), Some("on"), Some("true"), Some("anything")] {
+            assert!(jobs_enabled(on), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", " OFF ", "False"] {
+            assert!(!jobs_enabled(Some(off)), "{off}");
+        }
+    }
 }
 
 #[cfg(test)]
