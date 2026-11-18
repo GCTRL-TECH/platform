@@ -13,11 +13,13 @@ pub mod guardrail;
 /// cron triggers and guardrail must run exactly once per installation. Off also skips
 /// the migrations and the boot writes (secret backfill, admin self-heal, system skills);
 /// `main` then refuses to start unless the database carries exactly this binary's
-/// migrations (`db::verify_schema`). Any other value counts as on; `main` logs the
-/// effective state once at startup and warns about an unrecognized value
-/// ([`jobs_switch_notice`]).
+/// migrations (`db::verify_schema`). Surrounding quotes and whitespace are ignored (a
+/// compose list entry `- GCTRL_BACKGROUND_JOBS="off"` keeps its quotes in the value).
+/// Any other value refuses the start: `main` logs it and exits with status 1
+/// ([`jobs_switch_notice`]), since running would migrate a database the operator meant
+/// to leave alone. `main` logs the effective state once at startup.
 pub fn jobs_enabled(v: Option<&str>) -> bool {
-    jobs_switch(v) != JobsSwitch::Off
+    jobs_switch(v) == JobsSwitch::On
 }
 
 /// How a `GCTRL_BACKGROUND_JOBS` value resolves.
@@ -27,13 +29,14 @@ pub enum JobsSwitch {
     On,
     /// `0|false|no|off`.
     Off,
-    /// Any other value (a typo such as `of`): treated as on, warned about at startup.
+    /// Any other value (a typo such as `of`): the process refuses to start.
     Unrecognized(String),
 }
 
 pub fn jobs_switch(v: Option<&str>) -> JobsSwitch {
     let Some(raw) = v else { return JobsSwitch::On };
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let value = raw.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
+    match value.to_ascii_lowercase().as_str() {
         "" | "1" | "true" | "yes" | "on" => JobsSwitch::On,
         "0" | "false" | "no" | "off" => JobsSwitch::Off,
         _ => JobsSwitch::Unrecognized(raw.to_string()),
@@ -41,25 +44,23 @@ pub fn jobs_switch(v: Option<&str>) -> JobsSwitch {
 }
 
 /// The one startup line for the effective state of `GCTRL_BACKGROUND_JOBS`:
-/// `(warn, message)`, warn for off and for an unrecognized value.
-pub fn jobs_switch_notice(v: Option<&str>) -> (bool, String) {
+/// `Ok((warn, message))` to log and run (warn when off), `Err(message)` for an
+/// unrecognized value, which `main` logs as an error before exiting with status 1.
+pub fn jobs_switch_notice(v: Option<&str>) -> Result<(bool, String), String> {
     match jobs_switch(v) {
-        JobsSwitch::On => (
+        JobsSwitch::On => Ok((
             false,
             "GCTRL_BACKGROUND_JOBS is on: migrations, boot writes and background jobs run in this process".into(),
-        ),
-        JobsSwitch::Off => (
+        )),
+        JobsSwitch::Off => Ok((
             true,
             "GCTRL_BACKGROUND_JOBS is off: HTTP only, no migrations or boot writes, no background jobs, no agent version sync"
                 .into(),
-        ),
-        JobsSwitch::Unrecognized(raw) => (
-            true,
-            format!(
-                "GCTRL_BACKGROUND_JOBS={raw:?} is not a known value (off: 0|false|no|off, on: 1|true|yes|on or unset); \
-                 treated as ON: migrations, boot writes and background jobs run in this process"
-            ),
-        ),
+        )),
+        JobsSwitch::Unrecognized(raw) => Err(format!(
+            "GCTRL_BACKGROUND_JOBS={raw:?} is not a known value (off: 0|false|no|off, on: 1|true|yes|on or unset); \
+             refusing to start: set one of these values or remove the variable"
+        )),
     }
 }
 
@@ -747,7 +748,7 @@ mod jobs_switch_tests {
 
     #[test]
     fn background_jobs_default_on_and_switch_off() {
-        for on in [None, Some(""), Some("1"), Some("on"), Some("true"), Some("anything")] {
+        for on in [None, Some(""), Some("1"), Some("on"), Some("true")] {
             assert!(jobs_enabled(on), "{on:?}");
         }
         for off in ["0", "false", "no", "off", " OFF ", "False"] {
@@ -756,20 +757,36 @@ mod jobs_switch_tests {
     }
 
     #[test]
-    fn the_effective_state_is_logged_and_an_unknown_value_warned() {
+    fn the_effective_state_is_logged_and_an_unknown_value_refuses_the_start() {
         use super::{jobs_switch, jobs_switch_notice, JobsSwitch};
-        // A typo stays ON (the default), but never silently.
+        // A typo never runs: neither on (it would migrate) nor silently off.
         assert_eq!(jobs_switch(Some("of")), JobsSwitch::Unrecognized("of".into()));
-        assert!(jobs_enabled(Some("of")));
-        let (warn, msg) = jobs_switch_notice(Some("of"));
-        assert!(warn && msg.contains("\"of\"") && msg.contains("not a known value") && msg.contains("ON"), "{msg}");
+        let msg = jobs_switch_notice(Some("of")).expect_err("an unknown value refuses the start");
+        assert!(msg.contains("\"of\"") && msg.contains("not a known value") && msg.contains("refusing to start"), "{msg}");
         for on in [None, Some(""), Some("1"), Some(" Yes "), Some("TRUE"), Some("on")] {
             assert_eq!(jobs_switch(on), JobsSwitch::On, "{on:?}");
-            let (warn, msg) = jobs_switch_notice(on);
+            let (warn, msg) = jobs_switch_notice(on).expect("known value");
             assert!(!warn && msg.contains("is on"), "{on:?}: {msg}");
         }
-        let (warn, msg) = jobs_switch_notice(Some(" OFF "));
+        let (warn, msg) = jobs_switch_notice(Some(" OFF ")).expect("known value");
         assert!(warn && msg.contains("is off: HTTP only"), "{msg}");
+    }
+
+    #[test]
+    fn quoted_values_count_and_an_unknown_value_never_runs_the_jobs() {
+        use super::{jobs_switch, JobsSwitch};
+        // A compose list entry `- GCTRL_BACKGROUND_JOBS="off"` keeps the quotes in the value.
+        for off in ["\"off\"", "'off'", " \"OFF\" ", "\"0\"", "'false'"] {
+            assert_eq!(jobs_switch(Some(off)), JobsSwitch::Off, "{off}");
+            assert!(!jobs_enabled(Some(off)), "{off}");
+        }
+        for on in ["\"on\"", "'1'", "\"\"", "''"] {
+            assert_eq!(jobs_switch(Some(on)), JobsSwitch::On, "{on}");
+        }
+        for unknown in ["of", "\"of\"", "anything", "off,"] {
+            assert_eq!(jobs_switch(Some(unknown)), JobsSwitch::Unrecognized(unknown.into()), "{unknown}");
+            assert!(!jobs_enabled(Some(unknown)), "{unknown}");
+        }
     }
 }
 

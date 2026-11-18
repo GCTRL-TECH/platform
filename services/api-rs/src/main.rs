@@ -30,11 +30,17 @@ async fn main() {
     services::crypto::init(&cfg.jwt_secret);
 
     let jobs_env = std::env::var("GCTRL_BACKGROUND_JOBS").ok();
-    let jobs_on = background::jobs_enabled(jobs_env.as_deref());
     match background::jobs_switch_notice(jobs_env.as_deref()) {
-        (true, msg) => tracing::warn!("{msg}"),
-        (false, msg) => tracing::info!("{msg}"),
+        Ok((true, msg)) => tracing::warn!("{msg}"),
+        Ok((false, msg)) => tracing::info!("{msg}"),
+        // A value that is neither on nor off: guessing could migrate a database the
+        // operator meant to leave alone, so nothing runs.
+        Err(msg) => {
+            tracing::error!("{msg}");
+            std::process::exit(1);
+        }
     }
+    let jobs_on = background::jobs_enabled(jobs_env.as_deref());
     let db    = db::connect(&cfg.database_url).await;
     if jobs_on {
         db::MIGRATOR.run(&db).await.expect("DB migrations failed");
