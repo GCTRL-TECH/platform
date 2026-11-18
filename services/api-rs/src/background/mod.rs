@@ -10,7 +10,10 @@ pub mod guardrail;
 /// HTTP only: no [`spawn_all`] loops and no agent version sync. For a SECOND API
 /// instance on the same Postgres/Redis/Neo4j (a gateway test next to the productive
 /// one): result subscriber, stale-job recovery, license heartbeat, memory cycle,
-/// cron triggers and guardrail must run exactly once per installation.
+/// cron triggers and guardrail must run exactly once per installation. Off also skips
+/// the migrations and the boot writes (secret backfill, admin self-heal, system skills);
+/// `main` then refuses to start unless the database carries exactly this binary's
+/// migrations (`db::verify_schema`).
 pub fn jobs_enabled(v: Option<&str>) -> bool {
     !matches!(
         v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),

@@ -29,15 +29,25 @@ async fn main() {
     // derived from JWT_SECRET) before anything reads/writes sealed secrets.
     services::crypto::init(&cfg.jwt_secret);
 
+    let jobs_on = background::jobs_enabled(std::env::var("GCTRL_BACKGROUND_JOBS").ok().as_deref());
     let db    = db::connect(&cfg.database_url).await;
-    sqlx::migrate!().run(&db).await.expect("DB migrations failed");
+    if jobs_on {
+        db::MIGRATOR.run(&db).await.expect("DB migrations failed");
 
-    // Encrypt any legacy plaintext secrets in place (idempotent — skips v1:* rows).
-    services::crypto::backfill_encrypt_secrets(&db).await;
-    // Self-heal admin access (single-tenant instances must always have one admin).
-    ensure_admin_exists(&db).await;
-    // Ensure the system 'gctrl-memory' skill is present/current (single source).
-    routes::agent::ensure_system_skills(&db).await;
+        // Encrypt any legacy plaintext secrets in place (idempotent, skips v1:* rows).
+        services::crypto::backfill_encrypt_secrets(&db).await;
+        // Self-heal admin access (single-tenant instances must always have one admin).
+        ensure_admin_exists(&db).await;
+        // Ensure the system 'gctrl-memory' skill is present/current (single source).
+        routes::agent::ensure_system_skills(&db).await;
+    } else if let Err(why) = db::verify_schema(&db).await {
+        // HTTP-only instance on the productive database: it never migrates and never
+        // writes at boot. A newer binary would otherwise migrate the shared database and
+        // the older productive binary would panic on its next start (sqlx
+        // VersionMissing); an older one would serve on a schema it does not know.
+        tracing::error!("GCTRL_BACKGROUND_JOBS is off, refusing to start: {why}");
+        std::process::exit(1);
+    }
     let neo   = services::neo4j::connect(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password).await;
     let redis = services::redis::connect(&cfg.redis_url).await;
 
@@ -51,13 +61,15 @@ async fn main() {
         llm_gate: Arc::new(tokio::sync::Mutex::new((4, Arc::new(tokio::sync::Semaphore::new(4))))),
     });
 
-    if background::jobs_enabled(std::env::var("GCTRL_BACKGROUND_JOBS").ok().as_deref()) {
+    if jobs_on {
         background::spawn_all(state.clone());
         // Tell the agent which version is running (manual updates never did) —
         // best-effort, off the boot path. See routes::update::sync_agent_version.
         tokio::spawn(routes::update::sync_agent_version());
     } else {
-        tracing::warn!("GCTRL_BACKGROUND_JOBS is off: HTTP only, no background jobs, no agent version sync");
+        tracing::warn!(
+            "GCTRL_BACKGROUND_JOBS is off: HTTP only, no migrations or boot writes, no background jobs, no agent version sync"
+        );
     }
 
     let app = build_router(state);
