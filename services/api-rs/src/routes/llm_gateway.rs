@@ -64,9 +64,12 @@
 //! ## What is cloaked (chat completions)
 //! Every message's text in one batch, so the model sees ONE mapping: `content`
 //! (string or text parts) of every role, tool RESULTS (`role:"tool"`; opt out with
-//! `X-Cloak-Tool-Outputs: 0`, never forwarded), and the decoded string values of
-//! replayed `assistant.tool_calls[].function.arguments` (keys and numbers untouched,
-//! re-serialized as valid JSON). `tools[]` definitions are never cloaked. On the
+//! `X-Cloak-Tool-Outputs: 0`, never forwarded), the string reasoning fields of replayed
+//! messages (`reasoning`, `reasoning_content`, `reasoning_text`, `thinking`: the response
+//! side restores them, so a client that replays them would send real names), and the
+//! decoded string values of replayed `assistant.tool_calls[].function.arguments` (keys
+//! and numbers untouched, re-serialized as valid JSON). `tools[]` definitions are never
+//! cloaked. On the
 //! wire every pseudonym is bracketed (`[Place-7]`), and a cloaked request carries a
 //! short system note that bracketed terms are placeholders to pass on unchanged.
 //! The response side restores content and reasoning with the plain session and
@@ -1149,11 +1152,19 @@ pub(super) enum ChatSlot {
     /// `messages[i].content` (string, `None`) or `messages[i].content[j].text`
     /// (content-parts form, `Some(j)`), for every role incl. `tool`.
     Content(usize, Option<usize>),
+    /// `messages[i].<field>` for a string field of [`REASONING_FIELDS`].
+    Reasoning(usize, &'static str),
     /// `messages[i].tool_calls[j].function.arguments` of a replayed assistant call:
     /// one slot per decoded non-empty string VALUE (in `string_leaves` order), or one
     /// slot holding the raw string when it is not valid JSON.
     ToolArguments(usize, usize),
 }
+
+/// String reasoning fields of a chat message. The response side restores `reasoning`,
+/// `reasoning_content` and `thinking` ([`decloak_chat_completion`], [`ChatSseDecloaker`]),
+/// and clients (pi) replay the assistant message with them, so they go back through the
+/// cloak like `content`; `reasoning_text` is covered for clients that use that name.
+const REASONING_FIELDS: [&str; 4] = ["reasoning", "reasoning_content", "reasoning_text", "thinking"];
 
 /// The system note added to a cloaked request: placeholders are not values. The example
 /// carries number 0, which the registry never assigns (numbering starts at 1): the former
@@ -1163,7 +1174,8 @@ pub(super) const PLACEHOLDER_NOTE: &str = "Begriffe in eckigen Klammern wie [Per
 /// Every free text a cloud model would read, in request order: each message's
 /// `content` (string or the text of content parts; agent harnesses like pi send
 /// the array form for every message), tool RESULTS (`role:"tool"`) unless
-/// `cloak_tool_outputs` is off (`X-Cloak-Tool-Outputs: 0`), and the string values
+/// `cloak_tool_outputs` is off (`X-Cloak-Tool-Outputs: 0`), the string reasoning
+/// fields ([`REASONING_FIELDS`]) of every message, and the string values
 /// of replayed `assistant.tool_calls[].function.arguments`. Tool results and
 /// replayed calls must share the batch with the prose: the de-cloaker gave the
 /// client the real names, so sending them back in clear next to pseudonymised text
@@ -1192,6 +1204,14 @@ fn collect_cloak_texts(messages: &[Value], cloak_tool_outputs: bool) -> (Vec<Cha
                     }
                 }
                 _ => {}
+            }
+        }
+        for field in REASONING_FIELDS {
+            if let Some(Value::String(text)) = msg.get(field) {
+                if !text.is_empty() {
+                    slots.push(ChatSlot::Reasoning(idx, field));
+                    plain.push(text.clone());
+                }
             }
         }
         let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) else { continue };
@@ -1267,6 +1287,13 @@ fn write_cloaked_texts(messages: &mut [Value], slots: &[ChatSlot], cloaked: &[St
                             p["text"] = json!(text);
                         }
                     }
+                }
+            }
+            ChatSlot::Reasoning(i, field) => {
+                let text = &cloaked[k];
+                k += 1;
+                if let Some(msg) = messages.get_mut(i) {
+                    msg[field] = json!(text);
                 }
             }
         }
@@ -1688,6 +1715,43 @@ mod tests {
         assert_eq!(m["reasoning"], "Tom \"TA\" Arenstam will nach Berlin Hbf");
         let a: Value = serde_json::from_str(m["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).expect("valid JSON");
         assert_eq!(a, json!({ "text": "Berlin Hbf", "who": "Tom \"TA\" Arenstam", "p": "C:\\Daten" }));
+    }
+
+    #[test]
+    fn replayed_reasoning_goes_out_cloaked_again() {
+        // Turn 1: a reasoning model streams `reasoning_content` with pseudonyms (one split
+        // across chunks); the de-cloaker hands the client the real names.
+        let input = chunk(json!({ "role": "assistant", "reasoning_content": "Frage [Person-27] nach [Pla" }), None)
+            + &chunk(json!({ "reasoning_content": "ce-3]" }), None)
+            + &chunk(json!({ "content": "Erledigt." }), Some("stop"))
+            + "data: [DONE]\n\n";
+        let out = run(wire_session(), &[input.as_bytes()]);
+        let reasoning: String = data_events(&out)
+            .iter()
+            .filter_map(|e| {
+                let d = &e["choices"][0]["delta"];
+                d["reasoning_content"].as_str().or(d["reasoning"].as_str()).map(str::to_string)
+            })
+            .collect();
+        assert_eq!(reasoning, "Frage Tom \"TA\" Arenstam nach Berlin Hbf");
+
+        // Turn 2: the client replays that assistant message (pi keeps `reasoning_content`);
+        // other clients use the sibling field names.
+        let mut messages = vec![
+            json!({ "role": "user", "content": "Weiter" }),
+            json!({ "role": "assistant", "content": content_of(&out), "reasoning_content": reasoning }),
+            json!({ "role": "assistant", "content": null, "reasoning": "Tom \"TA\" Arenstam", "reasoning_text": "Berlin Hbf", "thinking": "C:\\Daten" }),
+            json!({ "role": "user", "content": "und dann?" }),
+        ];
+        cloak_messages(&mut messages, true);
+        assert_eq!(messages[1]["reasoning_content"], "Frage [Person-27] nach [Place-3]");
+        assert_eq!(messages[2]["reasoning"], "[Person-27]");
+        assert_eq!(messages[2]["reasoning_text"], "[Place-3]");
+        assert_eq!(messages[2]["thinking"], "[Term-2]");
+        let wire = serde_json::to_string(&json!({ "model": "gpt-5.4", "messages": messages })).unwrap();
+        for leak in ["Arenstam", "Berlin", "Daten"] {
+            assert!(!wire.contains(leak), "{leak} reached the upstream: {wire}");
+        }
     }
 
     #[test]
