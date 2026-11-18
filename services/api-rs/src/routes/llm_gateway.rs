@@ -25,8 +25,10 @@
 //! serves `POST /v1/chat/completions` for Ollama, OpenAI and Runware; Anthropic's
 //! `/v1/messages` lives in the sibling module `llm_gateway_anthropic`, and the OpenAI
 //! Responses API (`/v1/responses`, upstreams `chatgpt` = the ChatGPT subscription via
-//! Codex, and `openai`) in `llm_gateway_responses`; both build on the
+//! Codex, `openai` and `runware`) in `llm_gateway_responses`; both build on the
 //! `pub(super)` items here (auth, upstream base, header allowlist, cloak helpers).
+//! [`vendor_route`] is the one credential/base/header step that `/v1/chat/completions`
+//! and `/v1/responses` share, so an API-key caller only changes the path.
 //! Bases come from `ANTHROPIC_BASE` / `OPENAI_BASE` / `CHATGPT_BASE` / `RUNWARE_BASE`
 //! (host only, official host pinned via `validate_llm_base`; dev escape hatch
 //! `GCTRL_CLOAK_UPSTREAM_UNPINNED=1`).
@@ -37,7 +39,8 @@
 //! a cloud egress (`anthropic:claude@haiku-5.5`, `zai-glm-5-3`, ... never hit the
 //! `:cloud` tag rule), and `developer` messages go out as `system` because Runware
 //! routes to vendors that do not all know that role. `openai-beta` is not forwarded.
-//! `GET /v1/models` with `runware` relays Runware's catalog (see `llm_gateway_responses`).
+//! `GET /v1/models` with `runware` relays Runware's catalog, and `POST /v1/responses`
+//! with `runware` goes to Runware's own Responses endpoint (see `llm_gateway_responses`).
 //!
 //! ## Auth
 //! Ollama route: `Authorization: ApiKey <gctrl-token>` OR `Authorization: Bearer
@@ -164,10 +167,13 @@ pub fn router() -> Router<Arc<crate::models::AppState>> {
 }
 
 /// Capability probe (no auth): which upstreams this gateway can cloak for.
-/// Anvil polls it to decide what to offer; keep the list stable.
+/// Anvil polls it to decide what to offer; keep the list stable. `responses` lists
+/// the upstreams `POST /v1/responses` serves, so a caller can tell a gateway that
+/// takes `runware` there from an older one that answers 400.
 pub(super) async fn capabilities() -> Json<Value> {
     Json(json!({
         "upstreams": ["ollama", "anthropic", "openai", "chatgpt", "runware"],
+        "responses": super::llm_gateway_responses::RESPONSES_UPSTREAMS,
         "version": crate::routes::update::current_version(),
     }))
 }
@@ -547,6 +553,38 @@ pub(super) fn has_upstream_credential(headers: &HeaderMap, upstream: Upstream, c
     }
 }
 
+/// The 401 hint when the vendor credential is missing (Bearer-only upstreams).
+pub(super) fn credential_hint(upstream: Upstream) -> &'static str {
+    match upstream {
+        Upstream::ChatGpt => {
+            "no upstream credential: send Authorization: Bearer <ChatGPT access token> and the gctrl token in X-GCTRL-Token"
+        }
+        Upstream::Runware => {
+            "no upstream credential: send Authorization: Bearer <runware key> and the gctrl token in X-GCTRL-Token"
+        }
+        _ => "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token",
+    }
+}
+
+/// The vendor half of a request once the caller is authenticated, in fail-closed
+/// order: vendor credential (401), pinned upstream base (500), forwarded headers.
+/// ONE place for `/v1/chat/completions` (openai, runware) and `/v1/responses`
+/// (chatgpt, openai, runware), so both routes take the same key and send the same
+/// headers upstream; only the path differs. Returns `(base, headers)`.
+pub(super) fn vendor_route(
+    headers: &HeaderMap,
+    upstream: Upstream,
+    consumed_authorization: bool,
+) -> Result<(String, HeaderMap), Response> {
+    if !has_upstream_credential(headers, upstream, consumed_authorization) {
+        return Err(gateway_error_json(StatusCode::UNAUTHORIZED, "unauthorized", credential_hint(upstream)));
+    }
+    let base = upstream_base(upstream).map_err(|e| {
+        gateway_error_json(StatusCode::INTERNAL_SERVER_ERROR, "api_error", format!("invalid upstream base: {e}"))
+    })?;
+    Ok((base, forward_headers(headers, upstream, consumed_authorization)))
+}
+
 // ── Handler ──────────────────────────────────────────────────────────────────
 
 /// Traced wrapper: one CHAIN span per gateway request (model, whether cloaking
@@ -607,21 +645,10 @@ async fn chat_completions_inner(
         let Some(identity) = authenticate_gateway(&state, &headers).await else {
             return unauthorized();
         };
-        if !has_upstream_credential(&headers, upstream, identity.consumed_authorization) {
-            let hint = if upstream == Upstream::Runware {
-                "no upstream credential: send Authorization: Bearer <runware key> and the gctrl token in X-GCTRL-Token"
-            } else {
-                "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token"
-            };
-            return gateway_error_json(StatusCode::UNAUTHORIZED, "unauthorized", hint);
-        }
-        let base = match upstream_base(upstream) {
-            Ok(b) => b,
-            Err(e) => {
-                return gateway_error_json(StatusCode::INTERNAL_SERVER_ERROR, "api_error", format!("invalid upstream base: {e}"))
-            }
+        let (base, fwd) = match vendor_route(&headers, upstream, identity.consumed_authorization) {
+            Ok(x) => x,
+            Err(r) => return r,
         };
-        let fwd = forward_headers(&headers, upstream, identity.consumed_authorization);
         (identity.claims, chat_completions_url(&base), fwd)
     } else {
         let Some(claims) = authenticate(&state, &headers).await else {

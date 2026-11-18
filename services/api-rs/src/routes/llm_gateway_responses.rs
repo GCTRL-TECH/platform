@@ -1,15 +1,26 @@
 //! OpenAI Responses API adapter for the cloak gateway: `POST /v1/responses`.
 //!
-//! Two upstreams, picked by `X-Upstream-Provider`:
+//! Three upstreams, picked by `X-Upstream-Provider` ([`RESPONSES_UPSTREAMS`]):
 //! * `chatgpt`: the ChatGPT subscription as the Codex CLI uses it
 //!   (`https://chatgpt.com` + [`CHATGPT_CODEX_PATH`] + `/responses`; the caller's
 //!   ChatGPT access token travels in `Authorization: Bearer`, the Codex session
 //!   headers `chatgpt-account-id`, `originator`, `session-id`, `x-codex-*`, ... are
 //!   forwarded to chatgpt.com only);
-//! * `openai`: the public Responses API (`https://api.openai.com/v1/responses`).
+//! * `openai`: the public Responses API (`https://api.openai.com/v1/responses`);
+//! * `runware`: Runware's Responses endpoint (`https://api.runware.ai/v1/responses`,
+//!   OpenAI's own request body and SSE events; Runware serves the GPT models and a few
+//!   others there and does not support `previous_response_id`).
 //!
 //! The gctrl token goes in `X-GCTRL-Token`; auth, header allowlist, base pinning and
-//! the cloak namespace are shared with the sibling modules (`llm_gateway`).
+//! the cloak namespace are shared with the sibling modules (`llm_gateway`). The API-key
+//! upstreams `openai` and `runware` take exactly the key and headers of
+//! `/v1/chat/completions` (`llm_gateway::vendor_route`): a caller that already sends
+//! chat completions through the gateway only changes the path.
+//!
+//! The API-key upstreams also get the placeholder note of the chat route
+//! (`llm_gateway::PLACEHOLDER_NOTE`, prepended to `instructions` when something was
+//! cloaked). `chatgpt` does not: Codex's `instructions` reach chatgpt.com as Codex
+//! sent them, apart from the cloak itself.
 //!
 //! `CHATGPT_BASE` is the HOST only (the Codex path is appended here); with the dev
 //! escape hatch `GCTRL_CLOAK_UPSTREAM_UNPINNED=1` a path in it would be doubled.
@@ -81,9 +92,9 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::llm_gateway::{
-    authenticate_gateway, cloak_disabled, cloak_namespace, forward_headers, gateway_error_json,
-    has_upstream_credential, relay_response_headers, upstream_base, upstream_from_headers,
-    upstream_unreachable_message, Upstream, HTTP_NOREDIRECT,
+    authenticate_gateway, cloak_disabled, cloak_namespace, gateway_error_json, relay_response_headers,
+    upstream_from_headers, upstream_unreachable_message, vendor_route, Upstream, HTTP_NOREDIRECT,
+    PLACEHOLDER_NOTE,
 };
 use super::llm_gateway_anthropic::{json_escaped_session, relay_error, set_string_leaves, string_leaves};
 use crate::models::AppState;
@@ -798,18 +809,6 @@ fn provider_label(upstream: Upstream) -> &'static str {
     }
 }
 
-fn credential_hint(upstream: Upstream) -> &'static str {
-    match upstream {
-        Upstream::ChatGpt => {
-            "no upstream credential: send Authorization: Bearer <ChatGPT access token> and the gctrl token in X-GCTRL-Token"
-        }
-        Upstream::Runware => {
-            "no upstream credential: send Authorization: Bearer <runware key> and the gctrl token in X-GCTRL-Token"
-        }
-        _ => "no upstream credential: send Authorization: Bearer <openai key> and the gctrl token in X-GCTRL-Token",
-    }
-}
-
 fn responses_url(upstream: Upstream, base: &str) -> String {
     let base = base.trim_end_matches('/');
     match upstream {
@@ -836,27 +835,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new().route("/v1/responses", post(responses))
 }
 
-/// `X-Upstream-Provider` must be `chatgpt` or `openai` on this endpoint.
-fn responses_upstream(headers: &HeaderMap) -> Result<Upstream, Response> {
-    match upstream_from_headers(headers)? {
-        u @ (Upstream::ChatGpt | Upstream::OpenAi) => Ok(u),
-        _ => Err(gateway_error_json(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "/v1/responses needs X-Upstream-Provider: chatgpt or openai",
-        )),
-    }
-}
+/// The upstreams `POST /v1/responses` (and the `GET /v1/models` relay) serve, as
+/// `X-Upstream-Provider` names; `/v1/cloak/capabilities` lists them under `responses`.
+pub(super) const RESPONSES_UPSTREAMS: [&str; 3] = ["chatgpt", "openai", "runware"];
 
-/// `GET /v1/models` also serves `runware` (its catalog sits at `/v1/models` on the
-/// pinned host); `POST /v1/responses` stays `chatgpt` / `openai` only.
-fn models_upstream(headers: &HeaderMap) -> Result<Upstream, Response> {
+/// `X-Upstream-Provider` must be one of [`RESPONSES_UPSTREAMS`] on this endpoint.
+fn responses_upstream(headers: &HeaderMap) -> Result<Upstream, Response> {
     match upstream_from_headers(headers)? {
         u @ (Upstream::ChatGpt | Upstream::OpenAi | Upstream::Runware) => Ok(u),
         _ => Err(gateway_error_json(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "this /v1/models handler needs X-Upstream-Provider: chatgpt, openai or runware",
+            "/v1/responses needs X-Upstream-Provider: chatgpt, openai or runware",
         )),
     }
 }
@@ -870,13 +860,10 @@ struct Gate {
     base: String,
 }
 
+/// Credential, base and headers come from `vendor_route`, the step
+/// `/v1/chat/completions` uses for `openai` and `runware`.
 async fn gate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Gate, Response> {
     let upstream = responses_upstream(headers)?;
-    gate_for(state, headers, upstream).await
-}
-
-/// [`gate`] for an already chosen upstream.
-async fn gate_for(state: &Arc<AppState>, headers: &HeaderMap, upstream: Upstream) -> Result<Gate, Response> {
     let Some(identity) = authenticate_gateway(state, headers).await else {
         return Err(gateway_error_json(
             StatusCode::UNAUTHORIZED,
@@ -884,18 +871,55 @@ async fn gate_for(state: &Arc<AppState>, headers: &HeaderMap, upstream: Upstream
             "missing or invalid gctrl token (send it in X-GCTRL-Token, or as `ApiKey <token>` / `Bearer <token>` in Authorization)",
         ));
     };
-    if !has_upstream_credential(headers, upstream, identity.consumed_authorization) {
-        return Err(gateway_error_json(StatusCode::UNAUTHORIZED, "unauthorized", credential_hint(upstream)));
+    let (base, fwd) = vendor_route(headers, upstream, identity.consumed_authorization)?;
+    Ok(Gate { upstream, user_id: identity.claims.sub, fwd, base })
+}
+
+/// Does a cloaked request to this upstream carry the placeholder note of the chat
+/// route? The API-key upstreams do (same pseudonymization as their chat path);
+/// `chatgpt` keeps Codex's `instructions` as Codex sent them.
+fn upstream_takes_placeholder_note(upstream: Upstream) -> bool {
+    matches!(upstream, Upstream::OpenAi | Upstream::Runware)
+}
+
+/// Prepend [`PLACEHOLDER_NOTE`] to `instructions` (the Responses counterpart of the
+/// chat route's first system message), or set it when there is none. A non-string
+/// `instructions` is left as it is.
+fn add_responses_placeholder_note(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else { return };
+    match obj.get_mut("instructions") {
+        Some(Value::String(s)) if !s.is_empty() => *s = format!("{PLACEHOLDER_NOTE}\n\n{s}"),
+        None | Some(Value::Null) | Some(Value::String(_)) => {
+            obj.insert("instructions".into(), Value::String(PLACEHOLDER_NOTE.to_string()));
+        }
+        Some(_) => {}
     }
-    let base = upstream_base(upstream).map_err(|e| {
-        gateway_error_json(StatusCode::INTERNAL_SERVER_ERROR, "api_error", format!("invalid upstream base: {e}"))
-    })?;
-    Ok(Gate {
-        upstream,
-        user_id: identity.claims.sub,
-        fwd: forward_headers(headers, upstream, identity.consumed_authorization),
-        base,
-    })
+}
+
+/// PURE tail of [`cloak_responses_request`]: write the cloaked texts into their
+/// slots and, for an API-key upstream with a non-empty session, add the placeholder
+/// note. FAIL CLOSED: a result of another length than the slots is an error, never
+/// a body with plaintext slots.
+pub(super) fn apply_responses_cloak(
+    body: &mut Value,
+    upstream: Upstream,
+    slots: &[ResponsesSlot],
+    cloaked: &[String],
+    session: &privacy::CloakSession,
+) -> Result<(), Response> {
+    // write_responses_cloaked_texts zips: a short result would leave plaintext slots.
+    if cloaked.len() != slots.len() {
+        return Err(gateway_error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cloak_error",
+            "cloak result does not match the request texts",
+        ));
+    }
+    write_responses_cloaked_texts(body, slots, cloaked, session);
+    if upstream_takes_placeholder_note(upstream) && !session.is_empty() {
+        add_responses_placeholder_note(body);
+    }
+    Ok(())
 }
 
 /// Traced wrapper: one CHAIN span per gateway request, exported to Phoenix when
@@ -941,7 +965,8 @@ async fn responses_inner(state: Arc<AppState>, headers: HeaderMap, body: Bytes) 
     if cloak_disabled(&headers) {
         return proxy_passthrough_responses(name, reqwest::Method::POST, url, g.fwd, Some(body)).await;
     }
-    let (out_bytes, session) = match cloak_responses_request(&state, g.user_id, parsed, &model, tool_outputs_cloaked(&headers)).await {
+    let cloak_tool_outputs = tool_outputs_cloaked(&headers);
+    let (out_bytes, session) = match cloak_responses_request(&state, g.user_id, g.upstream, parsed, &model, cloak_tool_outputs).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -956,11 +981,7 @@ async fn responses_inner(state: Arc<AppState>, headers: HeaderMap, body: Bytes) 
 /// module, which owns the route): plain proxy, no prompt content, but gctrl auth and an
 /// upstream credential are still required.
 pub(super) async fn models_passthrough(state: Arc<AppState>, headers: HeaderMap, query: Option<String>) -> Response {
-    let upstream = match models_upstream(&headers) {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    let g = match gate_for(&state, &headers, upstream).await {
+    let g = match gate(&state, &headers).await {
         Ok(g) => g,
         Err(r) => return r,
     };
@@ -973,6 +994,7 @@ pub(super) async fn models_passthrough(state: Arc<AppState>, headers: HeaderMap,
 async fn cloak_responses_request(
     state: &Arc<AppState>,
     user_id: Uuid,
+    upstream: Upstream,
     mut body: Value,
     model: &str,
     cloak_tool_outputs: bool,
@@ -994,15 +1016,7 @@ async fn cloak_responses_request(
     let healed = privacy::heal_texts(&heal, &refs);
     let refs: Vec<&str> = healed.iter().map(String::as_str).collect();
     let (cloaked, session) = privacy::cloak_batch(&state.db, &[namespace], &candidates, &refs).await;
-    // write_responses_cloaked_texts zips: a short result would leave plaintext slots.
-    if cloaked.len() != slots.len() {
-        return Err(gateway_error_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cloak_error",
-            "cloak result does not match the request texts",
-        ));
-    }
-    write_responses_cloaked_texts(&mut body, &slots, &cloaked, &session);
+    apply_responses_cloak(&mut body, upstream, &slots, &cloaked, &session)?;
     tracing::debug!(
         "llm_gateway_responses: cloaked {} entities for user {} (model {})",
         session.map.len(),
@@ -1142,6 +1156,7 @@ async fn proxy_once_decloaked_responses(
 
 #[cfg(test)]
 mod tests {
+    use super::super::llm_gateway::{credential_hint, forward_headers, has_upstream_credential};
     use super::*;
 
     fn session() -> privacy::CloakSession {
@@ -1917,28 +1932,141 @@ mod tests {
     async fn capabilities_list_chatgpt() {
         let v = super::super::llm_gateway::capabilities().await.0;
         assert_eq!(v["upstreams"], json!(["ollama", "anthropic", "openai", "chatgpt", "runware"]));
+        assert_eq!(v["responses"], json!(["chatgpt", "openai", "runware"]));
     }
 
     #[test]
-    fn runware_serves_models_but_not_responses() {
+    fn runware_serves_responses_and_models() {
         use super::super::llm_gateway::upstream_base_from;
-        let rw = hm(&[("x-upstream-provider", "runware")]);
-        let r = responses_upstream(&rw).err().expect("/v1/responses rejects runware");
-        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(r.headers()["x-cloak-gateway-error"], "1");
-        assert_eq!(models_upstream(&rw).ok(), Some(Upstream::Runware));
-        assert_eq!(models_upstream(&hm(&[("x-upstream-provider", "openai")])).ok(), Some(Upstream::OpenAi));
-        assert_eq!(models_upstream(&hm(&[("x-upstream-provider", "chatgpt")])).ok(), Some(Upstream::ChatGpt));
+        // every name the capability probe announces is accepted and maps back to itself
+        for name in RESPONSES_UPSTREAMS {
+            let u = responses_upstream(&hm(&[("x-upstream-provider", name)])).expect(name);
+            assert_eq!(provider_label(u), name);
+        }
+        assert_eq!(responses_upstream(&hm(&[("x-upstream-provider", "Runware")])).ok(), Some(Upstream::Runware));
         for bad in [hm(&[]), hm(&[("x-upstream-provider", "anthropic")]), hm(&[("x-upstream-provider", "foo")])] {
-            let r = models_upstream(&bad).err().expect("rejected");
+            let r = responses_upstream(&bad).expect_err("rejected");
             assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(r.headers()["x-cloak-gateway-error"], "1");
         }
         let base = upstream_base_from(Upstream::Runware, None, false).unwrap();
+        assert_eq!(responses_url(Upstream::Runware, &base), "https://api.runware.ai/v1/responses");
+        // RUNWARE_BASE with the /v1 Anvil shows is host only after the pin: no /v1/v1
+        let with_v1 = upstream_base_from(Upstream::Runware, Some("https://api.runware.ai/v1"), false).unwrap();
+        assert_eq!(responses_url(Upstream::Runware, &with_v1), "https://api.runware.ai/v1/responses");
+        let dev = upstream_base_from(Upstream::Runware, Some("http://127.0.0.1:9798/"), true).unwrap();
+        assert_eq!(responses_url(Upstream::Runware, &dev), "http://127.0.0.1:9798/v1/responses");
         assert_eq!(responses_models_url(Upstream::Runware, &base, None), "https://api.runware.ai/v1/models");
         assert_eq!(responses_models_url(Upstream::Runware, &base, Some("a=b")), "https://api.runware.ai/v1/models?a=b");
         assert_eq!(upstream_name(Upstream::Runware), "Runware");
-        assert_eq!(provider_label(Upstream::Runware), "runware");
         assert!(credential_hint(Upstream::Runware).contains("<runware key>"));
+    }
+
+    /// The headers Anvil's provider-key proxy sends with a cloaked chat completion
+    /// (lib/provider-key-proxy.ts + lib/cloak-upstream.ts): the vendor key as Bearer,
+    /// the user's gctrl token in X-GCTRL-Token, the upstream in X-Upstream-Provider,
+    /// plus what the OpenAI client of pi sets itself, plus headers that must never
+    /// reach the vendor (cookie, a second key in x-api-key, Codex and Anthropic headers).
+    fn anvil_headers(upstream: &str) -> HeaderMap {
+        hm(&[
+            ("authorization", "Bearer sk-vendor-key"),
+            ("x-gctrl-token", "gctrl_user_token"),
+            ("x-upstream-provider", upstream),
+            ("content-type", "application/json"),
+            ("accept", "text/event-stream"),
+            ("user-agent", "OpenAI/JS 6.1.0"),
+            ("x-stainless-os", "Linux"),
+            ("openai-beta", "responses=v1"),
+            ("x-cloak-tool-outputs", "1"),
+            ("x-anvil-cloak", "on"),
+            ("content-length", "123"),
+            ("host", "gctrl-api:4000"),
+            ("accept-encoding", "gzip"),
+            ("cookie", "a=b"),
+            ("chatgpt-account-id", "acc"),
+            ("x-codex-turn-metadata", "{}"),
+            ("anthropic-version", "2023-06-01"),
+            ("x-api-key", "sk-ant-other"),
+        ])
+    }
+
+    fn sorted_names(h: &HeaderMap) -> Vec<String> {
+        let mut n: Vec<String> = h.keys().map(|k| k.as_str().to_string()).collect();
+        n.sort();
+        n
+    }
+
+    // 31
+    #[tokio::test]
+    async fn api_key_upstreams_take_the_chat_key_and_header_contract() {
+        // `vendor_route` is the step /v1/chat/completions runs for openai and runware, and
+        // the Responses gate runs the same one: same key, same headers, only the path moves.
+        let (base, fwd) = vendor_route(&anvil_headers("openai"), Upstream::OpenAi, false).expect("openai");
+        assert_eq!(base, "https://api.openai.com");
+        assert_eq!(responses_url(Upstream::OpenAi, &base), format!("{base}/v1/responses"));
+        assert_eq!(sorted_names(&fwd), ["accept", "authorization", "content-type", "openai-beta", "user-agent", "x-stainless-os"]);
+        assert_eq!(fwd["authorization"], "Bearer sk-vendor-key");
+        // Runware: the same set without openai-beta (env-independent: another test moves RUNWARE_BASE)
+        let rw = forward_headers(&anvil_headers("runware"), Upstream::Runware, false);
+        assert_eq!(sorted_names(&rw), ["accept", "authorization", "content-type", "user-agent", "x-stainless-os"]);
+        assert_eq!(rw["authorization"], "Bearer sk-vendor-key");
+        assert_eq!(rw["content-type"], "application/json");
+
+        // Refusals happen before any upstream call and carry the gateway marker, as on chat.
+        for (name, u) in [("openai", Upstream::OpenAi), ("runware", Upstream::Runware)] {
+            // the gctrl token came in Authorization (no X-GCTRL-Token): no vendor key left
+            let mut h = anvil_headers(name);
+            h.remove("x-gctrl-token");
+            let r = vendor_route(&h, u, true).expect_err("consumed authorization");
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{name}");
+            assert_eq!(r.headers()["x-cloak-gateway-error"], "1");
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"]["message"], credential_hint(u), "{name}");
+            // an x-api-key or a gctrl token in Authorization is no vendor key on these upstreams
+            for bad in [hm(&[("x-api-key", "sk-1")]), hm(&[("authorization", "Bearer gctrl_abc")]), HeaderMap::new()] {
+                let r = vendor_route(&bad, u, false).expect_err("no vendor key");
+                assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{name}");
+            }
+        }
+        assert!(has_upstream_credential(&anvil_headers("runware"), Upstream::Runware, false));
+    }
+
+    // 32
+    #[test]
+    fn placeholder_note_for_api_key_upstreams_only() {
+        let mut map = HashMap::new();
+        map.insert("[Person-3]".to_string(), "Max Müller".to_string());
+        let s = privacy::CloakSession { map };
+        let cloak = |u: Upstream, body: &Value, s: &privacy::CloakSession| {
+            let mut b = body.clone();
+            let (slots, texts) = collect_responses_cloak_texts(&b, true);
+            let (cloaked, bs) = real_cloak(&texts, s);
+            apply_responses_cloak(&mut b, u, &slots, &cloaked, &bs).expect("cloaked");
+            b
+        };
+        let body = json!({"model": "gpt-5.4", "instructions": "Du hilfst Max Müller.", "input": "Wer ist Max Müller?"});
+        for u in [Upstream::OpenAi, Upstream::Runware] {
+            let out = cloak(u, &body, &s);
+            assert_eq!(out["instructions"], format!("{PLACEHOLDER_NOTE}\n\nDu hilfst [Person-3]."), "{u:?}");
+            assert_eq!(out["input"], "Wer ist [Person-3]?");
+        }
+        // chatgpt: Codex's instructions are cloaked, never extended
+        assert_eq!(cloak(Upstream::ChatGpt, &body, &s)["instructions"], "Du hilfst [Person-3].");
+        // no instructions: the note becomes them; nothing cloaked: no note at all
+        assert_eq!(cloak(Upstream::Runware, &json!({"input": "Max Müller"}), &s)["instructions"], PLACEHOLDER_NOTE);
+        let plain = cloak(Upstream::Runware, &json!({"input": "Hallo"}), &privacy::CloakSession::empty());
+        assert_eq!(plain, json!({"input": "Hallo"}));
+        // a non-string instructions value is left as it is
+        let mut odd = json!({"instructions": [{"type": "message"}]});
+        add_responses_placeholder_note(&mut odd);
+        assert_eq!(odd, json!({"instructions": [{"type": "message"}]}));
+        // fail closed: a cloak result of another length is refused, never written half
+        let mut b = body.clone();
+        let (slots, _) = collect_responses_cloak_texts(&b, true);
+        let r = apply_responses_cloak(&mut b, Upstream::Runware, &slots, &["x".to_string()], &s).expect_err("refused");
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(r.headers()["x-cloak-gateway-error"], "1");
     }
 
     // 22
@@ -2193,5 +2321,258 @@ mod tests {
         write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
         assert_eq!(body["input"][1]["arguments"], r#"{"q":"x Person-3"}"#);
         assert!(!body.to_string().contains("Müller"));
+    }
+
+    // ── fake upstream: the HTTP legs against a local stand-in for Runware / OpenAI ──
+
+    /// What the fake upstream received: path, headers, body.
+    type Seen = Arc<std::sync::Mutex<Option<(String, HeaderMap, Bytes)>>>;
+
+    /// A local stand-in for api.runware.ai / api.openai.com on 127.0.0.1: records the
+    /// request and answers `status` + `content_type` with `chunks`, one body frame each
+    /// (so a pseudonym can straddle two reads). Returns the base URL (host only, like
+    /// the pinned bases) and the recorder.
+    async fn fake_upstream(status: u16, content_type: &'static str, chunks: Vec<Bytes>) -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let rec = seen.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+            let rec = rec.clone();
+            let chunks = chunks.clone();
+            async move {
+                *rec.lock().unwrap() = Some((uri.path().to_string(), headers, body));
+                let frames = futures::stream::iter(chunks.into_iter().map(Ok::<Bytes, std::io::Error>));
+                Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .header("x-request-id", "req_fake_1")
+                    .body(Body::from_stream(frames))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    /// `text` cut into frames of `n` bytes.
+    fn frames(text: &str, n: usize) -> Vec<Bytes> {
+        text.as_bytes().chunks(n).map(Bytes::copy_from_slice).collect()
+    }
+
+    /// The two entities of the fake-upstream scenarios, as the registry resolves them.
+    fn wire_session() -> privacy::CloakSession {
+        let mut map = HashMap::new();
+        map.insert("[Person-3]".to_string(), "Max Müller".to_string());
+        map.insert("[Org-2]".to_string(), r#"Nexovar "Labs" GmbH"#.to_string());
+        privacy::CloakSession { map }
+    }
+
+    /// A Responses request as pi/Anvil sends it with a tool round trip in its history:
+    /// user text, the replayed call (arguments as JSON text) and the tool output.
+    fn tool_round_trip_request(stream: bool) -> Value {
+        json!({
+            "model": "gpt-5.4",
+            "stream": stream,
+            "instructions": "Du bist Jarvis.",
+            "tools": [{"type": "function", "name": "crm_lookup", "description": "Sucht im CRM",
+                       "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}}],
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Was weißt du über Max Müller von Nexovar \"Labs\" GmbH?"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "crm_lookup",
+                 "arguments": "{\"name\":\"Max Müller\"}"},
+                {"type": "function_call_output", "call_id": "call_1",
+                 "output": "Max Müller ist CEO der Nexovar \"Labs\" GmbH."}
+            ]
+        })
+    }
+
+    /// The request side exactly as `cloak_responses_request` runs it after the registry
+    /// lookups (collect, production substitution, write-back + note), serialized.
+    fn cloaked_request_bytes(upstream: Upstream, body: Value) -> (Bytes, privacy::CloakSession) {
+        let mut body = body;
+        normalize_duplicate_argument_keys(&mut body);
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        let (cloaked, session) = real_cloak(&texts, &wire_session());
+        apply_responses_cloak(&mut body, upstream, &slots, &cloaked, &session).expect("cloaked");
+        (Bytes::from(serde_json::to_vec(&body).unwrap()), session)
+    }
+
+    /// What the vendor must never see, in any form.
+    fn assert_no_plaintext(wire: &str) {
+        for leak in ["Müller", "M\\u00fcller", "Nexovar", "Labs"] {
+            assert!(!wire.contains(leak), "{leak} reached the upstream: {wire}");
+        }
+    }
+
+    fn usage() -> Value {
+        json!({"input_tokens": 812, "input_tokens_details": {"cached_tokens": 512},
+               "output_tokens": 46, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 858})
+    }
+
+    /// Runware's `/v1/responses` stream for the scenario, recorded in OpenAI's event
+    /// format: a message whose pseudonyms are split across deltas, a function call
+    /// whose arguments are split inside a pseudonym, and `response.completed` with usage.
+    fn recorded_runware_stream() -> String {
+        let text = "[Person-3] leitet die [Org-2].";
+        let args = r#"{"name":"[Person-3]","firma":"[Org-2]"}"#;
+        let msg = msg_item(0, text);
+        let fc = json!({"id": "fc_1", "type": "function_call", "call_id": "call_2", "name": "crm_lookup",
+                        "arguments": args, "status": "completed"});
+        let mut s = created();
+        s += &msg_added(0);
+        s += &part_added(0, 0);
+        for d in ["[Pers", "on-3] leitet die [Org", "-2]."] {
+            s += &tdelta(0, 0, d);
+        }
+        s += &tdone(0, 0, text, 7);
+        s += &part_done(0, 0, text);
+        s += &item_done(0, msg.clone());
+        s += &ev(
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": 1, "sequence_number": 10,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "call_2", "name": "crm_lookup",
+                            "arguments": "", "status": "in_progress"}}),
+        );
+        for d in [r#"{"name":"[Per"#, r#"son-3]","firma":"[Org-2]"}"#] {
+            s += &adelta(1, d);
+        }
+        s += &adone(1, args, 13);
+        s += &item_done(1, fc.clone());
+        s += &ev(
+            "response.completed",
+            json!({"type": "response.completed", "sequence_number": 15,
+                   "response": {"id": "resp_rw_1", "object": "response", "status": "completed",
+                                "model": "gpt-5.4", "output": [msg, fc], "usage": usage()}}),
+        );
+        s
+    }
+
+    // 33
+    #[tokio::test]
+    async fn runware_stream_round_trip_against_a_fake_upstream() {
+        let (out_bytes, session) = cloaked_request_bytes(Upstream::Runware, tool_round_trip_request(true));
+        let (base, seen) = fake_upstream(200, "text/event-stream", frames(&recorded_runware_stream(), 23)).await;
+        let fwd = forward_headers(&anvil_headers("runware"), Upstream::Runware, false);
+        let resp = proxy_stream_decloaked_responses(
+            upstream_name(Upstream::Runware),
+            responses_url(Upstream::Runware, &base),
+            fwd,
+            out_bytes,
+            session,
+        )
+        .await;
+
+        // response side: the client gets plaintext everywhere
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        assert_eq!(resp.headers()["x-request-id"], "req_fake_1");
+        let out = String::from_utf8(axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        let events = parse_events(&out);
+        let want_text = r#"Max Müller leitet die Nexovar "Labs" GmbH."#;
+        assert_eq!(deltas(&events, "response.output_text.delta", 0, Some(0)), want_text);
+        let want_args = json!({"name": "Max Müller", "firma": "Nexovar \"Labs\" GmbH"});
+        let streamed_args = deltas(&events, "response.function_call_arguments.delta", 1, None);
+        assert_eq!(serde_json::from_str::<Value>(&streamed_args).expect("valid JSON"), want_args);
+        let done = |ty: &str| events.iter().find(|(_, d)| d["type"] == ty).map(|(_, d)| d.clone()).expect(ty);
+        assert_eq!(done("response.output_text.done")["text"], want_text);
+        let done_args = done("response.function_call_arguments.done")["arguments"].as_str().unwrap().to_string();
+        assert_eq!(done_args, streamed_args, "deltas == done");
+        let completed = done("response.completed");
+        assert_eq!(completed["response"]["output"][0]["content"][0]["text"], want_text);
+        assert_eq!(completed["response"]["output"][1]["arguments"], done_args);
+        assert_eq!(completed["response"]["usage"], usage(), "usage passes through unchanged");
+        assert_eq!(completed["sequence_number"], 15);
+        assert!(!out.contains("[Person-3]") && !out.contains("[Org-2]"), "no pseudonym reaches the client: {out}");
+
+        // request side: what Runware received
+        let (path, headers, body) = seen.lock().unwrap().take().expect("upstream was called");
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(headers["authorization"], "Bearer sk-vendor-key");
+        for gone in ["x-gctrl-token", "x-upstream-provider", "x-anvil-cloak", "x-cloak-tool-outputs", "x-api-key",
+                     "openai-beta", "chatgpt-account-id", "x-codex-turn-metadata", "anthropic-version", "cookie"] {
+            assert!(!headers.contains_key(gone), "{gone} must not reach Runware");
+        }
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+        assert_no_plaintext(&wire);
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["input"][0]["content"][0]["text"], "Was weißt du über [Person-3] von [Org-2]?");
+        assert_eq!(sent["input"][1]["arguments"], r#"{"name":"[Person-3]"}"#);
+        assert_eq!(sent["input"][2]["output"], "[Person-3] ist CEO der [Org-2].");
+        assert_eq!(sent["instructions"], format!("{PLACEHOLDER_NOTE}\n\nDu bist Jarvis."));
+        assert_eq!(sent["tools"], tool_round_trip_request(true)["tools"], "tool definitions travel unchanged");
+        assert_eq!(sent["stream"], true);
+    }
+
+    // 34
+    #[tokio::test]
+    async fn openai_non_stream_round_trip_against_a_fake_upstream() {
+        let (out_bytes, session) = cloaked_request_bytes(Upstream::OpenAi, tool_round_trip_request(false));
+        let answer = json!({
+            "id": "resp_oa_1", "object": "response", "status": "completed", "model": "gpt-5.4",
+            "output": [
+                {"id": "rs_1", "type": "reasoning", "summary": [{"type": "summary_text", "text": "[Person-3] nachschlagen"}]},
+                msg_item(1, "[Person-3] leitet die [Org-2]."),
+                {"id": "fc_2", "type": "function_call", "call_id": "call_2", "name": "crm_lookup",
+                 "arguments": r#"{"name":"[Person-3]"}"#, "status": "completed"}
+            ],
+            "usage": usage()
+        });
+        let (base, seen) = fake_upstream(200, "application/json", frames(&answer.to_string(), 64)).await;
+        let fwd = forward_headers(&anvil_headers("openai"), Upstream::OpenAi, false);
+        let resp = proxy_once_decloaked_responses(
+            upstream_name(Upstream::OpenAi),
+            responses_url(Upstream::OpenAi, &base),
+            fwd,
+            out_bytes,
+            session,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/json");
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["output"][1]["content"][0]["text"], r#"Max Müller leitet die Nexovar "Labs" GmbH."#);
+        let args: Value = serde_json::from_str(v["output"][2]["arguments"].as_str().unwrap()).expect("valid JSON");
+        assert_eq!(args, json!({"name": "Max Müller"}));
+        assert_eq!(v["output"][0], answer["output"][0], "reasoning items stay as the vendor sent them");
+        assert_eq!(v["usage"], usage());
+        assert_eq!(v["id"], "resp_oa_1");
+
+        let (path, headers, body) = seen.lock().unwrap().take().expect("upstream was called");
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(headers["authorization"], "Bearer sk-vendor-key");
+        assert_eq!(headers["openai-beta"], "responses=v1", "openai keeps openai-beta, as on chat");
+        assert!(!headers.contains_key("x-gctrl-token"));
+        assert_no_plaintext(std::str::from_utf8(&body).unwrap());
+    }
+
+    // 35
+    #[tokio::test]
+    async fn runware_vendor_error_is_relayed_unmarked() {
+        // A refused key is the vendor's verdict, relayed like on the chat route (status,
+        // body, request id) and WITHOUT the gateway marker, so Anvil's key pool judges it.
+        let err = json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string();
+        let (base, _) = fake_upstream(401, "application/json", frames(&err, 1024)).await;
+        let (out_bytes, session) = cloaked_request_bytes(Upstream::Runware, tool_round_trip_request(true));
+        let fwd = forward_headers(&anvil_headers("runware"), Upstream::Runware, false);
+        let resp = proxy_stream_decloaked_responses("Runware", responses_url(Upstream::Runware, &base), fwd, out_bytes, session).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(!resp.headers().contains_key("x-cloak-gateway-error"));
+        assert_eq!(resp.headers()["x-request-id"], "req_fake_1");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), err);
+
+        // an unreachable upstream is the gateway's own 502, marked
+        let resp = proxy_stream_decloaked_responses(
+            "Runware",
+            "http://127.0.0.1:9/v1/responses".to_string(),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+            privacy::CloakSession::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.headers()["x-cloak-gateway-error"], "1");
     }
 }
