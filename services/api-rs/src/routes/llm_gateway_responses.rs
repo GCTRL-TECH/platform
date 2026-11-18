@@ -222,13 +222,18 @@ fn is_protocol_object(o: &Map<String, Value>) -> bool {
     o.get("type").is_some_and(Value::is_string)
 }
 
-/// JSON text of an `arguments` string, when it holds an object or array without
-/// duplicate keys: its decoded string values are cloaked like `function_call.arguments`.
-fn json_arguments(key: Option<&str>, s: &str) -> Option<Value> {
-    if key != Some("arguments") || has_duplicate_keys(s) {
+/// JSON text of an `arguments` string, when it holds an object or array: its decoded
+/// string values are cloaked like `function_call.arguments`. A repeated key is
+/// normalized as [`normalize_duplicate_argument_keys`] does for `function_call`: serde
+/// keeps the last value, and the second field is the re-serialized text that replaces
+/// the raw string before the write-back, so an earlier duplicate never travels upstream.
+fn json_arguments(key: Option<&str>, s: &str) -> Option<(Value, Option<String>)> {
+    if key != Some("arguments") {
         return None;
     }
-    serde_json::from_str::<Value>(s).ok().filter(|v| v.is_object() || v.is_array())
+    let parsed = serde_json::from_str::<Value>(s).ok().filter(|v| v.is_object() || v.is_array())?;
+    let normalized = has_duplicate_keys(s).then(|| parsed.to_string());
+    Some((parsed, normalized))
 }
 
 /// The generic walk for content the gateway has no dedicated rule for: every non-empty
@@ -241,7 +246,7 @@ fn text_leaves(v: &Value, under_text: bool, out: &mut Vec<String>) {
     fn walk(v: &Value, under_text: bool, key: Option<&str>, out: &mut Vec<String>) {
         match v {
             Value::String(s) if under_text && !s.is_empty() && !is_opaque_string(s) => match json_arguments(key, s) {
-                Some(parsed) => string_leaves(&parsed, out),
+                Some((parsed, _)) => string_leaves(&parsed, out),
                 None => out.push(s.clone()),
             },
             Value::Array(a) => a.iter().for_each(|x| walk(x, under_text, key, out)),
@@ -263,11 +268,12 @@ fn set_text_leaves(v: &mut Value, under_text: bool, new: &[String], session: &pr
     fn walk(v: &mut Value, under_text: bool, key: Option<&str>, new: &[String], k: &mut usize, session: &privacy::CloakSession) {
         match v {
             Value::String(s) if under_text && !s.is_empty() && !is_opaque_string(s) => match json_arguments(key, s) {
-                Some(parsed) => {
+                Some((parsed, normalized)) => {
                     let mut leaves = Vec::new();
                     string_leaves(&parsed, &mut leaves);
                     let end = (*k + leaves.len()).min(new.len());
-                    *s = write_cloaked_arguments(s, &new[(*k).min(end)..end], session);
+                    let raw = normalized.unwrap_or_else(|| s.clone());
+                    *s = write_cloaked_arguments(&raw, &new[(*k).min(end)..end], session);
                     *k += leaves.len();
                 }
                 None => {
@@ -3079,5 +3085,24 @@ mod tests {
         assert_eq!(out[4], json!({"signature": "[Person-3]\nCEO [Org-2]", "data": {"kunde": "[Person-3]"}}));
         assert_eq!(out[5]["text"], "data: {\"kunde\": \"[Person-3]\"}");
         assert_eq!(out[6]["text"], format!("{blob} [Person-3]"));
+    }
+
+    // 41
+    #[test]
+    fn duplicate_keys_in_generic_arguments_are_normalized_and_cloaked_on_decoded_values() {
+        // names written with JSON escapes, the earlier `q` hidden behind the later one;
+        // the backslash is char 92 so the `u00fc` escape stays an escape in this source
+        let bs = char::from(92u8);
+        let raw = format!(r#"{{"q":"Max M{bs}u00fcller","q":"Nexovar \"Labs\" GmbH, Max M{bs}u00fcller","n":2}}"#);
+        assert!(raw.contains("M\\u00fcller") && !raw.contains('ü'), "{raw}");
+        let body = json!({"input": [{"type": "future_tool_call", "call_id": "f1", "arguments": raw}]});
+        let (out_bytes, _) = cloaked_request_bytes(Upstream::OpenAi, body);
+        assert_no_plaintext(std::str::from_utf8(&out_bytes).unwrap());
+        let sent: Value = serde_json::from_slice(&out_bytes).unwrap();
+        let args = sent["input"][0]["arguments"].as_str().unwrap();
+        assert!(!args.contains("u00fc"), "{args}");
+        assert_eq!(serde_json::from_str::<Value>(args).unwrap(), json!({"q": "[Org-2], [Person-3]", "n": 2}));
+        assert!(!has_duplicate_keys(args), "the earlier duplicate is gone: {args}");
+        assert_eq!(sent["input"][0]["call_id"], "f1");
     }
 }
