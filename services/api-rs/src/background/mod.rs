@@ -13,12 +13,54 @@ pub mod guardrail;
 /// cron triggers and guardrail must run exactly once per installation. Off also skips
 /// the migrations and the boot writes (secret backfill, admin self-heal, system skills);
 /// `main` then refuses to start unless the database carries exactly this binary's
-/// migrations (`db::verify_schema`).
+/// migrations (`db::verify_schema`). Any other value counts as on; `main` logs the
+/// effective state once at startup and warns about an unrecognized value
+/// ([`jobs_switch_notice`]).
 pub fn jobs_enabled(v: Option<&str>) -> bool {
-    !matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("0" | "false" | "no" | "off")
-    )
+    jobs_switch(v) != JobsSwitch::Off
+}
+
+/// How a `GCTRL_BACKGROUND_JOBS` value resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobsSwitch {
+    /// Unset, empty or `1|true|yes|on`.
+    On,
+    /// `0|false|no|off`.
+    Off,
+    /// Any other value (a typo such as `of`): treated as on, warned about at startup.
+    Unrecognized(String),
+}
+
+pub fn jobs_switch(v: Option<&str>) -> JobsSwitch {
+    let Some(raw) = v else { return JobsSwitch::On };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "yes" | "on" => JobsSwitch::On,
+        "0" | "false" | "no" | "off" => JobsSwitch::Off,
+        _ => JobsSwitch::Unrecognized(raw.to_string()),
+    }
+}
+
+/// The one startup line for the effective state of `GCTRL_BACKGROUND_JOBS`:
+/// `(warn, message)`, warn for off and for an unrecognized value.
+pub fn jobs_switch_notice(v: Option<&str>) -> (bool, String) {
+    match jobs_switch(v) {
+        JobsSwitch::On => (
+            false,
+            "GCTRL_BACKGROUND_JOBS is on: migrations, boot writes and background jobs run in this process".into(),
+        ),
+        JobsSwitch::Off => (
+            true,
+            "GCTRL_BACKGROUND_JOBS is off: HTTP only, no migrations or boot writes, no background jobs, no agent version sync"
+                .into(),
+        ),
+        JobsSwitch::Unrecognized(raw) => (
+            true,
+            format!(
+                "GCTRL_BACKGROUND_JOBS={raw:?} is not a known value (off: 0|false|no|off, on: 1|true|yes|on or unset); \
+                 treated as ON: migrations, boot writes and background jobs run in this process"
+            ),
+        ),
+    }
 }
 
 pub fn spawn_all(state: Arc<AppState>) {
@@ -711,6 +753,23 @@ mod jobs_switch_tests {
         for off in ["0", "false", "no", "off", " OFF ", "False"] {
             assert!(!jobs_enabled(Some(off)), "{off}");
         }
+    }
+
+    #[test]
+    fn the_effective_state_is_logged_and_an_unknown_value_warned() {
+        use super::{jobs_switch, jobs_switch_notice, JobsSwitch};
+        // A typo stays ON (the default), but never silently.
+        assert_eq!(jobs_switch(Some("of")), JobsSwitch::Unrecognized("of".into()));
+        assert!(jobs_enabled(Some("of")));
+        let (warn, msg) = jobs_switch_notice(Some("of"));
+        assert!(warn && msg.contains("\"of\"") && msg.contains("not a known value") && msg.contains("ON"), "{msg}");
+        for on in [None, Some(""), Some("1"), Some(" Yes "), Some("TRUE"), Some("on")] {
+            assert_eq!(jobs_switch(on), JobsSwitch::On, "{on:?}");
+            let (warn, msg) = jobs_switch_notice(on);
+            assert!(!warn && msg.contains("is on"), "{on:?}: {msg}");
+        }
+        let (warn, msg) = jobs_switch_notice(Some(" OFF "));
+        assert!(warn && msg.contains("is off: HTTP only"), "{msg}");
     }
 }
 

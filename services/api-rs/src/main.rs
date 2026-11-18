@@ -29,7 +29,12 @@ async fn main() {
     // derived from JWT_SECRET) before anything reads/writes sealed secrets.
     services::crypto::init(&cfg.jwt_secret);
 
-    let jobs_on = background::jobs_enabled(std::env::var("GCTRL_BACKGROUND_JOBS").ok().as_deref());
+    let jobs_env = std::env::var("GCTRL_BACKGROUND_JOBS").ok();
+    let jobs_on = background::jobs_enabled(jobs_env.as_deref());
+    match background::jobs_switch_notice(jobs_env.as_deref()) {
+        (true, msg) => tracing::warn!("{msg}"),
+        (false, msg) => tracing::info!("{msg}"),
+    }
     let db    = db::connect(&cfg.database_url).await;
     if jobs_on {
         db::MIGRATOR.run(&db).await.expect("DB migrations failed");
@@ -66,10 +71,6 @@ async fn main() {
         // Tell the agent which version is running (manual updates never did) —
         // best-effort, off the boot path. See routes::update::sync_agent_version.
         tokio::spawn(routes::update::sync_agent_version());
-    } else {
-        tracing::warn!(
-            "GCTRL_BACKGROUND_JOBS is off: HTTP only, no migrations or boot writes, no background jobs, no agent version sync"
-        );
     }
 
     let app = build_router(state);
