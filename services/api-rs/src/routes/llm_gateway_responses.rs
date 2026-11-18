@@ -37,7 +37,8 @@
 //! (`function_call.arguments`: decoded string values, written back byte-faithfully;
 //! `custom_tool_call.input`), and by default the tool outputs
 //! (`function_call_output` / `custom_tool_call_output`: string `output` or its
-//! `input_text`/`output_text` parts; `shell_call_output`: `stdout` / `stderr`;
+//! `input_text`/`output_text` parts, a JSON object or array text on its decoded strings
+//! with object keys, written back like `arguments`; `shell_call_output`: `stdout` / `stderr`;
 //! `apply_patch_call_output.output`; opt out with `X-Cloak-Tool-Outputs: 0`, which
 //! is never forwarded). Replayed calls must be cloaked: the de-cloaker gave the
 //! client the real names, and sending them back next to pseudonymised text would
@@ -157,6 +158,11 @@ pub(super) enum ResponsesSlot {
     ItemOutputString(usize),
     /// `input[i].output[j].text` of a tool output item (`input_text`/`output_text` part).
     ItemOutputPart(usize, usize),
+    /// `input[i].output` of a tool output item when it is JSON text ([`json_output`]):
+    /// one slot per [`json_text_leaves`] leaf.
+    ItemOutputJson(usize),
+    /// `input[i].output[j].text` when it is JSON text: one slot per [`json_text_leaves`] leaf.
+    ItemOutputPartJson(usize, usize),
     /// `input[i].action.command[j]` of a replayed `local_shell_call`.
     ItemShellCommand(usize, usize),
     /// A non-string `instructions`: one slot per [`text_leaves`] leaf (walked as text).
@@ -296,6 +302,14 @@ fn set_text_leaves(v: &mut Value, under_text: bool, new: &[String], session: &pr
     }
     let mut k = 0;
     walk(v, under_text, None, new, &mut k, session);
+}
+
+/// Collect the [`json_text_leaves`] of a JSON tool output as a run of `slot`.
+fn push_json_text_leaves(slot: ResponsesSlot, parsed: &Value, slots: &mut Vec<ResponsesSlot>, texts: &mut Vec<String>) {
+    let mut leaves = Vec::new();
+    json_text_leaves(parsed, &mut leaves);
+    slots.extend(std::iter::repeat_n(slot, leaves.len()));
+    texts.extend(leaves);
 }
 
 /// Collect the [`text_leaves`] of `v` as a run of `slot`.
@@ -482,15 +496,25 @@ fn collect_tool_item(
             if cloak_tool_outputs =>
         {
             match item.get("output") {
-            Some(Value::String(s)) if !s.is_empty() => {
-                slots.push(ResponsesSlot::ItemOutputString(i));
-                texts.push(s.clone());
-            }
+            Some(Value::String(s)) if !s.is_empty() => match json_output(s) {
+                Some(parsed) => push_json_text_leaves(ResponsesSlot::ItemOutputJson(i), &parsed, slots, texts),
+                None => {
+                    slots.push(ResponsesSlot::ItemOutputString(i));
+                    texts.push(s.clone());
+                }
+            },
             Some(Value::Array(parts)) => {
                 for (j, p) in parts.iter().enumerate() {
                     if let Some(t) = part_text(p) {
-                        slots.push(ResponsesSlot::ItemOutputPart(i, j));
-                        texts.push(t.to_string());
+                        match json_output(t) {
+                            Some(parsed) => {
+                                push_json_text_leaves(ResponsesSlot::ItemOutputPartJson(i, j), &parsed, slots, texts)
+                            }
+                            None => {
+                                slots.push(ResponsesSlot::ItemOutputPart(i, j));
+                                texts.push(t.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -608,6 +632,88 @@ pub(super) fn write_cloaked_arguments(raw: &str, cloaked: &[String], session: &p
     };
     let mut expected = parsed.clone();
     set_string_leaves(&mut expected, cloaked);
+    write_expected_json(raw, &parsed, &expected, cloaked, session)
+}
+
+/// Tool output text holding a JSON object or array without duplicate keys (a tool that
+/// prints `json.dumps`, non-ASCII as `\u` escapes and `\"Labs\"` included): cloaked on its decoded
+/// strings, object keys included ([`json_text_leaves`]), and written back by
+/// [`write_cloaked_json_text`]. `None` (plain text, invalid JSON, a repeated key): the
+/// raw text is cloaked as it is, as before.
+pub(super) fn json_output(s: &str) -> Option<Value> {
+    if !s.trim_start().starts_with(['{', '[']) {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(s).ok().filter(|v| v.is_object() || v.is_array())?;
+    (!has_duplicate_keys(s)).then_some(parsed)
+}
+
+/// The non-empty decoded strings of a JSON value, OBJECT KEYS INCLUDED (each key right
+/// before its value), in map order. Unlike `arguments`, whose keys are a tool's fixed
+/// schema, a tool output may key its data by name (`{"Max Müller": {...}}`), which the
+/// raw-text cloak caught before. Order is shared with [`with_json_text_leaves`].
+pub(super) fn json_text_leaves(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| json_text_leaves(x, out)),
+        Value::Object(o) => {
+            for (key, x) in o {
+                if !key.is_empty() {
+                    out.push(key.clone());
+                }
+                json_text_leaves(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `v` with the leaves of [`json_text_leaves`] replaced by `new`, in order. Two keys of
+/// one object that cloak to the same pseudonym (case variants of one name) keep the
+/// later entry, as serde does for a repeated key; nothing goes out in clear.
+fn with_json_text_leaves(v: &Value, new: &[String], k: &mut usize) -> Value {
+    fn take(old: &str, new: &[String], k: &mut usize) -> String {
+        let s = new.get(*k).cloned().unwrap_or_else(|| old.to_string());
+        *k += 1;
+        s
+    }
+    match v {
+        Value::String(s) if !s.is_empty() => Value::String(take(s, new, k)),
+        Value::Array(a) => Value::Array(a.iter().map(|x| with_json_text_leaves(x, new, k)).collect()),
+        Value::Object(o) => {
+            let mut m = Map::new();
+            for (key, x) in o {
+                let key = if key.is_empty() { key.clone() } else { take(key, new, k) };
+                let x = with_json_text_leaves(x, new, k);
+                m.insert(key, x);
+            }
+            Value::Object(m)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Write cloaked leaves ([`json_text_leaves`]) back into a JSON tool output: the same
+/// write-back as [`write_cloaked_arguments`] (unchanged text stays byte-identical, an
+/// original is replaced in its JSON-escaped form, else the cloaked value is
+/// re-serialized), with object keys cloaked too.
+pub(super) fn write_cloaked_json_text(raw: &str, cloaked: &[String], session: &privacy::CloakSession) -> String {
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return cloaked.first().cloned().unwrap_or_else(|| raw.to_string());
+    };
+    let expected = with_json_text_leaves(&parsed, cloaked, &mut 0);
+    write_expected_json(raw, &parsed, &expected, cloaked, session)
+}
+
+/// Shared tail of [`write_cloaked_arguments`] and [`write_cloaked_json_text`]: `raw`
+/// parses to `parsed`, and `expected` is `parsed` with the `cloaked` leaves.
+fn write_expected_json(
+    raw: &str,
+    parsed: &Value,
+    expected: &Value,
+    cloaked: &[String],
+    session: &privacy::CloakSession,
+) -> String {
     if expected == parsed {
         return raw.to_string();
     }
@@ -628,11 +734,11 @@ pub(super) fn write_cloaked_arguments(raw: &str, cloaked: &[String], session: &p
             out = out.replace(&escaped, pseudonym);
         }
     }
-    if serde_json::from_str::<Value>(&out).ok().as_ref() == Some(&expected) {
+    if serde_json::from_str::<Value>(&out).ok().as_ref() == Some(expected) {
         out
     } else {
         // Serializing a Value cannot fail; never fall back to the raw (plaintext) string.
-        serde_json::to_string(&expected).unwrap_or_default()
+        serde_json::to_string(expected).unwrap_or_default()
     }
 }
 
@@ -656,6 +762,20 @@ pub(super) fn write_responses_cloaked_texts(
             let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
             if let Some(Value::String(raw)) = item(body, i).and_then(|m| m.get_mut("arguments")) {
                 *raw = write_cloaked_arguments(raw, &cloaked[k..end], session);
+            }
+            k = end;
+            continue;
+        }
+        if let ResponsesSlot::ItemOutputJson(i) | ResponsesSlot::ItemOutputPartJson(i, _) = slot {
+            // a run of identical slots = the leaves of one JSON tool output, in order
+            let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
+            let output = item(body, i).and_then(|m| m.get_mut("output"));
+            let target = match slot {
+                ResponsesSlot::ItemOutputPartJson(_, j) => output.and_then(|o| o.get_mut(j)).and_then(|p| p.get_mut("text")),
+                _ => output,
+            };
+            if let Some(Value::String(raw)) = target {
+                *raw = write_cloaked_json_text(raw, &cloaked[k..end], session);
             }
             k = end;
             continue;
@@ -716,6 +836,8 @@ pub(super) fn write_responses_cloaked_texts(
                 .and_then(|c| c.get_mut(j)),
             // handled above
             ResponsesSlot::ItemArguments(_)
+            | ResponsesSlot::ItemOutputJson(_)
+            | ResponsesSlot::ItemOutputPartJson(..)
             | ResponsesSlot::InstructionsLeaves
             | ResponsesSlot::PromptVariable(_)
             | ResponsesSlot::ItemTextLeaves(_)
@@ -3104,5 +3226,48 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(args).unwrap(), json!({"q": "[Org-2], [Person-3]", "n": 2}));
         assert!(!has_duplicate_keys(args), "the earlier duplicate is gone: {args}");
         assert_eq!(sent["input"][0]["call_id"], "f1");
+    }
+
+    // 42
+    #[test]
+    fn json_tool_outputs_are_cloaked_on_decoded_strings_and_keys() {
+        // Python's json.dumps default: non-ASCII as \u escapes, quotes as \", newlines as \n;
+        // the backslash of the `u00fc` escape is char 92 so it stays an escape in this source
+        let bs = char::from(92u8);
+        let dumps = format!(
+            r#"{{"kunde": "Max M{bs}u00fcller", "firma": "Nexovar \"Labs\" GmbH", "notiz": "Kontakt:\nMax M{bs}u00fcller", "n": 3}}"#
+        );
+        let keyed = format!(r#"{{"Max M{bs}u00fcller": {{"rolle": "CEO"}}}}"#);
+        for t in [&dumps, &keyed] {
+            assert!(t.contains("M\\u00fcller") && !t.contains('ü'), "{t}");
+        }
+        let pretty = "{\n  \"kunde\": \"Max Müller\",\n  \"n\": 3\n}";
+        let plain = r#"{"n": 1, "ok": true, "s": "nichts"}"#;
+        let dup = r#"{"q": "x", "q": "Max Müller"}"#;
+        let body = json!({"input": [
+            {"type": "function_call_output", "call_id": "c1", "output": dumps},
+            {"type": "function_call_output", "call_id": "c2", "output": [{"type": "input_text", "text": keyed}]},
+            {"type": "custom_tool_call_output", "call_id": "c3", "output": pretty},
+            {"type": "function_call_output", "call_id": "c4", "output": plain},
+            {"type": "function_call_output", "call_id": "c5", "output": dup}
+        ]});
+        let (out_bytes, _) = cloaked_request_bytes(Upstream::OpenAi, body.clone());
+        let wire = std::str::from_utf8(&out_bytes).unwrap();
+        assert_no_plaintext(wire);
+        assert!(!wire.contains("u00fc"), "{wire}");
+        let sent: Value = serde_json::from_slice(&out_bytes).unwrap();
+        let parse = |v: &Value| serde_json::from_str::<Value>(v.as_str().unwrap()).unwrap();
+        assert_eq!(
+            parse(&sent["input"][0]["output"]),
+            json!({"kunde": "[Person-3]", "firma": "[Org-2]", "notiz": "Kontakt:\n[Person-3]", "n": 3})
+        );
+        // a key that is a name was cloaked as raw text before and still is
+        assert_eq!(parse(&sent["input"][1]["output"][0]["text"]), json!({"[Person-3]": {"rolle": "CEO"}}));
+        assert_eq!(sent["input"][2]["output"], "{\n  \"kunde\": \"[Person-3]\",\n  \"n\": 3\n}", "formatting kept");
+        assert_eq!(sent["input"][3]["output"], plain, "nothing to cloak: byte-identical");
+        assert_eq!(sent["input"][4]["output"], r#"{"q": "x", "q": "[Person-3]"}"#, "repeated key: raw text as before");
+        // the opt-out keeps them all
+        let (slots, _) = collect_responses_cloak_texts(&body, false);
+        assert!(slots.is_empty());
     }
 }

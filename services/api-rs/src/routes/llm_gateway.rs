@@ -63,8 +63,9 @@
 //!
 //! ## What is cloaked (chat completions)
 //! Every message's text in one batch, so the model sees ONE mapping: `content`
-//! (string or text parts) of every role, tool RESULTS (`role:"tool"`; opt out with
-//! `X-Cloak-Tool-Outputs: 0`, never forwarded), the string reasoning fields of replayed
+//! (string or text parts) of every role, tool RESULTS (`role:"tool"`; a JSON object or
+//! array text on its decoded strings with object keys, written back like `arguments`;
+//! opt out with `X-Cloak-Tool-Outputs: 0`, never forwarded), the string reasoning fields of replayed
 //! messages (`reasoning`, `reasoning_content`, `reasoning_text`, `thinking`: the response
 //! side restores them, so a client that replays them would send real names), and the
 //! decoded string values of replayed `assistant.tool_calls[].function.arguments` (keys
@@ -97,7 +98,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::llm_gateway_anthropic::{json_escaped_session, set_string_leaves, string_leaves};
-use super::llm_gateway_responses::{has_duplicate_keys, tool_outputs_cloaked, write_cloaked_arguments};
+use super::llm_gateway_responses::{
+    has_duplicate_keys, json_output, json_text_leaves, tool_outputs_cloaked, write_cloaked_arguments,
+    write_cloaked_json_text,
+};
 use crate::middleware::auth::JwtClaims;
 use crate::services::privacy;
 
@@ -1158,6 +1162,10 @@ pub(super) enum ChatSlot {
     /// one slot per decoded non-empty string VALUE (in `string_leaves` order), or one
     /// slot holding the raw string when it is not valid JSON.
     ToolArguments(usize, usize),
+    /// A tool RESULT (`role:"tool"`) whose `content` (`None`) or `content[j].text`
+    /// (`Some(j)`) is JSON text (`json_output`): one slot per decoded string, object
+    /// keys included (`json_text_leaves` order).
+    ToolJson(usize, Option<usize>),
 }
 
 /// String reasoning fields of a chat message. The response side restores `reasoning`,
@@ -1173,7 +1181,8 @@ pub(super) const PLACEHOLDER_NOTE: &str = "Begriffe in eckigen Klammern wie [Per
 
 /// Every free text a cloud model would read, in request order: each message's
 /// `content` (string or the text of content parts; agent harnesses like pi send
-/// the array form for every message), tool RESULTS (`role:"tool"`) unless
+/// the array form for every message), tool RESULTS (`role:"tool"`; JSON text on its
+/// decoded strings, [`ChatSlot::ToolJson`]) unless
 /// `cloak_tool_outputs` is off (`X-Cloak-Tool-Outputs: 0`), the string reasoning
 /// fields ([`REASONING_FIELDS`]) of every message, and the string values
 /// of replayed `assistant.tool_calls[].function.arguments`. Tool results and
@@ -1187,11 +1196,26 @@ fn collect_cloak_texts(messages: &[Value], cloak_tool_outputs: bool) -> (Vec<Cha
     let mut plain: Vec<String> = Vec::new();
     for (idx, msg) in messages.iter().enumerate() {
         let is_tool = msg.get("role").and_then(|r| r.as_str()) == Some("tool");
+        // A tool result that is JSON text goes out on its decoded strings (a name written
+        // with a `\u` escape is found), every other text as it is.
+        let mut push_text = |slot: ChatSlot, json_slot: ChatSlot, text: &str| {
+            match is_tool.then(|| json_output(text)).flatten() {
+                Some(parsed) => {
+                    let mut leaves = Vec::new();
+                    json_text_leaves(&parsed, &mut leaves);
+                    slots.extend(std::iter::repeat_n(json_slot, leaves.len()));
+                    plain.extend(leaves);
+                }
+                None => {
+                    slots.push(slot);
+                    plain.push(text.to_string());
+                }
+            }
+        };
         if !is_tool || cloak_tool_outputs {
             match msg.get("content") {
                 Some(Value::String(content)) if !content.is_empty() => {
-                    slots.push(ChatSlot::Content(idx, None));
-                    plain.push(content.clone());
+                    push_text(ChatSlot::Content(idx, None), ChatSlot::ToolJson(idx, None), content);
                 }
                 Some(Value::Array(parts)) => {
                     for (pidx, part) in parts.iter().enumerate() {
@@ -1199,8 +1223,7 @@ fn collect_cloak_texts(messages: &[Value], cloak_tool_outputs: bool) -> (Vec<Cha
                         if text.is_empty() {
                             continue;
                         }
-                        slots.push(ChatSlot::Content(idx, Some(pidx)));
-                        plain.push(text.to_string());
+                        push_text(ChatSlot::Content(idx, Some(pidx)), ChatSlot::ToolJson(idx, Some(pidx)), text);
                     }
                 }
                 _ => {}
@@ -1273,6 +1296,19 @@ fn write_cloaked_texts(messages: &mut [Value], slots: &[ChatSlot], cloaked: &[St
                     Some(Value::String(raw)) => *raw = write_cloaked_arguments(raw, &cloaked[k..end], session),
                     Some(v) => set_string_leaves(v, &cloaked[k..end]),
                     None => {}
+                }
+                k = end;
+            }
+            ChatSlot::ToolJson(i, part) => {
+                // a run of identical slots = the leaves of one JSON tool result, in order
+                let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
+                let content = messages.get_mut(i).and_then(|m| m.get_mut("content"));
+                let target = match part {
+                    None => content,
+                    Some(pidx) => content.and_then(|c| c.get_mut(pidx)).and_then(|p| p.get_mut("text")),
+                };
+                if let Some(Value::String(raw)) = target {
+                    *raw = write_cloaked_json_text(raw, &cloaked[k..end], session);
                 }
                 k = end;
             }
@@ -1528,6 +1564,37 @@ mod tests {
         cloak_messages(&mut messages, true);
         let raw = messages[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
         assert!(!raw.contains("Berlin"), "{raw}");
+    }
+
+    #[test]
+    fn json_tool_results_are_cloaked_on_decoded_strings_and_keys() {
+        // json.dumps style: quotes as \", a newline as \n right before the name
+        let dumps = r#"{"fahrgast": "Tom \"TA\" Arenstam", "ziel": "Ankunft:\nBerlin Hbf", "n": 2}"#;
+        let keyed = r#"{"Berlin Hbf": {"gleis": 7}}"#;
+        let plain = r#"[1, 2, {"ok": true, "s": "nichts"}]"#;
+        let mut messages = vec![
+            json!({ "role": "tool", "tool_call_id": "c1", "content": dumps }),
+            json!({ "role": "tool", "tool_call_id": "c2", "content": [{ "type": "text", "text": keyed }] }),
+            json!({ "role": "tool", "tool_call_id": "c3", "content": plain }),
+            // JSON text from another role is cloaked as text, as before
+            json!({ "role": "user", "content": r#"{"ziel": "Berlin Hbf"}"# }),
+        ];
+        let before = messages.clone();
+        cloak_messages(&mut messages, true);
+        let wire = serde_json::to_string(&messages).unwrap();
+        assert!(!wire.contains("Arenstam") && !wire.contains("Berlin"), "{wire}");
+        let parse = |v: &Value| serde_json::from_str::<Value>(v.as_str().unwrap()).unwrap();
+        assert_eq!(
+            parse(&messages[0]["content"]),
+            json!({"fahrgast": "[Person-27]", "ziel": "Ankunft:\n[Place-3]", "n": 2})
+        );
+        assert_eq!(parse(&messages[1]["content"][0]["text"]), json!({"[Place-3]": {"gleis": 7}}), "keys too");
+        assert_eq!(messages[2]["content"], plain, "nothing to cloak: byte-identical");
+        assert_eq!(messages[3]["content"], r#"{"ziel": "[Place-3]"}"#);
+        // opted out: tool results stay verbatim
+        let mut messages = before.clone();
+        cloak_messages(&mut messages, false);
+        assert_eq!(messages[..3], before[..3]);
     }
 
     #[test]
