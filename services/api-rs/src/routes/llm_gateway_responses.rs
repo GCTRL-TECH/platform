@@ -47,9 +47,12 @@
 //! nor `role`) never travel in clear: the generic walk cloaks every string below one of
 //! the keys `output`, `text`, `content`, `arguments`, `input`, `stdout`, `stderr`,
 //! `summary`, at any depth (an `arguments` string holding JSON on its decoded values,
-//! like `function_call.arguments`). It never alters `encrypted_content` nor the image
-//! and file references `image_url`, `file_id`, `file_data`, `file_url` (opaque or base64
-//! payloads that cloaking would corrupt), at any depth. The protocol identifiers `id`,
+//! like `function_call.arguments`). It never alters a key starting with `encrypted_` nor
+//! the image and file references `image_url`, `file_id`, `file_data`, `file_url` (opaque
+//! or base64 payloads that cloaking would corrupt), at any depth, nor a base64 string
+//! under `signature`, `data` or `b64_json` (anything else under those names is data and
+//! cloaked), nor a string that is a `data:` URL or more than 256 base64 / base64url
+//! characters without whitespace. The protocol identifiers `id`,
 //! `call_id`, `type`, `status`, `role`, `name` are kept only in an object that itself
 //! carries a string `type` (a protocol object); in free-form data such as the rows of a
 //! tool result they are cloaked like any text. Residual: a string under any other key
@@ -179,17 +182,40 @@ pub(super) enum ResponsesSlot {
 const TEXT_KEYS: [&str; 8] = ["output", "text", "content", "arguments", "input", "stdout", "stderr", "summary"];
 
 /// Keys the generic walk never alters, at any depth: opaque payloads and image / file
-/// references (base64 or ids that cloaking would corrupt).
+/// references (base64 or ids that cloaking would corrupt). Every key starting with
+/// `encrypted_` counts as well ([`kept_key`]).
 const PAYLOAD_KEYS: [&str; 5] = ["encrypted_content", "image_url", "file_id", "file_data", "file_url"];
+
+/// Keys whose value the generic walk keeps when it is a base64 / base64url string (a
+/// reasoning signature, inline audio, a generated image). Not kept at any depth: the
+/// same names also hold data, an email `signature`, a `{"data": {...}}` result
+/// wrapper, and those are cloaked like any text.
+const OPAQUE_VALUE_KEYS: [&str; 3] = ["signature", "data", "b64_json"];
+
+/// Non-empty and base64 / base64url alphabet only (no whitespace, no other punctuation).
+fn is_base64_text(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+}
+
+/// Strings the generic walk leaves alone even below a text key, as opaque payloads: a
+/// `data:` URL (no whitespace in it), or more than 256 characters of base64 / base64url
+/// alphabet only. Prose has whitespace; an SSE line `data: {...}` has a space.
+fn is_opaque_string(s: &str) -> bool {
+    (s.starts_with("data:") && !s.contains(char::is_whitespace)) || (s.len() > 256 && is_base64_text(s))
+}
 
 /// Protocol identifiers the generic walk keeps only in a protocol object, one that itself
 /// carries a string `type`. Anywhere else (the rows of a tool result, a free-form map)
 /// the same names hold data, `{"name": "Max Müller", "role": "CEO"}`, and are cloaked.
 const ID_KEYS: [&str; 6] = ["id", "call_id", "type", "status", "role", "name"];
 
-/// Does the generic walk leave `key` alone? `protocol`: the object carries a string `type`.
-fn kept_key(key: &str, protocol: bool) -> bool {
-    PAYLOAD_KEYS.contains(&key) || (protocol && ID_KEYS.contains(&key))
+/// Does the generic walk leave the entry `key: value` alone? `protocol`: the object
+/// carries a string `type`.
+fn kept_key(key: &str, value: &Value, protocol: bool) -> bool {
+    PAYLOAD_KEYS.contains(&key)
+        || key.starts_with("encrypted_")
+        || (protocol && ID_KEYS.contains(&key))
+        || (OPAQUE_VALUE_KEYS.contains(&key) && value.as_str().is_some_and(is_base64_text))
 }
 
 fn is_protocol_object(o: &Map<String, Value>) -> bool {
@@ -207,20 +233,21 @@ fn json_arguments(key: Option<&str>, s: &str) -> Option<Value> {
 
 /// The generic walk for content the gateway has no dedicated rule for: every non-empty
 /// string below a [`TEXT_KEYS`] key (or anywhere, with `under_text` set for the root),
-/// skipping [`PAYLOAD_KEYS`] subtrees and, in a protocol object, [`ID_KEYS`] subtrees
-/// ([`kept_key`]). An `arguments` string holding JSON yields its decoded string values
-/// ([`string_leaves`]). Order is shared with [`set_text_leaves`].
+/// skipping [`PAYLOAD_KEYS`] subtrees, base64 under [`OPAQUE_VALUE_KEYS`] and, in a
+/// protocol object, [`ID_KEYS`] subtrees ([`kept_key`]), and opaque strings
+/// ([`is_opaque_string`]). An `arguments` string holding JSON yields its decoded string
+/// values ([`string_leaves`]). Order is shared with [`set_text_leaves`].
 fn text_leaves(v: &Value, under_text: bool, out: &mut Vec<String>) {
     fn walk(v: &Value, under_text: bool, key: Option<&str>, out: &mut Vec<String>) {
         match v {
-            Value::String(s) if under_text && !s.is_empty() => match json_arguments(key, s) {
+            Value::String(s) if under_text && !s.is_empty() && !is_opaque_string(s) => match json_arguments(key, s) {
                 Some(parsed) => string_leaves(&parsed, out),
                 None => out.push(s.clone()),
             },
             Value::Array(a) => a.iter().for_each(|x| walk(x, under_text, key, out)),
             Value::Object(o) => {
                 let protocol = is_protocol_object(o);
-                for (k, x) in o.iter().filter(|(k, _)| !kept_key(k, protocol)) {
+                for (k, x) in o.iter().filter(|(k, x)| !kept_key(k, x, protocol)) {
                     walk(x, under_text || TEXT_KEYS.contains(&k.as_str()), Some(k), out);
                 }
             }
@@ -235,7 +262,7 @@ fn text_leaves(v: &Value, under_text: bool, out: &mut Vec<String>) {
 fn set_text_leaves(v: &mut Value, under_text: bool, new: &[String], session: &privacy::CloakSession) {
     fn walk(v: &mut Value, under_text: bool, key: Option<&str>, new: &[String], k: &mut usize, session: &privacy::CloakSession) {
         match v {
-            Value::String(s) if under_text && !s.is_empty() => match json_arguments(key, s) {
+            Value::String(s) if under_text && !s.is_empty() && !is_opaque_string(s) => match json_arguments(key, s) {
                 Some(parsed) => {
                     let mut leaves = Vec::new();
                     string_leaves(&parsed, &mut leaves);
@@ -253,7 +280,7 @@ fn set_text_leaves(v: &mut Value, under_text: bool, new: &[String], session: &pr
             Value::Array(a) => a.iter_mut().for_each(|x| walk(x, under_text, key, new, k, session)),
             Value::Object(o) => {
                 let protocol = is_protocol_object(o);
-                for (kk, x) in o.iter_mut().filter(|(kk, _)| !kept_key(kk, protocol)) {
+                for (kk, x) in o.iter_mut().filter(|(kk, x)| !kept_key(kk, x, protocol)) {
                     let text = under_text || TEXT_KEYS.contains(&kk.as_str());
                     walk(x, text, Some(kk), new, k, session);
                 }
@@ -3010,5 +3037,47 @@ mod tests {
         let sent: Value = serde_json::from_slice(&out_bytes).unwrap();
         assert_eq!(sent["input"]["content"][0]["text"], "[Person-3], [Org-2]");
         assert_eq!((&sent["input"]["type"], &sent["input"]["role"]), (&json!("message"), &json!("user")));
+    }
+
+    // 40
+    #[test]
+    fn generic_walk_keeps_opaque_payloads_but_cloaks_data_under_the_same_names() {
+        let blob = "TWF4IE3DvGxsZXI-_".repeat(20); // 340 characters of base64url
+        let mut body = json!({"input": [
+            {"type": "future_tool_output", "output": [
+                {"type": "thinking", "thinking": "Max Müller pruefen", "signature": "EqQBCkgIARABGAIiQL+/="},
+                {"type": "image", "b64_json": "iVBORw0KGgo=", "data": "UklGRiQAAABXQVZF"},
+                {"type": "reasoning_text", "encrypted_reasoning": "Max Müller",
+                 "text": "data:image/png;base64,TWF4IE3DvGxsZXI="},
+                {"text": blob.clone()},
+                // the same names holding data, and look-alikes with whitespace: cloaked
+                {"signature": "Max Müller\nCEO Nexovar \"Labs\" GmbH", "data": {"kunde": "Max Müller"}},
+                {"text": "data: {\"kunde\": \"Max Müller\"}"},
+                {"text": format!("{blob} Max Müller")}
+            ]}
+        ]});
+        let before = body.clone();
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        assert_eq!(
+            texts,
+            vec![
+                "Max Müller pruefen".to_string(),
+                "Max Müller".to_string(),
+                "Max Müller\nCEO Nexovar \"Labs\" GmbH".to_string(),
+                "data: {\"kunde\": \"Max Müller\"}".to_string(),
+                format!("{blob} Max Müller"),
+            ]
+        );
+        let (cloaked, bs) = real_cloak(&texts, &wire_session());
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
+        let out = &body["input"][0]["output"];
+        assert_eq!(out[0]["thinking"], "[Person-3] pruefen");
+        assert_eq!(out[0]["signature"], before["input"][0]["output"][0]["signature"]);
+        for j in 1..4 {
+            assert_eq!(out[j], before["input"][0]["output"][j], "opaque payloads stay byte-identical ({j})");
+        }
+        assert_eq!(out[4], json!({"signature": "[Person-3]\nCEO [Org-2]", "data": {"kunde": "[Person-3]"}}));
+        assert_eq!(out[5]["text"], "data: {\"kunde\": \"[Person-3]\"}");
+        assert_eq!(out[6]["text"], format!("{blob} [Person-3]"));
     }
 }
