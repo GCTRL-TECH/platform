@@ -9,7 +9,13 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: fabfd43 -->
+<!-- baseline-sha: 77ac909 -->
+
+## v0.9.33 - Updates install again on Apple Silicon
+
+*18 November 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **The API image can be pulled on arm64 hosts again.** The API runs as an amd64 image, on Apple Silicon under emulation. The build of v0.9.32 published it with an added attestation entry, which turned the image into an index without an arm64 entry. An arm64 host that does not pin the platform could not pull it ("no matching manifest") and stayed on its previous version. The image is published as a plain manifest again, as before. Installations that pin `platform: linux/amd64` in their compose file were not affected.
 
 ## v0.9.32 - The cloak covers Runware and the Responses API
 

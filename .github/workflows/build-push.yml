@@ -159,6 +159,11 @@ jobs:
           context: services/license-api
           file: services/license-api/build/Dockerfile.prod
           push: true
+          # Single-platform image: push a plain manifest, not an index with an
+          # attestation entry. arm64 hosts run this image under emulation and
+          # cannot pull an index that has no arm64 entry (run 329, 2026-11-18).
+          provenance: false
+          sbom: false
           tags: |
             ghcr.io/gctrl-tech/license-api:latest
             ghcr.io/gctrl-tech/license-api:${{ github.sha }}
@@ -187,6 +192,11 @@ jobs:
         with:
           context: ./services/agent-rs
           push: true
+          # Single-platform image: push a plain manifest, not an index with an
+          # attestation entry. arm64 hosts run this image under emulation and
+          # cannot pull an index that has no arm64 entry (run 329, 2026-11-18).
+          provenance: false
+          sbom: false
           tags: |
             ghcr.io/gctrl-tech/agent:latest
             ghcr.io/gctrl-tech/agent:${{ github.sha }}
@@ -216,6 +226,11 @@ jobs:
         with:
           context: ./services/api-rs
           push: true
+          # Single-platform image: push a plain manifest, not an index with an
+          # attestation entry. arm64 hosts run this image under emulation and
+          # cannot pull an index that has no arm64 entry (run 329, 2026-11-18).
+          provenance: false
+          sbom: false
           build-args: APP_VERSION=${{ env.VERSION }}
           tags: |
             ghcr.io/gctrl-tech/api:latest
@@ -340,6 +355,11 @@ jobs:
             VITE_UMAMI_SCRIPT_URL=https://analytics.gctrl.tech/script.js
             VITE_UMAMI_WEBSITE_ID=${{ vars.VITE_UMAMI_WEBSITE_ID }}
           push: true
+          # Single-platform image: push a plain manifest, not an index with an
+          # attestation entry. arm64 hosts run this image under emulation and
+          # cannot pull an index that has no arm64 entry (run 329, 2026-11-18).
+          provenance: false
+          sbom: false
           tags: |
             ghcr.io/gctrl-tech/portal:latest
             ghcr.io/gctrl-tech/portal:${{ github.sha }}

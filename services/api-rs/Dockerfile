@@ -1,3 +1,5 @@
+# amd64 only (Rust + OpenSSL, no cross build). CI pushes it as a plain single-platform
+# manifest so that arm64 hosts can pull it and run it under emulation.
 FROM rust:1.95 AS build
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
