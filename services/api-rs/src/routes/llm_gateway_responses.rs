@@ -26,8 +26,9 @@
 //! escape hatch `GCTRL_CLOAK_UPSTREAM_UNPINNED=1` a path in it would be doubled.
 //!
 //! What is cloaked (request side): `instructions` (a string, or every text leaf of a
-//! non-string value as in the generic walk below), the string values of
-//! `prompt.variables` (and the text of `input_text` variables), a string `input`, the
+//! non-string value as in the generic walk below), every text leaf of each
+//! `prompt.variables` value (each value walked as its own root, so a variable named
+//! `name` or `role` is cloaked like any other), a string `input`, the
 //! text of every message item in `input[]` (string `content`, or `input_text` /
 //! `output_text` parts) for every role, the replayed tool calls
 //! (`function_call.arguments`: decoded string values, written back byte-faithfully;
@@ -43,10 +44,12 @@
 //! nor `role`) never travel in clear: the generic walk cloaks every string below one of
 //! the keys `output`, `text`, `content`, `arguments`, `input`, `stdout`, `stderr`,
 //! `summary`, at any depth (an `arguments` string holding JSON on its decoded values,
-//! like `function_call.arguments`). It never alters `encrypted_content`, `id`,
-//! `call_id`, `type`, `status`, `role`, `name`, nor the image and file references
-//! `image_url`, `file_id`, `file_data`, `file_url` (protocol identifiers, opaque or
-//! base64 payloads that cloaking would corrupt). Residual: a string under any other key
+//! like `function_call.arguments`). It never alters `encrypted_content` nor the image
+//! and file references `image_url`, `file_id`, `file_data`, `file_url` (opaque or base64
+//! payloads that cloaking would corrupt), at any depth. The protocol identifiers `id`,
+//! `call_id`, `type`, `status`, `role`, `name` are kept only in an object that itself
+//! carries a string `type` (a protocol object); in free-form data such as the rows of a
+//! tool result they are cloaked like any text. Residual: a string under any other key
 //! of such an item travels as it is. The opt-out header does not apply to these items.
 //!
 //! What never is, because cloaking would break the protocol or protect nothing:
@@ -152,8 +155,10 @@ pub(super) enum ResponsesSlot {
     ItemShellCommand(usize, usize),
     /// A non-string `instructions`: one slot per [`text_leaves`] leaf (walked as text).
     InstructionsLeaves,
-    /// `prompt.variables`: one slot per [`text_leaves`] leaf (walked as text).
-    PromptVariables,
+    /// The value of the j-th entry of `prompt.variables` (map order), walked as its own
+    /// root so the variable's name is never taken for a protocol key: one slot per
+    /// [`text_leaves`] leaf (walked as text). A `variables` that is no object is one root (j = 0).
+    PromptVariable(usize),
     /// `input[i]` without a dedicated rule (unknown type, `shell_call_output`,
     /// `apply_patch_call_output`): one slot per [`text_leaves`] leaf of the item.
     ItemTextLeaves(usize),
@@ -162,12 +167,23 @@ pub(super) enum ResponsesSlot {
 /// Keys whose strings the generic walk ([`text_leaves`]) cloaks, at any depth below them.
 const TEXT_KEYS: [&str; 8] = ["output", "text", "content", "arguments", "input", "stdout", "stderr", "summary"];
 
-/// Keys the generic walk never alters, at any depth: protocol identifiers and opaque
-/// payloads, and image / file references (base64 or ids that cloaking would corrupt).
-const KEEP_KEYS: [&str; 11] = [
-    "encrypted_content", "id", "call_id", "type", "status", "role", "name", "image_url", "file_id", "file_data",
-    "file_url",
-];
+/// Keys the generic walk never alters, at any depth: opaque payloads and image / file
+/// references (base64 or ids that cloaking would corrupt).
+const PAYLOAD_KEYS: [&str; 5] = ["encrypted_content", "image_url", "file_id", "file_data", "file_url"];
+
+/// Protocol identifiers the generic walk keeps only in a protocol object, one that itself
+/// carries a string `type`. Anywhere else (the rows of a tool result, a free-form map)
+/// the same names hold data, `{"name": "Max Müller", "role": "CEO"}`, and are cloaked.
+const ID_KEYS: [&str; 6] = ["id", "call_id", "type", "status", "role", "name"];
+
+/// Does the generic walk leave `key` alone? `protocol`: the object carries a string `type`.
+fn kept_key(key: &str, protocol: bool) -> bool {
+    PAYLOAD_KEYS.contains(&key) || (protocol && ID_KEYS.contains(&key))
+}
+
+fn is_protocol_object(o: &Map<String, Value>) -> bool {
+    o.get("type").is_some_and(Value::is_string)
+}
 
 /// JSON text of an `arguments` string, when it holds an object or array without
 /// duplicate keys: its decoded string values are cloaked like `function_call.arguments`.
@@ -180,8 +196,9 @@ fn json_arguments(key: Option<&str>, s: &str) -> Option<Value> {
 
 /// The generic walk for content the gateway has no dedicated rule for: every non-empty
 /// string below a [`TEXT_KEYS`] key (or anywhere, with `under_text` set for the root),
-/// skipping [`KEEP_KEYS`] subtrees. An `arguments` string holding JSON yields its
-/// decoded string values ([`string_leaves`]). Order is shared with [`set_text_leaves`].
+/// skipping [`PAYLOAD_KEYS`] subtrees and, in a protocol object, [`ID_KEYS`] subtrees
+/// ([`kept_key`]). An `arguments` string holding JSON yields its decoded string values
+/// ([`string_leaves`]). Order is shared with [`set_text_leaves`].
 fn text_leaves(v: &Value, under_text: bool, out: &mut Vec<String>) {
     fn walk(v: &Value, under_text: bool, key: Option<&str>, out: &mut Vec<String>) {
         match v {
@@ -191,7 +208,8 @@ fn text_leaves(v: &Value, under_text: bool, out: &mut Vec<String>) {
             },
             Value::Array(a) => a.iter().for_each(|x| walk(x, under_text, key, out)),
             Value::Object(o) => {
-                for (k, x) in o.iter().filter(|(k, _)| !KEEP_KEYS.contains(&k.as_str())) {
+                let protocol = is_protocol_object(o);
+                for (k, x) in o.iter().filter(|(k, _)| !kept_key(k, protocol)) {
                     walk(x, under_text || TEXT_KEYS.contains(&k.as_str()), Some(k), out);
                 }
             }
@@ -223,7 +241,8 @@ fn set_text_leaves(v: &mut Value, under_text: bool, new: &[String], session: &pr
             },
             Value::Array(a) => a.iter_mut().for_each(|x| walk(x, under_text, key, new, k, session)),
             Value::Object(o) => {
-                for (kk, x) in o.iter_mut().filter(|(kk, _)| !KEEP_KEYS.contains(&kk.as_str())) {
+                let protocol = is_protocol_object(o);
+                for (kk, x) in o.iter_mut().filter(|(kk, _)| !kept_key(kk, protocol)) {
                     let text = under_text || TEXT_KEYS.contains(&kk.as_str());
                     walk(x, text, Some(kk), new, k, session);
                 }
@@ -305,8 +324,16 @@ pub(super) fn collect_responses_cloak_texts(
         }
         _ => {}
     }
-    if let Some(vars) = body.pointer("/prompt/variables") {
-        push_text_leaves(ResponsesSlot::PromptVariables, vars, true, &mut slots, &mut texts);
+    // Each variable's value is a root of its own: variable names are free-form (`name`,
+    // `role`, `file_id` ...) and never checked against the kept keys.
+    match body.pointer("/prompt/variables") {
+        Some(Value::Object(vars)) => {
+            for (j, v) in vars.values().enumerate() {
+                push_text_leaves(ResponsesSlot::PromptVariable(j), v, true, &mut slots, &mut texts);
+            }
+        }
+        Some(v) => push_text_leaves(ResponsesSlot::PromptVariable(0), v, true, &mut slots, &mut texts),
+        None => {}
     }
     match body.get("input") {
         Some(Value::String(s)) if !s.is_empty() => {
@@ -573,13 +600,19 @@ pub(super) fn write_responses_cloaked_texts(
         }
         if matches!(
             slot,
-            ResponsesSlot::InstructionsLeaves | ResponsesSlot::PromptVariables | ResponsesSlot::ItemTextLeaves(_)
+            ResponsesSlot::InstructionsLeaves | ResponsesSlot::PromptVariable(_) | ResponsesSlot::ItemTextLeaves(_)
         ) {
             // a run of identical slots = the text leaves of one value, in walk order
             let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
             let target = match slot {
                 ResponsesSlot::InstructionsLeaves => body.get_mut("instructions").map(|v| (v, true)),
-                ResponsesSlot::PromptVariables => body.pointer_mut("/prompt/variables").map(|v| (v, true)),
+                ResponsesSlot::PromptVariable(j) => body
+                    .pointer_mut("/prompt/variables")
+                    .and_then(|vars| match vars {
+                        Value::Object(m) => m.values_mut().nth(j),
+                        v => (j == 0).then_some(v),
+                    })
+                    .map(|v| (v, true)),
                 ResponsesSlot::ItemTextLeaves(i) => item(body, i).map(|v| (v, false)),
                 _ => None,
             };
@@ -611,7 +644,7 @@ pub(super) fn write_responses_cloaked_texts(
             // handled above
             ResponsesSlot::ItemArguments(_)
             | ResponsesSlot::InstructionsLeaves
-            | ResponsesSlot::PromptVariables
+            | ResponsesSlot::PromptVariable(_)
             | ResponsesSlot::ItemTextLeaves(_) => None,
         };
         if let Some(t) = target {
@@ -2842,5 +2875,49 @@ mod tests {
         assert_eq!(body["input"][0]["output"][2]["text"], "Person-3");
         body["input"][0]["output"][2]["text"] = before["input"][0]["output"][2]["text"].clone();
         assert_eq!(body, before, "identifiers, payloads, other keys and the exceptions stay byte-identical");
+    }
+
+    // 38
+    #[test]
+    fn identifier_key_names_in_free_form_data_and_prompt_variables_are_cloaked() {
+        let mut map = HashMap::new();
+        map.insert("[Person-3]".to_string(), "Max Müller".to_string());
+        map.insert("[Org-2]".to_string(), "Nexovar GmbH".to_string());
+        let s = privacy::CloakSession { map };
+        let mut body = json!({
+            "model": "gpt-5.4",
+            // scenario 1: variable NAMES that look like protocol keys
+            "prompt": {"id": "pmpt_x", "variables": {
+                "name": "Max Müller", "role": "CEO der Nexovar GmbH", "file_id": "Max Müller",
+                "type": "Max Müller"
+            }},
+            "input": [
+                // scenario 2: free-form rows below a text key of an unknown item
+                {"type": "future_tool_output", "id": "ft_1", "call_id": "f1", "status": "completed", "name": "crm",
+                 "output": {"rows": [{"name": "Max Müller", "role": "CEO der Nexovar GmbH", "id": "Max Müller",
+                                      "status": "Nexovar GmbH", "type": 5}]}}
+            ]
+        });
+        let before = body.clone();
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        let (cloaked, bs) = real_cloak(&texts, &s);
+        apply_responses_cloak(&mut body, Upstream::OpenAi, &slots, &cloaked, &bs).expect("cloaked");
+        let wire = serde_json::to_string(&body).unwrap();
+        for leak in ["Müller", "Nexovar"] {
+            assert!(!wire.contains(leak), "{leak} reached the upstream: {wire}");
+        }
+        let vars = &body["prompt"]["variables"];
+        assert_eq!(vars["name"], "[Person-3]");
+        assert_eq!(vars["role"], "CEO der [Org-2]");
+        assert_eq!(vars["file_id"], "[Person-3]", "a variable named like a payload key is still a variable");
+        assert_eq!(vars["type"], "[Person-3]");
+        assert_eq!(body["prompt"]["id"], "pmpt_x");
+        let row = &body["input"][0]["output"]["rows"][0];
+        assert_eq!(row, &json!({"name": "[Person-3]", "role": "CEO der [Org-2]", "id": "[Person-3]",
+                                "status": "[Org-2]", "type": 5}));
+        // the item itself carries a string `type`: its identifiers stay
+        for k in ["type", "id", "call_id", "status", "name"] {
+            assert_eq!(body["input"][0][k], before["input"][0][k], "{k}");
+        }
     }
 }
