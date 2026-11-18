@@ -30,7 +30,10 @@
 //! `prompt.variables` value (each value walked as its own root, so a variable named
 //! `name` or `role` is cloaked like any other), a string `input`, the
 //! text of every message item in `input[]` (string `content`, or `input_text` /
-//! `output_text` parts) for every role, the replayed tool calls
+//! `output_text` parts) for every role, every text leaf (generic walk, below) of a
+//! message part of any other type or shape (`{"type": "text"}`, `refusal`, a bare
+//! string; `input_image`, `input_file`, `input_audio` stay as they are), of a message
+//! `content` object and of an `input` object, the replayed tool calls
 //! (`function_call.arguments`: decoded string values, written back byte-faithfully;
 //! `custom_tool_call.input`), and by default the tool outputs
 //! (`function_call_output` / `custom_tool_call_output`: string `output` or its
@@ -162,6 +165,14 @@ pub(super) enum ResponsesSlot {
     /// `input[i]` without a dedicated rule (unknown type, `shell_call_output`,
     /// `apply_patch_call_output`): one slot per [`text_leaves`] leaf of the item.
     ItemTextLeaves(usize),
+    /// `input[i].content[j]` of a message, a part of no known type
+    /// ([`MESSAGE_PART_TYPES`]): one slot per [`text_leaves`] leaf (walked as text).
+    ItemPartLeaves(usize, usize),
+    /// `input[i].content` of a message when it is an object: one slot per
+    /// [`text_leaves`] leaf (walked as text).
+    ItemContentLeaves(usize),
+    /// `input` when it is an object: one slot per [`text_leaves`] leaf (walked as text).
+    InputLeaves,
 }
 
 /// Keys whose strings the generic walk ([`text_leaves`]) cloaks, at any depth below them.
@@ -291,6 +302,16 @@ fn is_message_item(item: &Value) -> bool {
     }
 }
 
+/// Message content part types with a rule of their own: the text of `input_text` /
+/// `output_text` is cloaked ([`part_text`]), images, files and audio travel as they are.
+/// A part of any other type or shape (a chat-completions `{"type": "text"}`, a
+/// `refusal`, a bare string) goes through the generic walk.
+const MESSAGE_PART_TYPES: [&str; 5] = ["input_text", "output_text", "input_image", "input_file", "input_audio"];
+
+fn is_known_message_part(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str).is_some_and(|t| MESSAGE_PART_TYPES.contains(&t))
+}
+
 /// Text of an `input_text` / `output_text` content part, when non-empty.
 fn part_text(part: &Value) -> Option<&str> {
     match part.get("type").and_then(Value::as_str) {
@@ -353,16 +374,24 @@ pub(super) fn collect_responses_cloak_texts(
                     }
                     Some(Value::Array(parts)) => {
                         for (j, p) in parts.iter().enumerate() {
-                            if let Some(t) = part_text(p) {
+                            if !is_known_message_part(p) {
+                                push_text_leaves(ResponsesSlot::ItemPartLeaves(i, j), p, true, &mut slots, &mut texts);
+                            } else if let Some(t) = part_text(p) {
                                 slots.push(ResponsesSlot::ItemPart(i, j));
                                 texts.push(t.to_string());
                             }
                         }
                     }
+                    // Off-schema: a single part object instead of an array.
+                    Some(v @ Value::Object(_)) => {
+                        push_text_leaves(ResponsesSlot::ItemContentLeaves(i), v, true, &mut slots, &mut texts)
+                    }
                     _ => {}
                 }
             }
         }
+        // Off-schema: a single item object instead of an array.
+        Some(v @ Value::Object(_)) => push_text_leaves(ResponsesSlot::InputLeaves, v, true, &mut slots, &mut texts),
         _ => {}
     }
     (slots, texts)
@@ -600,7 +629,12 @@ pub(super) fn write_responses_cloaked_texts(
         }
         if matches!(
             slot,
-            ResponsesSlot::InstructionsLeaves | ResponsesSlot::PromptVariable(_) | ResponsesSlot::ItemTextLeaves(_)
+            ResponsesSlot::InstructionsLeaves
+                | ResponsesSlot::PromptVariable(_)
+                | ResponsesSlot::ItemTextLeaves(_)
+                | ResponsesSlot::ItemPartLeaves(..)
+                | ResponsesSlot::ItemContentLeaves(_)
+                | ResponsesSlot::InputLeaves
         ) {
             // a run of identical slots = the text leaves of one value, in walk order
             let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
@@ -614,6 +648,12 @@ pub(super) fn write_responses_cloaked_texts(
                     })
                     .map(|v| (v, true)),
                 ResponsesSlot::ItemTextLeaves(i) => item(body, i).map(|v| (v, false)),
+                ResponsesSlot::ItemPartLeaves(i, j) => item(body, i)
+                    .and_then(|m| m.get_mut("content"))
+                    .and_then(|c| c.get_mut(j))
+                    .map(|v| (v, true)),
+                ResponsesSlot::ItemContentLeaves(i) => item(body, i).and_then(|m| m.get_mut("content")).map(|v| (v, true)),
+                ResponsesSlot::InputLeaves => body.get_mut("input").map(|v| (v, true)),
                 _ => None,
             };
             if let Some((v, under_text)) = target {
@@ -645,7 +685,10 @@ pub(super) fn write_responses_cloaked_texts(
             ResponsesSlot::ItemArguments(_)
             | ResponsesSlot::InstructionsLeaves
             | ResponsesSlot::PromptVariable(_)
-            | ResponsesSlot::ItemTextLeaves(_) => None,
+            | ResponsesSlot::ItemTextLeaves(_)
+            | ResponsesSlot::ItemPartLeaves(..)
+            | ResponsesSlot::ItemContentLeaves(_)
+            | ResponsesSlot::InputLeaves => None,
         };
         if let Some(t) = target {
             *t = Value::String(text.clone());
@@ -1674,11 +1717,17 @@ mod tests {
         });
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
         // An item that is no message (neither `type` nor `role`, or a non-string `type`)
-        // has no rule of its own: the generic walk cloaks its `content`.
-        assert_eq!(texts, vec!["no role and no type", "odd type", "ok"]);
+        // has no rule of its own: the generic walk cloaks its `content`. So does a part
+        // without a type; an `input_text` part without a string text has nothing to cloak.
+        assert_eq!(texts, vec!["no role and no type", "odd type", "no type", "ok"]);
         assert_eq!(
             slots,
-            vec![ResponsesSlot::ItemTextLeaves(1), ResponsesSlot::ItemTextLeaves(2), ResponsesSlot::ItemPart(3, 4)]
+            vec![
+                ResponsesSlot::ItemTextLeaves(1),
+                ResponsesSlot::ItemTextLeaves(2),
+                ResponsesSlot::ItemPartLeaves(3, 1),
+                ResponsesSlot::ItemPart(3, 4)
+            ]
         );
         let (s, t) = collect_responses_cloak_texts(&json!({"model": "x", "input": ""}), true);
         assert!(s.is_empty() && t.is_empty());
@@ -2919,5 +2968,47 @@ mod tests {
         for k in ["type", "id", "call_id", "status", "name"] {
             assert_eq!(body["input"][0][k], before["input"][0][k], "{k}");
         }
+    }
+
+    // 39
+    #[test]
+    fn unknown_message_parts_and_off_schema_shapes_never_go_out_in_clear() {
+        let body = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "text", "text": "Max Müller fragt nach Nexovar \"Labs\" GmbH"},
+                    "Max Müller als blanker String",
+                    {"type": "refusal", "refusal": "Nichts zu Nexovar \"Labs\" GmbH"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
+                    {"type": "input_file", "file_id": "file-1", "filename": "a.pdf"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                    {"type": "input_text", "text": "Wer ist Max Müller?"}
+                ]},
+                {"type": "message", "role": "user", "content": {"type": "input_text", "text": "Max Müller als Objekt"}}
+            ]
+        });
+        let (out_bytes, _) = cloaked_request_bytes(Upstream::OpenAi, body.clone());
+        assert_no_plaintext(std::str::from_utf8(&out_bytes).unwrap());
+        let sent: Value = serde_json::from_slice(&out_bytes).unwrap();
+        let parts = &sent["input"][0]["content"];
+        assert_eq!(parts[0], json!({"type": "text", "text": "[Person-3] fragt nach [Org-2]"}));
+        assert_eq!(parts[1], "[Person-3] als blanker String");
+        assert_eq!(parts[2], json!({"type": "refusal", "refusal": "Nichts zu [Org-2]"}));
+        // the known part types keep their dedicated handling: images, files, audio as they are
+        for j in 3..6 {
+            assert_eq!(parts[j], body["input"][0]["content"][j], "part {j}");
+        }
+        assert_eq!(parts[6]["text"], "Wer ist [Person-3]?");
+        assert_eq!(sent["input"][1]["content"], json!({"type": "input_text", "text": "[Person-3] als Objekt"}));
+
+        // `input` sent as a single object
+        let body = json!({"input": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Max Müller, Nexovar \"Labs\" GmbH"}]}});
+        let (out_bytes, _) = cloaked_request_bytes(Upstream::OpenAi, body);
+        assert_no_plaintext(std::str::from_utf8(&out_bytes).unwrap());
+        let sent: Value = serde_json::from_slice(&out_bytes).unwrap();
+        assert_eq!(sent["input"]["content"][0]["text"], "[Person-3], [Org-2]");
+        assert_eq!((&sent["input"]["type"], &sent["input"]["role"]), (&json!("message"), &json!("user")));
     }
 }
