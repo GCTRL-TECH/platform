@@ -9,7 +9,19 @@ Transparency is part of the product. A knowledge platform you build on should vi
 keep improving - so here it is, release by release.
 
 <!-- POST-ROUTINE-ANCHOR: the shipping-test post-routine inserts auto-drafted entries as an HTML comment directly below this line; an author turns each draft into a real `## vX` section and deletes the comment. -->
-<!-- baseline-sha: cdae2d9 -->
+<!-- baseline-sha: fabfd43 -->
+
+## v0.9.32 - The cloak covers Runware and the Responses API
+
+*18 November 2026 · [GCTRL Team / TortillaJackson](https://github.com/TortillaJackson)*
+
+- **Runware is a cloak target.** Send `X-Upstream-Provider: runware` and the gateway forwards `POST /v1/chat/completions` to Runware with names and personal data replaced by placeholders, streamed or not, and puts the real names back into the answer. Every model on Runware counts as cloud, so nothing takes the local plaintext path by accident. `GET /v1/models` relays the Runware catalog.
+- **The Responses API works for OpenAI and Runware keys.** `POST /v1/responses` used to accept the ChatGPT subscription only and answered 400 for the two key-based targets. It now cloaks instructions, messages, replayed tool calls and tool outputs for all three, and translates text, tool-call arguments and the final response back. A client that already sends Chat Completions through the gateway changes the path and nothing else.
+- **Ask the gateway what it can do.** `GET /v1/cloak/capabilities` lists the upstreams and, under `responses`, the targets of `/v1/responses`. A client can tell an older gateway apart before it sends anything.
+- **Replayed reasoning is cloaked again.** The gateway translates a model's reasoning back to real names for the client. Clients that send the assistant message back on the next turn returned that reasoning in plain text next to the cloaked answer, which revealed the mapping. Reasoning fields now pass through the same cloak as the content.
+- **Free-form data on the Responses API is cloaked in full.** Values under keys such as `name` or `role` stayed readable when they appeared inside prompt variables, tool outputs or items the gateway did not know. Only the identifiers of the protocol itself stay as they are now. Shell and patch outputs, tool results encoded as JSON text and arguments with duplicate keys are covered as well, and signatures and Base64 payloads pass through unchanged.
+- **Access tokens work as Bearer.** MCP clients that can only send `Authorization: Bearer` were rejected with 401. A Bearer value that starts with `gctrl_` is now checked as an access token, with the same expiry, clearance and read-only rules as before.
+- **A second API instance can serve HTTP only.** With `GCTRL_BACKGROUND_JOBS=off` an instance next to the productive one runs no background jobs, does not migrate the database and writes nothing at start. It checks that its schema matches the database and refuses to start when it does not. The default stays on.
 
 ## v0.9.31 - Duplicate cleanup runs at night, not every hour
 
