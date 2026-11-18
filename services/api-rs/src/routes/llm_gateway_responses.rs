@@ -25,25 +25,52 @@
 //! `CHATGPT_BASE` is the HOST only (the Codex path is appended here); with the dev
 //! escape hatch `GCTRL_CLOAK_UPSTREAM_UNPINNED=1` a path in it would be doubled.
 //!
-//! What is cloaked (request side): `instructions`, a string `input`, the text of
-//! every message item in `input[]` (string `content`, or `input_text` /
+//! What is cloaked (request side): `instructions` (a string, or every text leaf of a
+//! non-string value as in the generic walk below), the string values of
+//! `prompt.variables` (and the text of `input_text` variables), a string `input`, the
+//! text of every message item in `input[]` (string `content`, or `input_text` /
 //! `output_text` parts) for every role, the replayed tool calls
 //! (`function_call.arguments`: decoded string values, written back byte-faithfully;
 //! `custom_tool_call.input`), and by default the tool outputs
 //! (`function_call_output` / `custom_tool_call_output`: string `output` or its
-//! `input_text`/`output_text` parts; opt out with `X-Cloak-Tool-Outputs: 0`, which
+//! `input_text`/`output_text` parts; `shell_call_output`: `stdout` / `stderr`;
+//! `apply_patch_call_output.output`; opt out with `X-Cloak-Tool-Outputs: 0`, which
 //! is never forwarded). Replayed calls must be cloaked: the de-cloaker gave the
 //! client the real names, and sending them back next to pseudonymised text would
-//! reveal the pseudonym mapping. What never is: `reasoning` items (their `summary`
-//! and `encrypted_content` are replayed by Codex and must stay byte-identical),
-//! compaction items, item references, shell / web search / MCP items, images,
-//! files, and the keys `tools`, `tool_choice`, `text`, `reasoning`, `metadata`,
-//! `prompt_cache_key`, `client_metadata`, `include`, `model`, `store`, `stream`.
+//! reveal the pseudonym mapping.
+//!
+//! Item types without a rule here (new or unknown types, an item with neither `type`
+//! nor `role`) never travel in clear: the generic walk cloaks every string below one of
+//! the keys `output`, `text`, `content`, `arguments`, `input`, `stdout`, `stderr`,
+//! `summary`, at any depth (an `arguments` string holding JSON on its decoded values,
+//! like `function_call.arguments`). It never alters `encrypted_content`, `id`,
+//! `call_id`, `type`, `status`, `role`, `name`, nor the image and file references
+//! `image_url`, `file_id`, `file_data`, `file_url` (protocol identifiers, opaque or
+//! base64 payloads that cloaking would corrupt). Residual: a string under any other key
+//! of such an item travels as it is. The opt-out header does not apply to these items.
+//!
+//! What never is, because cloaking would break the protocol or protect nothing:
+//! * `reasoning` items: Codex replays `summary` and `encrypted_content`, which must stay
+//!   byte-identical; the de-cloaker never restores them, so they carry only the
+//!   model's pseudonyms;
+//! * `compaction` items (`encrypted_content`) and `item_reference` (an id);
+//! * `web_search_call` and the hosted MCP items (`mcp_call`, `mcp_list_tools`,
+//!   `mcp_approval_request`, `mcp_approval_response`): the vendor ran them itself and
+//!   the de-cloaker never restores them, so a replay carries what the vendor produced;
+//!   cloaking it would protect nothing and would show the vendor the pseudonym next to
+//!   its own original. `web_search_call.action.query` keeps the model's pseudonyms both
+//!   ways;
+//! * `shell_call.action` and `apply_patch_call.operation`: the model's own commands and
+//!   diffs, never restored, so they round-trip with its pseudonyms (the generic walk
+//!   finds no text key in them);
+//! * images, files, and the keys `tools`, `tool_choice`, `text`, `reasoning`,
+//!   `metadata`, `prompt_cache_key`, `client_metadata`, `include`, `model`, `store`,
+//!   `stream`, `prompt.id`, `prompt.version`.
+//!
 //! `local_shell_call.action.command[]` and `local_shell_call_output.output` are
 //! treated like function calls and their outputs; `local_shell_call.action`'s
 //! `working_directory` and `env` are passed through (neither de-cloaked nor
-//! re-cloaked); `web_search_call` stays untouched (its query keeps the model's
-//! pseudonyms both ways).
+//! re-cloaked).
 //!
 //! Path policy (privacy.rs `apply_pseudonyms_recording`): a name glued into a file
 //! path or slug is NOT cloaked, multi-word names included (`crm/Max Müller.md`,
@@ -123,6 +150,103 @@ pub(super) enum ResponsesSlot {
     ItemOutputPart(usize, usize),
     /// `input[i].action.command[j]` of a replayed `local_shell_call`.
     ItemShellCommand(usize, usize),
+    /// A non-string `instructions`: one slot per [`text_leaves`] leaf (walked as text).
+    InstructionsLeaves,
+    /// `prompt.variables`: one slot per [`text_leaves`] leaf (walked as text).
+    PromptVariables,
+    /// `input[i]` without a dedicated rule (unknown type, `shell_call_output`,
+    /// `apply_patch_call_output`): one slot per [`text_leaves`] leaf of the item.
+    ItemTextLeaves(usize),
+}
+
+/// Keys whose strings the generic walk ([`text_leaves`]) cloaks, at any depth below them.
+const TEXT_KEYS: [&str; 8] = ["output", "text", "content", "arguments", "input", "stdout", "stderr", "summary"];
+
+/// Keys the generic walk never alters, at any depth: protocol identifiers and opaque
+/// payloads, and image / file references (base64 or ids that cloaking would corrupt).
+const KEEP_KEYS: [&str; 11] = [
+    "encrypted_content", "id", "call_id", "type", "status", "role", "name", "image_url", "file_id", "file_data",
+    "file_url",
+];
+
+/// JSON text of an `arguments` string, when it holds an object or array without
+/// duplicate keys: its decoded string values are cloaked like `function_call.arguments`.
+fn json_arguments(key: Option<&str>, s: &str) -> Option<Value> {
+    if key != Some("arguments") || has_duplicate_keys(s) {
+        return None;
+    }
+    serde_json::from_str::<Value>(s).ok().filter(|v| v.is_object() || v.is_array())
+}
+
+/// The generic walk for content the gateway has no dedicated rule for: every non-empty
+/// string below a [`TEXT_KEYS`] key (or anywhere, with `under_text` set for the root),
+/// skipping [`KEEP_KEYS`] subtrees. An `arguments` string holding JSON yields its
+/// decoded string values ([`string_leaves`]). Order is shared with [`set_text_leaves`].
+fn text_leaves(v: &Value, under_text: bool, out: &mut Vec<String>) {
+    fn walk(v: &Value, under_text: bool, key: Option<&str>, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) if under_text && !s.is_empty() => match json_arguments(key, s) {
+                Some(parsed) => string_leaves(&parsed, out),
+                None => out.push(s.clone()),
+            },
+            Value::Array(a) => a.iter().for_each(|x| walk(x, under_text, key, out)),
+            Value::Object(o) => {
+                for (k, x) in o.iter().filter(|(k, _)| !KEEP_KEYS.contains(&k.as_str())) {
+                    walk(x, under_text || TEXT_KEYS.contains(&k.as_str()), Some(k), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, under_text, None, out);
+}
+
+/// Write the cloaked leaves of [`text_leaves`] back, in the same order. A JSON
+/// `arguments` string is rewritten byte-faithfully by [`write_cloaked_arguments`].
+fn set_text_leaves(v: &mut Value, under_text: bool, new: &[String], session: &privacy::CloakSession) {
+    fn walk(v: &mut Value, under_text: bool, key: Option<&str>, new: &[String], k: &mut usize, session: &privacy::CloakSession) {
+        match v {
+            Value::String(s) if under_text && !s.is_empty() => match json_arguments(key, s) {
+                Some(parsed) => {
+                    let mut leaves = Vec::new();
+                    string_leaves(&parsed, &mut leaves);
+                    let end = (*k + leaves.len()).min(new.len());
+                    *s = write_cloaked_arguments(s, &new[(*k).min(end)..end], session);
+                    *k += leaves.len();
+                }
+                None => {
+                    if let Some(n) = new.get(*k) {
+                        *s = n.clone();
+                    }
+                    *k += 1;
+                }
+            },
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, under_text, key, new, k, session)),
+            Value::Object(o) => {
+                for (kk, x) in o.iter_mut().filter(|(kk, _)| !KEEP_KEYS.contains(&kk.as_str())) {
+                    let text = under_text || TEXT_KEYS.contains(&kk.as_str());
+                    walk(x, text, Some(kk), new, k, session);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut k = 0;
+    walk(v, under_text, None, new, &mut k, session);
+}
+
+/// Collect the [`text_leaves`] of `v` as a run of `slot`.
+fn push_text_leaves(
+    slot: ResponsesSlot,
+    v: &Value,
+    under_text: bool,
+    slots: &mut Vec<ResponsesSlot>,
+    texts: &mut Vec<String>,
+) {
+    let mut leaves = Vec::new();
+    text_leaves(v, under_text, &mut leaves);
+    slots.extend(std::iter::repeat_n(slot, leaves.len()));
+    texts.extend(leaves);
 }
 
 /// Request header that turns tool-output cloaking off (`0|off|false|no`); never
@@ -171,11 +295,18 @@ pub(super) fn collect_responses_cloak_texts(
 ) -> (Vec<ResponsesSlot>, Vec<String>) {
     let mut slots = Vec::new();
     let mut texts = Vec::new();
-    if let Some(Value::String(s)) = body.get("instructions") {
-        if !s.is_empty() {
+    match body.get("instructions") {
+        Some(Value::String(s)) if !s.is_empty() => {
             slots.push(ResponsesSlot::Instructions);
             texts.push(s.clone());
         }
+        Some(v @ (Value::Array(_) | Value::Object(_))) => {
+            push_text_leaves(ResponsesSlot::InstructionsLeaves, v, true, &mut slots, &mut texts)
+        }
+        _ => {}
+    }
+    if let Some(vars) = body.pointer("/prompt/variables") {
+        push_text_leaves(ResponsesSlot::PromptVariables, vars, true, &mut slots, &mut texts);
     }
     match body.get("input") {
         Some(Value::String(s)) if !s.is_empty() => {
@@ -210,12 +341,13 @@ pub(super) fn collect_responses_cloak_texts(
     (slots, texts)
 }
 
-/// Tool items of `input[]`: replayed calls (`function_call`, `custom_tool_call`,
+/// Non-message items of `input[]`: replayed calls (`function_call`, `custom_tool_call`,
 /// `local_shell_call`) always, outputs (`function_call_output`,
-/// `custom_tool_call_output`, `local_shell_call_output`) when enabled. Reasoning,
-/// compaction, item references, web search and MCP items are never collected
-/// (`web_search_call.action.query` is the model's own query, neither de-cloaked nor
-/// re-cloaked, so it round-trips with its pseudonyms).
+/// `custom_tool_call_output`, `local_shell_call_output`, `shell_call_output`,
+/// `apply_patch_call_output`) when enabled. Reasoning, compaction, item references,
+/// web search and MCP items are never collected (`web_search_call.action.query` is the
+/// model's own query, neither de-cloaked nor re-cloaked, so it round-trips with its
+/// pseudonyms). Every other item goes through the generic walk ([`text_leaves`]).
 fn collect_tool_item(
     i: usize,
     item: &Value,
@@ -276,7 +408,22 @@ fn collect_tool_item(
             _ => {}
             }
         }
-        _ => {}
+        // `output[].stdout` / `output[].stderr`, and the string `output`.
+        Some("shell_call_output") | Some("apply_patch_call_output") if cloak_tool_outputs => {
+            push_text_leaves(ResponsesSlot::ItemTextLeaves(i), item, false, slots, texts)
+        }
+        // Outputs the caller opted out of.
+        Some(
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" | "shell_call_output"
+            | "apply_patch_call_output",
+        ) => {}
+        // Documented exceptions (module doc): never restored, replayed as the vendor sent them.
+        Some(
+            "reasoning" | "compaction" | "item_reference" | "web_search_call" | "mcp_call" | "mcp_list_tools"
+            | "mcp_approval_request" | "mcp_approval_response",
+        ) => {}
+        // Anything else, including an item with neither `type` nor `role`.
+        _ => push_text_leaves(ResponsesSlot::ItemTextLeaves(i), item, false, slots, texts),
     }
 }
 
@@ -424,6 +571,24 @@ pub(super) fn write_responses_cloaked_texts(
             k = end;
             continue;
         }
+        if matches!(
+            slot,
+            ResponsesSlot::InstructionsLeaves | ResponsesSlot::PromptVariables | ResponsesSlot::ItemTextLeaves(_)
+        ) {
+            // a run of identical slots = the text leaves of one value, in walk order
+            let end = (k..n).find(|&e| slots[e] != slot).unwrap_or(n);
+            let target = match slot {
+                ResponsesSlot::InstructionsLeaves => body.get_mut("instructions").map(|v| (v, true)),
+                ResponsesSlot::PromptVariables => body.pointer_mut("/prompt/variables").map(|v| (v, true)),
+                ResponsesSlot::ItemTextLeaves(i) => item(body, i).map(|v| (v, false)),
+                _ => None,
+            };
+            if let Some((v, under_text)) = target {
+                set_text_leaves(v, under_text, &cloaked[k..end], session);
+            }
+            k = end;
+            continue;
+        }
         let text = &cloaked[k];
         k += 1;
         let target = match slot {
@@ -443,7 +608,11 @@ pub(super) fn write_responses_cloaked_texts(
             ResponsesSlot::ItemShellCommand(i, j) => item(body, i)
                 .and_then(|m| m.pointer_mut("/action/command"))
                 .and_then(|c| c.get_mut(j)),
-            ResponsesSlot::ItemArguments(_) => None, // handled above
+            // handled above
+            ResponsesSlot::ItemArguments(_)
+            | ResponsesSlot::InstructionsLeaves
+            | ResponsesSlot::PromptVariables
+            | ResponsesSlot::ItemTextLeaves(_) => None,
         };
         if let Some(t) = target {
             *t = Value::String(text.clone());
@@ -1471,8 +1640,13 @@ mod tests {
             ]
         });
         let (slots, texts) = collect_responses_cloak_texts(&body, true);
-        assert_eq!(texts, vec!["ok"]);
-        assert_eq!(slots, vec![ResponsesSlot::ItemPart(3, 4)]);
+        // An item that is no message (neither `type` nor `role`, or a non-string `type`)
+        // has no rule of its own: the generic walk cloaks its `content`.
+        assert_eq!(texts, vec!["no role and no type", "odd type", "ok"]);
+        assert_eq!(
+            slots,
+            vec![ResponsesSlot::ItemTextLeaves(1), ResponsesSlot::ItemTextLeaves(2), ResponsesSlot::ItemPart(3, 4)]
+        );
         let (s, t) = collect_responses_cloak_texts(&json!({"model": "x", "input": ""}), true);
         assert!(s.is_empty() && t.is_empty());
     }
@@ -2574,5 +2748,99 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(resp.headers()["x-cloak-gateway-error"], "1");
+    }
+
+    // 36
+    #[test]
+    fn shell_and_patch_outputs_prompt_variables_instructions_and_unknown_items_never_go_out_in_clear() {
+        let body = json!({
+            "model": "gpt-5.4",
+            "instructions": [{"type": "message", "role": "developer",
+                              "content": [{"type": "input_text", "text": "Kunde: Max Müller"}]}],
+            "prompt": {"id": "pmpt_1", "version": "2", "variables": {
+                "kunde": "Max Müller",
+                "firma": {"type": "input_text", "text": "Nexovar \"Labs\" GmbH"},
+                "logo": {"type": "input_image", "file_id": "file-abc123"}
+            }},
+            "input": [
+                {"type": "message", "role": "user", "content": "Wer ist das?"},
+                {"type": "shell_call", "id": "sh_1", "call_id": "s1", "status": "completed",
+                 "action": {"commands": ["grep -rn '[Person-3]' crm/"], "timeout_ms": 1000}},
+                {"type": "shell_call_output", "call_id": "s1", "output": [
+                    {"stdout": "crm/a.md: Max Müller", "stderr": "warn: Nexovar \"Labs\" GmbH",
+                     "outcome": {"type": "exit", "exit_code": 0}}]},
+                {"type": "apply_patch_call", "call_id": "p1", "status": "completed",
+                 "operation": {"type": "update_file", "path": "crm/a.md", "diff": "-[Person-3]\n+[Person-3] (CEO)"}},
+                {"type": "apply_patch_call_output", "call_id": "p1", "status": "failed",
+                 "output": "context mismatch near Max Müller"},
+                {"type": "future_tool_output", "id": "ft_1", "call_id": "f1", "status": "completed",
+                 "output": {"rows": [{"text": "Max Müller"}], "log": "Nexovar \"Labs\" GmbH"},
+                 "arguments": r#"{"q":"Nexovar \"Labs\" GmbH","n":2}"#,
+                 "summary": [{"type": "summary_text", "text": "Max Müller"}]},
+                {"content": "Max Müller, ohne type und role"}
+            ]
+        });
+        let (out_bytes, _) = cloaked_request_bytes(Upstream::OpenAi, body.clone());
+        assert_no_plaintext(std::str::from_utf8(&out_bytes).unwrap());
+        let sent: Value = serde_json::from_slice(&out_bytes).unwrap();
+        // shell and apply_patch outputs
+        assert_eq!(sent["input"][2]["output"][0]["stdout"], "crm/a.md: [Person-3]");
+        assert_eq!(sent["input"][2]["output"][0]["stderr"], "warn: [Org-2]");
+        assert_eq!(sent["input"][2]["output"][0]["outcome"], json!({"type": "exit", "exit_code": 0}));
+        assert_eq!(sent["input"][4]["output"], "context mismatch near [Person-3]");
+        // the model's own command and patch carry no text key: unchanged
+        assert_eq!(sent["input"][1], body["input"][1]);
+        assert_eq!(sent["input"][3], body["input"][3]);
+        // unknown type: text keys at any depth, JSON arguments on decoded values, ids kept
+        let ft = &sent["input"][5];
+        assert_eq!(ft["output"]["rows"][0]["text"], "[Person-3]");
+        assert_eq!(ft["output"]["log"], "[Org-2]");
+        assert_eq!(ft["arguments"], r#"{"q":"[Org-2]","n":2}"#);
+        assert_eq!(ft["summary"][0], json!({"type": "summary_text", "text": "[Person-3]"}));
+        for k in ["type", "id", "call_id", "status"] {
+            assert_eq!(ft[k], body["input"][5][k], "{k}");
+        }
+        assert_eq!(sent["input"][6]["content"], "[Person-3], ohne type und role");
+        // non-string instructions and prompt variables
+        assert_eq!(sent["instructions"][0]["content"][0]["text"], "Kunde: [Person-3]");
+        assert_eq!(sent["instructions"][0]["role"], "developer");
+        assert_eq!(sent["prompt"]["variables"]["kunde"], "[Person-3]");
+        assert_eq!(sent["prompt"]["variables"]["firma"], json!({"type": "input_text", "text": "[Org-2]"}));
+        assert_eq!(sent["prompt"]["variables"]["logo"], body["prompt"]["variables"]["logo"]);
+        assert_eq!((&sent["prompt"]["id"], &sent["prompt"]["version"]), (&json!("pmpt_1"), &json!("2")));
+        // the opt-out keeps the two outputs, never the unknown item
+        let (_, texts) = collect_responses_cloak_texts(&body, false);
+        assert!(!texts.iter().any(|t| t.contains("crm/a.md") || t.contains("context mismatch")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Max Müller, ohne type und role"));
+    }
+
+    // 37
+    #[test]
+    fn generic_walk_keeps_identifiers_payloads_and_the_documented_exceptions() {
+        let mut body = json!({"input": [
+            {"type": "new_tool_output", "id": "Max Müller", "call_id": "Max Müller", "status": "Max Müller",
+             "name": "Max Müller", "role": "Max Müller", "encrypted_content": "Max Müller",
+             "output": [
+                 {"type": "input_image", "image_url": "data:image/png;base64,TWF4IE3DvGxsZXI=", "file_id": "Max Müller"},
+                 {"type": "input_file", "file_data": "Max Müller", "file_url": "Max Müller", "filename": "a.pdf"},
+                 {"type": "input_text", "text": "Max Müller"}
+             ],
+             "meta": {"note": "Max Müller"}},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Max Müller"}], "encrypted_content": "x"},
+            {"type": "compaction", "encrypted_content": "Max Müller"},
+            {"type": "item_reference", "id": "Max Müller"},
+            {"type": "web_search_call", "action": {"type": "search", "query": "Max Müller"}},
+            {"type": "mcp_call", "arguments": "{\"q\":\"Max Müller\"}", "output": "Max Müller"},
+            {"type": "mcp_approval_request", "arguments": "{\"q\":\"Max Müller\"}"}
+        ]});
+        let before = body.clone();
+        let (slots, texts) = collect_responses_cloak_texts(&body, true);
+        assert_eq!(texts, vec!["a.pdf", "Max Müller"]);
+        assert_eq!(slots, vec![ResponsesSlot::ItemTextLeaves(0); 2]);
+        let (cloaked, bs) = real_cloak(&texts, &one("Person-3", "Max Müller"));
+        write_responses_cloaked_texts(&mut body, &slots, &cloaked, &bs);
+        assert_eq!(body["input"][0]["output"][2]["text"], "Person-3");
+        body["input"][0]["output"][2]["text"] = before["input"][0]["output"][2]["text"].clone();
+        assert_eq!(body, before, "identifiers, payloads, other keys and the exceptions stay byte-identical");
     }
 }
