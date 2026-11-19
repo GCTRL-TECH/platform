@@ -7,6 +7,13 @@
     <language>en</language>
     <atom:link href="https://gctrl.tech/rss.xml" rel="self" type="application/rss+xml"/>
     <item>
+      <title>How to Run Always-On AI Agents Cheaply</title>
+      <link>https://gctrl.tech/blog/how-to-run-always-on-ai-agents-cheaply</link>
+      <guid isPermaLink="true">https://gctrl.tech/blog/how-to-run-always-on-ai-agents-cheaply</guid>
+      <description>Learn how to run always on ai agents cheaply by switching to webhook-driven architectures, using local hardware, and implementing model tiering.</description>
+      <pubDate>Thu, 19 Nov 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
       <title>Running Ollama in Production: Challenges and Alternatives</title>
       <link>https://gctrl.tech/blog/running-ollama-in-production-what-changes</link>
       <guid isPermaLink="true">https://gctrl.tech/blog/running-ollama-in-production-what-changes</guid>
